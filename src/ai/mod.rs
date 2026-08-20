@@ -251,6 +251,18 @@ impl ClassifyAiError for RemoteAiError {
     }
 }
 
+impl ClassifyAiError for reqwest::Error {
+    fn ai_error_class(&self) -> AiErrorClass {
+        if self.is_builder() || self.is_redirect() {
+            AiErrorClass::Fatal
+        } else {
+            AiErrorClass::Transient {
+                retry_after: Duration::from_secs(0),
+            }
+        }
+    }
+}
+
 pub(crate) fn classify_status_code(status: reqwest::StatusCode) -> Option<AiErrorClass> {
     match status {
         reqwest::StatusCode::TOO_MANY_REQUESTS => Some(AiErrorClass::RateLimit {
@@ -293,6 +305,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<vllm::VllmError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<reqwest::Error>() {
         return e.ai_error_class();
     }
     AiErrorClass::Fatal
@@ -1209,6 +1224,22 @@ mod tests {
         assert_ai_error_class(
             anyhow!("Remote AI Error: rate limit exceeded"),
             AiErrorClass::Fatal,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_classify_ai_error_reqwest_transport_is_transient() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:9/")
+            .send()
+            .await
+            .expect_err("connection to 127.0.0.1:9 should be refused");
+
+        assert_ai_error_class(
+            err,
+            AiErrorClass::Transient {
+                retry_after: Duration::from_secs(0),
+            },
         );
     }
 

@@ -153,6 +153,8 @@ pub enum ClaudeError {
     AuthenticationError(String),
     #[error("API error {0}: {1}")]
     ApiError(reqwest::StatusCode, String),
+    #[error("Transport error, retry after {1:?}: {0}")]
+    Transport(String, Duration),
 }
 
 impl ClassifyAiError for ClaudeError {
@@ -162,6 +164,9 @@ impl ClassifyAiError for ClaudeError {
                 retry_after: *retry_after,
             },
             ClaudeError::OverloadedError(retry_after) => AiErrorClass::Transient {
+                retry_after: *retry_after,
+            },
+            ClaudeError::Transport(_, retry_after) => AiErrorClass::Transient {
                 retry_after: *retry_after,
             },
             ClaudeError::InvalidRequest(_) => AiErrorClass::Fatal,
@@ -277,7 +282,10 @@ impl ClaudeClient {
             Ok(res) => res,
             Err(e) => {
                 let err_str = redact_secret(&e.to_string());
-                anyhow::bail!("Failed to send request to Claude API: {}", err_str);
+                if e.is_builder() || e.is_redirect() {
+                    anyhow::bail!("Failed to send request to Claude API: {}", err_str);
+                }
+                return Err(ClaudeError::Transport(err_str, Duration::from_secs(0)).into());
             }
         };
 
@@ -795,6 +803,17 @@ mod tests {
         let err = ClaudeError::InvalidRequest("bad request".to_string());
 
         assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_transport_error_classifies_as_transient() {
+        let retry_after = Duration::from_secs(0);
+        let err = ClaudeError::Transport("connection reset".to_string(), retry_after);
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient { retry_after }
+        );
     }
 
     #[test]
