@@ -13,12 +13,18 @@ and ARM64 Hyp (EL2) rows — all four guides apply.
 The triggers column below includes both path names, function calls,
 and symbols regexes.
 
+Path triggers describe mainline layout. When reviewing an out-of-tree module the
+paths will not match, so rely on the symbol triggers -- they fire on the same
+code wherever it lives. Prefer over-inclusion here: a guide loaded for code it
+does not describe costs tokens, while a guide missed because the path was
+unfamiliar costs the finding it would have made.
+
 ## Subsystem Guides
 
 | Subsystem | Triggers | File |
 |-----------|----------|------|
 | Networking Core | net/, skb_, sockets, xfrm, dst_, sock_put, release_sock, pskb_may_pull, SNMP_*_STATS | networking-core.md |
-| Networking Drivers | drivers/net/, ethtool_ops, net_device_ops | networking-drivers.md |
+| Networking Drivers | drivers/net/, drivers/eth/, `*/ionic/`, `*/pds_*/`, `*/pensando/`, ethtool_ops, net_device_ops, netdev_ops, napi_, ndo_ | networking-drivers.md |
 | Netlink | `genl_`, `nla_`, `NLA_`, `NLM_F_`, `nlmsg_`, `netlink_callback`, Documentation/netlink/specs/, files marked `YNL-GEN` | netlink.md |
 | MM Page Tables | `pte_*`, `pmd_*`, `pud_*`, `set_pte`, `ptep_*`, `tlb_*`, `page_vma_mapped_walk`, `walk_page_range`, `zap_pte_range`, mm/memory.c, mm/mprotect.c, mm/pagewalk.c | mm-pagetable.md |
 | Alignment Helpers | `ALIGN`, `ALIGN_DOWN`, `IS_ALIGNED`, `PAGE_ALIGN`, `PAGE_ALIGN_DOWN`, `pageblock_align`, `pageblock_aligned`, `pageblock_start_pfn`, `pageblock_end_pfn` | alignment.md |

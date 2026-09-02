@@ -690,6 +690,49 @@ pub async fn repack_repository(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Checks that a reference repository exists and that its revision resolves.
+///
+/// Called at daemon startup rather than lazily, because the failure is silent
+/// where it would otherwise land: a bad path or a tag that was never fetched
+/// reaches the model as a tool error, which it absorbs and works around by
+/// answering from memory. The review then looks normal and is ungrounded.
+pub async fn validate_reference_repository(path: &Path, revision: Option<&str>) -> Result<()> {
+    if !path.exists() {
+        return Err(anyhow!(
+            "git.reference_repository_path {} does not exist",
+            path.display()
+        ));
+    }
+
+    let revision = revision.unwrap_or("HEAD");
+    let output = Command::new("git")
+        .current_dir(path)
+        .args(["-c", "safe.bareRepository=all"])
+        // `^{commit}` so a path that is a directory but not a repository, or a
+        // revision that names a tree or a missing tag, both fail here.
+        .args(["rev-parse", "--verify", &format!("{}^{{commit}}", revision)])
+        .kill_on_drop(true)
+        .output()
+        .await?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "git.reference_revision '{}' does not resolve in {}: {}",
+            revision,
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    info!(
+        "Reference repository {} validated at {} ({})",
+        path.display(),
+        revision,
+        String::from_utf8_lossy(&output.stdout).trim()
+    );
+    Ok(())
+}
+
 #[allow(dead_code)]
 pub async fn cleanup_worktree_dir(worktree_dir: &Path) -> Result<()> {
     if !worktree_dir.exists() {
@@ -1842,6 +1885,56 @@ mod tests {
             "Command should NOT have been executed!"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reference_repository_validation_rejects_what_it_cannot_read() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // A path that is not there at all.
+        let missing = temp.path().join("nope");
+        let err = validate_reference_repository(&missing, None)
+            .await
+            .expect_err("a missing path must not pass");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+
+        // A directory that exists but is not a git repository.
+        let not_a_repo = temp.path().join("plain");
+        std::fs::create_dir(&not_a_repo)?;
+        assert!(
+            validate_reference_repository(&not_a_repo, None)
+                .await
+                .is_err(),
+            "a plain directory must not pass as a repository"
+        );
+
+        // A real repository, but a revision that was never fetched -- the
+        // likeliest misconfiguration, and the one that would otherwise reach the
+        // model as a tool error it works around.
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo)?;
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "T"],
+            vec!["config", "user.email", "t@e"],
+            vec!["commit", "--allow-empty", "-m", "c"],
+        ] {
+            let status = tokio::process::Command::new("git")
+                .current_dir(&repo)
+                .args(&args)
+                .status()
+                .await?;
+            assert!(status.success());
+        }
+
+        let err = validate_reference_repository(&repo, Some("v6.12"))
+            .await
+            .expect_err("an unresolvable revision must not pass");
+        assert!(err.to_string().contains("v6.12"), "{err}");
+
+        validate_reference_repository(&repo, None).await?;
+        validate_reference_repository(&repo, Some("HEAD")).await?;
         Ok(())
     }
 

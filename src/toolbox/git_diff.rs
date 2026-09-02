@@ -36,6 +36,7 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "base_revision": { "type": "string", "description": "The baseline commit SHA or revision reference." },
                 "target_revision": { "type": "string", "description": "The target commit SHA or revision reference to compare against." },
                 "paths": {
@@ -62,12 +63,12 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
         let base_raw = args["base_revision"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing base_revision"))?;
-        let base_virt = context.virtualize_ref(base_raw);
+        let base_virt = context.resolve_ref(&args, base_raw)?;
         let base = base_virt.as_str();
         let target_raw = args["target_revision"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing target_revision"))?;
-        let target_virt = context.virtualize_ref(target_raw);
+        let target_virt = context.resolve_ref(&args, target_raw)?;
         let target = target_virt.as_str();
 
         if base.starts_with('-') || target.starts_with('-') {
@@ -75,7 +76,7 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
         }
 
         let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path).args([
+        cmd.current_dir(context.repo_root(&args)?).args([
             "diff",
             "--diff-algorithm=histogram",
             base,

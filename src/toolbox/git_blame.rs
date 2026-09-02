@@ -36,6 +36,7 @@ impl LlmTool<SashikoToolContext> for GitBlameTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "revision": { "type": "string", "description": "The Git commit SHA or reference to blame from." },
                 "path": { "type": "string", "description": "Relative path to the file." },
                 "start_line": { "type": "integer", "description": "1-based start line (optional)." },
@@ -62,7 +63,7 @@ impl LlmTool<SashikoToolContext> for GitBlameTool {
         let revision_raw = args["revision"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing revision"))?;
-        let revision_virt = context.virtualize_ref(revision_raw);
+        let revision_virt = context.resolve_ref(&args, revision_raw)?;
         let revision = revision_virt.as_str();
         let path_str = args["path"]
             .as_str()
@@ -71,7 +72,7 @@ impl LlmTool<SashikoToolContext> for GitBlameTool {
         let end_line = args["end_line"].as_u64();
 
         let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path).arg("blame");
+        cmd.current_dir(context.repo_root(&args)?).arg("blame");
 
         if let (Some(s), Some(e)) = (start_line, end_line) {
             cmd.arg(format!("-L{},{}", s, e));

@@ -36,6 +36,7 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "object": { "type": "string", "description": "Git object specifier (e.g. 'HEAD:README.md' or 'HEAD')." },
                 "suppress_diff": { "type": "boolean", "description": "If true, suppresses commit diff output." },
                 "start_line": { "type": "integer", "description": "Focus start line (blobs only, optional)." },
@@ -76,7 +77,7 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
         let object_raw = args["object"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing object"))?;
-        let object_virt = context.virtualize_ref(object_raw);
+        let object_virt = context.resolve_ref(&args, object_raw)?;
         let object = object_virt.as_str();
         let suppress_diff = args["suppress_diff"].as_bool().unwrap_or(false);
         let start_line = args["start_line"].as_u64().map(|v| v as usize);
@@ -86,8 +87,13 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
             return Err(anyhow!("Invalid object name: {}", object));
         }
 
+        // The repository belongs in this key as much as the object does. A tag
+        // like `v6.12` names a different commit in the reference tree than in
+        // the repository under review, and serving one for the other is a wrong
+        // answer with no symptom.
         let raw_key = format!(
-            "git_show_raw:{}:{}:{:?}",
+            "git_show_raw:{:?}:{}:{}:{:?}",
+            context.repo_target(&args)?,
             object,
             suppress_diff,
             args.get("paths")
@@ -103,7 +109,7 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
                 raw_str
             } else {
                 let mut cmd = Command::new("git");
-                cmd.current_dir(&context.worktree_path).arg("show");
+                cmd.current_dir(context.repo_root(&args)?).arg("show");
 
                 if suppress_diff {
                     cmd.arg("--no-patch");
