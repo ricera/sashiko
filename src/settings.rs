@@ -412,6 +412,20 @@ pub struct CustomRemoteSettings {
 pub struct GitSettings {
     pub repository_path: String,
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
+    /// A second, read-only repository the review can consult for grounding.
+    ///
+    /// Set when `repository_path` is an out-of-tree kernel module: the module's
+    /// own tree has no `include/linux/`, so without this the model answers
+    /// questions about kernel API contracts from recall rather than from source,
+    /// and does so silently. Absent means single-repository review, exactly as
+    /// before.
+    #[serde(default)]
+    pub reference_repository_path: Option<String>,
+    /// Revision to read the reference repository at, e.g. the tag the module is
+    /// built against. Defaults to `HEAD`, which on a tracking clone means
+    /// whatever was last fetched -- pin it to keep reviews reproducible.
+    #[serde(default)]
+    pub reference_revision: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

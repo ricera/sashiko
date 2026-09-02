@@ -37,6 +37,7 @@ impl LlmTool<SashikoToolContext> for GitFindFilesTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "revision": { "type": "string", "description": "The Git commit SHA or reference to search in." },
                 "pattern": { "type": "string", "description": "Glob pattern to match (e.g., '*.rs' or 'src/**/mod.rs')." },
                 "path": { "type": "string", "description": "Optional relative path to restrict the search (e.g., 'drivers/net/')." }
@@ -59,7 +60,7 @@ impl LlmTool<SashikoToolContext> for GitFindFilesTool {
         let revision_raw = args["revision"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing revision"))?;
-        let revision_virt = context.virtualize_ref(revision_raw);
+        let revision_virt = context.resolve_ref(&args, revision_raw)?;
         let revision = revision_virt.as_str();
         let pattern = args["pattern"]
             .as_str()
@@ -72,7 +73,7 @@ impl LlmTool<SashikoToolContext> for GitFindFilesTool {
         }
 
         let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path)
+        cmd.current_dir(context.repo_root(&args)?)
             .args(["ls-tree", "-r", "--name-only", revision]);
 
         if let Some(p) = path_str

@@ -47,6 +47,11 @@ pub struct WorkerOptions {
     pub stages: Option<Vec<u8>>,
     pub scratch_clone: bool,
     pub current_tree: bool,
+    /// Read-only repository consulted for grounding, overriding
+    /// `git.reference_repository_path`. Needed because a `--repo` override loads
+    /// `LocalReviewSettings`, which has no `[git]` section to read it from.
+    pub reference_repo: Option<PathBuf>,
+    pub reference_revision: Option<String>,
 }
 
 impl Default for WorkerOptions {
@@ -66,6 +71,8 @@ impl Default for WorkerOptions {
             stages: None,
             scratch_clone: false,
             current_tree: false,
+            reference_repo: None,
+            reference_revision: None,
         }
     }
 }
@@ -307,30 +314,54 @@ pub async fn run_worker(
     repo_override: Option<PathBuf>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    let (mut ai, configured_repo_path, concurrency) = if let Some(path) = &options.settings_path {
-        let local_settings = Settings::local_review_from_file(path)
-            .with_context(|| format!("Failed to load settings from {}", path.display()))?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
-        (local_settings.ai, None, concurrency)
-    } else if repo_override.is_some() {
-        let local_settings =
-            Settings::local_review_settings().context("Failed to load local review settings")?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
-        (local_settings.ai, None, concurrency)
-    } else {
-        let settings = Settings::new().context("Failed to load settings")?;
-        (
-            settings.ai,
-            Some(PathBuf::from(settings.git.repository_path)),
-            settings.review.concurrency,
-        )
-    };
+    let (mut ai, configured_repo_path, concurrency, mut reference) =
+        if let Some(path) = &options.settings_path {
+            let local_settings = Settings::local_review_from_file(path)
+                .with_context(|| format!("Failed to load settings from {}", path.display()))?;
+            let concurrency = local_settings
+                .review
+                .and_then(|r| r.concurrency)
+                .unwrap_or(4);
+            (local_settings.ai, None, concurrency, None)
+        } else if repo_override.is_some() {
+            let local_settings = Settings::local_review_settings()
+                .context("Failed to load local review settings")?;
+            let concurrency = local_settings
+                .review
+                .and_then(|r| r.concurrency)
+                .unwrap_or(4);
+            (local_settings.ai, None, concurrency, None)
+        } else {
+            let settings = Settings::new().context("Failed to load settings")?;
+            // Only this branch reads full settings; the two above deserialize
+            // `LocalReviewSettings`, which has no `[git]` section at all. Those
+            // paths depend on the CLI flags applied just below.
+            let reference = settings
+                .git
+                .reference_repository_path
+                .as_ref()
+                .map(|path| (PathBuf::from(path), settings.git.reference_revision.clone()));
+            (
+                settings.ai,
+                Some(PathBuf::from(settings.git.repository_path)),
+                settings.review.concurrency,
+                reference,
+            )
+        };
+
+    // An explicit flag wins over settings, and is the only source on the
+    // `--repo` and `--settings` paths.
+    if let Some(path) = &options.reference_repo {
+        reference = Some((path.clone(), options.reference_revision.clone()));
+    }
+
+    if let Some((path, revision)) = &reference {
+        info!(
+            "Grounding reads against reference repository {} at {}",
+            path.display(),
+            revision.as_deref().unwrap_or("HEAD")
+        );
+    }
 
     if let Some(provider) = &options.ai_provider {
         ai.provider = provider.clone();
@@ -430,6 +461,7 @@ pub async fn run_worker(
         &baseline_arg,
         &baseline_sha,
         &options,
+        reference,
         progress,
     )
     .await;
@@ -457,6 +489,7 @@ async fn review_single_patch(
     patch_shas: &HashMap<i64, String>,
     options: &WorkerOptions,
     baseline_sha: &str,
+    reference: Option<&(PathBuf, Option<String>)>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     let mut last_error = None;
@@ -506,6 +539,9 @@ async fn review_single_patch(
         );
 
         let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+        if let Some((path, revision)) = reference {
+            tools = tools.with_reference(path.clone(), revision.clone());
+        }
         tools.set_active_patch_files(patch_files);
 
         if let Some(sha) = patch_shas.get(&p.index) {
@@ -723,6 +759,7 @@ async fn run_worker_in_worktree(
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
+    reference: Option<(PathBuf, Option<String>)>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     info!("Worktree at {:?}", worktree.path);
@@ -901,6 +938,7 @@ async fn run_worker_in_worktree(
         let rich_patches = rich_patches.clone();
         let patch_shas = &patch_shas;
         let options = &options;
+        let reference = reference.as_ref();
         let subject_clone = subject.clone();
         let cover_letter_ref = cover_letter.as_deref();
         let all_patches = &patches;
@@ -917,6 +955,7 @@ async fn run_worker_in_worktree(
                 patch_shas,
                 options,
                 baseline_sha,
+                reference,
                 progress,
             )
             .await

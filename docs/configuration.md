@@ -142,6 +142,48 @@ Settings for the Kiro CLI provider (`provider = "kiro-cli"`).
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `repository_path` | string | -- | Path to the kernel git repository used for patch application and context. |
+| `reference_repository_path` | string | unset | Optional read-only second repository consulted for grounding. See [Reviewing out-of-tree modules](#reviewing-out-of-tree-modules). |
+| `reference_revision` | string | `HEAD` | Revision to read the reference repository at. |
+
+#### Reviewing out-of-tree modules
+
+When `repository_path` is an out-of-tree kernel module rather than a kernel tree,
+the review has no `include/linux/` to read. The model then answers questions
+about kernel APIs from training recall — unversioned, possibly wrong for the
+kernel you build against, and with no signal that it is doing so.
+
+Point `reference_repository_path` at a separate kernel checkout to fix that:
+
+```toml
+[git]
+repository_path = "/srv/sashiko/linux-ionic"
+reference_repository_path = "/srv/sashiko/linux"
+reference_revision = "v6.12"
+```
+
+This does three things. The git tools gain a `repo` argument, so the model can
+read the kernel tree with `repo: "kernel"` while the code under review stays the
+default. The system prompt gains a block stating the repository is out-of-tree,
+naming the pinned kernel, and withdrawing the in-tree conventions that do not
+apply here — `Fixes:` tags, lore threads, and treating compat `#ifdef`s as
+needless complexity. And the daemon validates the path and revision at startup,
+because a reference that does not resolve otherwise surfaces as tool errors the
+model works around, leaving a review that looks normal and is ungrounded.
+
+Notes:
+
+- **The daemon never writes to or fetches the reference repository.** Clone and
+  update it yourself.
+- **Pin `reference_revision`.** Left at `HEAD` on a tracking clone, the answers
+  change under you as the tree moves.
+- **A nested clone or submodule inside the module repo does not work.** `git grep`
+  and `git show <rev>:<path>` read the repository's own index, so only this
+  setting makes a second tree reachable.
+- Leaving `reference_repository_path` unset reproduces the previous behaviour
+  exactly: no `repo` argument is advertised to the model, and no out-of-tree
+  block is added to the prompt.
+- For `sashiko-cli local` against an ad-hoc repository, use `--reference-repo`
+  and `--reference-revision`; a `--repo` override bypasses the `[git]` section.
 
 #### `[[git.custom_remotes]]`
 

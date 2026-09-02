@@ -264,7 +264,9 @@ mod tests {
         assert_eq!(result1["end_line"].as_u64().unwrap(), 5);
 
         // Verify raw cache was populated
-        let raw_key = "git_show_raw:HEAD:README.md:false:None";
+        // The repository is part of the key; see the comment on `raw_key` in
+        // git_show.rs for why.
+        let raw_key = "git_show_raw:Review:HEAD:README.md:false:None";
         {
             let cache = toolbox.cache.read().unwrap();
             assert!(cache.contains_key(raw_key), "Raw key should be cached");
@@ -523,5 +525,205 @@ mod tests {
         assert!(res.get("error").is_none(), "unexpected error: {res:?}");
         assert_eq!(res["content"].as_str().unwrap(), "");
         assert_eq!(res["total_lines"].as_u64().unwrap(), 0);
+    }
+
+    /// Builds a reference repo whose content cannot be confused with the review
+    /// repo's, so a test can tell which one actually answered.
+    fn setup_reference_repo() -> (tempfile::TempDir, PathBuf) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().to_path_buf();
+
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        std::fs::create_dir_all(repo_path.join("include/linux")).unwrap();
+        std::fs::write(
+            repo_path.join("include/linux/netdevice.h"),
+            "struct net_device_ops {\n\tint (*ndo_open)(struct net_device *dev);\n};\n",
+        )
+        .unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "Reference kernel tree"]);
+        run_git(&["tag", "v6.12"]);
+
+        (temp_dir, repo_path)
+    }
+
+    /// The whole point: a `repo: "kernel"` read must reach the reference tree,
+    /// not the repository under review.
+    #[test]
+    fn reference_reads_hit_the_reference_repo() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let (_ref_dir, ref_path) = setup_reference_repo();
+        let toolbox =
+            ToolBox::new(review_path, None).with_reference(ref_path, Some("v6.12".to_string()));
+        let rt = Runtime::new().unwrap();
+
+        let args = json!({
+            "repo": "kernel",
+            "revision": "v6.12",
+            "pattern": "net_device_ops",
+            "is_literal": true,
+        });
+        let result = rt.block_on(toolbox.call("git_grep", args)).unwrap();
+        assert!(
+            result["content"].as_str().unwrap().contains("netdevice.h"),
+            "expected a hit in the reference tree: {result:?}"
+        );
+
+        // The review repo has no such file, so the same search there must come
+        // back empty rather than quietly reusing the reference answer.
+        let args = json!({
+            "revision": "HEAD",
+            "pattern": "net_device_ops",
+            "is_literal": true,
+        });
+        let result = rt.block_on(toolbox.call("git_grep", args)).unwrap();
+        let content = result["content"].as_str().unwrap_or_default();
+        assert!(
+            !content.contains("netdevice.h"),
+            "the review repo must not answer with reference content: {result:?}"
+        );
+    }
+
+    /// Asking for a repository that was never configured has to say so. Falling
+    /// back to the review repo would answer a question about the kernel with a
+    /// search of the driver, and "no matches" reads as a fact.
+    #[test]
+    fn reference_read_without_a_reference_configured_is_an_error() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let toolbox = ToolBox::new(review_path, None);
+        let rt = Runtime::new().unwrap();
+
+        let args = json!({ "repo": "kernel", "revision": "HEAD", "pattern": "anything" });
+        let err = rt
+            .block_on(toolbox.call("git_grep", args))
+            .expect_err("must not silently search the review repo");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reference_repository_path"),
+            "the error must name the missing setting: {msg}"
+        );
+    }
+
+    /// The virtual head is a commit in the review worktree. Rewriting `HEAD`
+    /// into it before querying the kernel tree would ask for an object that is
+    /// not there, and this is the failure most likely to survive review.
+    #[test]
+    fn virtual_head_does_not_leak_into_reference_reads() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let (_ref_dir, ref_path) = setup_reference_repo();
+
+        let review_head = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(&review_path)
+                .args(["rev-parse", "HEAD~1"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+
+        let mut toolbox =
+            ToolBox::new(review_path, None).with_reference(ref_path, Some("v6.12".to_string()));
+        toolbox.set_virtual_head(review_head.clone());
+
+        // Same input, two repositories, two correct answers.
+        let args = json!({ "revision": "HEAD", "pattern": "x" });
+        assert_eq!(
+            toolbox.context.resolve_ref(&args, "HEAD").unwrap(),
+            review_head,
+            "the review repo still gets the virtual head"
+        );
+
+        let args = json!({ "repo": "kernel", "revision": "HEAD", "pattern": "x" });
+        assert_eq!(
+            toolbox.context.resolve_ref(&args, "HEAD").unwrap(),
+            "v6.12",
+            "the reference repo gets its configured revision, never the virtual head"
+        );
+
+        // An explicit revision is still honoured, so the model can ask whether
+        // something changed in a later release.
+        assert_eq!(
+            toolbox.context.resolve_ref(&args, "v6.13").unwrap(),
+            "v6.13"
+        );
+    }
+
+    /// git_show keeps its own cache keyed on the object name. A tag names a
+    /// different commit in each repository, so the key must separate them or one
+    /// repo is served the other's content with no symptom.
+    #[test]
+    fn git_show_cache_does_not_collide_across_repos() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let (_ref_dir, ref_path) = setup_reference_repo();
+
+        // Same tag name in both repositories, pointing at different commits.
+        let status = std::process::Command::new("git")
+            .current_dir(&review_path)
+            .args(["tag", "v6.12"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let toolbox =
+            ToolBox::new(review_path, None).with_reference(ref_path, Some("v6.12".to_string()));
+        let rt = Runtime::new().unwrap();
+
+        let review = rt
+            .block_on(toolbox.call("git_show", json!({ "object": "v6.12" })))
+            .unwrap();
+        let reference = rt
+            .block_on(toolbox.call("git_show", json!({ "repo": "kernel", "object": "v6.12" })))
+            .unwrap();
+
+        let review = review["content"].as_str().unwrap();
+        let reference = reference["content"].as_str().unwrap();
+        assert!(review.contains("Second commit"), "{review}");
+        assert!(reference.contains("Reference kernel tree"), "{reference}");
+        assert_ne!(review, reference);
+    }
+
+    /// With nothing to point at, the model must not be offered the option: every
+    /// attempt would cost a turn to learn what the schema could have said.
+    #[test]
+    fn repo_argument_is_hidden_when_no_reference_is_configured() {
+        let (_review_dir, review_path) = setup_test_repo();
+
+        let bare = ToolBox::new(review_path.clone(), None);
+        for tool in bare.get_declarations_generic() {
+            assert!(
+                tool.parameters["properties"].get("repo").is_none(),
+                "{} must not advertise repo without a reference repository",
+                tool.name
+            );
+        }
+
+        let with_ref =
+            ToolBox::new(review_path, None).with_reference(PathBuf::from("/nonexistent"), None);
+        let grep = with_ref
+            .get_declarations_generic()
+            .into_iter()
+            .find(|t| t.name == "git_grep")
+            .expect("git_grep is registered");
+        assert!(
+            grep.parameters["properties"]["repo"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "kernel")
+        );
     }
 }

@@ -47,6 +47,10 @@ pub struct KernelReviewState {
     pub cover_letter: Option<String>,
     pub series_range: Option<String>,
     pub follow_up_series_context: Option<String>,
+    /// Revision of the reference kernel tree, when one is configured. Its
+    /// presence is what marks this review as out-of-tree: the repository has no
+    /// mainline history and no kernel headers of its own.
+    pub reference_revision: Option<String>,
 
     /// Subsystem guide markdown files selected during Phase 0 pre-screen.
     pub selected_guides: Vec<String>,
@@ -142,7 +146,7 @@ The following documents contain the official technical patterns, architectural r
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
 Baseline SHA: {{{{baseline_sha}}}}
-==========================={{{{cover_letter_block}}}}
+==========================={{{{oot_context_block}}}}{{{{cover_letter_block}}}}
 
 Target Commit:
 {diff_var}
@@ -161,6 +165,37 @@ Target Commit:
                 s.prefetched_context
             )
         }
+    })
+    // Out-of-tree review differs from in-tree in two directions, and both need
+    // saying. The model has somewhere else to look for kernel APIs, which it
+    // will not use unless told; and several in-tree conventions it would
+    // otherwise enforce do not exist here, which produces confident findings
+    // about a tree that was never claiming to follow them.
+    .with_var("oot_context_block", |s: &KernelReviewState| {
+        s.reference_revision.as_deref().map_or_else(String::new, |revision| {
+            format!(
+                "\n\n=== Out-of-Tree Module ===\n\
+                 The repository under review is an out-of-tree Linux kernel module, not a \
+                 mainline kernel tree. It contains the module's own sources and nothing else: \
+                 there is no include/linux/, no kernel core code, and no mainline history.\n\n\
+                 The kernel this module builds against is available as a separate, read-only \
+                 repository, pinned at {revision}. Reach it by passing repo=\"kernel\" to any \
+                 git tool. Verify API contracts, struct layouts, and helper semantics by \
+                 reading that tree rather than recalling them -- your recollection is not \
+                 pinned to this kernel version and may describe a different one.\n\n\
+                 Consequences of being out-of-tree, all of which change what counts as a \
+                 finding:\n\
+                 - Fixes: tags, lore threads, and 'look forward in git history for the fix' do \
+                 not apply. There is no mainline history in this repository to search, and a \
+                 missing Fixes: tag is not a defect here.\n\
+                 - Compatibility shims and kernel-version #ifdefs are expected in this \
+                 codebase; they exist because the module supports several kernel releases. Do \
+                 not report them as unnecessary complexity unless the specific logic is wrong.\n\
+                 - File paths will not match mainline paths. Do not conclude that code is \
+                 missing or misplaced from its path alone.\n\
+                 ==========================="
+            )
+        })
     })
     // The author's description of the series as a whole. Labelled as intent
     // rather than as a patch, so the model does not go looking for code in it,

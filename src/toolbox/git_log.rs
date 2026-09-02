@@ -36,6 +36,7 @@ impl LlmTool<SashikoToolContext> for GitLogTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "range": { "type": "string", "description": "The commit range or reference to view logs for (e.g., 'baseline..HEAD' or 'HEAD')." },
                 "limit": { "type": "integer", "description": "Limit the number of commits returned (defaults to 10, max 100)." }
             },
@@ -57,7 +58,7 @@ impl LlmTool<SashikoToolContext> for GitLogTool {
         let range_raw = args["range"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing range"))?;
-        let range_virt = context.virtualize_ref(range_raw);
+        let range_virt = context.resolve_ref(&args, range_raw)?;
         let range = range_virt.as_str();
         let limit = args["limit"].as_u64().unwrap_or(10).min(100) as usize;
 
@@ -67,7 +68,7 @@ impl LlmTool<SashikoToolContext> for GitLogTool {
 
         let limit_str = limit.to_string();
         let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path)
+        cmd.current_dir(context.repo_root(&args)?)
             .args(["log", "-n", &limit_str, range])
             .kill_on_drop(true);
 

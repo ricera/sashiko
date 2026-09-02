@@ -36,6 +36,7 @@ impl LlmTool<SashikoToolContext> for GitReadFilesTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "revision": { "type": "string", "description": "Git SHA or reference to read from." },
                 "files": {
                     "type": "array",
@@ -90,6 +91,11 @@ impl LlmTool<SashikoToolContext> for GitReadFilesTool {
             ));
         }
 
+        // Resolved once for the batch rather than per file: every file in a
+        // request comes from the same repository at the same revision.
+        let root = context.repo_root(&args)?.to_path_buf();
+        let revision = context.resolve_ref(&args, revision)?;
+
         let mut results = Vec::new();
 
         for file_args in files {
@@ -103,7 +109,7 @@ impl LlmTool<SashikoToolContext> for GitReadFilesTool {
             let end_line = file_args["end_line"].as_u64().map(|v| v as usize);
 
             match self
-                .read_single_file(context, revision, path_str, start_line, end_line)
+                .read_single_file(&root, &revision, path_str, start_line, end_line)
                 .await
             {
                 Ok(mut val) => {
@@ -128,20 +134,18 @@ impl LlmTool<SashikoToolContext> for GitReadFilesTool {
 impl GitReadFilesTool {
     async fn read_single_file(
         &self,
-        context: &SashikoToolContext,
+        root: &std::path::Path,
         revision: &str,
         path_str: &str,
         start_line: Option<usize>,
         end_line: Option<usize>,
     ) -> Result<Value> {
-        let revision_virt = context.virtualize_ref(revision);
-        let revision = revision_virt.as_str();
         if path_str.starts_with('-') {
             return Err(anyhow!("Invalid path name: {}", path_str));
         }
 
         let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path)
+        cmd.current_dir(root)
             .args(["show", &format!("{}:{}", revision, path_str)]);
 
         let output = cmd.output().await?;

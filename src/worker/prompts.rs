@@ -770,6 +770,7 @@ impl Worker {
             target_commit_diff_only,
             prefetched_context,
             cover_letter: patchset["cover_letter"].as_str().map(str::to_string),
+            reference_revision: self.tools.reference_revision().map(str::to_string),
             series_range: self.series_range.clone(),
             follow_up_series_context,
             selected_guides: Vec::new(),
@@ -1446,6 +1447,76 @@ mod tests {
                 context_window_size: 1000,
             }
         }
+    }
+
+    /// The out-of-tree framing must reach the model, and must stay away when the
+    /// review is a normal in-tree one -- telling an in-tree review that Fixes:
+    /// tags do not apply would suppress real findings.
+    #[tokio::test]
+    async fn oot_context_reaches_the_stage_context_only_when_grounded() {
+        async fn system_prompt_for(reference: Option<(&str, &str)>) -> String {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let prompts_dir = temp_dir.path().join("prompts");
+            std::fs::create_dir_all(&prompts_dir).unwrap();
+
+            let mut tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+            if let Some((path, revision)) = reference {
+                tools = tools
+                    .with_reference(std::path::PathBuf::from(path), Some(revision.to_string()));
+            }
+
+            let mut worker = Worker::new(
+                std::sync::Arc::new(MockProviderAlwaysFails),
+                std::sync::Arc::new(tools),
+                PromptRegistry::new(prompts_dir),
+                WorkerConfig {
+                    max_input_tokens: 10000,
+                    max_interactions: 3,
+                    temperature: 0.0,
+                    series_range: None,
+                    baseline_sha: None,
+                    custom_prompt: None,
+                    stages: Some(vec![1]),
+                },
+            );
+
+            let res = worker
+                .run(
+                    serde_json::json!({
+                        "id": 1,
+                        "patch_index": 1,
+                        "patches": [{"diff": "diff --git a/x.c b/x.c\n+int x;"}]
+                    }),
+                    None,
+                )
+                .await
+                .expect("review runs");
+            res.history[0].content.clone().unwrap_or_default()
+        }
+
+        let grounded = system_prompt_for(Some(("/srv/linux", "v6.12"))).await;
+        assert!(
+            grounded.contains("Out-of-Tree Module"),
+            "the model must be told the tree it is reviewing is not mainline"
+        );
+        assert!(
+            grounded.contains("v6.12"),
+            "the pinned kernel version must be named: {grounded}"
+        );
+        assert!(
+            grounded.contains(r#"repo="kernel""#),
+            "the model must be told how to reach the kernel tree"
+        );
+        assert!(
+            grounded.contains("Fixes:"),
+            "the in-tree conventions that no longer apply must be named"
+        );
+
+        let in_tree = system_prompt_for(None).await;
+        assert!(
+            !in_tree.contains("Out-of-Tree Module"),
+            "an in-tree review must not be told to relax in-tree conventions"
+        );
     }
 
     /// The cover letter has to survive the whole trip into stage context, or

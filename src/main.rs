@@ -188,6 +188,16 @@ enum Commands {
         /// Select which stages from 1-7 to run
         #[arg(long, hide = true, value_delimiter = ',')]
         stages: Option<Vec<u8>>,
+
+        /// Read-only kernel tree to consult for API contracts and headers.
+        /// Overrides git.reference_repository_path, and is the only way to set
+        /// one alongside --repo, which bypasses the [git] settings section.
+        #[arg(long)]
+        reference_repo: Option<PathBuf>,
+
+        /// Revision to read the reference repository at. Default: HEAD.
+        #[arg(long)]
+        reference_revision: Option<String>,
     },
 }
 
@@ -312,6 +322,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ai_provider,
                 custom_prompt,
                 stages,
+                reference_repo,
+                reference_revision,
             } => {
                 std::panic::set_hook(Box::new(|info| {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
@@ -332,6 +344,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stages: stages.clone(),
                     scratch_clone: false,
                     current_tree: false,
+                    reference_repo: reference_repo.clone(),
+                    reference_revision: reference_revision.clone(),
                 })
                 .await;
 
@@ -420,6 +434,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Signal path from a cancel request to the review it should interrupt.
     // Shared because the API and reviewer run as separate tasks.
     let cancels = sashiko::cancel::CancelRegistry::new();
+
+    // A reference repository that does not resolve is worth refusing to start
+    // over. Left to the review, it surfaces as tool errors the model absorbs and
+    // works around, and the run reads as a normal review that quietly did its
+    // grounding from memory.
+    if let Some(path) = &settings.git.reference_repository_path {
+        sashiko::git_ops::validate_reference_repository(
+            std::path::Path::new(path),
+            settings.git.reference_revision.as_deref(),
+        )
+        .await?;
+    }
 
     // Initialize FetchAgent
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
