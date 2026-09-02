@@ -114,13 +114,76 @@ pub fn log_entry_event_for_test(stage: u8, msg: &crate::ai::AiMessage) -> Worker
     log_entry_event(stage, msg)
 }
 
+/// Renders tool-call arguments on one line, dropping any that are absent.
+///
+/// Bounded per argument rather than as a whole: a long `pattern` must not push
+/// the `revision` that gives it meaning off the end.
+fn compact_args(args: &Value) -> String {
+    const MAX_ARG_CHARS: usize = 120;
+
+    let Some(obj) = args.as_object() else {
+        return args.to_string();
+    };
+
+    obj.iter()
+        .filter(|(_, v)| !v.is_null())
+        .map(|(k, v)| {
+            let rendered = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let clipped = if rendered.chars().count() > MAX_ARG_CHARS {
+                let head: String = rendered.chars().take(MAX_ARG_CHARS).collect();
+                format!("{head}...")
+            } else {
+                rendered
+            };
+            format!("{k}={clipped}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Unwraps a tool result envelope for display.
+///
+/// Tool results reach the model as a JSON envelope -- `{"content": "...",
+/// "truncated": ..., ...}` -- serialised with `to_string()`, so every quote and
+/// newline in a diff arrives backslash-escaped. That is right for the model and
+/// unreadable for a person, which is all this preview is for. Anything that is
+/// not that envelope is passed through untouched.
+fn unwrap_tool_envelope(body: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
+    let content = parsed.get("content")?.as_str()?;
+    // Truncation is the one flag worth keeping: without it a clipped result
+    // reads as a complete one.
+    Some(
+        if parsed.get("truncated").and_then(Value::as_bool) == Some(true) {
+            format!("{content}\n[truncated]")
+        } else {
+            content.to_string()
+        },
+    )
+}
+
 /// Builds a streamable log entry from a message, truncated for the wire.
 fn log_entry_event(stage: u8, msg: &crate::ai::AiMessage) -> WorkerProgressEvent {
     let mut body = msg.content.clone().unwrap_or_default();
+
+    if msg.role == crate::ai::AiRole::Tool
+        && let Some(unwrapped) = unwrap_tool_envelope(&body)
+    {
+        body = unwrapped;
+    }
+
     if let Some(calls) = &msg.tool_calls {
-        // Tool calls carry no content of their own, so surface what was asked.
-        let names: Vec<&str> = calls.iter().map(|c| c.function_name.as_str()).collect();
-        body = format!("{}[tool calls: {}]", body, names.join(", "));
+        // Tool calls carry no content of their own, so surface what was asked --
+        // arguments included. "git_grep" alone says a search happened but not
+        // what was searched for, which is the only part worth watching.
+        let calls: Vec<String> = calls
+            .iter()
+            .map(|c| format!("{}({})", c.function_name, compact_args(&c.arguments)))
+            .collect();
+        body = format!("{}[tool calls: {}]", body, calls.join(", "));
     }
 
     let truncated =

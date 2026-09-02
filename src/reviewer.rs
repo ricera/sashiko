@@ -3966,6 +3966,110 @@ done
         );
     }
 
+    /// A tool call with no arguments says a search happened but not what was
+    /// searched for, which is the only part worth watching live.
+    #[test]
+    fn streamed_tool_calls_name_their_arguments() {
+        use crate::worker::prompts::log_entry_event_for_test;
+
+        let msg = crate::ai::AiMessage {
+            role: crate::ai::AiRole::Assistant,
+            content: None,
+            thought: None,
+            thought_signature: None,
+            tool_calls: Some(vec![
+                crate::ai::ToolCall {
+                    id: "c0".to_string(),
+                    function_name: "git_grep".to_string(),
+                    arguments: serde_json::json!({
+                        "pattern": "ionic_hwstamp_replay",
+                        "revision": "HEAD",
+                        "unset": null,
+                    }),
+                    thought_signature: None,
+                },
+                crate::ai::ToolCall {
+                    id: "c1".to_string(),
+                    function_name: "git_show".to_string(),
+                    arguments: serde_json::json!({ "path": "drivers/net/x.c" }),
+                    thought_signature: None,
+                },
+            ]),
+            tool_call_id: None,
+        };
+
+        let crate::worker::prompts::WorkerProgressEvent::LogEntry { content, .. } =
+            log_entry_event_for_test(4, &msg)
+        else {
+            panic!("expected a log entry");
+        };
+
+        assert!(
+            content.contains("pattern=ionic_hwstamp_replay"),
+            "the search term must be visible: {content}"
+        );
+        assert!(content.contains("revision=HEAD"), "{content}");
+        assert!(content.contains("path=drivers/net/x.c"), "{content}");
+        assert!(
+            !content.contains("unset"),
+            "an absent argument is noise, not information: {content}"
+        );
+    }
+
+    /// Tool results reach the model as a JSON envelope, so a diff arrives with
+    /// every quote backslash-escaped. Right for the model, unreadable for a
+    /// person -- and this preview exists only for the person.
+    #[test]
+    fn streamed_tool_results_are_not_json_escaped() {
+        use crate::worker::prompts::log_entry_event_for_test;
+
+        let envelope = serde_json::json!({
+            "content": "diff --git a/x.c b/x.c\n+\tstrcpy(buf, \"name\");\n",
+            "truncated": true,
+            "metadata": { "total_items": 400, "returned_items": 2 },
+        });
+
+        let msg = crate::ai::AiMessage {
+            role: crate::ai::AiRole::Tool,
+            content: Some(envelope.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: Some("c0".to_string()),
+        };
+
+        let crate::worker::prompts::WorkerProgressEvent::LogEntry { content, .. } =
+            log_entry_event_for_test(4, &msg)
+        else {
+            panic!("expected a log entry");
+        };
+
+        assert!(
+            content.contains("strcpy(buf, \"name\");"),
+            "quotes must arrive unescaped: {content}"
+        );
+        assert!(
+            !content.contains("\\\""),
+            "no backslash-escaped quotes should survive: {content}"
+        );
+        assert!(
+            content.contains("[truncated]"),
+            "a clipped result must not read as a complete one: {content}"
+        );
+
+        // A plain-text tool result is passed through untouched.
+        let plain = crate::ai::AiMessage {
+            content: Some("not json at all".to_string()),
+            ..msg
+        };
+        let crate::worker::prompts::WorkerProgressEvent::LogEntry { content, .. } =
+            log_entry_event_for_test(4, &plain)
+        else {
+            panic!("expected a log entry");
+        };
+        assert_eq!(content, "not json at all");
+    }
+
     /// The reported bug: a commit with a message but no file changes was
     /// reviewed, failed to apply, and retried three more times to fail
     /// identically. `extract_files_from_diff` returning nothing is the signal.
