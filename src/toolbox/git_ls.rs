@@ -35,6 +35,7 @@ impl LlmTool<SashikoToolContext> for GitLsTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "revision": { "type": "string", "description": "The Git commit SHA or reference to list from." },
                 "path": { "type": "string", "description": "Relative path to the directory (e.g., '.' or 'src/')." }
             },
@@ -46,7 +47,7 @@ impl LlmTool<SashikoToolContext> for GitLsTool {
         let revision_raw = args["revision"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing revision"))?;
-        let revision_virt = context.virtualize_ref(revision_raw);
+        let revision_virt = context.resolve_ref(&args, revision_raw)?;
         let revision = revision_virt.as_str();
         let path_str = args["path"]
             .as_str()
@@ -63,7 +64,7 @@ impl LlmTool<SashikoToolContext> for GitLsTool {
         };
 
         let mut cmd = Command::new("git");
-        cmd.current_dir(&context.worktree_path)
+        cmd.current_dir(context.repo_root(&args)?)
             .args(["ls-tree", &tree_spec]);
 
         let output = cmd.output().await?;
