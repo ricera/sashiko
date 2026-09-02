@@ -42,6 +42,9 @@ pub struct KernelReviewState {
     pub target_commit_diff: String,
     pub target_commit_diff_only: String,
     pub prefetched_context: String,
+    /// The series cover letter, when the submission had one. Context about
+    /// intent, not something to review.
+    pub cover_letter: Option<String>,
     pub series_range: Option<String>,
     pub follow_up_series_context: Option<String>,
 
@@ -139,7 +142,7 @@ The following documents contain the official technical patterns, architectural r
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
 Baseline SHA: {{{{baseline_sha}}}}
-===========================
+==========================={{{{cover_letter_block}}}}
 
 Target Commit:
 {diff_var}
@@ -158,6 +161,18 @@ Target Commit:
                 s.prefetched_context
             )
         }
+    })
+    // The author's description of the series as a whole. Labelled as intent
+    // rather than as a patch, so the model does not go looking for code in it,
+    // and truncated so a long cover letter cannot crowd out the diff.
+    .with_var("cover_letter_block", |s: &KernelReviewState| {
+        s.cover_letter.as_deref().map(str::trim).filter(|c| !c.is_empty()).map_or_else(String::new, |c| {
+            let trimmed = crate::ai::truncator::Truncator::truncate_sequential(c, crate::worker::prompts::COVER_LETTER_TOKENS);
+            format!(
+                "\n\n=== Series Cover Letter ===\nThe author's description of this series. Context for intent only — it is not part of the patch under review and contains no code to inspect.\n\n{}\n===========================",
+                trimmed.content
+            )
+        })
     })
     .with_var("custom_prompt_block", |s: &KernelReviewState| {
         s.custom_prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()).map_or_else(String::new, |p| {
@@ -917,7 +932,12 @@ pub fn build_kernel_review_workflow_with_options(
         .dynamic_parallel(
             planning_stage(),
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),
-            ParallelPolicy::FailFast,
+            // `BestEffort`, not `FailFast`: fail-fast discards every sibling
+            // result, so one failing or cancelled analysis stage would throw
+            // away all the work the others had already completed. The failures
+            // are recorded in the outcome, so the lost coverage is reported
+            // rather than silently absorbed.
+            ParallelPolicy::BestEffort,
         )
         .early_exit_if(
             |s| s.all_concerns.is_empty(),

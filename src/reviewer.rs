@@ -51,6 +51,8 @@ struct ReviewContext {
     quota_manager: Arc<QuotaManager>,
     target_review_count: usize,
     provider: Arc<dyn AiProvider>,
+    activity: Arc<crate::activity::ActivityRegistry>,
+    cancels: Arc<crate::cancel::CancelRegistry>,
 }
 
 enum PatchResult {
@@ -96,6 +98,56 @@ pub struct Reviewer {
     baseline_registry: Arc<BaselineRegistry>,
     quota_manager: Arc<QuotaManager>,
     provider: Arc<dyn AiProvider>,
+    activity: Arc<crate::activity::ActivityRegistry>,
+    cancels: Arc<crate::cancel::CancelRegistry>,
+}
+
+/// Writes the review's running total to the database on an interval.
+///
+/// A review task has many exit paths and a killed daemon takes none of them,
+/// so the total cannot be left to a write at the end. The interval matches
+/// the activity registry's: at most half a minute of a run's time is lost if
+/// the process dies, against one small UPDATE per in-flight patchset.
+struct ReviewClockGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ReviewClockGuard {
+    fn new(
+        db: Arc<Database>,
+        patchset_id: i64,
+        carried_seconds: u64,
+        started: std::time::Instant,
+    ) -> Self {
+        const CHECKPOINT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(CHECKPOINT);
+            // The first tick fires immediately; skip it, since zero elapsed
+            // would overwrite the carried total with itself for no reason.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let total = carried_seconds + started.elapsed().as_secs();
+                // Best effort: timing must never be able to fail a review.
+                if let Err(e) = db.set_patchset_review_duration(patchset_id, total).await {
+                    tracing::debug!(
+                        "Failed to checkpoint review duration for {}: {}",
+                        patchset_id,
+                        e
+                    );
+                }
+            }
+        });
+
+        Self { handle }
+    }
+}
+
+impl Drop for ReviewClockGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 impl Reviewer {
@@ -105,7 +157,12 @@ impl Reviewer {
     ///
     /// * `db` - The database connection.
     /// * `settings` - Application settings.
-    pub async fn new(db: Arc<Database>, settings: Settings) -> Self {
+    pub async fn new(
+        db: Arc<Database>,
+        settings: Settings,
+        activity: Arc<crate::activity::ActivityRegistry>,
+        cancels: Arc<crate::cancel::CancelRegistry>,
+    ) -> Self {
         let concurrency = settings.review.concurrency;
         let repo_path = PathBuf::from(&settings.git.repository_path);
 
@@ -153,6 +210,8 @@ impl Reviewer {
             baseline_registry,
             quota_manager: Arc::new(QuotaManager::new()),
             provider,
+            activity,
+            cancels,
         }
     }
 
@@ -246,6 +305,8 @@ impl Reviewer {
                 quota_manager: self.quota_manager.clone(),
                 target_review_count,
                 provider: self.provider.clone(),
+                activity: self.activity.clone(),
+                cancels: self.cancels.clone(),
             };
 
             tokio::spawn(async move {
@@ -287,6 +348,8 @@ impl Reviewer {
                 quota_manager: self.quota_manager.clone(),
                 target_review_count: 1,
                 provider: self.provider.clone(),
+                activity: self.activity.clone(),
+                cancels: self.cancels.clone(),
             };
 
             if let Err(e) = Self::release_patchset_results(&context, &patchset).await {
@@ -365,6 +428,53 @@ impl Reviewer {
     async fn review_patchset_task(ctx: ReviewContext, patchset: PatchsetRow) {
         let patchset_id = patchset.id;
         info!("Starting review for patchset {}", patchset_id);
+
+        // Held for the lifetime of the task: whichever way this returns, every
+        // entry for this patchset is cleared rather than left claiming work is
+        // still running.
+        let _activity = crate::activity::PatchsetActivityGuard::new(
+            ctx.activity.clone(),
+            patchset_id,
+            crate::activity::Phase::Queued,
+        );
+
+        // Clock for the whole patchset, covering every patch and every retry.
+        //
+        // Seeded from what is already banked, because a review interrupted by a
+        // restart is not redone from scratch: patches that completed keep their
+        // reviews and are skipped on the next run, so the earlier run bought
+        // work the final review still rests on. Counting only the run that
+        // happened to finish reported a fraction of what the review cost.
+        let patchset_review_started = std::time::Instant::now();
+        let carried_seconds = ctx
+            .db
+            .get_patchset_review_duration(patchset_id)
+            .await
+            .unwrap_or(0);
+        if carried_seconds > 0 {
+            info!(
+                "Resuming review of patchset {} with {} already spent",
+                patchset_id,
+                crate::activity::format_duration(carried_seconds)
+            );
+        }
+        let review_clock = |now: std::time::Instant| carried_seconds + now.elapsed().as_secs();
+
+        // Checkpointed while the review runs, not only at the end: a daemon
+        // killed mid-review never reaches the end, and that is exactly the run
+        // whose time would otherwise go unrecorded.
+        let _clock_guard = ReviewClockGuard::new(
+            ctx.db.clone(),
+            patchset_id,
+            carried_seconds,
+            patchset_review_started,
+        );
+
+        // Makes this review reachable by a cancel request for as long as it runs.
+        // Bound to a named variable (not `_`) so it lives for the whole task;
+        // dropping it early would silently make the review uncancellable.
+        // `run_review_tool` looks the token up via `ctx.cancels.token_for`.
+        let _cancel_guard = crate::cancel::CancelGuard::new(ctx.cancels.clone(), patchset_id);
 
         if let Err(e) = ctx
             .db
@@ -507,10 +617,14 @@ impl Reviewer {
                 })
                 .unwrap_or_default();
 
+            // `body` is the patchset's cover letter where one exists. It has
+            // fed baseline resolution above; passing it on is what gets the
+            // author's series intent in front of the model.
             let input_payload = json!({
                 "id": patchset_id,
                 "message_id": patchset_msg_id,
                 "subject": patchset.subject.clone().unwrap_or("Unknown".to_string()),
+                "cover_letter": body,
                 "patches": patches_json
             });
 
@@ -624,6 +738,16 @@ impl Reviewer {
             // Reverse so that pop() processes in the original order (index 1 first)
             valid_jobs.reverse();
             let total_valid = valid_jobs.len();
+
+            // The one place the patchset's own phase moves once work begins. Set
+            // here rather than from the patches, so the clock behind it spans
+            // the whole review instead of restarting whenever a patch does.
+            ctx.activity.update(
+                crate::activity::ActivityKey::Patchset(patchset_id),
+                crate::activity::Phase::ReviewingPatches {
+                    patches: total_valid,
+                },
+            );
             let valid_jobs_queue = Arc::new(tokio::sync::Mutex::new(valid_jobs));
             let mut handles = Vec::new();
             let baseline_ref_str = resolution.as_str();
@@ -755,6 +879,18 @@ impl Reviewer {
                     .db
                     .update_patchset_status(patchset_id, &final_status)
                     .await;
+
+                let elapsed = review_clock(patchset_review_started);
+                let _ = ctx
+                    .db
+                    .set_patchset_review_duration(patchset_id, elapsed)
+                    .await;
+                info!(
+                    "Patchset {} finished review in {} ({})",
+                    patchset_id,
+                    crate::activity::format_duration(elapsed),
+                    final_status
+                );
 
                 if review_success
                     && patchset.embargo_until.is_some()
@@ -1144,6 +1280,21 @@ impl Reviewer {
         }
 
         let files = extract_files_from_diff(diff);
+
+        // An empty commit can never be applied, so reviewing it fails and the
+        // retry loop then fails identically three more times. Kept separate from
+        // the ignored-files rule below, which cannot match this case anyway:
+        // that rule means "touches only ignored files" and so requires at least
+        // one file.
+        if files.is_empty() {
+            info!(
+                "Skipping review for patch {}/{} (ID: {}) as it changes no files.",
+                patchset_id, index, patch_id
+            );
+            let _ = ctx.db.update_patch_status(patch_id, "Skipped").await;
+            return Ok(PatchResult::Success);
+        }
+
         if !files.is_empty()
             && files.iter().all(|f| {
                 ctx.settings
@@ -1196,6 +1347,11 @@ impl Reviewer {
         let mut retries = 0;
         let max_retries = ctx.settings.review.max_retries;
 
+        // Started before the retry loop, so the recorded duration covers every
+        // attempt. Timing each attempt separately would undercount a review that
+        // needed three goes, which is exactly the case worth measuring.
+        let review_started = std::time::Instant::now();
+
         let mut existing_pending_review_id = ctx
             .db
             .get_pending_review_id(patchset_id, Some(patch_id))
@@ -1222,8 +1378,13 @@ impl Reviewer {
                 .update_review_status(review_id, ReviewStatus::InReview.as_str(), None)
                 .await;
 
+            // Stamped before the work runs, not after, so a row that never
+            // reaches a terminal state still records which attempt it was.
+            let _ = ctx.db.set_review_attempt(review_id, retries + 1).await;
+
             let result = run_review_tool(
                 patchset_id,
+                patch_id,
                 input_payload,
                 &ctx.settings,
                 ctx.db.clone(),
@@ -1235,8 +1396,21 @@ impl Reviewer {
                 worktree_path,
                 ctx.provider.clone(),
                 ctx.llm_semaphore.clone(),
+                ctx.activity.clone(),
+                ctx.cancels.token_for(patchset_id),
+                retries + 1,
+                max_retries + 1,
             )
             .await;
+
+            // Stamped once per attempt with the cumulative elapsed time, so
+            // whichever row ends up final carries the full total. Recorded here
+            // rather than at each of the loop's several exit points, which would
+            // be easy to add an eighth to and forget.
+            let _ = ctx
+                .db
+                .set_review_duration(review_id, review_started.elapsed().as_secs())
+                .await;
 
             match result {
                 Ok(json_output) => {
@@ -1245,6 +1419,35 @@ impl Reviewer {
                         .and_then(|arr| arr.iter().find(|p| p["index"] == index))
                         .map(|p| p["status"] == "applied")
                         .unwrap_or(false);
+
+                    // Record incomplete coverage before anything else touches the
+                    // review row, so a partial review can never be presented as
+                    // a complete one.
+                    if let Some(failures) = json_output
+                        .get("review")
+                        .and_then(|r| r.get("stage_failures"))
+                        .or_else(|| json_output.get("stage_failures"))
+                        .and_then(|f| f.as_array())
+                        .filter(|f| !f.is_empty())
+                    {
+                        let stages: Vec<u64> = failures
+                            .iter()
+                            .filter_map(|f| f["stage"].as_u64())
+                            .collect();
+                        warn!(
+                            "Review {} completed with {} incomplete stage(s): {:?}",
+                            review_id,
+                            failures.len(),
+                            stages
+                        );
+                        let _ = ctx
+                            .db
+                            .set_review_stage_failures(
+                                review_id,
+                                &serde_json::Value::Array(failures.clone()).to_string(),
+                            )
+                            .await;
+                    }
 
                     let history = json_output.get("history");
                     let logs_str = if let Some(h) = history {
@@ -1539,9 +1742,221 @@ impl Reviewer {
     }
 }
 
+/// How long a cancelled worker gets to wind down and report partial results
+/// before it is killed outright.
+const GRACEFUL_CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Error text when a worker ignored the cancel request and had to be killed.
+/// Distinguished from a plain timeout so the log says what actually happened.
+const CANCEL_IGNORED: &str = "Review tool ignored cancellation and was killed";
+
+/// Resolves when the token fires; never resolves when there is no token.
+///
+/// `select!` needs a future either way, and a review with no registered token
+/// simply cannot be cancelled.
+async fn wait_for_cancel(token: &Option<tokio_util::sync::CancellationToken>) {
+    match token {
+        Some(t) => t.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Recovers the stage number from a request's context tag.
+///
+/// The tag is built by the worker as `[ps:N p:M] [s:S] `; carrying the stage
+/// there rather than as an `AiRequest` field keeps the change to one producer
+/// instead of every construction site.
+fn stage_from_context_tag(tag: &str) -> Option<u8> {
+    let start = tag.find("[s:")? + 3;
+    let rest = &tag[start..];
+    let end = rest.find(']')?;
+    rest[..end].trim().parse().ok()
+}
+
+/// The stage number when this payload marks a stage beginning.
+fn started_stage(payload: &serde_json::Value) -> Option<u8> {
+    match payload.get("kind")?.as_str()? {
+        "stage_started" | "stage_turn" => Some(payload.get("stage")?.as_u64()? as u8),
+        _ => None,
+    }
+}
+
+/// The stage number when this payload marks a stage ending.
+fn finished_stage(payload: &serde_json::Value) -> Option<u8> {
+    match payload.get("kind")?.as_str()? {
+        "stage_finished" => Some(payload.get("stage")?.as_u64()? as u8),
+        _ => None,
+    }
+}
+
+/// What a worker progress message should do to the activity registry.
+#[derive(Debug, PartialEq, Eq)]
+enum ProgressUpdate {
+    Set(crate::activity::ActivityKey, crate::activity::Phase),
+    /// The unit is done. Recorded as finished rather than deleted, so a
+    /// completed stage stays visible beside the ones still running.
+    Finished(crate::activity::ActivityKey),
+}
+
+/// Translates a worker progress payload into a registry update.
+///
+/// Stage events are routed to per-stage keys because the component review
+/// stages run concurrently; sharing one key would make the reported phase flap
+/// between whichever stage reported last and hide a wedged stage behind its
+/// siblings.
+///
+/// Returns `None` for anything unrecognised — progress reporting is advisory and
+/// must never be able to fail a review.
+fn progress_update(
+    patchset_id: i64,
+    patch_id: i64,
+    payload: &serde_json::Value,
+    attempt: u32,
+    max_attempts: u32,
+) -> Option<ProgressUpdate> {
+    use crate::activity::{ActivityKey, Phase, StageWait};
+
+    let stage_key = |payload: &serde_json::Value| -> Option<(ActivityKey, u8)> {
+        let stage = payload.get("stage")?.as_u64()? as u8;
+        Some((
+            ActivityKey::PatchsetStage {
+                patchset_id,
+                patch_id,
+                stage,
+            },
+            stage,
+        ))
+    };
+
+    match payload.get("kind")?.as_str()? {
+        // Planning is per patch -- each patch's worker decides which stages that
+        // patch needs, and `attempt` is that patch's retry count. Keyed by patch
+        // so several planning at once do not overwrite each other, and so the
+        // patchset's own entry is left to describe the patchset.
+        "planning" => Some(ProgressUpdate::Set(
+            ActivityKey::PatchsetPatch {
+                patchset_id,
+                patch_id,
+            },
+            Phase::Planning {
+                attempt,
+                max_attempts,
+            },
+        )),
+        "stage_started" => {
+            let (key, stage) = stage_key(payload)?;
+            Some(ProgressUpdate::Set(
+                key,
+                Phase::Stage {
+                    stage,
+                    turn: 0,
+                    max_turns: 0,
+                    waiting: StageWait::Model,
+                },
+            ))
+        }
+        // A turn beginning means the request has gone to the model.
+        "stage_turn" => {
+            let (key, stage) = stage_key(payload)?;
+            Some(ProgressUpdate::Set(
+                key,
+                Phase::Stage {
+                    stage,
+                    turn: payload.get("turn")?.as_u64()? as usize,
+                    max_turns: payload.get("max_turns")?.as_u64()? as usize,
+                    waiting: StageWait::Model,
+                },
+            ))
+        }
+        // The model answered and the worker is now running git. An empty tool
+        // list means they finished, so the turn is back to awaiting the model.
+        "stage_tools" => {
+            let (key, stage) = stage_key(payload)?;
+            let tools: Vec<String> = payload
+                .get("tools")
+                .and_then(|t| t.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ProgressUpdate::Set(
+                key,
+                Phase::Stage {
+                    stage,
+                    turn: payload.get("turn").and_then(|t| t.as_u64()).unwrap_or(0) as usize,
+                    max_turns: payload
+                        .get("max_turns")
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0) as usize,
+                    // Empty means the tools finished, so the turn is back with
+                    // the model.
+                    waiting: if tools.is_empty() {
+                        StageWait::Model
+                    } else {
+                        StageWait::Tools { names: tools }
+                    },
+                },
+            ))
+        }
+        // A rate limit with no Retry-After header sleeps a flat 60s, which is
+        // otherwise indistinguishable from a very slow model.
+        "stage_backoff" => {
+            let (key, stage) = stage_key(payload)?;
+            let retry = payload.get("retry_in_seconds").and_then(|r| r.as_u64());
+            Some(ProgressUpdate::Set(
+                key,
+                Phase::Stage {
+                    stage,
+                    turn: payload.get("turn").and_then(|t| t.as_u64()).unwrap_or(0) as usize,
+                    max_turns: payload
+                        .get("max_turns")
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0) as usize,
+                    waiting: match retry {
+                        Some(secs) => StageWait::RateLimited {
+                            retry_in_seconds: secs,
+                        },
+                        // The wait is over; the request goes back to the model.
+                        None => StageWait::Model,
+                    },
+                },
+            ))
+        }
+        // A finished stage stops existing rather than lingering in a done state,
+        // so the live view lists exactly the stages still running.
+        "stage_finished" => Some(ProgressUpdate::Finished(stage_key(payload)?.0)),
+        // A failed stage is not cleared: the review carries on without it, and
+        // a stage that silently disappeared would be indistinguishable from one
+        // that never ran. Replacing the phase is what stops the entry claiming
+        // to be mid-turn -- the bug this arm exists to fix.
+        "stage_failed" => {
+            let (key, stage) = stage_key(payload)?;
+            Some(ProgressUpdate::Set(
+                key,
+                Phase::StageFailed {
+                    stage,
+                    reason: payload
+                        .get("reason")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    cancelled: payload
+                        .get("cancelled")
+                        .and_then(|c| c.as_bool())
+                        .unwrap_or(false),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_review_tool(
     patchset_id: i64,
+    patch_id: i64,
     input_payload: &serde_json::Value,
     settings: &Settings,
     db: Arc<Database>,
@@ -1553,11 +1968,16 @@ async fn run_review_tool(
     worktree_path: Option<&Path>,
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
+    activity: Arc<crate::activity::ActivityRegistry>,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+    attempt: u32,
+    max_attempts: u32,
 ) -> Result<serde_json::Value> {
     let cmd = default_worker_command()?;
     run_review_tool_with_cmd(
         cmd,
         patchset_id,
+        patch_id,
         input_payload,
         settings,
         db,
@@ -1569,6 +1989,10 @@ async fn run_review_tool(
         worktree_path,
         provider,
         llm_semaphore,
+        activity,
+        cancel_token,
+        attempt,
+        max_attempts,
     )
     .await
 }
@@ -1602,6 +2026,7 @@ fn default_worker_command() -> Result<Command> {
 async fn run_review_tool_with_cmd(
     mut cmd: Command,
     patchset_id: i64,
+    patch_id: i64,
     input_payload: &serde_json::Value,
     settings: &Settings,
     db: Arc<Database>,
@@ -1613,6 +2038,10 @@ async fn run_review_tool_with_cmd(
     worktree_path: Option<&Path>,
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
+    activity: Arc<crate::activity::ActivityRegistry>,
+    cancel_token: Option<tokio_util::sync::CancellationToken>,
+    attempt: u32,
+    max_attempts: u32,
 ) -> Result<serde_json::Value> {
     cmd.args([
         "--json",
@@ -1744,6 +2173,22 @@ async fn run_review_tool_with_cmd(
             let turn_count = Arc::new(AtomicU32::new(0));
 
             let (abort_tx, mut abort_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
+            let mut cancel_requested = false;
+
+            // Per-stage timing, derived from the progress events the worker
+            // already emits. Doing it here rather than in the worker covers every
+            // stage uniformly, including the consolidation stages that run
+            // outside the concurrent block.
+            let mut stage_starts: std::collections::HashMap<u8, TokioInstant> =
+                std::collections::HashMap::new();
+            // Highest turn number seen per stage, which is how many LLM round
+            // trips that stage needed before it finished.
+            let mut stage_turns: std::collections::HashMap<u8, u64> =
+                std::collections::HashMap::new();
+            let mut stage_stats: Vec<(u8, u64, u64)> = Vec::new();
+            // Ordering for streamed log entries; the table is append-only and
+            // read back by this number.
+            let mut log_seq: i64 = 0;
 
             loop {
                 let current_deadline = {
@@ -1755,9 +2200,38 @@ async fn run_review_tool_with_cmd(
                     Some(err) = abort_rx.recv() => {
                         return Err(err);
                     }
+                    // Guarded so it fires once: a cancelled token stays ready
+                    // forever and would otherwise spin this arm.
+                    _ = wait_for_cancel(&cancel_token), if !cancel_requested => {
+                        cancel_requested = true;
+                        info!(
+                            "Cancellation requested for patchset {}; asking worker to wind down",
+                            patchset_id
+                        );
+
+                        // Ask politely first. A SIGKILL here would lose every
+                        // stage the review had already completed; the worker
+                        // stops issuing new LLM calls and reports what it has.
+                        let msg = "{\"type\":\"cancel\",\"tx_id\":0,\"payload\":null}\n";
+                        {
+                            let mut writer = stdin_writer.lock().await;
+                            let _ = writer.write_all(msg.as_bytes()).await;
+                            let _ = writer.flush().await;
+                        }
+
+                        // Bound the politeness. If the worker ignores us, the
+                        // deadline arm below escalates to a kill.
+                        {
+                            let mut d = deadline.lock().unwrap();
+                            *d = TokioInstant::now() + GRACEFUL_CANCEL_WAIT;
+                        }
+                    }
                     line_res = timeout_at(current_deadline, lines.next_line()) => {
                         let line_result = match line_res {
                             Ok(res) => res,
+                            Err(_) if cancel_requested => {
+                                return Err(anyhow::anyhow!("{}", CANCEL_IGNORED));
+                            }
                             Err(_) => {
                                 return Err(anyhow::anyhow!(
                                     "Review tool timed out (active time exceeded)"
@@ -1804,6 +2278,7 @@ async fn run_review_tool_with_cmd(
                                         let total_output_tokens_used_clone = total_output_tokens_used.clone();
                                         let abort_tx_clone = abort_tx.clone();
                                         let llm_semaphore_clone = llm_semaphore.clone();
+                                        let activity_clone = activity.clone();
 
                                         let handle = tokio::spawn(async move {
                                             let req: AiRequest = match serde_json::from_value(payload) {
@@ -1862,9 +2337,35 @@ async fn run_review_tool_with_cmd(
                                             }
 
                                             let ctx_tag = req.context_tag.clone().unwrap_or_default();
+                                            // The queue and quota waits happen here, before the request
+                                            // reaches the model. Without attributing them, a stage sitting
+                                            // in the queue is indistinguishable from a slow model — which
+                                            // calls for changing concurrency, not for patience.
+                                            let waiting_stage = stage_from_context_tag(&ctx_tag);
+                                            // Only the wait changes here. This side does not know
+                                            // which turn the request belongs to -- `local_turn`
+                                            // counts every request across all of the patch's
+                                            // concurrent stages, and the cap is the worker's to
+                                            // report -- so writing a whole phase overwrote the
+                                            // worker's numbers on every request and left the stage
+                                            // reading "starting" for nearly its whole life.
+                                            let mark_wait = |wait: crate::activity::StageWait| {
+                                                if let Some(stage) = waiting_stage {
+                                                    activity_clone.update_stage_wait(
+                                                        crate::activity::ActivityKey::PatchsetStage {
+                                                            patchset_id,
+                                                            patch_id,
+                                                            stage,
+                                                        },
+                                                        stage,
+                                                        wait,
+                                                    );
+                                                }
+                                            };
                                             let resp_payload = crate::ai::LOG_CONTEXT.scope(ctx_tag, async {
                                                 let mut local_transient_errors = 0;
                                                 loop {
+                                                    mark_wait(crate::activity::StageWait::Queued);
                                                     let slept = quota_clone.wait_for_access().await;
                                                     {
                                                         let mut d = deadline_clone.lock().unwrap();
@@ -1883,6 +2384,10 @@ async fn run_review_tool_with_cmd(
                                                     }
 
                                                     let _permit = llm_semaphore_clone.acquire().await?;
+
+                                                    // Slot acquired: from here the time is genuinely the
+                                                    // model's.
+                                                    mark_wait(crate::activity::StageWait::Model);
 
                                                     match provider_clone.generate_content(req.clone()).await {
                                                         Ok(resp) => {
@@ -2050,6 +2555,133 @@ async fn run_review_tool_with_cmd(
                                         });
                                         spawned_tasks.push(handle);
                                     }
+                                    "progress" => {
+                                        let p = &json_msg["payload"];
+
+                                        // Streamed conversation, so a running
+                                        // review can be read before it finishes.
+                                        // It rides the progress envelope, so it
+                                        // is dispatched on the payload `kind`,
+                                        // not the message type. Best-effort: a
+                                        // failed insert must never disturb the
+                                        // review.
+                                        if p["kind"] == "log_entry" {
+                                            let role = p["role"].as_str().unwrap_or("unknown");
+                                            let content = p["content"].as_str().unwrap_or_default();
+                                            let stage = p["stage"].as_u64().map(|v| v as u8);
+                                            if let Err(e) = db
+                                                .append_review_log_entry(
+                                                    review_id, log_seq, stage, role, content,
+                                                )
+                                                .await
+                                            {
+                                                tracing::debug!(
+                                                    "Failed to store log entry: {}",
+                                                    e
+                                                );
+                                            }
+                                            log_seq += 1;
+                                        }
+
+                                        // Advisory only: never let a malformed
+                                        // progress line disturb the review.
+                                        match progress_update(
+                                            patchset_id,
+                                            patch_id,
+                                            &json_msg["payload"],
+                                            attempt,
+                                            max_attempts,
+                                        ) {
+                                            Some(ProgressUpdate::Set(key, phase)) => {
+                                                // A stage's clock starts when it
+                                                // first reports, not on each turn.
+                                                if let Some(stage) = started_stage(
+                                                    &json_msg["payload"],
+                                                ) {
+                                                    stage_starts
+                                                        .entry(stage)
+                                                        .or_insert_with(TokioInstant::now);
+                                                    if let Some(turn) = json_msg["payload"]
+                                                        .get("turn")
+                                                        .and_then(|t| t.as_u64())
+                                                    {
+                                                        let seen = stage_turns
+                                                            .entry(stage)
+                                                            .or_insert(0);
+                                                        *seen = (*seen).max(turn);
+                                                    }
+                                                }
+                                                // First stage to start flips this
+                                                // patch from planning to reviewing.
+                                                // Keyed by patch, not patchset:
+                                                // sibling patches plan and review
+                                                // at overlapping times, and
+                                                // alternating their phases on one
+                                                // key restarted the clock the
+                                                // top-level display reads.
+                                                if matches!(
+                                                    key,
+                                                    crate::activity::ActivityKey::PatchsetStage { .. }
+                                                ) {
+                                                    activity.update(
+                                                        crate::activity::ActivityKey::PatchsetPatch {
+                                                            patchset_id,
+                                                            patch_id,
+                                                        },
+                                                        crate::activity::Phase::Reviewing {
+                                                            attempt,
+                                                            max_attempts,
+                                                        },
+                                                    );
+                                                }
+                                                activity.update(key, phase);
+                                            }
+                                            Some(ProgressUpdate::Finished(key)) => {
+                                                // Marked done rather than
+                                                // removed. Dropping it made the
+                                                // patch's card show less and
+                                                // less as the review went on,
+                                                // with the finished work only
+                                                // reappearing once the whole
+                                                // review ended. Carries the same
+                                                // numbers the recorded breakdown
+                                                // will show, so the row settles
+                                                // in place.
+                                                let mut done = None;
+                                                if let Some(stage) =
+                                                    finished_stage(&json_msg["payload"])
+                                                    && let Some(started) =
+                                                        stage_starts.remove(&stage)
+                                                {
+                                                    let seconds =
+                                                        started.elapsed().as_secs();
+                                                    let turns = stage_turns
+                                                        .remove(&stage)
+                                                        .unwrap_or(0);
+                                                    stage_stats
+                                                        .push((stage, seconds, turns));
+                                                    done = Some(
+                                                        crate::activity::Phase::StageDone {
+                                                            stage,
+                                                            seconds,
+                                                            turns,
+                                                        },
+                                                    );
+                                                }
+                                                match done {
+                                                    Some(phase) => {
+                                                        activity.update(key, phase)
+                                                    }
+                                                    // No start time means nothing
+                                                    // to report about it, and a
+                                                    // row saying only "done" is
+                                                    // worse than none.
+                                                    None => activity.clear(&key),
+                                                }
+                                            }
+                                            None => {}
+                                        }
+                                    }
                                     _ => {
                                         // Unknown type. Assume it's result if it matches result structure.
                                         if json_msg.get("patchset_id").is_some() {
@@ -2075,12 +2707,37 @@ async fn run_review_tool_with_cmd(
 
             // Return result
             if let Some(res) = final_result {
-                Ok(res)
+                Ok((res, stage_stats))
             } else {
                 Err(anyhow::anyhow!("Review tool finished without valid result"))
             }
         }
         .await;
+
+    // Split the timings back off; everything below deals in the result alone.
+    let (interaction_result, stage_stats) = match interaction_result {
+        Ok((res, stats)) => (Ok(res), stats),
+        Err(e) => (Err(e), Vec::new()),
+    };
+
+    if !stage_stats.is_empty() {
+        let payload: Vec<serde_json::Value> = stage_stats
+            .iter()
+            .map(|(stage, secs, turns)| {
+                serde_json::json!({"stage": stage, "seconds": secs, "turns": turns})
+            })
+            .collect();
+        let _ = db
+            .set_review_stage_durations(review_id, &serde_json::Value::Array(payload).to_string())
+            .await;
+    }
+
+    // Unconditional: the streamed preview has served its purpose however the
+    // review ended. Leaving it behind grows the table without bound, and the
+    // failure mode is slow growth rather than an error, so it is easy to miss.
+    if let Err(e) = db.delete_review_log_entries(review_id).await {
+        tracing::debug!("Failed to clear streamed log entries: {}", e);
+    }
 
     // Abort all spawned AI request tasks to drop their stdin clones
     for task in spawned_tasks {
@@ -2095,18 +2752,32 @@ async fn run_review_tool_with_cmd(
     }
     drop(stdin_writer);
 
-    let timed_out = match &interaction_result {
-        Err(e) => e
-            .to_string()
-            .contains("Review tool timed out (active time exceeded)"),
-        Ok(_) => false,
+    let (timed_out, cancel_ignored) = match &interaction_result {
+        Err(e) => {
+            let msg = e.to_string();
+            (
+                msg.contains("Review tool timed out (active time exceeded)"),
+                msg.contains(CANCEL_IGNORED),
+            )
+        }
+        Ok(_) => (false, false),
     };
 
-    if timed_out {
-        error!(
-            "Review tool timed out after {} active seconds. Killing process.",
-            settings.review.timeout_seconds
-        );
+    if timed_out || cancel_ignored {
+        if cancel_ignored {
+            // Partial results are lost here, unlike the graceful path. Say so
+            // rather than leaving it to be inferred from a missing report.
+            error!(
+                "Review tool did not exit within {}s of cancellation. Killing process; \
+                 partial results are lost.",
+                GRACEFUL_CANCEL_WAIT.as_secs()
+            );
+        } else {
+            error!(
+                "Review tool timed out after {} active seconds. Killing process.",
+                settings.review.timeout_seconds
+            );
+        }
         let _ = child.start_kill();
         let _ = timeout(Duration::from_secs(5), child.wait()).await;
     } else {
@@ -2557,6 +3228,225 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    /// The worker encodes progress and the daemon decodes it. Those two ends live
+    /// in different files and different processes, so a round-trip test is what
+    /// keeps the wire format honest.
+    #[test]
+    fn progress_events_round_trip_from_worker_to_activity_update() {
+        use crate::activity::{ActivityKey, Phase, StageWait};
+        use crate::local_review::{ProgressEvent, encode_progress};
+
+        let cases = vec![
+            (
+                ProgressEvent::AiReviewPlanningStarted { patch_index: 0 },
+                // Per patch, not per patchset: each patch's worker plans its own
+                // stages, and `attempt` is that patch's retry count. Sharing the
+                // patchset's key meant sibling patches overwrote each other and
+                // restarted the clock the top-level display reads.
+                ProgressUpdate::Set(
+                    ActivityKey::PatchsetPatch {
+                        patchset_id: 77,
+                        patch_id: 3,
+                    },
+                    Phase::Planning {
+                        attempt: 1,
+                        max_attempts: 4,
+                    },
+                ),
+            ),
+            (
+                ProgressEvent::AiReviewStageStarted {
+                    patch_index: 0,
+                    stage: 4,
+                },
+                ProgressUpdate::Set(
+                    ActivityKey::PatchsetStage {
+                        patchset_id: 77,
+                        patch_id: 3,
+                        stage: 4,
+                    },
+                    Phase::Stage {
+                        stage: 4,
+                        turn: 0,
+                        max_turns: 0,
+                        waiting: StageWait::Model,
+                    },
+                ),
+            ),
+            (
+                ProgressEvent::AiReviewStageTurn {
+                    patch_index: 0,
+                    stage: 6,
+                    turn: 12,
+                    max_turns: 100,
+                },
+                ProgressUpdate::Set(
+                    ActivityKey::PatchsetStage {
+                        patchset_id: 77,
+                        patch_id: 3,
+                        stage: 6,
+                    },
+                    Phase::Stage {
+                        stage: 6,
+                        turn: 12,
+                        max_turns: 100,
+                        waiting: StageWait::Model,
+                    },
+                ),
+            ),
+            // A finished stage is removed, not relabelled.
+            (
+                ProgressEvent::AiReviewStageFinished {
+                    patch_index: 0,
+                    stage: 3,
+                },
+                ProgressUpdate::Finished(ActivityKey::PatchsetStage {
+                    patchset_id: 77,
+                    patch_id: 3,
+                    stage: 3,
+                }),
+            ),
+            // A failed stage is relabelled, not removed: the review carries on
+            // without it, and a stage that vanished would be indistinguishable
+            // from one that was never planned.
+            (
+                ProgressEvent::AiReviewStageFailed {
+                    patch_index: 0,
+                    stage: 2,
+                    reason: "Session exceeded max turns limit (50)".to_string(),
+                    cancelled: false,
+                },
+                ProgressUpdate::Set(
+                    ActivityKey::PatchsetStage {
+                        patchset_id: 77,
+                        patch_id: 3,
+                        stage: 2,
+                    },
+                    Phase::StageFailed {
+                        stage: 2,
+                        reason: "Session exceeded max turns limit (50)".to_string(),
+                        cancelled: false,
+                    },
+                ),
+            ),
+            (
+                ProgressEvent::AiReviewStageFailed {
+                    patch_index: 0,
+                    stage: 5,
+                    reason: "Session cancelled by supervisor".to_string(),
+                    cancelled: true,
+                },
+                ProgressUpdate::Set(
+                    ActivityKey::PatchsetStage {
+                        patchset_id: 77,
+                        patch_id: 3,
+                        stage: 5,
+                    },
+                    Phase::StageFailed {
+                        stage: 5,
+                        reason: "Session cancelled by supervisor".to_string(),
+                        cancelled: true,
+                    },
+                ),
+            ),
+        ];
+
+        for (event, expected) in cases {
+            let line = encode_progress(&event).expect("event should be forwarded");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&line).expect("encoded progress must be valid JSON");
+            assert_eq!(parsed["type"], "progress");
+
+            let update = progress_update(77, 3, &parsed["payload"], 1, 4)
+                .expect("daemon must understand what the worker emitted");
+            assert_eq!(update, expected);
+        }
+    }
+
+    /// Concurrent stages must not share a slot, or a wedged stage would be masked
+    /// by whichever sibling reported most recently.
+    #[test]
+    fn concurrent_stages_are_tracked_independently() {
+        use crate::activity::{ActivityKey, ActivityRegistry};
+
+        let registry = ActivityRegistry::new();
+        for stage in [1u8, 2, 3] {
+            let payload = serde_json::json!({
+                "kind": "stage_turn", "stage": stage, "turn": 4, "max_turns": 100
+            });
+            match progress_update(5, 3, &payload, 1, 4).unwrap() {
+                ProgressUpdate::Set(key, phase) => registry.update(key, phase),
+                ProgressUpdate::Finished(_) => panic!("stage_turn must not finish a stage"),
+            }
+        }
+
+        assert_eq!(registry.patchset_snapshot(5).len(), 3);
+
+        // Finishing one leaves the other two visible and still running.
+        match progress_update(
+            5,
+            3,
+            &serde_json::json!({"kind": "stage_finished", "stage": 2}),
+            1,
+            4,
+        )
+        .unwrap()
+        {
+            ProgressUpdate::Finished(key) => {
+                assert_eq!(
+                    key,
+                    ActivityKey::PatchsetStage {
+                        patchset_id: 5,
+                        patch_id: 3,
+                        stage: 2
+                    }
+                );
+                // What the review loop does with it: record the numbers the
+                // breakdown will show, rather than dropping the entry and
+                // leaving the patch's card emptier than before.
+                registry.update(
+                    key,
+                    crate::activity::Phase::StageDone {
+                        stage: 2,
+                        seconds: 41,
+                        turns: 5,
+                    },
+                );
+            }
+            ProgressUpdate::Set(..) => panic!("stage_finished must report a finish"),
+        }
+
+        let remaining = registry.patchset_snapshot(5);
+        assert_eq!(remaining.len(), 3, "a finished stage keeps its slot");
+
+        let finished = remaining
+            .iter()
+            .find(|e| e.key == "patchset:5/patch:3/stage:2")
+            .expect("the finished stage must still be listed");
+        assert_eq!(finished.description, "stage 2 done in 41s, 5 turns");
+
+        // Its siblings are untouched and still running.
+        assert_eq!(
+            remaining
+                .iter()
+                .filter(|e| e.description.contains("turn 4/100"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn progress_decoding_rejects_garbage_without_panicking() {
+        // Progress is advisory: a malformed line must never be able to fail a review.
+        assert!(progress_update(1, 3, &serde_json::json!({}), 1, 4).is_none());
+        assert!(progress_update(1, 3, &serde_json::json!({"kind": "nonsense"}), 1, 4).is_none());
+        assert!(progress_update(1, 3, &serde_json::json!({"kind": "stage_turn"}), 1, 4).is_none());
+        assert!(
+            progress_update(1, 3, &serde_json::json!({"kind": "stage_finished"}), 1, 4).is_none()
+        );
+        assert!(progress_update(1, 3, &serde_json::Value::Null, 1, 4).is_none());
+    }
+
     #[test]
     fn interaction_ids_are_unique_with_the_same_timestamp() {
         let ids: HashSet<_> = (0..1_000)
@@ -2652,6 +3542,14 @@ mod tests {
         mock_script: &str,
         provider: Arc<dyn AiProvider>,
     ) -> Result<Value> {
+        run_single_ai_request_mock_with_cancel(mock_script, provider, None).await
+    }
+
+    async fn run_single_ai_request_mock_with_cancel(
+        mock_script: &str,
+        provider: Arc<dyn AiProvider>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+    ) -> Result<Value> {
         let temp_dir = tempdir()?;
         let bin_path = temp_dir.path().join("mock_review");
 
@@ -2698,6 +3596,7 @@ mod tests {
         run_review_tool_with_cmd(
             Command::new(&bin_path),
             ps_id,
+            p_id,
             &json!({}),
             &settings,
             db,
@@ -2709,8 +3608,412 @@ mod tests {
             None,
             provider,
             Arc::new(Semaphore::new(56)),
+            crate::activity::ActivityRegistry::new(),
+            cancel_token,
+            1,
+            1,
         )
         .await
+    }
+
+    /// Cancelling must interrupt the worker, not merely discard its result.
+    ///
+    /// The worker is asked to stop over stdin and gets a window to report what it
+    /// already finished, so a long review is not a total loss.
+    #[tokio::test]
+    async fn test_cancellation_asks_worker_to_stop_and_keeps_partial_results() -> Result<()> {
+        // Reads the initial payload, then waits for the cancel message and
+        // reports the stages it managed to finish before stopping.
+        let mock = r#"#!/bin/sh
+read -r _payload
+while read -r msg; do
+  case "$msg" in
+    *'"type":"cancel"'*)
+      echo '{"patchset_id":1,"cancelled":true,"patches":[],"stage_failures":[{"stage":5,"reason":"Session cancelled by supervisor","cancelled":true}],"findings":[]}'
+      exit 0
+      ;;
+  esac
+done
+"#;
+
+        // Pre-fired so the cancel arm is ready on the first loop iteration,
+        // which keeps the test deterministic rather than racing a sleep.
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let result =
+            run_single_ai_request_mock_with_cancel(mock, Arc::new(MockProvider), Some(token))
+                .await?;
+
+        assert_eq!(
+            result["cancelled"], true,
+            "the worker should have been told to stop"
+        );
+
+        let failures = result["stage_failures"]
+            .as_array()
+            .expect("partial results must survive cancellation");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["stage"], 5);
+        assert_eq!(
+            failures[0]["cancelled"], true,
+            "a cancelled stage must not be reported as a genuine failure"
+        );
+
+        Ok(())
+    }
+
+    /// Stage timing is derived in the daemon from the worker's progress events,
+    /// so the two ends have to agree on the wire format for it to work at all.
+    #[tokio::test]
+    async fn test_stage_timings_are_derived_from_worker_progress() {
+        use std::collections::HashMap;
+
+        // Replays the event sequence a real stage produces.
+        let events = vec![
+            serde_json::json!({"kind": "stage_started", "stage": 3}),
+            serde_json::json!({"kind": "stage_turn", "stage": 3, "turn": 1, "max_turns": 100}),
+            serde_json::json!({"kind": "stage_turn", "stage": 3, "turn": 5, "max_turns": 100}),
+            serde_json::json!({"kind": "stage_finished", "stage": 3}),
+        ];
+
+        let mut turns: HashMap<u8, u64> = HashMap::new();
+        let mut started: HashMap<u8, ()> = HashMap::new();
+        let mut finished: Vec<(u8, u64)> = Vec::new();
+
+        for e in &events {
+            if let Some(stage) = started_stage(e) {
+                started.entry(stage).or_insert(());
+                if let Some(turn) = e.get("turn").and_then(|t| t.as_u64()) {
+                    let seen = turns.entry(stage).or_insert(0);
+                    *seen = (*seen).max(turn);
+                }
+            }
+            if let Some(stage) = finished_stage(e)
+                && started.remove(&stage).is_some()
+            {
+                finished.push((stage, turns.remove(&stage).unwrap_or(0)));
+            }
+        }
+
+        assert_eq!(
+            finished,
+            vec![(3u8, 5u64)],
+            "a stage should report the highest turn it reached, not the count of events"
+        );
+        assert!(
+            started.is_empty(),
+            "a finished stage must not stay open, or its timing would never be recorded"
+        );
+    }
+
+    /// A stalled stage is either waiting on the model or grinding through git,
+    /// and those need different responses. The worker reports the switch; this
+    /// checks the report survives the wire.
+    #[test]
+    fn tool_execution_is_distinguishable_from_waiting_on_the_model() {
+        use crate::activity::{ActivityKey, Phase, StageWait};
+        use crate::local_review::{ProgressEvent, encode_progress};
+
+        let running = ProgressEvent::AiReviewStageTools {
+            patch_index: 0,
+            stage: 4,
+            tools: vec!["git_grep".to_string()],
+            turn: 9,
+            max_turns: 100,
+        };
+        let line = encode_progress(&running).expect("tool events must be forwarded");
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+        let update = progress_update(7, 2, &parsed["payload"], 1, 4).expect("daemon must decode");
+        let ProgressUpdate::Set(key, phase) = update else {
+            panic!("tool events set a phase, they do not clear one");
+        };
+        assert_eq!(
+            key,
+            ActivityKey::PatchsetStage {
+                patchset_id: 7,
+                patch_id: 2,
+                stage: 4
+            }
+        );
+        assert_eq!(
+            phase,
+            Phase::Stage {
+                stage: 4,
+                turn: 9,
+                max_turns: 100,
+                waiting: StageWait::Tools {
+                    names: vec!["git_grep".to_string()]
+                },
+            }
+        );
+        assert_eq!(phase.describe(), "stage 4, turn 9/100 (running git_grep)");
+
+        // An empty tool list means they finished: back to awaiting the model,
+        // without losing the turn number.
+        let done = ProgressEvent::AiReviewStageTools {
+            patch_index: 0,
+            stage: 4,
+            tools: vec![],
+            turn: 9,
+            max_turns: 100,
+        };
+        let line = encode_progress(&done).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let ProgressUpdate::Set(_, phase) =
+            progress_update(7, 2, &parsed["payload"], 1, 4).expect("daemon must decode")
+        else {
+            panic!("expected a phase update");
+        };
+        assert_eq!(phase.describe(), "stage 4, turn 9/100 (awaiting model)");
+    }
+
+    /// The two sub-phases are the same stage, so the stage clock must not reset
+    /// when a turn switches between them — otherwise `age_seconds` would measure
+    /// the sub-phase rather than the stage.
+    #[test]
+    fn switching_between_model_and_tools_keeps_the_stage_clock() {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase, StageWait};
+
+        let reg = ActivityRegistry::new();
+        let key = ActivityKey::PatchsetStage {
+            patchset_id: 1,
+            patch_id: 1,
+            stage: 4,
+        };
+
+        reg.update(
+            key.clone(),
+            Phase::Stage {
+                stage: 4,
+                turn: 1,
+                max_turns: 100,
+                waiting: StageWait::Model,
+            },
+        );
+        let age_before = reg.get(&key).unwrap().age_seconds;
+
+        reg.update(
+            key.clone(),
+            Phase::Stage {
+                stage: 4,
+                turn: 1,
+                max_turns: 100,
+                waiting: StageWait::Tools {
+                    names: vec!["git_grep".to_string()],
+                },
+            },
+        );
+
+        assert!(reg.get(&key).unwrap().age_seconds >= age_before);
+        assert_eq!(
+            reg.get(&key).unwrap().description,
+            "stage 4, turn 1/100 (running git_grep)"
+        );
+    }
+
+    #[test]
+    fn stage_is_recoverable_from_the_context_tag() {
+        // The real shape the worker produces.
+        assert_eq!(stage_from_context_tag("[ps:12 p:34] [s:7] "), Some(7));
+        assert_eq!(stage_from_context_tag("[ps:1 p:2] [s:11] "), Some(11));
+
+        // Anything else must not guess a stage; mis-attributing a queue wait to
+        // the wrong stage is worse than not reporting it.
+        assert_eq!(stage_from_context_tag("[ps:12 p:34] "), None);
+        assert_eq!(stage_from_context_tag(""), None);
+        assert_eq!(stage_from_context_tag("[s:]"), None);
+        assert_eq!(stage_from_context_tag("[s:abc]"), None);
+        assert_eq!(stage_from_context_tag("[s:7"), None);
+    }
+
+    /// Every wait a stage can be blocked on must be distinguishable, since each
+    /// calls for a different response.
+    #[test]
+    fn every_stage_wait_reads_differently() {
+        use crate::activity::{Phase, StageWait};
+
+        let describe = |waiting| {
+            Phase::Stage {
+                stage: 4,
+                turn: 9,
+                max_turns: 100,
+                waiting,
+            }
+            .describe()
+        };
+
+        assert_eq!(
+            describe(StageWait::Model),
+            "stage 4, turn 9/100 (awaiting model)"
+        );
+        assert_eq!(
+            describe(StageWait::Queued),
+            "stage 4, turn 9/100 (queued for a model slot)"
+        );
+        assert_eq!(
+            describe(StageWait::RateLimited {
+                retry_in_seconds: 60
+            }),
+            "stage 4, turn 9/100 (rate limited, retrying in 60s)"
+        );
+        assert_eq!(
+            describe(StageWait::Tools {
+                names: vec!["git_grep".to_string()]
+            }),
+            "stage 4, turn 9/100 (running git_grep)"
+        );
+    }
+
+    /// A backoff ending must put the turn back with the model rather than
+    /// leaving it stuck reporting a rate limit that has expired.
+    #[test]
+    fn backoff_events_round_trip_and_clear() {
+        use crate::activity::{Phase, StageWait};
+        use crate::local_review::{ProgressEvent, encode_progress};
+
+        let decode = |retry: Option<u64>| {
+            let line = encode_progress(&ProgressEvent::AiReviewStageBackoff {
+                patch_index: 0,
+                stage: 4,
+                retry_in_seconds: retry,
+                turn: 9,
+                max_turns: 100,
+            })
+            .expect("backoff events must be forwarded");
+            let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match progress_update(1, 2, &parsed["payload"], 1, 4).expect("daemon must decode") {
+                ProgressUpdate::Set(_, phase) => phase,
+                ProgressUpdate::Finished(_) => panic!("backoff sets a phase"),
+            }
+        };
+
+        assert_eq!(
+            decode(Some(60)),
+            Phase::Stage {
+                stage: 4,
+                turn: 9,
+                max_turns: 100,
+                waiting: StageWait::RateLimited {
+                    retry_in_seconds: 60
+                },
+            }
+        );
+        assert_eq!(
+            decode(None),
+            Phase::Stage {
+                stage: 4,
+                turn: 9,
+                max_turns: 100,
+                waiting: StageWait::Model,
+            }
+        );
+    }
+
+    /// The worker streams the conversation and the daemon stores it, so the two
+    /// ends must agree on the wire shape.
+    #[test]
+    fn log_entries_round_trip_and_stay_bounded() {
+        use crate::local_review::{ProgressEvent, encode_progress};
+
+        let line = encode_progress(&ProgressEvent::AiReviewLogEntry {
+            patch_index: 0,
+            stage: 5,
+            role: "tool".to_string(),
+            content: "git_grep output".to_string(),
+        })
+        .expect("log entries must be forwarded");
+
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["type"], "progress");
+        assert_eq!(parsed["payload"]["kind"], "log_entry");
+        assert_eq!(parsed["payload"]["stage"], 5);
+        assert_eq!(parsed["payload"]["role"], "tool");
+        assert_eq!(parsed["payload"]["content"], "git_grep output");
+
+        // Log entries are not activity updates; decoding one as a phase must
+        // yield nothing rather than corrupting the stage display.
+        assert!(progress_update(1, 2, &parsed["payload"], 1, 4).is_none());
+    }
+
+    /// A single tool result can be a whole kernel file. Streaming that verbatim
+    /// every turn would push megabytes through the IPC pipe.
+    #[test]
+    fn streamed_log_entries_are_truncated_before_leaving_the_worker() {
+        use crate::ai::{AiMessage, AiRole};
+        use crate::worker::prompts::log_entry_event_for_test;
+
+        let huge = "x".repeat(4_000_000);
+        let msg = AiMessage {
+            role: AiRole::Tool,
+            content: Some(huge.clone()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+
+        let event = log_entry_event_for_test(6, &msg);
+        let crate::worker::WorkerProgressEvent::LogEntry { content, role, .. } = event else {
+            panic!("expected a log entry");
+        };
+        assert_eq!(role, "tool");
+        assert!(
+            content.len() < huge.len() / 10,
+            "streamed content should be a preview, got {} bytes",
+            content.len()
+        );
+    }
+
+    /// The reported bug: a commit with a message but no file changes was
+    /// reviewed, failed to apply, and retried three more times to fail
+    /// identically. `extract_files_from_diff` returning nothing is the signal.
+    #[test]
+    fn empty_commits_are_recognised_as_having_no_files() {
+        // A b4 prep tracker: real message, no diff.
+        assert!(extract_files_from_diff("").is_empty());
+        assert!(extract_files_from_diff("\n\n").is_empty());
+        assert!(
+            extract_files_from_diff("Signed-off-by: A <a@x>\n").is_empty(),
+            "a message body alone is not a change"
+        );
+
+        // A real patch still reports its files, so the skip cannot swallow one.
+        let real = "diff --git a/drivers/net/ionic/x.c b/drivers/net/ionic/x.c\n                    --- a/drivers/net/ionic/x.c\n                    +++ b/drivers/net/ionic/x.c\n                    @@ -1 +1 @@\n-old\n+new\n";
+        assert!(
+            !extract_files_from_diff(real).is_empty(),
+            "a patch with changes must never be skipped as empty"
+        );
+    }
+
+    #[test]
+    fn test_stage_event_classification() {
+        // Only stage_finished ends a stage; a turn must not close it early.
+        assert_eq!(
+            started_stage(&serde_json::json!({"kind": "stage_started", "stage": 2})),
+            Some(2)
+        );
+        assert_eq!(
+            started_stage(&serde_json::json!({"kind": "stage_turn", "stage": 4, "turn": 1})),
+            Some(4)
+        );
+        assert_eq!(
+            started_stage(&serde_json::json!({"kind": "stage_finished", "stage": 4})),
+            None
+        );
+        assert_eq!(
+            finished_stage(&serde_json::json!({"kind": "stage_finished", "stage": 4})),
+            Some(4)
+        );
+        assert_eq!(
+            finished_stage(&serde_json::json!({"kind": "stage_turn", "stage": 4, "turn": 1})),
+            None
+        );
+        assert_eq!(
+            finished_stage(&serde_json::json!({"kind": "planning"})),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2890,6 +4193,7 @@ sleep 30
             run_review_tool_with_cmd(
                 Command::new(&bin_path),
                 ps_id,
+                p_id,
                 &json!({}),
                 &settings,
                 db,
@@ -2901,6 +4205,10 @@ sleep 30
                 None,
                 provider,
                 Arc::new(Semaphore::new(56)),
+                crate::activity::ActivityRegistry::new(),
+                None,
+                1,
+                1,
             ),
         )
         .await;
@@ -2956,6 +4264,8 @@ fi
             quota_manager,
             target_review_count: 1,
             provider,
+            activity: crate::activity::ActivityRegistry::new(),
+            cancels: crate::cancel::CancelRegistry::new(),
         };
 
         // Create dummy patchset and patch in DB
@@ -3225,6 +4535,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
         run_review_tool_with_cmd(
             Command::new(&bin_path),
             ps_id,
+            p_id,
             &json!({}),
             &settings,
             db,
@@ -3236,6 +4547,10 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             None,
             provider,
             Arc::new(Semaphore::new(56)),
+            crate::activity::ActivityRegistry::new(),
+            None,
+            1,
+            1,
         )
         .await
         .map(|_| ())
@@ -3356,6 +4671,8 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
+            activity: crate::activity::ActivityRegistry::new(),
+            cancels: crate::cancel::CancelRegistry::new(),
         };
 
         // Scenario 1: Mixed findings
@@ -3601,6 +4918,8 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
+            activity: crate::activity::ActivityRegistry::new(),
+            cancels: crate::cancel::CancelRegistry::new(),
         };
 
         Reviewer::queue_notifications(

@@ -251,6 +251,18 @@ impl ClassifyAiError for RemoteAiError {
     }
 }
 
+impl ClassifyAiError for reqwest::Error {
+    fn ai_error_class(&self) -> AiErrorClass {
+        if self.is_builder() || self.is_redirect() {
+            AiErrorClass::Fatal
+        } else {
+            AiErrorClass::Transient {
+                retry_after: Duration::from_secs(0),
+            }
+        }
+    }
+}
+
 pub(crate) fn classify_status_code(status: reqwest::StatusCode) -> Option<AiErrorClass> {
     match status {
         reqwest::StatusCode::TOO_MANY_REQUESTS => Some(AiErrorClass::RateLimit {
@@ -293,6 +305,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<vllm::VllmError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<reqwest::Error>() {
         return e.ai_error_class();
     }
     AiErrorClass::Fatal
@@ -420,6 +435,7 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 base_url,
                 thinking,
                 effort,
+                ai.api_timeout_secs,
             )))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient::new())),
@@ -789,6 +805,17 @@ pub(crate) fn ipc_registry() -> Arc<IpcRegistry> {
         .clone()
 }
 
+/// Process-wide cancellation signal for a review worker.
+///
+/// Global for the same reason [`ipc_registry`] is: stages run concurrently
+/// across the process and all need to observe the one supervisor request. In the
+/// daemon and in local CLI reviews nothing ever trips it, so it costs nothing.
+pub fn worker_cancel_token() -> &'static tokio_util::sync::CancellationToken {
+    static WORKER_CANCEL: std::sync::OnceLock<tokio_util::sync::CancellationToken> =
+        std::sync::OnceLock::new();
+    WORKER_CANCEL.get_or_init(tokio_util::sync::CancellationToken::new)
+}
+
 pub(crate) fn ipc_writer() -> Arc<AtomicWriter> {
     IPC_WRITER
         .get_or_init(|| Arc::new(AtomicWriter::new()))
@@ -848,6 +875,13 @@ pub(crate) fn start_stdin_reader(registry: Arc<IpcRegistry>) -> tokio::task::Joi
                             );
                             std::process::exit(1);
                         }
+                    }
+                    "cancel" => {
+                        // The supervisor wants us to stop. Trip the token and let
+                        // in-flight stages wind down so completed work is still
+                        // reported; the supervisor kills us if we take too long.
+                        tracing::info!("Cancellation requested by supervisor");
+                        worker_cancel_token().cancel();
                     }
                     unknown => {
                         eprintln!("CRITICAL PROTOCOL ERROR: Unknown message type: {}", unknown);
@@ -1209,6 +1243,22 @@ mod tests {
         assert_ai_error_class(
             anyhow!("Remote AI Error: rate limit exceeded"),
             AiErrorClass::Fatal,
+        );
+    }
+
+    #[tokio::test]
+    async fn test_classify_ai_error_reqwest_transport_is_transient() {
+        let err = reqwest::Client::new()
+            .get("http://127.0.0.1:9/")
+            .send()
+            .await
+            .expect_err("connection to 127.0.0.1:9 should be refused");
+
+        assert_ai_error_class(
+            err,
+            AiErrorClass::Transient {
+                retry_after: Duration::from_secs(0),
+            },
         );
     }
 

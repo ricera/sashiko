@@ -153,6 +153,8 @@ pub enum ClaudeError {
     AuthenticationError(String),
     #[error("API error {0}: {1}")]
     ApiError(reqwest::StatusCode, String),
+    #[error("Transport error, retry after {1:?}: {0}")]
+    Transport(String, Duration),
 }
 
 impl ClassifyAiError for ClaudeError {
@@ -162,6 +164,9 @@ impl ClassifyAiError for ClaudeError {
                 retry_after: *retry_after,
             },
             ClaudeError::OverloadedError(retry_after) => AiErrorClass::Transient {
+                retry_after: *retry_after,
+            },
+            ClaudeError::Transport(_, retry_after) => AiErrorClass::Transient {
                 retry_after: *retry_after,
             },
             ClaudeError::InvalidRequest(_) => AiErrorClass::Fatal,
@@ -187,6 +192,30 @@ pub struct ClaudeClient {
     extra_headers: std::collections::HashMap<String, String>,
 }
 
+/// A floor on sustained output rate, used only to size the request timeout.
+///
+/// Roughly an order of magnitude below what a healthy connection sustains. The
+/// estimate is deliberately pessimistic: guessing too high only delays recovery
+/// from a dead connection, while guessing too low kills requests that would have
+/// succeeded and burns the session's transient-retry budget on nothing.
+const SLOWEST_PLAUSIBLE_OUTPUT_TOKENS_PER_SEC: u64 = 10;
+
+/// Headroom for time to first token, which on a large uncached prompt is not
+/// instant and is not covered by the generation estimate.
+const FIRST_TOKEN_ALLOWANCE_SECS: u64 = 120;
+
+/// How long one request may take before it is abandoned.
+///
+/// Thinking tokens are output tokens, so `max_tokens` — not the difficulty of
+/// the question — bounds how long a legitimate response can take. A timeout
+/// below that bound would turn every full-length response into a retry, so the
+/// configured value can raise the ceiling but not lower it past what the model
+/// has been given permission to emit.
+fn request_timeout(api_timeout_secs: u64, max_tokens: u32) -> Duration {
+    let generation = max_tokens as u64 / SLOWEST_PLAUSIBLE_OUTPUT_TOKENS_PER_SEC;
+    Duration::from_secs(api_timeout_secs.max(generation + FIRST_TOKEN_ALLOWANCE_SECS))
+}
+
 impl ClaudeClient {
     pub fn new(
         model: String,
@@ -195,6 +224,7 @@ impl ClaudeClient {
         base_url: String,
         thinking: Option<String>,
         effort: Option<String>,
+        api_timeout_secs: u64,
     ) -> Self {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
@@ -203,10 +233,33 @@ impl ClaudeClient {
 
         let extra_headers = Self::parse_env_headers();
 
+        // Without this the request has no deadline at all, and a stalled
+        // connection parks the session inside generate_content forever. Nothing
+        // upstream can rescue it: the turn cap is checked between round trips,
+        // so it cannot fire while one never returns.
+        let timeout = request_timeout(api_timeout_secs, max_tokens);
+        if timeout.as_secs() > api_timeout_secs {
+            info!(
+                "Claude request timeout raised to {}s: {} max_tokens cannot be emitted within the \
+                 configured {}s",
+                timeout.as_secs(),
+                max_tokens,
+                api_timeout_secs
+            );
+        }
+        // Client::new() panics on a failed build, so this is no stricter than
+        // what it replaces — and unlike an unwrap_or_else(Client::new) fallback
+        // it cannot quietly hand back a client with no timeout, which is the
+        // exact bug being fixed.
+        let client = Client::builder()
+            .timeout(timeout)
+            .build()
+            .expect("failed to build the Claude HTTP client");
+
         Self {
             api_key,
             model,
-            client: Client::new(),
+            client,
             enable_caching,
             max_tokens,
             base_url,
@@ -277,7 +330,10 @@ impl ClaudeClient {
             Ok(res) => res,
             Err(e) => {
                 let err_str = redact_secret(&e.to_string());
-                anyhow::bail!("Failed to send request to Claude API: {}", err_str);
+                if e.is_builder() || e.is_redirect() {
+                    anyhow::bail!("Failed to send request to Claude API: {}", err_str);
+                }
+                return Err(ClaudeError::Transport(err_str, Duration::from_secs(0)).into());
             }
         };
 
@@ -798,6 +854,17 @@ mod tests {
     }
 
     #[test]
+    fn test_transport_error_classifies_as_transient() {
+        let retry_after = Duration::from_secs(0);
+        let err = ClaudeError::Transport("connection reset".to_string(), retry_after);
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient { retry_after }
+        );
+    }
+
+    #[test]
     fn test_authentication_error_classifies_as_fatal() {
         let err = ClaudeError::AuthenticationError("bad key".to_string());
 
@@ -825,6 +892,48 @@ mod tests {
             ClaudeError::ApiError(reqwest::StatusCode::BAD_REQUEST, "bad request".to_string());
 
         assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    // --- Request timeout ---
+
+    /// The client used to be built with `Client::new()`, which has no request
+    /// timeout, so a stalled connection parked the session inside
+    /// `generate_content` indefinitely. Nothing upstream could recover it: the
+    /// turn cap is checked between round trips, so it cannot fire while one
+    /// never returns.
+    #[test]
+    fn test_request_timeout_is_never_shorter_than_the_output_allowance() {
+        // 4096 tokens at the pessimistic floor rate needs ~410s, so the 300s
+        // default must not be taken literally -- doing so would abandon a
+        // full-length response that was still arriving.
+        let effective = request_timeout(300, 4096);
+        assert!(
+            effective.as_secs() > 300,
+            "a full-length response must not be cut off by the default timeout, got {}s",
+            effective.as_secs()
+        );
+        assert_eq!(effective, Duration::from_secs(4096 / 10 + 120));
+
+        // Thinking tokens are output tokens, so the bound scales with the
+        // permission given rather than with how hard the question is.
+        assert!(request_timeout(300, 32_000) > request_timeout(300, 4096));
+    }
+
+    #[test]
+    fn test_request_timeout_honours_a_longer_configured_value() {
+        // The floor only raises. An operator who wants more patience than the
+        // estimate implies keeps it.
+        assert_eq!(request_timeout(7200, 4096), Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_request_timeout_is_always_finite() {
+        // The point is not to fail fast, it is that no configuration can produce
+        // a request that waits forever -- including the degenerate ones.
+        for (configured, max_tokens) in [(0, 0), (0, 1), (u64::MAX / 2, 0)] {
+            let t = request_timeout(configured, max_tokens);
+            assert!(t > Duration::ZERO, "{configured}/{max_tokens} gave {t:?}");
+        }
     }
 
     // --- ThinkingConfig tests (Bug 1 regression) ---

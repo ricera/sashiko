@@ -134,6 +134,24 @@ pub trait LlmSession: Send {
     }
 }
 
+/// Marker in the error text of a session stopped by supervisor cancellation.
+///
+/// Stage results are collected as `Result`s, so consumers need to tell "this
+/// stage was cancelled" apart from "this stage genuinely failed" when reporting
+/// which parts of the review did not run.
+pub const SESSION_CANCELLED: &str = "Session cancelled by supervisor";
+
+/// Fired around tool execution with the tool names, current turn, and turn cap.
+/// An empty name slice signals the tools finished.
+type ToolsCallback<'a> = dyn Fn(&[String], usize, usize) + Send + Sync + 'a;
+
+/// Fired around provider backoff with the wait in seconds (`None` once over),
+/// plus the current turn and turn cap.
+type BackoffCallback<'a> = dyn Fn(Option<u64>, usize, usize) + Send + Sync + 'a;
+
+/// Fired as each message joins the conversation log.
+type MessageCallback<'a> = dyn Fn(&AiMessage) + Send + Sync + 'a;
+
 /// Orchestrates the execution of an [`LlmSession`].
 pub struct SessionRunner<'a> {
     provider: &'a dyn AiProvider,
@@ -142,6 +160,15 @@ pub struct SessionRunner<'a> {
     max_transient_retries: usize,
     max_provider_error_retries: usize,
     on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
+    /// Called with the tool names when a turn starts executing tools, and with
+    /// an empty slice when they finish.
+    on_tools: Option<Box<ToolsCallback<'a>>>,
+    /// Called with the backoff duration when the provider asks us to slow down,
+    /// and with `None` once the wait is over.
+    on_backoff: Option<Box<BackoffCallback<'a>>>,
+    /// Called as each message joins the log, so the conversation can be watched
+    /// while it happens rather than only after it ends.
+    on_message: Option<Box<MessageCallback<'a>>>,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -154,6 +181,9 @@ impl<'a> SessionRunner<'a> {
             max_transient_retries: 5,
             max_provider_error_retries: 3,
             on_turn: None,
+            on_tools: None,
+            on_backoff: None,
+            on_message: None,
         }
     }
 
@@ -181,6 +211,46 @@ impl<'a> SessionRunner<'a> {
         self
     }
 
+    /// Configures a callback fired around tool execution.
+    ///
+    /// A turn's elapsed time is split between waiting on the model and running
+    /// git; without this the two are indistinguishable from outside, which is
+    /// the difference between "the model is slow" and "a tree-wide grep is
+    /// chewing through the kernel".
+    pub fn with_tools_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(&[String], usize, usize) + Send + Sync + 'a,
+    {
+        self.on_tools = Some(Box::new(cb));
+        self
+    }
+
+    /// Configures a callback fired around rate-limit and transient backoff.
+    ///
+    /// A rate limit with no `Retry-After` header sleeps a flat 60s, which from
+    /// outside is indistinguishable from a very slow model — and calls for a
+    /// completely different response.
+    pub fn with_backoff_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(Option<u64>, usize, usize) + Send + Sync + 'a,
+    {
+        self.on_backoff = Some(Box::new(cb));
+        self
+    }
+
+    /// Configures a callback fired as each message is appended to the log.
+    ///
+    /// The full conversation is only persisted when the review ends, so without
+    /// this there is nothing to show while one is running — which is exactly
+    /// when you want to see what it is doing.
+    pub fn with_message_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(&AiMessage) + Send + Sync + 'a,
+    {
+        self.on_message = Some(Box::new(cb));
+        self
+    }
+
     /// Configures a turn callback.
     pub fn with_turn_callback<F>(mut self, cb: F) -> Self
     where
@@ -188,6 +258,13 @@ impl<'a> SessionRunner<'a> {
     {
         self.on_turn = Some(Box::new(cb));
         self
+    }
+
+    /// Reports one message to the live-log callback, if one is configured.
+    fn emit_message(&self, msg: &AiMessage) {
+        if let Some(ref cb) = self.on_message {
+            cb(msg);
+        }
     }
 
     /// Runs the session to completion. Returns the validated output and conversation history (for logging).
@@ -222,6 +299,12 @@ impl<'a> SessionRunner<'a> {
         let mut total_cached_tokens = 0;
 
         loop {
+            // Checked before spending another LLM round trip rather than after,
+            // so a cancelled review stops costing money immediately.
+            if crate::ai::worker_cancel_token().is_cancelled() {
+                anyhow::bail!("{}", SESSION_CANCELLED);
+            }
+
             turns += 1;
             if turns > self.max_turns {
                 anyhow::bail!("Session exceeded max turns limit ({})", self.max_turns);
@@ -259,7 +342,13 @@ impl<'a> SessionRunner<'a> {
                             transient_retries,
                             self.max_transient_retries
                         );
+                        if let Some(ref cb) = self.on_backoff {
+                            cb(Some(retry_after.as_secs()), turns, self.max_turns);
+                        }
                         tokio::time::sleep(retry_after).await;
+                        if let Some(ref cb) = self.on_backoff {
+                            cb(None, turns, self.max_turns);
+                        }
                         turns = turns.saturating_sub(1);
                         continue;
                     }
@@ -283,6 +372,7 @@ impl<'a> SessionRunner<'a> {
                                     tool_call_id: None,
                                 };
                                 history.push(msg.clone());
+                                self.emit_message(&msg);
                                 log_history.push(msg);
                                 turns = turns.saturating_sub(1);
                                 continue;
@@ -312,11 +402,21 @@ impl<'a> SessionRunner<'a> {
                 tool_call_id: None,
             };
             history.push(assistant_msg.clone());
+            self.emit_message(&assistant_msg);
             log_history.push(assistant_msg);
 
             // Handle Tool Calls
             if let Some(tool_calls) = &resp.tool_calls {
-                let results = session.call_tools(tool_calls.clone()).await?;
+                if let Some(ref cb) = self.on_tools {
+                    let names: Vec<String> =
+                        tool_calls.iter().map(|c| c.function_name.clone()).collect();
+                    cb(&names, turns, self.max_turns);
+                }
+                let results = session.call_tools(tool_calls.clone()).await;
+                if let Some(ref cb) = self.on_tools {
+                    cb(&[], turns, self.max_turns);
+                }
+                let results = results?;
                 for (call_id, result) in results {
                     let tool_msg = AiMessage {
                         role: AiRole::Tool,
@@ -327,6 +427,7 @@ impl<'a> SessionRunner<'a> {
                         tool_call_id: Some(call_id),
                     };
                     history.push(tool_msg.clone());
+                    self.emit_message(&tool_msg);
                     log_history.push(tool_msg);
                 }
                 continue; // Loop again to feed tool results back to LLM
@@ -366,6 +467,7 @@ impl<'a> SessionRunner<'a> {
                         tool_call_id: None,
                     };
                     history.push(msg.clone());
+                    self.emit_message(&msg);
                     log_history.push(msg);
                     turns = turns.saturating_sub(1);
                 }

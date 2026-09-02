@@ -132,6 +132,8 @@ pub struct AppState {
     pub allow_all_submit: bool,
     pub smtp_enabled: bool,
     pub dry_run: bool,
+    pub activity: Arc<crate::activity::ActivityRegistry>,
+    pub cancels: Arc<crate::cancel::CancelRegistry>,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
     stats_tools_cache: AsyncCache<serde_json::Value>,
@@ -190,6 +192,11 @@ pub struct SubsystemQuery {
 }
 
 #[derive(Deserialize)]
+pub struct PatchsetActivityQuery {
+    pub id: i64,
+}
+
+#[derive(Deserialize)]
 pub struct CancelQuery {
     pub id: i64,
     #[serde(default)]
@@ -217,6 +224,9 @@ pub enum SubmitRequest {
         repo: Option<String>,
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
+        /// Treat an empty first commit as the series cover letter.
+        #[serde(default)]
+        b4_cover_letter: bool,
     },
     #[serde(rename = "remote-range")]
     RemoteRange {
@@ -224,6 +234,9 @@ pub enum SubmitRequest {
         repo: Option<String>,
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
+        /// Treat an empty first commit as the series cover letter.
+        #[serde(default)]
+        b4_cover_letter: bool,
     },
     Thread {
         msgid: String,
@@ -256,6 +269,7 @@ async fn redirect_www(req: Request, next: Next) -> impl IntoResponse {
 ///
 /// Extracted from [`run_server`] so that integration tests can construct the
 /// router independently (e.g. bind to port 0 for random-port testing).
+#[allow(clippy::too_many_arguments)]
 pub fn build_router(
     settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
@@ -264,6 +278,8 @@ pub fn build_router(
     allow_all_submit: bool,
     smtp_enabled: bool,
     dry_run: bool,
+    activity: Arc<crate::activity::ActivityRegistry>,
+    cancels: Arc<crate::cancel::CancelRegistry>,
 ) -> Router {
     let forge_registry = Arc::new(crate::forge::ForgeRegistry::new());
     let read_only = settings.server.read_only;
@@ -278,6 +294,8 @@ pub fn build_router(
         allow_all_submit,
         smtp_enabled,
         dry_run,
+        activity,
+        cancels,
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
         stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -302,6 +320,8 @@ pub fn build_router(
         .route("/api/stats/timeline", get(stats_timeline))
         .route("/api/stats/reviews", get(stats_reviews))
         .route("/api/stats/tools", get(stats_tools))
+        .route("/api/activity", get(get_activity))
+        .route("/api/patchset/activity", get(get_patchset_activity))
         .route("/api/submit", post(submit_patch))
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
@@ -314,6 +334,7 @@ pub fn build_router(
         .with_state(state)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_server(
     settings: Arc<crate::settings::Settings>,
     db: Arc<Database>,
@@ -322,6 +343,8 @@ pub async fn run_server(
     allow_all_submit: bool,
     smtp_enabled: bool,
     dry_run: bool,
+    activity: Arc<crate::activity::ActivityRegistry>,
+    cancels: Arc<crate::cancel::CancelRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let app = build_router(
         settings.clone(),
@@ -331,6 +354,8 @@ pub async fn run_server(
         allow_all_submit,
         smtp_enabled,
         dry_run,
+        activity,
+        cancels,
     );
 
     let bind_addr = format!("{}:{}", settings.server.host, settings.server.port);
@@ -428,12 +453,14 @@ async fn submit_patch(
             repo,
             skip_subjects,
             only_subjects,
+            b4_cover_letter,
         }
         | SubmitRequest::RemoteRange {
             sha,
             repo,
             skip_subjects,
             only_subjects,
+            b4_cover_letter,
         } => {
             let id = sha.clone();
             let repo_display = repo.as_deref().unwrap_or("local");
@@ -462,7 +489,9 @@ async fn submit_patch(
             }
 
             // Create a placeholder record in the DB so the user can track status
-            if let Err(e) = state
+            // Captured, not discarded: the fetch agent needs it to know whose
+            // work a commit belongs to when the patchset is cancelled.
+            let placeholder_patchset_id = match state
                 .db
                 .create_fetching_patchset(
                     &format!("{}@sashiko.local", id),
@@ -476,13 +505,18 @@ async fn submit_patch(
                 )
                 .await
             {
-                error!("Failed to create placeholder patchset: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
+                Ok(ps_id) => Some(ps_id),
+                Err(e) => {
+                    error!("Failed to create placeholder patchset: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
 
             let req = FetchRequest {
                 repo_url: repo,
                 commit_hash: sha,
+                patchset_id: placeholder_patchset_id,
+                b4_cover_letter,
                 mr_url: None,
                 mr_title: None,
                 mr_number: None,
@@ -849,7 +883,21 @@ async fn get_review(
     };
 
     match result {
-        Ok(Some(details)) => Ok(Json(details)),
+        Ok(Some(mut details)) => {
+            // The complete log only exists once the review ends. Until then,
+            // hand back the streamed preview so the view has something to show,
+            // flagged so it is never mistaken for the finished record.
+            let has_final_log = details.get("logs").map(|l| !l.is_null()).unwrap_or(false);
+            if !has_final_log
+                && let Some(id) = details.get("id").and_then(|v| v.as_i64())
+                && let Ok(entries) = state.db.get_review_log_entries(id).await
+                && !entries.is_empty()
+                && let Some(obj) = details.as_object_mut()
+            {
+                obj.insert("live_log".to_string(), serde_json::Value::Array(entries));
+            }
+            Ok(Json(details))
+        }
         Ok(None) => {
             info!("Review not found");
             Err(StatusCode::NOT_FOUND)
@@ -1020,6 +1068,52 @@ async fn get_stats(
     })))
 }
 
+/// Live view of every in-flight fetch and review.
+///
+/// Exists so a patchset stuck in `Fetching` or `In Review` can say what it is
+/// waiting on — `idle_seconds` is the field that distinguishes slow from wedged.
+async fn get_activity(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let entries = state.activity.snapshot();
+    Ok(Json(serde_json::json!({
+        "count": entries.len(),
+        "entries": entries,
+    })))
+}
+
+/// Activity for one patchset: live if anything is running, otherwise the last
+/// known state from before the daemon stopped.
+///
+/// The `live` flag matters — a persisted row says what the work *was* doing, not
+/// what it is doing, and presenting the two identically would be misleading.
+async fn get_patchset_activity(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PatchsetActivityQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let live = state.activity.patchset_snapshot(query.id);
+    if !live.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "live": true,
+            "entries": live,
+        })));
+    }
+
+    let last = state
+        .db
+        .get_patchset_activity(query.id)
+        .await
+        .map_err(|e| {
+            error!("Failed to read persisted activity for {}: {}", query.id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+    Ok(Json(serde_json::json!({
+        "live": false,
+        "entries": last,
+    })))
+}
+
 async fn stats_timeline(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SubsystemQuery>,
@@ -1088,13 +1182,25 @@ async fn rerun_patchset(
         .parse::<i64>()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    state.db.rerun_patchset(id).await.map_err(|e| {
+    let requeued = state.db.rerun_patchset(id).await.map_err(|e| {
         error!("Failed to rerun patchset {}: {}", id, e);
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Json(serde_json::json!({ "status": "accepted" })))
+    if requeued {
+        Ok(Json(serde_json::json!({ "status": "accepted" })))
+    } else {
+        Ok(Json(serde_json::json!({
+            "status": "not_modified",
+            "reason": RERUN_IN_PROGRESS_REASON,
+        })))
+    }
 }
+
+/// Explains a refused rerun. Requeueing a running review would put a second
+/// worker on the same patchset, so the cancel has to happen first.
+const RERUN_IN_PROGRESS_REASON: &str =
+    "Patchset is already being reviewed. Cancel it first (force=true), then rerun.";
 
 async fn cancel_patchset(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1119,13 +1225,23 @@ async fn cancel_patchset(
         })?;
 
     if cancelled {
-        info!("Patchset {} cancelled (force={})", query.id, query.force);
-        Ok(Json(serde_json::json!({ "status": "cancelled" })))
+        // The status update alone stops nothing. Firing the token is what
+        // actually interrupts a running review; without it the LLM would run to
+        // completion and its result merely be discarded.
+        let interrupted = state.cancels.cancel(query.id);
+        info!(
+            "Patchset {} cancelled (force={}, live work interrupted={})",
+            query.id, query.force, interrupted
+        );
+        Ok(Json(serde_json::json!({
+            "status": "cancelled",
+            "interrupted": interrupted,
+        })))
     } else {
         let reason = if query.force {
-            "Patchset is not in a cancellable state (must be Pending, Incomplete, or In Review)"
+            "Patchset is not in a cancellable state (must be Pending, Incomplete, In Review, or Fetching)"
         } else {
-            "Patchset is not in a cancellable state (must be Pending or Incomplete; use force=true for In Review)"
+            "Patchset is not in a cancellable state (must be Pending or Incomplete; use force=true for In Review or Fetching)"
         };
         Ok(Json(serde_json::json!({
             "status": "not_modified",
@@ -1147,7 +1263,7 @@ async fn rerun_patch(
         return Err(StatusCode::FORBIDDEN);
     }
 
-    state
+    let requeued = state
         .db
         .rerun_patch(query.patchset_id, query.patch_id)
         .await
@@ -1159,7 +1275,14 @@ async fn rerun_patch(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    Ok(Json(serde_json::json!({ "status": "accepted" })))
+    if requeued {
+        Ok(Json(serde_json::json!({ "status": "accepted" })))
+    } else {
+        Ok(Json(serde_json::json!({
+            "status": "not_modified",
+            "reason": RERUN_IN_PROGRESS_REASON,
+        })))
+    }
 }
 
 async fn health_check() -> StatusCode {
@@ -1241,7 +1364,8 @@ async fn forge_webhook(
         format!("{}-{}", repo, metadata.pr_number)
     });
 
-    state
+    // Captured so the fetch agent can tie this commit to a cancellable patchset.
+    let placeholder_patchset_id = state
         .db
         .create_fetching_patchset(
             &placeholder_id,
@@ -1262,6 +1386,10 @@ async fn forge_webhook(
     let req = FetchRequest {
         repo_url: metadata.repo_url,
         commit_hash: commit_range,
+        patchset_id: Some(placeholder_patchset_id),
+        // Forge webhooks carry no b4 tracker; the convention is a local
+        // `b4 prep` workflow, so this is opt-in via the CLI only.
+        b4_cover_letter: false,
         mr_url: metadata.pr_url,
         mr_title: metadata.pr_title,
         mr_number: Some(metadata.pr_number),

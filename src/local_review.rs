@@ -148,9 +148,38 @@ pub enum ProgressEvent {
         turn: usize,
         max_turns: usize,
     },
+    AiReviewStageTools {
+        patch_index: i64,
+        stage: u8,
+        tools: Vec<String>,
+        turn: usize,
+        max_turns: usize,
+    },
+    AiReviewLogEntry {
+        patch_index: i64,
+        stage: u8,
+        role: String,
+        content: String,
+    },
+    AiReviewStageBackoff {
+        patch_index: i64,
+        stage: u8,
+        retry_in_seconds: Option<u64>,
+        turn: usize,
+        max_turns: usize,
+    },
     AiReviewStageFinished {
         patch_index: i64,
         stage: u8,
+    },
+    /// A stage stopped without finishing. Distinct from
+    /// [`ProgressEvent::AiReviewStageFinished`] because the two mean opposite
+    /// things to anyone watching: one stage is done, the other never will be.
+    AiReviewStageFailed {
+        patch_index: i64,
+        stage: u8,
+        reason: String,
+        cancelled: bool,
     },
     AiReviewAttempt {
         patch_index: i64,
@@ -230,6 +259,9 @@ pub async fn build_review_input_from_git(
         ReviewInput {
             id: 0,
             subject,
+            // A local git range carries no cover letter; that is a submit-time
+            // choice made against the daemon.
+            cover_letter: None,
             patches,
         },
         shas,
@@ -306,6 +338,7 @@ pub async fn run_worker(
 
     let patchset_id = input.id;
     let subject = input.subject;
+    let cover_letter = input.cover_letter;
     let patches = input.patches;
     let baseline_arg = if options.current_tree {
         options.baseline.clone().unwrap_or_default()
@@ -392,6 +425,7 @@ pub async fn run_worker(
         concurrency,
         patchset_id,
         subject,
+        cover_letter,
         patches,
         &baseline_arg,
         &baseline_sha,
@@ -416,6 +450,7 @@ async fn review_single_patch(
     ai: &AiSettings,
     patchset_id: i64,
     subject: &str,
+    cover_letter: Option<&str>,
     p: &PatchInput,
     all_patches: &[PatchInput],
     rich_patches: &[Value],
@@ -538,10 +573,62 @@ async fn review_single_patch(
                         max_turns,
                     });
                 }
+                crate::worker::WorkerProgressEvent::StageTools {
+                    stage,
+                    tools,
+                    turn,
+                    max_turns,
+                } => {
+                    cb(ProgressEvent::AiReviewStageTools {
+                        patch_index: p_index,
+                        stage,
+                        tools,
+                        turn,
+                        max_turns,
+                    });
+                }
+                crate::worker::WorkerProgressEvent::LogEntry {
+                    stage,
+                    role,
+                    content,
+                } => {
+                    cb(ProgressEvent::AiReviewLogEntry {
+                        patch_index: p_index,
+                        stage,
+                        role,
+                        content,
+                    });
+                }
+                crate::worker::WorkerProgressEvent::StageBackoff {
+                    stage,
+                    retry_in_seconds,
+                    turn,
+                    max_turns,
+                } => {
+                    cb(ProgressEvent::AiReviewStageBackoff {
+                        patch_index: p_index,
+                        stage,
+                        retry_in_seconds,
+                        turn,
+                        max_turns,
+                    });
+                }
                 crate::worker::WorkerProgressEvent::StageFinished { stage } => {
                     cb(ProgressEvent::AiReviewStageFinished {
                         patch_index: p_index,
                         stage,
+                    });
+                }
+                crate::worker::WorkerProgressEvent::StageFailed {
+                    stage,
+                    reason,
+                    cancelled,
+                } => {
+                    cb(ProgressEvent::AiReviewStageFailed {
+                        patch_index: p_index,
+                        stage,
+                        reason,
+                        cancelled,
                     });
                 }
             }
@@ -550,6 +637,7 @@ async fn review_single_patch(
         let patchset_val = json!({
             "id": patchset_id,
             "subject": subject,
+            "cover_letter": cover_letter,
             "patches": rich_patches,
             "patch_index": Some(p.index),
             "baseline": baseline_sha
@@ -630,6 +718,7 @@ async fn run_worker_in_worktree(
     concurrency: usize,
     patchset_id: i64,
     subject: String,
+    cover_letter: Option<String>,
     patches: Vec<PatchInput>,
     baseline_arg: &str,
     baseline_sha: &str,
@@ -813,6 +902,7 @@ async fn run_worker_in_worktree(
         let patch_shas = &patch_shas;
         let options = &options;
         let subject_clone = subject.clone();
+        let cover_letter_ref = cover_letter.as_deref();
         let all_patches = &patches;
         async move {
             review_single_patch(
@@ -820,6 +910,7 @@ async fn run_worker_in_worktree(
                 ai,
                 patchset_id,
                 &subject_clone,
+                cover_letter_ref,
                 p,
                 all_patches,
                 &rich_patches,
@@ -937,6 +1028,84 @@ async fn run_worker_in_worktree(
     Ok(combined_result)
 }
 
+/// Encodes a progress event as an IPC line for the supervising daemon.
+///
+/// Returns `None` for events the daemon has no use for — only review progress is
+/// forwarded, since that is what makes a long-running review legible from outside.
+pub fn encode_progress(event: &ProgressEvent) -> Option<String> {
+    let payload = match event {
+        ProgressEvent::AiReviewPlanningStarted { .. } => json!({ "kind": "planning" }),
+        ProgressEvent::AiReviewStageStarted { stage, .. } => {
+            json!({ "kind": "stage_started", "stage": stage })
+        }
+        ProgressEvent::AiReviewStageTurn {
+            stage,
+            turn,
+            max_turns,
+            ..
+        } => json!({
+            "kind": "stage_turn",
+            "stage": stage,
+            "turn": turn,
+            "max_turns": max_turns,
+        }),
+        ProgressEvent::AiReviewStageTools {
+            stage,
+            tools,
+            turn,
+            max_turns,
+            ..
+        } => json!({
+            "kind": "stage_tools",
+            "stage": stage,
+            "tools": tools,
+            "turn": turn,
+            "max_turns": max_turns,
+        }),
+        ProgressEvent::AiReviewLogEntry {
+            stage,
+            role,
+            content,
+            ..
+        } => json!({
+            "kind": "log_entry",
+            "stage": stage,
+            "role": role,
+            "content": content,
+        }),
+        ProgressEvent::AiReviewStageBackoff {
+            stage,
+            retry_in_seconds,
+            turn,
+            max_turns,
+            ..
+        } => json!({
+            "kind": "stage_backoff",
+            "stage": stage,
+            "retry_in_seconds": retry_in_seconds,
+            "turn": turn,
+            "max_turns": max_turns,
+        }),
+        ProgressEvent::AiReviewStageFinished { stage, .. } => {
+            json!({ "kind": "stage_finished", "stage": stage })
+        }
+        ProgressEvent::AiReviewStageFailed {
+            stage,
+            reason,
+            cancelled,
+            ..
+        } => json!({
+            "kind": "stage_failed",
+            "stage": stage,
+            "reason": reason,
+            "cancelled": cancelled,
+        }),
+        _ => return None,
+    };
+
+    serde_json::to_string(&json!({ "type": "progress", "payload": payload })).ok()
+}
+
 pub async fn run_worker_from_stdin(options: WorkerOptions) -> Result<Value> {
     let mut buffer = String::new();
     if std::io::stdin().read_line(&mut buffer)? == 0 {
@@ -944,7 +1113,34 @@ pub async fn run_worker_from_stdin(options: WorkerOptions) -> Result<Value> {
     }
     let input: ReviewInput = serde_json::from_str(&buffer)?;
     let repo_override = options.repo.clone();
-    run_worker(input, options, repo_override, None).await
+
+    // Forward progress to the parent so an in-flight review can report which
+    // stage and turn it is on. Previously this was `None` and every progress
+    // event computed by the worker was discarded, leaving the daemon blind.
+    //
+    // The channel is unbounded and drained by a single task: reporting must
+    // never block or reorder the review itself.
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let writer_task = tokio::spawn(async move {
+        let writer = crate::ai::ipc_writer();
+        while let Some(line) = progress_rx.recv().await {
+            let _ = writer.write_line(&line).await;
+        }
+    });
+
+    let progress_cb = move |event: ProgressEvent| {
+        if let Some(line) = encode_progress(&event) {
+            let _ = progress_tx.send(line);
+        }
+    };
+
+    let result = run_worker(input, options, repo_override, Some(&progress_cb)).await;
+
+    // Drop the sender so the writer task sees the channel close and drains.
+    drop(progress_cb);
+    let _ = writer_task.await;
+
+    result
 }
 
 pub fn result_has_error(result: &Value) -> bool {

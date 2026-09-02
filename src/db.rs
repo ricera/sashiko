@@ -13,6 +13,12 @@
 // limitations under the License.
 
 use crate::ReviewStatus;
+/// Ceiling on streamed log entries kept per review.
+///
+/// A pathological review could otherwise write unboundedly before it finishes
+/// and its entries are cleared.
+const MAX_LIVE_LOG_ENTRIES: i64 = 2000;
+
 use crate::settings::DatabaseSettings;
 use anyhow::Result;
 use libsql::Builder;
@@ -422,6 +428,21 @@ impl Database {
         Ok(None)
     }
 
+    /// Replaces a message's stored body.
+    ///
+    /// Used to attach a series cover letter to the synthetic message a fetched
+    /// patchset already points at, so `get_message_body` finds it without any
+    /// new lookup on the read side.
+    pub async fn set_message_body(&self, msg_id: &str, body: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE messages SET body = ? WHERE message_id = ?",
+                libsql::params![crate::compression::compress_string_if_needed(body), msg_id],
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_message_body(&self, msg_id: &str) -> Result<Option<String>> {
         let mut rows = self
             .conn
@@ -581,6 +602,19 @@ impl Database {
             .try_add_column("reviews", "inline_review", "TEXT")
             .await;
         let _ = self
+            .try_add_column("reviews", "stage_failures", "TEXT")
+            .await;
+        let _ = self.try_add_column("reviews", "attempt", "INTEGER").await;
+        let _ = self
+            .try_add_column("reviews", "duration_seconds", "INTEGER")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "stage_durations", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("patchsets", "review_duration_seconds", "INTEGER")
+            .await;
+        let _ = self
             .try_add_column("patchsets", "baseline_id", "INTEGER")
             .await;
         let _ = self
@@ -652,6 +686,52 @@ impl Database {
             .await;
         let _ = self
             .try_create_index("idx_tool_usages_review", "tool_usages", "review_id")
+            .await;
+
+        // Live review conversation; see schema.sql for the rationale.
+        let _ = self
+            .conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS review_log_entries (
+                    id INTEGER PRIMARY KEY,
+                    review_id INTEGER NOT NULL,
+                    seq INTEGER NOT NULL,
+                    stage INTEGER,
+                    role TEXT NOT NULL,
+                    content TEXT,
+                    created_at INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_review_log_entries_review",
+                "review_log_entries",
+                "review_id, seq",
+            )
+            .await;
+
+        // Durable fallback for live activity; see schema.sql for the rationale.
+        let _ = self
+            .conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS patchset_activity (
+                    key TEXT PRIMARY KEY,
+                    patchset_id INTEGER,
+                    phase TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )",
+                (),
+            )
+            .await;
+        let _ = self
+            .try_create_index(
+                "idx_patchset_activity_patchset",
+                "patchset_activity",
+                "patchset_id",
+            )
             .await;
         let _ = self
             .try_create_index(
@@ -1001,6 +1081,316 @@ impl Database {
             )
             .await?;
         Ok(())
+    }
+
+    /// Records which review stages did not complete, as a JSON array.
+    ///
+    /// The concurrent review stages are joined with `join_all`, so one failing
+    /// or cancelled stage no longer aborts the review. That is only safe if the
+    /// gap is visible: a review that silently skipped the security stage but
+    /// reads as complete is worse than one that failed outright.
+    pub async fn set_review_stage_failures(
+        &self,
+        review_id: i64,
+        failures_json: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET stage_failures = ? WHERE id = ?",
+                libsql::params![failures_json, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Appends one streamed conversation entry for a running review.
+    ///
+    /// Capped per review: a runaway review must not be able to flood the table,
+    /// and the live view is a preview rather than the record of account.
+    pub async fn append_review_log_entry(
+        &self,
+        review_id: i64,
+        seq: i64,
+        stage: Option<u8>,
+        role: &str,
+        content: &str,
+    ) -> Result<()> {
+        if seq >= MAX_LIVE_LOG_ENTRIES {
+            return Ok(());
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn
+            .execute(
+                "INSERT INTO review_log_entries (review_id, seq, stage, role, content, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?)",
+                libsql::params![review_id, seq, stage.map(|s| s as i64), role, content, now],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The streamed conversation for a review, in order.
+    pub async fn get_review_log_entries(&self, review_id: i64) -> Result<Vec<serde_json::Value>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT seq, stage, role, content, created_at FROM review_log_entries
+                 WHERE review_id = ? ORDER BY seq",
+                libsql::params![review_id],
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            out.push(serde_json::json!({
+                "seq": row.get::<i64>(0).unwrap_or_default(),
+                "stage": row.get::<Option<i64>>(1).ok().flatten(),
+                "role": row.get::<String>(2).unwrap_or_default(),
+                "content": row.get::<Option<String>>(3).ok().flatten(),
+                "created_at": row.get::<i64>(4).unwrap_or_default(),
+            }));
+        }
+        Ok(out)
+    }
+
+    /// Drops a review's streamed entries once the complete log is persisted.
+    ///
+    /// Without this the table grows without bound; the failure mode is slow
+    /// growth rather than an error, so it is easy to miss.
+    pub async fn delete_review_log_entries(&self, review_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM review_log_entries WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Removes streamed entries for reviews that already finished.
+    ///
+    /// A daemon killed mid-review never reaches its own cleanup, so those rows
+    /// would otherwise linger for a review that will never produce more.
+    pub async fn sweep_orphan_review_log_entries(&self) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM review_log_entries WHERE review_id IN (
+                     SELECT id FROM reviews WHERE status NOT IN ('Pending', 'In Review')
+                 )",
+                (),
+            )
+            .await?;
+        Ok(count)
+    }
+
+    /// Records which retry produced this review row.
+    ///
+    /// Each attempt creates its own row, so this is what makes "it succeeded on
+    /// the third try" answerable after the fact -- the live attempt counter in
+    /// the activity view disappears the moment the review finishes.
+    pub async fn set_review_attempt(&self, review_id: i64, attempt: u32) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET attempt = ? WHERE id = ?",
+                libsql::params![attempt, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Records how long a patch took to reach this result, retries included.
+    ///
+    /// Measured from the first attempt starting, not from this row's creation:
+    /// each retry gets its own row, so per-row elapsed time would undercount a
+    /// review that needed three goes.
+    pub async fn set_review_duration(&self, review_id: i64, seconds: u64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET duration_seconds = ? WHERE id = ?",
+                libsql::params![seconds as i64, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Records how long each review stage took, as a JSON array of
+    /// `{stage, seconds}`.
+    ///
+    /// Scoped to one attempt: a retry re-runs the stages and gets its own review
+    /// row, so mixing attempts into one set of timings would be meaningless.
+    pub async fn set_review_stage_durations(
+        &self,
+        review_id: i64,
+        durations_json: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET stage_durations = ? WHERE id = ?",
+                libsql::params![durations_json, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Records how long a patchset has spent in review.
+    ///
+    /// Written periodically while the review runs, not only at the end, because
+    /// a daemon killed mid-review would otherwise record nothing for that run at
+    /// all. The value is the accumulated total across runs; see
+    /// [`Database::get_patchset_review_duration`].
+    pub async fn set_patchset_review_duration(&self, patchset_id: i64, seconds: u64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE patchsets SET review_duration_seconds = ? WHERE id = ?",
+                libsql::params![seconds as i64, patchset_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Time already banked against this patchset's review, in seconds.
+    ///
+    /// A review interrupted by a restart is not redone from scratch: patches
+    /// that completed keep their reviews and are skipped on the next run
+    /// (`count_successful_reviews` against `target_review_count`). The earlier
+    /// run therefore bought work the final review still rests on, and a total
+    /// that counted only the run which happened to finish would report a
+    /// fraction of what the review cost.
+    pub async fn get_patchset_review_duration(&self, patchset_id: i64) -> Result<u64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COALESCE(review_duration_seconds, 0) FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+
+        if let Ok(Some(row)) = rows.next().await {
+            return Ok(row.get::<i64>(0).unwrap_or(0).max(0) as u64);
+        }
+        Ok(0)
+    }
+
+    /// Records the last known activity for one unit of work.
+    ///
+    /// Upsert rather than insert: this is a "where is it now" row, not a log.
+    pub async fn upsert_activity(
+        &self,
+        key: &str,
+        patchset_id: Option<i64>,
+        phase: &str,
+        description: &str,
+        updated_at: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO patchset_activity (key, patchset_id, phase, description, updated_at)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(key) DO UPDATE SET
+                     patchset_id = excluded.patchset_id,
+                     phase = excluded.phase,
+                     description = excluded.description,
+                     updated_at = excluded.updated_at",
+                libsql::params![key, patchset_id, phase, description, updated_at],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Removes the persisted activity for one key.
+    pub async fn delete_activity(&self, key: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM patchset_activity WHERE key = ?",
+                libsql::params![key],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Removes persisted activity for a patchset and all of its stages.
+    pub async fn delete_patchset_activity(&self, patchset_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM patchset_activity WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Last known activity for a patchset, most recently updated first.
+    ///
+    /// Only consulted when nothing live is running: a row here means the daemon
+    /// stopped before the work finished.
+    pub async fn get_patchset_activity(&self, patchset_id: i64) -> Result<Vec<serde_json::Value>> {
+        // Fetch work is keyed by commit, not patchset: FetchRequest carries no
+        // patchset id, so those rows have patchset_id NULL. Without bridging
+        // them, a patchset stranded mid-fetch — the very case this exists for —
+        // would report no last activity at all. The link is the synthetic
+        // message id `{sha}@sashiko.local` written by create_fetching_patchset.
+        let commit_key = self
+            .get_patchset_fetch_commit(patchset_id)
+            .await?
+            .map(|sha| format!("commit:{}", sha));
+
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT key, phase, description, updated_at FROM patchset_activity
+                 WHERE patchset_id = ? OR key = ? ORDER BY updated_at DESC",
+                libsql::params![patchset_id, commit_key.clone().unwrap_or_default()],
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let phase_raw: String = row.get(1).unwrap_or_default();
+            let key: String = row.get(0).unwrap_or_default();
+            // Only the rendered key is stored, so the patch a stage belonged to
+            // has to be read back out of it. Carried in the payload alongside the
+            // live snapshots' own fields so both halves of the endpoint present
+            // the same shape and callers need only one code path.
+            let parsed = crate::activity::ActivityKey::parse(&key);
+            out.push(serde_json::json!({
+                "key": key,
+                "phase": serde_json::from_str::<serde_json::Value>(&phase_raw)
+                    .unwrap_or(serde_json::Value::Null),
+                "description": row.get::<String>(2).unwrap_or_default(),
+                "updated_at": row.get::<i64>(3).unwrap_or_default(),
+                "patch_id": parsed.as_ref().and_then(|k| k.patch_id()),
+                "stage": parsed.as_ref().and_then(|k| k.stage()),
+            }));
+        }
+        Ok(out)
+    }
+
+    /// The commit a fetch-created patchset is waiting on, if it is one.
+    ///
+    /// `create_fetching_patchset` stores `{sha}@sashiko.local` as the cover
+    /// letter message id; this recovers the sha so commit-keyed fetch activity
+    /// can be tied back to the patchset.
+    async fn get_patchset_fetch_commit(&self, patchset_id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT cover_letter_message_id FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+
+        if let Ok(Some(row)) = rows.next().await
+            && let Ok(Some(msgid)) = row.get::<Option<String>>(0)
+            && let Some(sha) = msgid.strip_suffix("@sashiko.local")
+            && !sha.is_empty()
+        {
+            return Ok(Some(sha.to_string()));
+        }
+        Ok(None)
     }
 
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
@@ -2789,7 +3179,7 @@ impl Database {
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
                     p.total_parts, p.received_parts, p.failed_reason,
                     p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
-                    p.embargo_until, p.mr_url, p.slug
+                    p.embargo_until, p.mr_url, p.slug, p.review_duration_seconds
                 FROM patchsets p
                 WHERE p.id = ?",
                 libsql::params![id],
@@ -2818,6 +3208,8 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
+            // Wall time this patchset spent in review, retries included.
+            let review_duration_seconds: Option<i64> = row.get(20).ok();
             // Fetch baseline details if needed
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
@@ -2929,7 +3321,7 @@ impl Database {
             }
             let query_str = format!(
                 "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
+                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.stage_failures, r.attempt, r.duration_seconds, r.stage_durations
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -2956,6 +3348,15 @@ impl Database {
                     "patch_id": r.get::<Option<i64>>(10).ok(),
                     "id": r.get::<i64>(11).ok(),
                     "tokens_cached": r.get::<Option<u32>>(12).ok(),
+                    // These three feed the CLI. They were previously selected
+                    // only by get_patchset_summary (which serves the web), so the
+                    // CLI silently rendered nothing for them.
+                    "stage_failures": r.get::<Option<String>>(13).ok().flatten()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    "attempt": r.get::<Option<i64>>(14).ok().flatten(),
+                    "duration_seconds": r.get::<Option<i64>>(15).ok().flatten(),
+                    "stage_durations": r.get::<Option<String>>(16).ok().flatten()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -3010,6 +3411,7 @@ impl Database {
                 "subsystems": subsystems,
                 "model_name": model_name,
                 "prompts_git_hash": prompts_git_hash,
+                "review_duration_seconds": review_duration_seconds,
                 "baseline_logs": baseline_logs,
                 "baseline": baseline,
                 "provider": provider,
@@ -3035,7 +3437,7 @@ impl Database {
                     p.author, p.date, p.cover_letter_message_id, p.thread_id,
                     p.total_parts, p.received_parts, p.failed_reason,
                     p.model_name, p.prompts_git_hash, p.baseline_logs, p.baseline_id, p.provider,
-                    p.embargo_until, p.mr_url, p.slug
+                    p.embargo_until, p.mr_url, p.slug, p.review_duration_seconds
                 FROM patchsets p
                 WHERE p.id = ?",
                 libsql::params![id],
@@ -3064,6 +3466,8 @@ impl Database {
             let embargo_until: Option<i64> = row.get(17).ok();
             let mr_url: Option<String> = row.get(18).ok();
             let slug: Option<String> = row.get(19).ok();
+            // Wall time this patchset spent in review, retries included.
+            let review_duration_seconds: Option<i64> = row.get(20).ok();
             let baseline = if let Some(bid) = baseline_id {
                 let mut browse = self
                     .conn
@@ -3171,7 +3575,7 @@ impl Database {
             }
             let query_str = format!(
                 "SELECT r.summary, r.created_at, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
+                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.stage_failures, r.attempt, r.duration_seconds, r.stage_durations
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -3197,6 +3601,16 @@ impl Database {
                     "patch_id": r.get::<Option<i64>>(8).ok(),
                     "id": r.get::<i64>(9).ok(),
                     "tokens_cached": r.get::<Option<u32>>(10).ok(),
+                    // Which review stages did not complete, if any. Present so a
+                    // partial review is never displayed as full coverage.
+                    "stage_failures": r.get::<Option<String>>(11).ok().flatten()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    // Which retry produced this row; absent on pre-existing rows.
+                    "attempt": r.get::<Option<i64>>(12).ok().flatten(),
+                    // Wall time to this result, retries included.
+                    "duration_seconds": r.get::<Option<i64>>(13).ok().flatten(),
+                    "stage_durations": r.get::<Option<String>>(14).ok().flatten()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -3250,6 +3664,7 @@ impl Database {
                 "subsystems": subsystems,
                 "model_name": model_name,
                 "prompts_git_hash": prompts_git_hash,
+                "review_duration_seconds": review_duration_seconds,
                 "baseline_logs": baseline_logs,
                 "baseline": baseline,
                 "provider": provider,
@@ -3779,8 +4194,11 @@ impl Database {
     }
 
     pub async fn cancel_patchset(&self, id: i64, force: bool) -> Result<bool> {
+        // 'Fetching' is force-only: a plain cancel could race a fetch that is
+        // about to write 'Pending', silently losing the cancel. That mirrors how
+        // 'In Review' is already gated.
         let query = if force {
-            "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete', 'In Review')"
+            "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete', 'In Review', 'Fetching')"
         } else {
             "UPDATE patchsets SET status = 'Cancelled' WHERE id = ? AND status IN ('Pending', 'Incomplete')"
         };
@@ -3788,41 +4206,88 @@ impl Database {
         Ok(count > 0)
     }
 
-    pub async fn rerun_patchset(&self, id: i64) -> Result<()> {
-        // 1. Get current status of the patchset
+    /// Marks patchsets stranded in 'Fetching' as 'Failed'. Returns how many.
+    ///
+    /// A fetch is driven by an in-process task, so it cannot survive a restart.
+    /// Any row still in 'Fetching' when the daemon starts is orphaned: nothing
+    /// will deliver its parts, and no time-based transition exists to move it on,
+    /// so without this it sits there forever.
+    ///
+    /// Assumes one daemon per database. With concurrent daemons this would fail
+    /// a peer's in-flight fetch.
+    pub async fn fail_stranded_fetching_patchsets(&self) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(
+                "UPDATE patchsets SET status = 'Failed', failed_reason = ?
+                 WHERE status = 'Fetching'",
+                libsql::params!["Fetch interrupted by daemon restart"],
+            )
+            .await?;
+        Ok(count)
+    }
+
+    /// Requeues a patchset for a fresh review.
+    ///
+    /// Returns `false` without changing anything when a review is already
+    /// running. Requeueing mid-review would let the reviewer pick the patchset
+    /// up while the existing worker is still going, leaving two workers on one
+    /// patchset writing to the same rows. Cancel it first, then rerun.
+    pub async fn rerun_patchset(&self, id: i64) -> Result<bool> {
+        if self.get_patchset_status(id).await?.as_deref() == Some("In Review") {
+            return Ok(false);
+        }
+
+        // 1. Reset patchset status to Pending, and the review clock with it.
+        //
+        // The clock accumulates across runs so that a review interrupted by a
+        // restart reports what it actually cost. A rerun is a new review rather
+        // than a continuation of the old one, so it starts from zero; carrying
+        // the previous cycle's time forward would make "review time" grow
+        // without bound and stop describing any single review.
+        self.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Pending', review_duration_seconds = NULL
+                 WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+
+        // 2. Raise target_review_count above what any patch has already achieved.
+        //
+        // `process_patch_review` skips a patch once its successful review count
+        // reaches this target, so a rerun that leaves the target unchanged is a
+        // silent no-op: the patchset goes Pending, every patch is skipped, and it
+        // returns to a terminal state having reviewed nothing.
+        //
+        // This used to increment only when the previous status was exactly
+        // "Reviewed", which meant rerunning a Cancelled or Failed patchset that
+        // nonetheless had a successful review did nothing at all. Deriving the
+        // target from the actual review counts makes it correct from any status.
         let mut rows = self
             .conn
             .query(
-                "SELECT status FROM patchsets WHERE id = ?",
+                "SELECT COALESCE(MAX(cnt), 0) FROM (
+                     SELECT COUNT(*) AS cnt FROM reviews
+                     WHERE patchset_id = ? AND patch_id IS NOT NULL AND status = 'Reviewed'
+                     GROUP BY patch_id
+                 )",
                 libsql::params![id],
             )
             .await?;
+        let max_successful: i64 = match rows.next().await {
+            Ok(Some(row)) => row.get(0).unwrap_or(0),
+            _ => 0,
+        };
 
-        let mut current_status = None;
-        if let Ok(Some(row)) = rows.next().await {
-            let status: String = row.get(0)?;
-            current_status = Some(status);
-        }
-
-        let should_increment = current_status.as_deref() == Some("Reviewed");
-
-        // 2. Reset patchset status to Pending
+        // Never lower an existing target: a patchset deliberately configured for
+        // several reviews should keep that setting.
         self.conn
             .execute(
-                "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
-                libsql::params![id],
+                "UPDATE patchsets SET target_review_count = MAX(COALESCE(target_review_count, 1), ?) WHERE id = ?",
+                libsql::params![max_successful + 1, id],
             )
             .await?;
-
-        // 3. Increment target_review_count only if it was previously Reviewed
-        if should_increment {
-            self.conn
-                .execute(
-                    "UPDATE patchsets SET target_review_count = COALESCE(target_review_count, 1) + 1 WHERE id = ?",
-                    libsql::params![id],
-                )
-                .await?;
-        }
 
         // 4. Delete associated tool usages and findings for failed reviews that block retrying
         self.conn
@@ -3851,10 +4316,11 @@ impl Database {
             )
             .await?;
 
-        Ok(())
+        Ok(true)
     }
 
-    pub async fn rerun_patch(&self, patchset_id: i64, _patch_id: i64) -> Result<()> {
+    /// Returns `false` when a review is already running; see [`Self::rerun_patchset`].
+    pub async fn rerun_patch(&self, patchset_id: i64, _patch_id: i64) -> Result<bool> {
         // NOTE: Currently we only support re-running the entire patchset to trigger more reviews.
         // Even if the user requested a specific patch, we increment the set's target count
         // to allow the reviewer service to proceed.
@@ -4380,6 +4846,1052 @@ mod tests {
         let db = Database::new(&settings).await.unwrap();
         db.migrate().await.unwrap();
         Arc::new(db)
+    }
+
+    #[tokio::test]
+    async fn test_review_attempt_is_recorded_and_returned() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("root", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "msg_p1", thread_id, None, "Author", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "root", "Subject", "Author", 1000, 1, 1, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let p_id = db.create_patch(ps_id, "msg_p1", 1, "diff").await.unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+
+        // Each retry gets its own review row, so the attempt number is what makes
+        // "it took three goes" answerable once the live counter is gone.
+        db.set_review_attempt(review_id, 3).await.unwrap();
+
+        let summary = db
+            .get_patchset_summary(ps_id, None, None)
+            .await
+            .unwrap()
+            .expect("summary");
+        let reviews = summary["reviews"].as_array().expect("reviews array");
+        let review = reviews
+            .iter()
+            .find(|r| r["id"] == review_id)
+            .expect("our review");
+
+        assert_eq!(review["attempt"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_review_and_patchset_durations_round_trip() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("root2", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "msg_d1", thread_id, None, "Author", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "root2", "Subject", "Author", 1000, 1, 1, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let p_id = db.create_patch(ps_id, "msg_d1", 1, "diff").await.unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+
+        // Per-patch clock covers every attempt, so it can exceed any single one.
+        db.set_review_duration(review_id, 754).await.unwrap();
+        // Per-patchset clock covers every patch and every retry.
+        db.set_patchset_review_duration(ps_id, 1_820).await.unwrap();
+
+        let summary = db
+            .get_patchset_summary(ps_id, None, None)
+            .await
+            .unwrap()
+            .expect("summary");
+
+        assert_eq!(summary["review_duration_seconds"], 1820);
+
+        let review = summary["reviews"]
+            .as_array()
+            .expect("reviews")
+            .iter()
+            .find(|r| r["id"] == review_id)
+            .expect("our review");
+        assert_eq!(review["duration_seconds"], 754);
+    }
+
+    /// The web reads `get_patchset_summary` and the CLI reads
+    /// `get_patchset_details`. They are separate queries over the same rows, so
+    /// it is easy to extend one and forget the other — which is exactly what
+    /// happened when attempt/duration/stage_failures were first added.
+    #[tokio::test]
+    async fn test_summary_and_details_expose_the_same_review_fields() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("root4", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "msg_s1", thread_id, None, "Author", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "root4", "Subject", "Author", 1000, 1, 1, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let p_id = db.create_patch(ps_id, "msg_s1", 1, "diff").await.unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+
+        db.set_review_attempt(review_id, 2).await.unwrap();
+        db.set_review_duration(review_id, 321).await.unwrap();
+        db.set_review_stage_failures(review_id, r#"[{"stage":5,"cancelled":false}]"#)
+            .await
+            .unwrap();
+        db.set_patchset_review_duration(ps_id, 999).await.unwrap();
+
+        let summary = db
+            .get_patchset_summary(ps_id, None, None)
+            .await
+            .unwrap()
+            .expect("summary");
+        let details = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .expect("details");
+
+        for (label, payload) in [("summary", &summary), ("details", &details)] {
+            assert_eq!(
+                payload["review_duration_seconds"], 999,
+                "{label} must expose the patchset review duration"
+            );
+
+            let review = payload["reviews"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{label} has no reviews array"))
+                .iter()
+                .find(|r| r["id"] == review_id)
+                .unwrap_or_else(|| panic!("{label} is missing our review"));
+
+            assert_eq!(review["attempt"], 2, "{label} must expose attempt");
+            assert_eq!(
+                review["duration_seconds"], 321,
+                "{label} must expose duration_seconds"
+            );
+            assert_eq!(
+                review["stage_failures"][0]["stage"], 5,
+                "{label} must expose stage_failures"
+            );
+        }
+    }
+
+    /// Rerun must actually force another review pass.
+    ///
+    /// `process_patch_review` skips a patch when its successful review count has
+    /// reached `target_review_count`, so a rerun that does not raise the target
+    /// is a silent no-op: the patchset goes Pending, every patch is skipped, and
+    /// it lands back in a terminal state having done nothing.
+    #[tokio::test]
+    async fn test_rerun_forces_another_pass_from_any_terminal_status() {
+        for status in ["Reviewed", "Cancelled", "Failed", "Failed To Apply"] {
+            let db = setup_db().await;
+
+            let thread_id = db.create_thread("r", "Subject", 1000).await.unwrap();
+            db.create_message(
+                "m1", thread_id, None, "A", "Subject", 1000, "Body", "", "", None, None,
+            )
+            .await
+            .unwrap();
+            let ps_id = db
+                .create_patchset(
+                    thread_id, None, "r", "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                    None, None,
+                )
+                .await
+                .unwrap()
+                .expect("patchset");
+            let p_id = db.create_patch(ps_id, "m1", 1, "diff").await.unwrap();
+
+            // One completed review already exists for this patch.
+            let review_id = db
+                .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+                .await
+                .unwrap();
+            db.complete_review(review_id, "Reviewed", "ok", None, None, None, None)
+                .await
+                .unwrap();
+            db.update_patchset_status(ps_id, status).await.unwrap();
+
+            db.rerun_patchset(ps_id).await.unwrap();
+
+            let successful = db
+                .count_successful_reviews(ps_id, p_id, None)
+                .await
+                .unwrap();
+            // Read the column directly: this is the value the reviewer loads
+            // into ReviewContext and compares against.
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COALESCE(target_review_count, 1) FROM patchsets WHERE id = ?",
+                    libsql::params![ps_id],
+                )
+                .await
+                .unwrap();
+            let target = rows
+                .next()
+                .await
+                .unwrap()
+                .map(|r| r.get::<i64>(0).unwrap_or(1))
+                .unwrap_or(1) as usize;
+
+            assert!(
+                target > successful,
+                "rerun from {status} left target={target} <= successful={successful}, \
+                 so every patch would be skipped and the rerun would do nothing"
+            );
+        }
+    }
+
+    /// A review interrupted by a restart is not redone from scratch -- patches
+    /// that completed keep their reviews and are skipped on the next run -- so
+    /// the earlier run bought work the final review rests on. Recording only the
+    /// run that happened to finish reported a fraction of what it cost.
+    #[tokio::test]
+    async fn test_review_time_accumulates_across_runs() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("r", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "m1", thread_id, None, "A", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "r", "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+
+        // Nothing banked yet, so a first run starts from zero.
+        assert_eq!(db.get_patchset_review_duration(ps_id).await.unwrap(), 0);
+
+        // A run checkpoints as it goes, then the daemon dies without reaching an
+        // end. Without the checkpoint there would be nothing here at all.
+        db.set_patchset_review_duration(ps_id, 2_400).await.unwrap();
+        assert_eq!(db.get_patchset_review_duration(ps_id).await.unwrap(), 2_400);
+
+        // The next run seeds from that and adds its own time.
+        let carried = db.get_patchset_review_duration(ps_id).await.unwrap();
+        db.set_patchset_review_duration(ps_id, carried + 300)
+            .await
+            .unwrap();
+        assert_eq!(db.get_patchset_review_duration(ps_id).await.unwrap(), 2_700);
+
+        let summary = db
+            .get_patchset_summary(ps_id, Some(1), Some(50))
+            .await
+            .unwrap()
+            .expect("summary");
+        assert_eq!(
+            summary["review_duration_seconds"], 2_700,
+            "the surfaced total must be the accumulated one"
+        );
+    }
+
+    /// A rerun is a new review rather than a continuation, so it starts from
+    /// zero. Carrying the previous cycle's time forward would make the reported
+    /// review time grow without bound and stop describing any single review.
+    #[tokio::test]
+    async fn test_rerun_starts_the_review_clock_over() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("r", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "m1", thread_id, None, "A", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "r", "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let p_id = db.create_patch(ps_id, "m1", 1, "diff").await.unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+        db.complete_review(review_id, "Reviewed", "ok", None, None, None, None)
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        db.set_patchset_review_duration(ps_id, 3_600).await.unwrap();
+
+        assert!(db.rerun_patchset(ps_id).await.unwrap());
+        assert_eq!(
+            db.get_patchset_review_duration(ps_id).await.unwrap(),
+            0,
+            "a rerun measures the new review, not the old one plus the new one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_repeated_reruns_keep_adding_passes_and_never_lower_the_target() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("rr", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "mm", thread_id, None, "A", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "rr", "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let p_id = db.create_patch(ps_id, "mm", 1, "diff").await.unwrap();
+
+        let target = |db: Arc<Database>| async move {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COALESCE(target_review_count, 1) FROM patchsets WHERE id = ?",
+                    libsql::params![ps_id],
+                )
+                .await
+                .unwrap();
+            rows.next()
+                .await
+                .unwrap()
+                .map(|r| r.get::<i64>(0).unwrap_or(1))
+                .unwrap_or(1)
+        };
+
+        // A patchset deliberately configured for several reviews keeps that
+        // setting; rerun raises the floor, it does not reset it.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET target_review_count = 5 WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        db.rerun_patchset(ps_id).await.unwrap();
+        assert_eq!(target(db.clone()).await, 5);
+
+        // Each completed review makes the next rerun ask for one more.
+        for expected in [6i64, 7] {
+            let review_id = db
+                .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+                .await
+                .unwrap();
+            db.complete_review(review_id, "Reviewed", "ok", None, None, None, None)
+                .await
+                .unwrap();
+            // Bring the count up to the current target so the next rerun must move it.
+            while db
+                .count_successful_reviews(ps_id, p_id, None)
+                .await
+                .unwrap()
+                < (expected - 1) as usize
+            {
+                let extra = db
+                    .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+                    .await
+                    .unwrap();
+                db.complete_review(extra, "Reviewed", "ok", None, None, None, None)
+                    .await
+                    .unwrap();
+            }
+
+            db.rerun_patchset(ps_id).await.unwrap();
+            assert_eq!(
+                target(db.clone()).await,
+                expected,
+                "rerun must always ask for one more pass than already achieved"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stage_durations_round_trip_through_both_queries() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("sd", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "sd1", thread_id, None, "A", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "sd", "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let p_id = db.create_patch(ps_id, "sd1", 1, "diff").await.unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+
+        db.set_review_stage_durations(
+            review_id,
+            r#"[{"stage":3,"seconds":95,"turns":7},{"stage":5,"seconds":140,"turns":12}]"#,
+        )
+        .await
+        .unwrap();
+
+        // Both the web (summary) and CLI (details) payloads must carry it.
+        for (label, payload) in [
+            ("summary", db.get_patchset_summary(ps_id, None, None).await),
+            ("details", db.get_patchset_details(ps_id, None, None).await),
+        ] {
+            let payload = payload.unwrap().expect("payload");
+            let review = payload["reviews"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{label} has no reviews"))
+                .iter()
+                .find(|r| r["id"] == review_id)
+                .unwrap_or_else(|| panic!("{label} missing review"));
+
+            let stages = review["stage_durations"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{label} missing stage_durations"));
+            assert_eq!(stages.len(), 2, "{label}");
+            assert_eq!(stages[0]["stage"], 3, "{label}");
+            assert_eq!(stages[0]["seconds"], 95, "{label}");
+            assert_eq!(stages[0]["turns"], 7, "{label}");
+            assert_eq!(stages[1]["turns"], 12, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_startup_sweep_fails_only_stranded_fetches() {
+        let db = setup_db().await;
+
+        let stranded = db
+            .create_fetching_patchset("a@x", "Fetching a...", None, None, None, None, None, None)
+            .await
+            .unwrap();
+        let other = db
+            .create_fetching_patchset("b@x", "Fetching b...", None, None, None, None, None, None)
+            .await
+            .unwrap();
+        db.update_patchset_status(other, "Pending").await.unwrap();
+
+        let swept = db.fail_stranded_fetching_patchsets().await.unwrap();
+        assert_eq!(swept, 1);
+
+        // The orphan gets a terminal state and says why.
+        assert_eq!(
+            db.get_patchset_status(stranded).await.unwrap().as_deref(),
+            Some("Failed")
+        );
+        let summary = db
+            .get_patchset_summary(stranded, None, None)
+            .await
+            .unwrap()
+            .expect("summary");
+        assert!(
+            summary["failed_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("restart"),
+            "the reason should explain itself: {:?}",
+            summary["failed_reason"]
+        );
+
+        // Everything else is left alone.
+        assert_eq!(
+            db.get_patchset_status(other).await.unwrap().as_deref(),
+            Some("Pending")
+        );
+    }
+
+    /// The sweep deliberately keeps the activity row.
+    ///
+    /// Together they tell the whole story: `failed_reason` says the daemon
+    /// restarted, and the activity says the work was fetching at the time. The
+    /// activity is where it got to, not why it ended, and the surfaces label it
+    /// "stopped while" to keep that distinction.
+    #[tokio::test]
+    async fn test_sweep_preserves_the_last_activity_for_context() {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase};
+
+        let db = setup_db().await;
+        let ps_id = db
+            .create_fetching_patchset(
+                "ctx@sashiko.local",
+                "Fetching ctx...",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let registry = ActivityRegistry::with_persistence(db.clone());
+        // Keyed by commit, as the real fetch agent does — FetchRequest carries
+        // no patchset id, so the lookup has to bridge from the synthetic msgid.
+        registry.update(
+            ActivityKey::Commit("ctx".to_string()),
+            Phase::Fetching {
+                remote: "https://example.com/linux.git".to_string(),
+                commits: 3,
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert_eq!(db.fail_stranded_fetching_patchsets().await.unwrap(), 1);
+
+        let rows = db.get_patchset_activity(ps_id).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the sweep must not discard where the work got to"
+        );
+        assert!(
+            rows[0]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("fetching 3 commit(s)"),
+            "unexpected description: {:?}",
+            rows[0]["description"]
+        );
+        assert_eq!(
+            rows[0]["key"], "commit:ctx",
+            "fetch activity is commit-keyed and must still be reachable from the patchset"
+        );
+
+        // And the reason still explains why it ended.
+        let summary = db
+            .get_patchset_summary(ps_id, None, None)
+            .await
+            .unwrap()
+            .expect("summary");
+        assert!(
+            summary["failed_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("restart")
+        );
+    }
+
+    /// Requeueing a running review would leave two workers on one patchset,
+    /// writing to the same rows.
+    #[tokio::test]
+    async fn test_rerun_refuses_while_a_review_is_running() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("ir", "Subject", 1000).await.unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "ir", "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+
+        db.update_patchset_status(ps_id, "In Review").await.unwrap();
+        assert!(
+            !db.rerun_patchset(ps_id).await.unwrap(),
+            "rerun must refuse while a review is in flight"
+        );
+        assert_eq!(
+            db.get_patchset_status(ps_id).await.unwrap().as_deref(),
+            Some("In Review"),
+            "a refused rerun must not touch the status"
+        );
+
+        // Once cancelled, the rerun goes through — the documented sequence.
+        assert!(db.cancel_patchset(ps_id, true).await.unwrap());
+        assert!(db.rerun_patchset(ps_id).await.unwrap());
+        assert_eq!(
+            db.get_patchset_status(ps_id).await.unwrap().as_deref(),
+            Some("Pending")
+        );
+    }
+
+    /// Helper: a patchset + patch + review to hang log entries off.
+    async fn review_fixture(db: &Arc<Database>, tag: &str) -> i64 {
+        let thread_id = db.create_thread(tag, "Subject", 1000).await.unwrap();
+        db.create_message(
+            &format!("{}-m", tag),
+            thread_id,
+            None,
+            "A",
+            "Subject",
+            1000,
+            "Body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, tag, "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let p_id = db
+            .create_patch(ps_id, &format!("{}-m", tag), 1, "diff")
+            .await
+            .unwrap();
+        db.create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_review_log_entries_round_trip_in_order() {
+        let db = setup_db().await;
+        let review_id = review_fixture(&db, "log1").await;
+
+        // Inserted out of order to prove the read is ordered by seq, not rowid.
+        db.append_review_log_entry(review_id, 2, Some(3), "tool", "tool output")
+            .await
+            .unwrap();
+        db.append_review_log_entry(review_id, 0, Some(3), "user", "the prompt")
+            .await
+            .unwrap();
+        db.append_review_log_entry(review_id, 1, Some(3), "assistant", "thinking")
+            .await
+            .unwrap();
+
+        let entries = db.get_review_log_entries(review_id).await.unwrap();
+        let roles: Vec<&str> = entries
+            .iter()
+            .map(|e| e["role"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant", "tool"]);
+        assert_eq!(entries[0]["content"], "the prompt");
+        assert_eq!(entries[2]["stage"], 3);
+    }
+
+    /// The live preview is scratch space; leaving it behind grows the table
+    /// forever, and the failure mode is slow growth rather than an error.
+    #[tokio::test]
+    async fn test_review_log_entries_are_deleted_on_completion() {
+        let db = setup_db().await;
+        let review_id = review_fixture(&db, "log2").await;
+
+        for seq in 0..5 {
+            db.append_review_log_entry(review_id, seq, Some(1), "user", "x")
+                .await
+                .unwrap();
+        }
+        assert_eq!(db.get_review_log_entries(review_id).await.unwrap().len(), 5);
+
+        db.delete_review_log_entries(review_id).await.unwrap();
+        assert!(
+            db.get_review_log_entries(review_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_log_entries_are_capped() {
+        let db = setup_db().await;
+        let review_id = review_fixture(&db, "log3").await;
+
+        // Writes past the cap are dropped rather than erroring, so a runaway
+        // review degrades its own preview instead of flooding the table.
+        db.append_review_log_entry(review_id, MAX_LIVE_LOG_ENTRIES - 1, None, "user", "last")
+            .await
+            .unwrap();
+        db.append_review_log_entry(review_id, MAX_LIVE_LOG_ENTRIES, None, "user", "over")
+            .await
+            .unwrap();
+        db.append_review_log_entry(
+            review_id,
+            MAX_LIVE_LOG_ENTRIES + 50,
+            None,
+            "user",
+            "way over",
+        )
+        .await
+        .unwrap();
+
+        let entries = db.get_review_log_entries(review_id).await.unwrap();
+        assert_eq!(entries.len(), 1, "only the in-cap entry should be stored");
+        assert_eq!(entries[0]["content"], "last");
+    }
+
+    /// A daemon killed mid-review never runs its own cleanup.
+    #[tokio::test]
+    async fn test_orphan_sweep_spares_running_reviews() {
+        let db = setup_db().await;
+        let finished = review_fixture(&db, "log4").await;
+        let running = review_fixture(&db, "log5").await;
+
+        db.append_review_log_entry(finished, 0, None, "user", "done")
+            .await
+            .unwrap();
+        db.append_review_log_entry(running, 0, None, "user", "still going")
+            .await
+            .unwrap();
+
+        db.complete_review(finished, "Reviewed", "ok", None, None, None, None)
+            .await
+            .unwrap();
+        db.update_review_status(running, "In Review", None)
+            .await
+            .unwrap();
+
+        let swept = db.sweep_orphan_review_log_entries().await.unwrap();
+        assert_eq!(swept, 1);
+        assert!(
+            db.get_review_log_entries(finished)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_review_log_entries(running).await.unwrap().len(),
+            1,
+            "a review still in flight must keep its live preview"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_durations_absent_before_review_completes() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("root3", "Subject", 1000).await.unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "root3", "Subject", "Author", 1000, 1, 1, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+
+        let summary = db
+            .get_patchset_summary(ps_id, None, None)
+            .await
+            .unwrap()
+            .expect("summary");
+
+        // Null rather than 0: an unfinished review has no duration, and zero
+        // would read as "completed instantly".
+        assert!(
+            summary["review_duration_seconds"].is_null(),
+            "expected null, got {:?}",
+            summary["review_duration_seconds"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_activity_upsert_replaces_rather_than_appends() {
+        let db = setup_db().await;
+
+        db.upsert_activity(
+            "patchset:1/patch:1/stage:4",
+            Some(1),
+            r#"{"kind":"stage"}"#,
+            "stage 4, turn 1/100",
+            1000,
+        )
+        .await
+        .unwrap();
+        db.upsert_activity(
+            "patchset:1/patch:1/stage:4",
+            Some(1),
+            r#"{"kind":"stage"}"#,
+            "stage 4, turn 7/100",
+            1200,
+        )
+        .await
+        .unwrap();
+
+        // "Where is it now", not a log: one row per key.
+        let rows = db.get_patchset_activity(1).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["description"], "stage 4, turn 7/100");
+        assert_eq!(rows[0]["updated_at"], 1200);
+        assert_eq!(rows[0]["phase"]["kind"], "stage");
+    }
+
+    /// The web UI places stage activity under the patch it describes, and it
+    /// makes that decision the same way for live and persisted entries. Only the
+    /// rendered key is stored, so the patch has to be recovered from it here or
+    /// a restarted daemon's activity all collapses back into one list.
+    #[tokio::test]
+    async fn test_persisted_activity_carries_patch_and_stage() {
+        let db = setup_db().await;
+
+        db.upsert_activity(
+            "patchset:1/patch:12/stage:4",
+            Some(1),
+            r#"{"kind":"stage"}"#,
+            "stage 4, turn 7/100 (awaiting model)",
+            1200,
+        )
+        .await
+        .unwrap();
+        db.upsert_activity(
+            "patchset:1",
+            Some(1),
+            r#"{"kind":"reviewing"}"#,
+            "running review stages",
+            1200,
+        )
+        .await
+        .unwrap();
+
+        let rows = db.get_patchset_activity(1).await.unwrap();
+        let stage = rows
+            .iter()
+            .find(|r| r["key"] == "patchset:1/patch:12/stage:4")
+            .expect("stage row");
+        assert_eq!(stage["patch_id"], 12);
+        assert_eq!(stage["stage"], 4);
+
+        // The coarse entry is about the whole review, so it has no patch to sit
+        // under and must stay in the patchset-wide list.
+        let coarse = rows
+            .iter()
+            .find(|r| r["key"] == "patchset:1")
+            .expect("patchset row");
+        assert!(coarse["patch_id"].is_null());
+        assert!(coarse["stage"].is_null());
+    }
+
+    /// A patchset stuck in 'Fetching' was previously uncancellable: the state was
+    /// in neither branch, so the UPDATE matched nothing and the API reported a
+    /// misleading "not in a cancellable state".
+    #[tokio::test]
+    async fn test_cancel_fetching_patchset_requires_force() {
+        let db = setup_db().await;
+
+        let make = |db: Arc<Database>| async move {
+            db.create_fetching_patchset(
+                "stuck@sashiko.local",
+                "Fetching abc...",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+        };
+
+        let id = make(db.clone()).await;
+        assert_eq!(
+            db.get_patchset_status(id).await.unwrap().as_deref(),
+            Some("Fetching")
+        );
+
+        // A plain cancel could race a fetch about to write 'Pending', so it is
+        // deliberately refused.
+        assert!(!db.cancel_patchset(id, false).await.unwrap());
+        assert_eq!(
+            db.get_patchset_status(id).await.unwrap().as_deref(),
+            Some("Fetching")
+        );
+
+        assert!(db.cancel_patchset(id, true).await.unwrap());
+        assert_eq!(
+            db.get_patchset_status(id).await.unwrap().as_deref(),
+            Some("Cancelled")
+        );
+    }
+
+    /// A completing fetch must not resurrect a cancelled patchset. The status
+    /// guards on the Fetching -> Pending/Incomplete transitions provide this
+    /// implicitly; this test pins that behaviour down.
+    #[tokio::test]
+    async fn test_cancelled_patchset_is_not_resurrected_by_a_completing_fetch() {
+        let db = setup_db().await;
+
+        let id = db
+            .create_fetching_patchset(
+                "race@sashiko.local",
+                "Fetching def...",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(db.cancel_patchset(id, true).await.unwrap());
+
+        // Simulate the fetch finishing after the cancel landed.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Pending' WHERE id = ? AND status IN ('Incomplete', 'Fetching')",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.get_patchset_status(id).await.unwrap().as_deref(),
+            Some("Cancelled"),
+            "a late-completing fetch must not undo a cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_activity_delete_scopes() {
+        let db = setup_db().await;
+
+        for (key, stage) in [
+            ("patchset:2", None),
+            ("patchset:2/patch:1/stage:3", Some(3)),
+        ] {
+            let desc = stage.map_or("planning".to_string(), |s| format!("stage {}", s));
+            db.upsert_activity(key, Some(2), "{}", &desc, 100)
+                .await
+                .unwrap();
+        }
+        db.upsert_activity("patchset:9", Some(9), "{}", "planning", 100)
+            .await
+            .unwrap();
+
+        // Deleting one key leaves the patchset's other entries alone.
+        db.delete_activity("patchset:2/patch:1/stage:3")
+            .await
+            .unwrap();
+        assert_eq!(db.get_patchset_activity(2).await.unwrap().len(), 1);
+
+        // Deleting the patchset clears everything under it, and nothing else.
+        db.delete_patchset_activity(2).await.unwrap();
+        assert_eq!(db.get_patchset_activity(2).await.unwrap().len(), 0);
+        assert_eq!(db.get_patchset_activity(9).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_registry_write_through_survives_registry_loss() {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase, StageWait};
+
+        let db = setup_db().await;
+        let registry = ActivityRegistry::with_persistence(db.clone());
+
+        registry.update(
+            ActivityKey::Patchset(31),
+            Phase::Planning {
+                attempt: 1,
+                max_attempts: 1,
+            },
+        );
+        registry.update(
+            ActivityKey::PatchsetStage {
+                patchset_id: 31,
+                patch_id: 1,
+                stage: 6,
+            },
+            Phase::Stage {
+                stage: 6,
+                turn: 2,
+                max_turns: 100,
+                waiting: StageWait::Model,
+            },
+        );
+
+        // Writes are handed to a background task, so allow it to drain.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // Dropping the registry stands in for a daemon restart: in-memory state
+        // is gone, but the database still explains what the patchset was doing.
+        drop(registry);
+
+        let rows = db.get_patchset_activity(31).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|r| r["key"] == "patchset:31/patch:1/stage:6"
+                    && r["description"] == "stage 6, turn 2/100 (awaiting model)")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_registry_clear_removes_persisted_rows() {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase, StageWait};
+
+        let db = setup_db().await;
+        let registry = ActivityRegistry::with_persistence(db.clone());
+
+        registry.update(
+            ActivityKey::Patchset(44),
+            Phase::Planning {
+                attempt: 1,
+                max_attempts: 1,
+            },
+        );
+        registry.update(
+            ActivityKey::PatchsetStage {
+                patchset_id: 44,
+                patch_id: 1,
+                stage: 1,
+            },
+            Phase::Stage {
+                stage: 1,
+                turn: 1,
+                max_turns: 10,
+                waiting: StageWait::Model,
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(db.get_patchset_activity(44).await.unwrap().len(), 2);
+
+        // Completed work must not leave a durable row claiming it is still running.
+        registry.clear_patchset(44);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(db.get_patchset_activity(44).await.unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -6287,7 +7799,11 @@ mod tests {
                 .unwrap()
         );
 
-        // RERUN Reviewed patchset -> Should increment target count
+        // RERUN Reviewed patchset -> target must exceed the successful reviews
+        // that actually exist. This fixture has none (only the status was set),
+        // so one pass is what is needed; the target used to become 2 here purely
+        // because the status said "Reviewed", which asked for two review passes
+        // on a patchset that had never been reviewed at all.
         db.rerun_patchset(ps_reviewed).await.unwrap();
         let mut rows = db
             .conn
@@ -6299,9 +7815,9 @@ mod tests {
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
         let target: i64 = row.get(0).unwrap();
-        assert_eq!(target, 2);
+        assert_eq!(target, 1);
 
-        // RERUN Failed patchset -> Should NOT increment target count
+        // RERUN Failed patchset -> no successful reviews, so still one pass
         db.rerun_patchset(ps_failed).await.unwrap();
         let mut rows = db
             .conn

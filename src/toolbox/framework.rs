@@ -104,14 +104,220 @@ impl<C> ToolRegistry<C> {
         let tool = self
             .tools
             .get(name)
-            .ok_or_else(|| anyhow::anyhow!("Tool not found in registry: {}", name))?;
+            .ok_or_else(|| anyhow::anyhow!("{}", self.unknown_tool_error(name)))?;
 
         tool.call(args, context).await
     }
+
+    /// Explains an unknown tool name well enough for the caller to fix it.
+    ///
+    /// The model reaches this by emitting a name that does not exist — most of
+    /// this registry's names share a `git_` prefix, so a near miss like
+    /// `git_gray` for `git_grep` is the common shape. The error is fed back as
+    /// the tool's result, so it is the model's only chance to correct itself,
+    /// and each attempt costs a turn against `max_interactions`. Naming the
+    /// alternatives turns that into one corrected call rather than a series of
+    /// guesses against a tool list it has to recall unaided.
+    fn unknown_tool_error(&self, name: &str) -> String {
+        let mut available: Vec<&str> = self.tools.keys().copied().collect();
+        available.sort_unstable();
+
+        let suggestion = self
+            .closest_tool(name)
+            .map(|best| format!(" Did you mean \"{}\"?", best))
+            .unwrap_or_default();
+
+        format!(
+            "Tool not found: \"{}\".{} Available tools: {}",
+            name,
+            suggestion,
+            available.join(", ")
+        )
+    }
+
+    /// The registered name closest to `name`, when one is close enough to be a
+    /// plausible correction rather than a different request entirely.
+    fn closest_tool(&self, name: &str) -> Option<&'static str> {
+        // Scaled to the name's length: two edits is a typo in `git_grep` and a
+        // coin flip in `git_ls`. Suggesting confidently and wrongly is worse
+        // than not suggesting, because the model is inclined to take it.
+        let budget = (name.chars().count() / 3).clamp(1, 3);
+
+        self.tools
+            .keys()
+            .map(|candidate| (edit_distance(name, candidate), *candidate))
+            .filter(|(distance, _)| *distance <= budget)
+            // Ties broken by name so the message is stable across runs; the map
+            // iterates in an arbitrary order.
+            .min()
+            .map(|(_, candidate)| candidate)
+    }
+}
+
+/// Levenshtein distance, counting insertions, deletions and substitutions.
+///
+/// Two rows rather than a full matrix: names are short, and this runs on a
+/// path that is already an error.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+
+    for (i, ac) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, bc) in b.iter().enumerate() {
+            let substitution = previous[j] + usize::from(ac != bc);
+            let deletion = previous[j + 1] + 1;
+            let insertion = current[j] + 1;
+            current[j + 1] = substitution.min(deletion).min(insertion);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[b.len()]
 }
 
 impl<C> Default for ToolRegistry<C> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Stub(&'static str);
+
+    #[async_trait]
+    impl LlmTool<()> for Stub {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "stub"
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn call(&self, _args: Value, _context: &()) -> Result<Value> {
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    /// The real set, because the near misses this exists to catch come from the
+    /// names sharing a `git_` prefix.
+    fn registry() -> ToolRegistry<()> {
+        let mut reg = ToolRegistry::new();
+        for name in [
+            "git_blame",
+            "git_diff",
+            "git_find_files",
+            "git_grep",
+            "git_log",
+            "git_ls",
+            "git_read_files",
+            "git_show",
+            "read_prompt",
+        ] {
+            reg.register(Stub(name));
+        }
+        reg
+    }
+
+    /// Observed in the wild: the model emits a name with the right prefix and a
+    /// wrong tail. The error is fed back as the tool result, so it is the only
+    /// chance to correct, and every attempt costs a turn.
+    #[tokio::test]
+    async fn unknown_tool_names_the_alternatives_and_the_near_miss() {
+        let reg = registry();
+
+        for bad in ["git_gray", "git_grag"] {
+            let err = reg
+                .call(bad, serde_json::json!({}), &())
+                .await
+                .expect_err("an unregistered name must not dispatch")
+                .to_string();
+
+            assert!(
+                err.contains(bad),
+                "the error must quote what was tried: {err}"
+            );
+            assert!(
+                err.contains(r#"Did you mean "git_grep"?"#),
+                "{bad} should suggest git_grep, got: {err}"
+            );
+            // Recalling the list unaided is what the model just failed to do.
+            assert!(
+                err.contains(
+                    "git_blame, git_diff, git_find_files, git_grep, git_log, \
+                              git_ls, git_read_files, git_show, read_prompt"
+                ),
+                "the full list must be present and sorted, got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_name_with_no_near_miss_suggests_nothing() {
+        // Confidently wrong is worse than silent: the model tends to take the
+        // suggestion, so an unrelated name must not be handed one.
+        let err = registry()
+            .call("run_tests", serde_json::json!({}), &())
+            .await
+            .expect_err("unregistered")
+            .to_string();
+
+        assert!(!err.contains("Did you mean"), "{err}");
+        assert!(err.contains("Available tools: git_blame"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn short_names_get_a_tighter_budget() {
+        let reg = registry();
+
+        // Two edits from `git_ls` reaches `git_log`, but at six characters that
+        // is a different tool, not a typo.
+        let err = reg
+            .call("git_l", serde_json::json!({}), &())
+            .await
+            .expect_err("unregistered")
+            .to_string();
+        assert!(
+            err.contains(r#"Did you mean "git_log"?"#) || err.contains(r#"Did you mean "git_ls"?"#),
+            "one edit from both, either is a fair suggestion: {err}"
+        );
+
+        // A long name tolerates more drift before it stops being a typo.
+        let err = reg
+            .call("git_read_file", serde_json::json!({}), &())
+            .await
+            .expect_err("unregistered")
+            .to_string();
+        assert!(err.contains(r#"Did you mean "git_read_files"?"#), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_registered_tool_still_dispatches() {
+        let out = registry()
+            .call("git_grep", serde_json::json!({}), &())
+            .await
+            .expect("registered tools must be unaffected");
+        assert_eq!(out, serde_json::json!({"ok": true}));
+    }
+
+    #[test]
+    fn edit_distance_counts_each_kind_of_edit() {
+        assert_eq!(edit_distance("git_grep", "git_grep"), 0);
+        assert_eq!(edit_distance("git_gray", "git_grep"), 2); // two substitutions
+        assert_eq!(edit_distance("git_grep", "git_gre"), 1); // deletion
+        assert_eq!(edit_distance("git_gre", "git_grep"), 1); // insertion
+        assert_eq!(edit_distance("", "git_ls"), 6);
+        assert_eq!(edit_distance("git_ls", ""), 6);
+        // Compares by character, not byte, so a multi-byte name cannot panic or
+        // score a single edit as several.
+        assert_eq!(edit_distance("gít_grep", "git_grep"), 1);
     }
 }

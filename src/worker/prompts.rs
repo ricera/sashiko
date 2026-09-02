@@ -78,6 +78,10 @@ pub struct PatchInput {
 pub struct ReviewInput {
     pub id: i64,
     pub subject: String,
+    /// The series cover letter, when the submission had one. Context about
+    /// intent, not something to review.
+    #[serde(default)]
+    pub cover_letter: Option<String>,
     pub patches: Vec<PatchInput>,
 }
 
@@ -89,6 +93,44 @@ pub struct WorkerConfig {
     pub series_range: Option<String>,
     pub baseline_sha: Option<String>,
     pub stages: Option<Vec<u8>>,
+}
+
+/// Token budget for the series cover letter in stage context.
+///
+/// Generous enough for a real kernel cover letter, bounded so it cannot crowd
+/// out the diff that is actually under review.
+pub(crate) const COVER_LETTER_TOKENS: usize = 2000;
+
+/// Rough token budget for one streamed log entry.
+///
+/// The live view is a preview; the complete conversation is persisted when the
+/// review ends. A single tool result can be a whole kernel file, and streaming
+/// those verbatim would mean megabytes crossing the IPC pipe every turn.
+const LIVE_LOG_ENTRY_TOKENS: usize = 1000;
+
+/// Test-only accessor for [`log_entry_event`].
+#[cfg(test)]
+pub fn log_entry_event_for_test(stage: u8, msg: &crate::ai::AiMessage) -> WorkerProgressEvent {
+    log_entry_event(stage, msg)
+}
+
+/// Builds a streamable log entry from a message, truncated for the wire.
+fn log_entry_event(stage: u8, msg: &crate::ai::AiMessage) -> WorkerProgressEvent {
+    let mut body = msg.content.clone().unwrap_or_default();
+    if let Some(calls) = &msg.tool_calls {
+        // Tool calls carry no content of their own, so surface what was asked.
+        let names: Vec<&str> = calls.iter().map(|c| c.function_name.as_str()).collect();
+        body = format!("{}[tool calls: {}]", body, names.join(", "));
+    }
+
+    let truncated =
+        crate::ai::truncator::Truncator::truncate_sequential(&body, LIVE_LOG_ENTRY_TOKENS);
+
+    WorkerProgressEvent::LogEntry {
+        stage,
+        role: format!("{:?}", msg.role).to_lowercase(),
+        content: truncated.content,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +150,42 @@ pub enum WorkerProgressEvent {
         stage: u8,
         turn: usize,
         max_turns: usize,
+    },
+    /// A stage started running tools, or finished (empty `tools`).
+    ///
+    /// Splits a turn's elapsed time into waiting on the model versus running
+    /// git, which are indistinguishable from outside without this.
+    StageTools {
+        stage: u8,
+        tools: Vec<String>,
+        turn: usize,
+        max_turns: usize,
+    },
+    /// One message joining the conversation log, streamed so a running review
+    /// can be read before it finishes. `content` is already truncated.
+    LogEntry {
+        stage: u8,
+        role: String,
+        content: String,
+    },
+    /// A stage is backing off after the provider asked us to slow down.
+    /// `retry_in_seconds` is `None` once the wait is over.
+    StageBackoff {
+        stage: u8,
+        retry_in_seconds: Option<u64>,
+        turn: usize,
+        max_turns: usize,
+    },
+    /// A stage stopped without finishing.
+    ///
+    /// The counterpart to [`WorkerProgressEvent::StageFinished`], which is only
+    /// reached on the success path. Without this, a stage that failed kept its
+    /// last reported turn on display — claiming to still be running — for as
+    /// long as the rest of the review took.
+    StageFailed {
+        stage: u8,
+        reason: String,
+        cancelled: bool,
     },
 }
 
@@ -628,6 +706,7 @@ impl Worker {
             target_commit_diff,
             target_commit_diff_only,
             prefetched_context,
+            cover_letter: patchset["cover_letter"].as_str().map(str::to_string),
             series_range: self.series_range.clone(),
             follow_up_series_context,
             selected_guides: Vec::new(),
@@ -701,6 +780,57 @@ impl Worker {
                             });
                         }
                     }
+                    WorkflowEvent::StageTools {
+                        stage_name,
+                        tools,
+                        turn,
+                        max_turns,
+                    } => {
+                        if let Some(num) = parse_stage_number(stage_name) {
+                            progress_cb(WorkerProgressEvent::StageTools {
+                                stage: num,
+                                tools,
+                                turn,
+                                max_turns,
+                            });
+                        }
+                    }
+                    WorkflowEvent::StageBackoff {
+                        stage_name,
+                        retry_in_seconds,
+                        turn,
+                        max_turns,
+                    } => {
+                        if let Some(num) = parse_stage_number(stage_name) {
+                            progress_cb(WorkerProgressEvent::StageBackoff {
+                                stage: num,
+                                retry_in_seconds,
+                                turn,
+                                max_turns,
+                            });
+                        }
+                    }
+                    WorkflowEvent::StageMessage {
+                        stage_name,
+                        message,
+                    } => {
+                        if let Some(num) = parse_stage_number(stage_name) {
+                            progress_cb(log_entry_event(num, &message));
+                        }
+                    }
+                    WorkflowEvent::StageFailed {
+                        stage_name,
+                        reason,
+                        cancelled,
+                    } => {
+                        if let Some(num) = parse_stage_number(stage_name) {
+                            progress_cb(WorkerProgressEvent::StageFailed {
+                                stage: num,
+                                reason,
+                                cancelled,
+                            });
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -723,12 +853,39 @@ impl Worker {
             state.review_inline
         };
 
+        // Stages that did not complete, so the caller can report which parts of
+        // the review are missing instead of presenting partial coverage as full.
+        let stage_failures: Vec<serde_json::Value> = outcome
+            .stage_failures
+            .iter()
+            .map(|f| {
+                json!({
+                    "stage": parse_stage_number(f.stage_name),
+                    "reason": f.reason,
+                    "cancelled": f.cancelled,
+                })
+            })
+            .collect();
+
+        if !stage_failures.is_empty() {
+            tracing::warn!(
+                "{} review stages did not complete: {:?}",
+                stage_failures.len(),
+                outcome
+                    .stage_failures
+                    .iter()
+                    .map(|f| f.stage_name)
+                    .collect::<Vec<_>>()
+            );
+        }
+
         let final_output = json!({
             "findings": state.findings,
             "dismissed_concerns": dismissed_concerns,
             "review_inline": review_inline,
             "fixes": state.fixes,
             "concerns_count": concerns_count,
+            "stage_failures": stage_failures,
             "dismissed_concerns_count": dismissed_concerns_count,
         });
 
@@ -1228,8 +1385,92 @@ mod tests {
         }
     }
 
+    /// The cover letter has to survive the whole trip into stage context, or
+    /// the flag buys nothing.
     #[tokio::test]
-    async fn test_stage_failure_aborts_review() {
+    async fn cover_letter_reaches_the_stage_context() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        let provider = std::sync::Arc::new(MockProviderAlwaysFails);
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let config = WorkerConfig {
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: None,
+            baseline_sha: None,
+            custom_prompt: None,
+            stages: Some(vec![1]),
+        };
+        let mut worker = Worker::new(
+            provider,
+            std::sync::Arc::new(tools),
+            PromptRegistry::new(prompts_dir.clone()),
+            config,
+        );
+
+        let patchset = serde_json::json!({
+            "id": 1,
+            "patch_index": 1,
+            "cover_letter": "This series frees hwstamp queues when timestamping is disabled.",
+            "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
+        });
+
+        let res = worker.run(patchset, None).await.expect("review runs");
+        let sys = res.history[0].content.as_deref().unwrap_or_default();
+        assert!(
+            sys.contains("Series Cover Letter"),
+            "the cover letter must be labelled as intent, not smuggled in as a patch"
+        );
+        assert!(sys.contains("frees hwstamp queues"), "{sys}");
+
+        // An absent cover letter renders nothing, rather than an empty labelled
+        // section the model would have to reason about.
+        let mut bare_worker = Worker::new(
+            std::sync::Arc::new(MockProviderAlwaysFails),
+            std::sync::Arc::new(crate::toolbox::ToolBox::new(
+                temp_dir.path().to_path_buf(),
+                None,
+            )),
+            PromptRegistry::new(prompts_dir),
+            WorkerConfig {
+                max_input_tokens: 10000,
+                max_interactions: 3,
+                temperature: 0.0,
+                series_range: None,
+                baseline_sha: None,
+                custom_prompt: None,
+                stages: Some(vec![1]),
+            },
+        );
+        let bare = bare_worker
+            .run(
+                serde_json::json!({
+                    "id": 1,
+                    "patch_index": 1,
+                    "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
+                }),
+                None,
+            )
+            .await
+            .expect("review runs");
+        assert!(
+            !bare.history[0]
+                .content
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Series Cover Letter")
+        );
+    }
+
+    /// The concurrent analysis stages run under `BestEffort`, so a failing
+    /// stage no longer aborts the review. That is only acceptable because the
+    /// failure is reported: partial coverage presented as full coverage would
+    /// be worse than an outright failure.
+    #[tokio::test]
+    async fn test_stage_failure_is_reported_not_swallowed() {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
@@ -1244,7 +1485,10 @@ mod tests {
             series_range: None,
             baseline_sha: None,
             custom_prompt: None,
-            stages: None,
+            // Named explicitly so the pre-screen and planning stages skip and
+            // the run reaches the concurrent analysis stages, which are the
+            // ones the best-effort policy covers.
+            stages: Some(vec![1, 2]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1254,13 +1498,39 @@ mod tests {
             "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
         });
 
-        match worker.run(patchset, None).await {
-            Ok(_) => panic!("Expected stage failure error, got Ok"),
-            Err(e) => assert!(
-                e.to_string().contains("simulated AI failure"),
-                "unexpected error: {e}"
-            ),
-        }
+        let result = worker
+            .run(patchset, None)
+            .await
+            .expect("a failing stage must no longer abort the whole review");
+
+        let output = result
+            .output
+            .expect("a review with failed stages still produces output");
+        let failures = output["stage_failures"]
+            .as_array()
+            .expect("stage_failures must be present in the output");
+
+        assert!(
+            !failures.is_empty(),
+            "every stage failed, so the review must say so rather than reporting clean"
+        );
+        assert!(
+            failures.iter().all(|f| f["reason"]
+                .as_str()
+                .unwrap_or("")
+                .contains("simulated AI failure")),
+            "the reason must survive to the caller: {:?}",
+            failures
+        );
+        assert!(
+            failures.iter().all(|f| f["stage"].is_number()),
+            "each failure must name which stage it was: {:?}",
+            failures
+        );
+        assert!(
+            failures.iter().all(|f| f["cancelled"] == false),
+            "a genuine error must not be mislabelled as a cancellation"
+        );
     }
 
     // ReviewError tests

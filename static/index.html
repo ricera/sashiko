@@ -1420,6 +1420,10 @@
             const app = document.getElementById('app');
             app.innerHTML = '<div class="loading">Loading...</div>';
 
+            // Any activity or log poll belongs to the view being replaced.
+            stopActivityPolling();
+            stopLogPolling();
+
             try {
                 // Ensure lists are loaded
                 if (state.mailingLists.length === 0) {
@@ -2113,6 +2117,334 @@
         // =====================================================================
         // PATCHSET DETAIL VIEW
         // =====================================================================
+        let activityTimer = null;
+
+        // Mirrors activity::format_duration on the server. Past roughly two
+        // minutes a bare second count stops being readable at a glance:
+        // "137s" parses as a number, "2m 17s" parses as a duration.
+        function formatDuration(seconds) {
+            const s = Math.max(0, Math.floor(seconds || 0));
+            if (s < 120) return `${s}s`;
+            if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+            return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
+        }
+
+        function stopActivityPolling() {
+            if (activityTimer !== null) {
+                clearInterval(activityTimer);
+                activityTimer = null;
+            }
+        }
+
+        // Mirrors activity::StageWait::describe on the server. Falls back to the
+        // server's own rendered description, so an unrecognised wait degrades to
+        // slightly coarser wording rather than an empty cell.
+        function describeStageWait(waiting, fallback) {
+            if (!waiting) return fallback || '';
+            switch (waiting.on) {
+                case 'model': return 'awaiting model';
+                case 'queued': return 'queued for a model slot';
+                case 'rate_limited':
+                    return `rate limited, retrying in ${waiting.retry_in_seconds || 0}s`;
+                case 'tools':
+                    return Array.isArray(waiting.names) && waiting.names.length
+                        ? `running ${waiting.names.join(', ')}`
+                        : 'running tools';
+                default: return fallback || '';
+            }
+        }
+
+        // Heading for a finished review's stage table.
+        //
+        // With one stage there is nothing to overlap and nothing to sum, so the
+        // comparison would be noise; say the single duration instead.
+        function stageBreakdownLabel(stages) {
+            const seconds = stages.map(st => st.seconds || 0);
+            if (stages.length === 1) {
+                return `Stage breakdown (1 stage, ${formatDuration(seconds[0])})`;
+            }
+            const longest = Math.max(...seconds);
+            const summed = seconds.reduce((a, b) => a + b, 0);
+            return `Stage breakdown (${stages.length} stages overlapping:`
+                + ` longest ${formatDuration(longest)},`
+                + ` ${formatDuration(summed)} summed)`;
+        }
+
+        // Mirrors activity::summarize_reason on the server. Reasons are
+        // multi-line error chains; the first line carries the identifying part,
+        // and the full text goes in the row's tooltip.
+        function summarizeReason(reason) {
+            const first = String(reason || '').split('\n')[0].trim();
+            if (!first) return 'no reason given';
+            return first.length > 140 ? first.slice(0, 140) + '…' : first;
+        }
+
+        // One in-progress stage, as a row of the same table the finished review
+        // shows. Live rows carry a fourth column the recorded breakdown has no
+        // use for: what the stage is currently blocked on.
+        function renderLiveStageRow(entry, live) {
+            const phase = entry.phase || {};
+            const stage = entry.stage != null ? entry.stage : phase.stage;
+            const label = `Stage ${escapeHtml(String(stage != null ? stage : '?'))}`;
+
+            // A persisted entry has no clocks — it records where the work got to,
+            // not how long it has been there — so those columns stay empty
+            // rather than showing a fabricated zero.
+            if (!live) {
+                return `<tr><td style="padding:2px 12px 2px 0;">${label}</td>`
+                    + `<td colspan="3" style="padding:2px 0; color:var(--text-muted);">`
+                    + `${escapeHtml(entry.description || '?')}</td></tr>`;
+            }
+
+            const age = entry.age_seconds || 0;
+
+            // A finished stage keeps its row, in the columns the recorded
+            // breakdown uses, so it settles in place rather than disappearing
+            // and returning only once the whole review ends.
+            if (phase.kind === 'stage_done') {
+                const turns = !phase.turns
+                    ? '—'
+                    : phase.turns === 1 ? '1 turn' : `${phase.turns} turns`;
+                return `<tr style="color:var(--text-muted);">`
+                    + `<td style="padding:2px 12px 2px 0;">${label}</td>`
+                    + `<td style="padding:2px 12px 2px 0; text-align:right;">`
+                    + `${formatDuration(phase.seconds || 0)}</td>`
+                    + `<td style="padding:2px 12px 2px 0; text-align:right;">${turns}</td>`
+                    + `<td style="padding:2px 0; color:var(--status-reviewed, var(--text-muted));">`
+                    + `done</td></tr>`;
+            }
+
+            // A stage that stopped keeps its row rather than disappearing:
+            // vanishing would be indistinguishable from never having run, and
+            // the review carries on without it.
+            if (phase.kind === 'stage_failed') {
+                const what = phase.cancelled ? 'cancelled' : 'failed';
+                const colour = phase.cancelled ? 'var(--text-muted)' : 'var(--status-failed)';
+                return `<tr title="${escapeHtml(phase.reason || '')}">`
+                    + `<td style="padding:2px 12px 2px 0;">${label}</td>`
+                    + `<td style="padding:2px 12px 2px 0; text-align:right; color:var(--text-muted);">`
+                    + `${formatDuration(age)} ago</td>`
+                    + `<td style="padding:2px 12px 2px 0; text-align:right;">—</td>`
+                    + `<td style="padding:2px 0; color:${colour};">`
+                    + `${what}: ${escapeHtml(summarizeReason(phase.reason))}</td></tr>`;
+            }
+
+            const idle = entry.idle_seconds || 0;
+            // Age says how long this stage has been running; idle says how long
+            // since it last moved. Only the second one can reveal a wedge.
+            const stalled = idle > 300;
+
+            // The patch's own entry, above its stages: planning has no stage
+            // number yet, and once stages start it says the patch is running
+            // them. Reusing the stage columns for it would print "Stage ?".
+            if (stage == null) {
+                return `<tr>`
+                    + `<td style="padding:2px 12px 2px 0;">This patch</td>`
+                    + `<td style="padding:2px 12px 2px 0; text-align:right;">${formatDuration(age)}</td>`
+                    + `<td style="padding:2px 12px 2px 0; text-align:right;">—</td>`
+                    + `<td style="padding:2px 0; color:var(--text-muted);">`
+                    + `${escapeHtml(entry.description || '?')}</td></tr>`;
+            }
+
+            const turns = phase.max_turns
+                ? `turn ${phase.turn || 0}/${phase.max_turns}`
+                : 'starting';
+
+            return `<tr>`
+                + `<td style="padding:2px 12px 2px 0;">${label}</td>`
+                + `<td style="padding:2px 12px 2px 0; text-align:right;">${formatDuration(age)}</td>`
+                + `<td style="padding:2px 12px 2px 0; text-align:right;">${escapeHtml(turns)}</td>`
+                + `<td style="padding:2px 0; color:var(--text-muted);">`
+                + `${escapeHtml(describeStageWait(phase.waiting, entry.description))}`
+                + (stalled
+                    ? ` <span style="color:var(--status-failed);">`
+                      + `— no progress for ${formatDuration(idle)}</span>`
+                    : '')
+                + `</td></tr>`;
+        }
+
+        // The element that holds one patch's live progress.
+        //
+        // renderReviewCard puts one in the card of a review that is in progress,
+        // but the page is built once and the activity behind it is polled. A
+        // review that started after the page loaded — or a retry, which creates a
+        // new review row — therefore has no card here, and its stages used to
+        // fall back to the patchset-wide row, which looks exactly like the old
+        // behaviour of grouping every stage at the top.
+        //
+        // So build one on demand, in the patch's own block. Every patch on the
+        // page has a block even with no reviews yet, so this covers everything
+        // except a patch on another page of a paginated patchset.
+        function hostForPatch(patchId) {
+            const existing = document.getElementById(`stage-progress-${patchId}`);
+            if (existing) return existing;
+
+            const block = document.getElementById(`patch-${patchId}`);
+            if (!block) return null;
+
+            // The element is the card, rather than sitting inside one. Hiding it
+            // when the stages end has to leave nothing behind, and a wrapper
+            // would stay as an empty bordered box.
+            const host = document.createElement('details');
+            host.className = 'stage-progress review-card';
+            host.id = `stage-progress-${patchId}`;
+            host.setAttribute('data-stage-progress', '');
+            host.open = true;
+            host.style.fontSize = '0.9em';
+            host.innerHTML = `<summary style="cursor:pointer; color:var(--text-muted);"></summary>`
+                + `<div class="stage-progress-body"></div>`;
+
+            // Under the patch's title, where the review card would be.
+            const heading = block.querySelector('h3');
+            if (heading && heading.nextSibling) {
+                block.insertBefore(host, heading.nextSibling);
+            } else {
+                block.appendChild(host);
+            }
+            return host;
+        }
+
+        // Fills one patch's stage-progress element, reusing the slot the finished
+        // review's "Stage breakdown" occupies.
+        function paintStageProgress(host, entries, live) {
+            const summary = host.querySelector('summary');
+            const body = host.querySelector('.stage-progress-body');
+            if (!summary || !body) return;
+
+            // The patch's own entry has no stage number, so it sorts to the top,
+            // above the stages it covers.
+            const sorted = [...entries].sort((a, b) => (a.stage || 0) - (b.stage || 0));
+            // Counts describe stages only. The patch's own entry is not a stage,
+            // and failed stages keep a row but are not running -- counting either
+            // would overstate what the review is still doing.
+            const stages = sorted.filter(e => e.stage != null);
+            const kindOf = e => (e.phase || {}).kind;
+            const done = stages.filter(e => kindOf(e) === 'stage_done').length;
+            const stopped = stages.filter(e => kindOf(e) === 'stage_failed').length;
+            const running = stages.length - done - stopped;
+            const counts = [
+                `${running} running`,
+                ...(done ? [`${done} done`] : []),
+                ...(stopped ? [`${stopped} stopped`] : []),
+            ].join(', ');
+            summary.textContent = live
+                ? `Stage progress (${counts})`
+                : 'Stage progress (stopped)';
+            // Persisted entries describe what the work *was* doing when the
+            // daemon stopped. Worth keeping — it says where a failed patch got to
+            // — but phrased as an observation, not a cause: the work stopped
+            // during this activity, which is not the same as failing because of
+            // it. The failure reason banner says why.
+            summary.title = live
+                ? 'What each review stage of this patch is doing right now.'
+                : 'Last activity recorded before the daemon stopped. This is where'
+                  + ' the work got to, not necessarily why it failed.';
+
+            body.innerHTML = `<table style="margin:6px 0 0 12px; border-collapse:collapse;">`
+                + sorted.map(e => renderLiveStageRow(e, live)).join('')
+                + `</table>`;
+            host.style.display = '';
+        }
+
+        // Shows what a patchset is actually doing right now. Status alone sits on
+        // "Fetching" or "In Review" for the whole run, so it cannot distinguish
+        // slow from stuck; idle_seconds can.
+        //
+        // Stage-level entries are routed to the review card of the patch they
+        // describe; everything else stays in the patchset-wide "Activity:" row.
+        async function refreshActivity(patchsetId) {
+            const row = document.getElementById('activity-row');
+            const value = document.getElementById('activity-value');
+            if (!row || !value) {
+                stopActivityPolling();
+                return;
+            }
+
+            let entries = [];
+            let live = true;
+            try {
+                const res = await fetch(`/api/patchset/activity?id=${encodeURIComponent(patchsetId)}`);
+                if (!res.ok) return;
+                const data = await res.json();
+                entries = data.entries || [];
+                live = data.live !== false;
+            } catch (e) {
+                return; // Advisory only; leave the last known value in place.
+            }
+
+            // Activity only moves to its patch if that patch is on screen. Patch
+            // lists paginate, so a patch on another page has no host here;
+            // falling back to the patchset-wide row keeps its activity visible
+            // rather than routing it into nothing.
+            const byPatch = new Map();
+            const general = [];
+            entries.forEach(entry => {
+                const host = entry.patch_id != null
+                    ? hostForPatch(entry.patch_id)
+                    : null;
+                if (!host) {
+                    general.push(entry);
+                    return;
+                }
+                if (!byPatch.has(host)) byPatch.set(host, []);
+                byPatch.get(host).push(entry);
+            });
+
+            // A stage that finished since the last poll has no entry this time
+            // round, so its host has to be emptied — otherwise it would keep
+            // claiming the stage is running.
+            document.querySelectorAll('[data-stage-progress]').forEach(host => {
+                if (!byPatch.has(host)) host.style.display = 'none';
+            });
+            byPatch.forEach((patchEntries, host) => paintStageProgress(host, patchEntries, live));
+
+            if (general.length === 0) {
+                row.style.display = 'none';
+                return;
+            }
+            row.style.display = '';
+
+            if (!live) {
+                value.innerHTML = `<div style="color:var(--text-muted);"`
+                    + ` title="Last activity recorded before the daemon stopped.`
+                    + ` This is where the work got to, not necessarily why it failed.">`
+                    + `Stopped while:</div>`
+                    + general.map(e => `<div>${escapeHtml(e.description || '?')}</div>`).join('');
+                return;
+            }
+
+            // Whatever is left is patchset-wide — queued, fetching, planning — or
+            // belongs to a patch that is not on this page.
+            value.innerHTML = general.map(entry => {
+                const idle = entry.idle_seconds || 0;
+                const age = entry.age_seconds || 0;
+                const stalled = idle > 300;
+                return `<div>${escapeHtml(entry.description)}`
+                    + ` <span style="color:var(--text-muted);">`
+                    + `(${formatDuration(age)}, idle ${formatDuration(idle)})</span>`
+                    + (stalled
+                        ? ` <span style="color:var(--status-failed);">`
+                          + `— no progress for ${formatDuration(idle)}</span>`
+                        : '')
+                    + `</div>`;
+            }).join('');
+        }
+
+        function startActivityPolling(patchsetId, status) {
+            stopActivityPolling();
+
+            // A terminal patchset is not going to move again, so it gets one read
+            // rather than a timer. Not zero reads: a run interrupted by a restart
+            // keeps its last activity on purpose, and that is the case where
+            // "where did it get to" is worth the most. A patchset that finished
+            // cleanly has had its activity deleted, so this shows nothing.
+            const terminal = ['Reviewed', 'Failed', 'Error', 'Cancelled', 'Failed To Apply'];
+            refreshActivity(patchsetId);
+            if (terminal.includes(status)) return;
+
+            activityTimer = setInterval(() => refreshActivity(patchsetId), 5000);
+        }
+
         async function renderPatchsetView(id, query = {}) {
             const page = parseInt(query.page) || 1;
             const limit = parseInt(query.limit) || 50;
@@ -2458,6 +2790,10 @@
                     <div class="kv"><div class="label">Date:</div><div>${date}</div></div>
                     <div class="kv"><div class="label">Subsystems:</div><div>${subsystemsHtml}</div></div>
                     <div class="kv"><div class="label">Patches:</div><div>${data.received_parts || 0} / ${data.total_parts || 0}</div></div>
+                    ${typeof data.review_duration_seconds === 'number'
+                        ? `<div class="kv"><div class="label">Review time:</div><div>${formatDuration(data.review_duration_seconds)}</div></div>`
+                        : ''}
+                    <div class="kv" id="activity-row" style="display:none;"><div class="label">Activity:</div><div id="activity-value"></div></div>
                     <div class="kv"><div class="label">Model:</div><div>${escapeHtml(providerModel)}</div></div>
                     <div class="kv"><div class="label">Sashiko ver.:</div><div>${escapeHtml(promptsHash)}</div></div>
                 </div>
@@ -2485,6 +2821,8 @@
                     ${paginationHtml}
                 </div>
             `;
+
+            startActivityPolling(data.id, currentStatus);
 
             if (query.patch || query.part) {
                 setTimeout(() => {
@@ -2548,6 +2886,94 @@
 
         function renderReviewCard(r, emailHtml = '') {
             const uniqueId = Math.random().toString(36).substr(2, 9);
+
+            // Incomplete coverage must be stated, not inferred. A review missing
+            // (say) the security stage but presenting as clean is worse than one
+            // that failed outright, because nothing signals the gap.
+            // The live attempt counter disappears when the review ends, so the
+            // finished review has to carry the number itself. Only shown when it
+            // took more than one go — otherwise it is noise on every card.
+            const runNotes = [];
+            if (typeof r.duration_seconds === 'number') {
+                runNotes.push(`Reviewed in ${formatDuration(r.duration_seconds)}`);
+            }
+            // Only worth saying when it took more than one go.
+            if (typeof r.attempt === 'number' && r.attempt > 1) {
+                runNotes.push(`succeeded on attempt ${r.attempt}`);
+            }
+            const attemptHtml = runNotes.length
+                ? `<div style="color:var(--text-muted); font-size:0.9em;">${escapeHtml(runNotes.join(', '))}</div>`
+                : '';
+
+            const statusRaw = r.status || 'Finished';
+            const s = statusRaw.toLowerCase();
+            const showDetails = s === 'reviewed' || s === 'finished' || s === 'failed' || s === 'skipped';
+
+            // One element covers both halves of a review's life. While the
+            // stages run it holds live per-stage progress; once they finish it
+            // holds the recorded breakdown. Putting them in the same place means
+            // the table does not appear from nowhere at the moment the review
+            // completes, and — the reason for the change — a patch's progress
+            // reads beside that patch rather than in one undifferentiated list
+            // at the top of the page.
+            //
+            // Per-stage timings are recorded per attempt, so a retried review
+            // shows the stages of the attempt that produced it rather than a
+            // meaningless mix across attempts.
+            let stageTimingHtml = '';
+            if (Array.isArray(r.stage_durations) && r.stage_durations.length > 0) {
+                const stages = [...r.stage_durations].sort((a, b) => (a.stage || 0) - (b.stage || 0));
+                const rows = stages.map(st => {
+                    const turns = typeof st.turns !== 'number' || st.turns === 0
+                        ? '—'
+                        : st.turns === 1 ? '1 turn' : `${st.turns} turns`;
+                    return `<tr>`
+                        + `<td style="padding:2px 12px 2px 0;">Stage ${escapeHtml(String(st.stage))}</td>`
+                        + `<td style="padding:2px 12px 2px 0; text-align:right;">${formatDuration(st.seconds || 0)}</td>`
+                        + `<td style="padding:2px 0; text-align:right;">${turns}</td>`
+                        + `</tr>`;
+                }).join('');
+                // The rows will not add up to the patch's review time, because
+                // the stages overlap. Saying only "run concurrently" asserted
+                // that without showing it, and was the same words on every card;
+                // the longest stage beside the sum makes the gap visible, and
+                // both numbers are about this review rather than about the
+                // system in general.
+                stageTimingHtml = `<details style="margin:6px 0; font-size:0.9em;">`
+                    + `<summary style="cursor:pointer; color:var(--text-muted);">`
+                    + `${escapeHtml(stageBreakdownLabel(stages))}</summary>`
+                    + `<table style="margin:6px 0 0 12px; border-collapse:collapse;">${rows}</table>`
+                    + `</details>`;
+            } else if (!showDetails && r.patch_id != null) {
+                // Rendered empty and hidden: this view is built once, while the
+                // activity behind it is polled. refreshActivity finds the host by
+                // patch id and reveals it when there is something to say, so an
+                // unstarted review does not show a vacant table.
+                //
+                // Only the unfinished card gets one. A patch reviewed more than
+                // once has a finished card per earlier attempt, and each of those
+                // already carries its own recorded breakdown.
+                stageTimingHtml = `<details class="stage-progress" data-stage-progress`
+                    + ` id="stage-progress-${r.patch_id}" open`
+                    + ` style="display:none; margin:6px 0; font-size:0.9em;">`
+                    + `<summary style="cursor:pointer; color:var(--text-muted);"></summary>`
+                    + `<div class="stage-progress-body"></div>`
+                    + `</details>`;
+            }
+
+            let coverageHtml = '';
+            if (Array.isArray(r.stage_failures) && r.stage_failures.length > 0) {
+                const parts = r.stage_failures.map(f => {
+                    const what = f.cancelled ? 'cancelled' : 'failed';
+                    const why = f.reason ? `: ${escapeHtml(String(f.reason))}` : '';
+                    return `<div>Stage ${escapeHtml(String(f.stage))} ${what}${why}</div>`;
+                }).join('');
+                coverageHtml = `<div style="margin:8px 0; padding:8px; border-radius:6px;`
+                    + ` border:1px solid var(--status-failed); color:var(--status-failed);">`
+                    + `<strong>Incomplete coverage — ${r.stage_failures.length} stage(s) did not run</strong>`
+                    + parts
+                    + `</div>`;
+            }
 
             let displayResult = '';
             
@@ -2674,12 +3100,23 @@
                 `;
             }
 
-            const statusRaw = r.status || 'Finished';
-            const s = statusRaw.toLowerCase();
-            const showDetails = s === 'reviewed' || s === 'finished' || s === 'failed' || s === 'skipped';
+            // The conversation is streamed while the review runs, so the link is
+            // offered throughout. Named for what it opens: mid-review the log
+            // view shows a live preview that is still arriving, and calling that
+            // "raw log" would promise a complete one.
+            //
+            // Rendered outside the showDetails block below. It used to be inside
+            // it, which meant the link existed for every status except the ones
+            // it was added to serve.
+            const logLinkHtml = !r.id
+                ? '<span></span>'
+                : `<a href="#/log/${r.id}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${showDetails ? 'View Raw Log' : 'View Live Log'}</a>`;
 
             return `
                 <div class="review-card">
+                    ${attemptHtml}
+                    ${stageTimingHtml}
+                    ${coverageHtml}
                     <div class="review-meta">
                         ${showDetails ? `
                         <div class="review-meta-label">Result:</div>
@@ -2700,11 +3137,11 @@
                             <strong>Tokens used:</strong> ${tokenStr}
                         </div>
                     </div>
+                    ` : ''}
                     <div style="margin-top:8px; display:flex; justify-content:space-between; align-items:center; font-size: 0.9em;">
-                        ${r.id ? `<a href="#/log/${r.id}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">View Raw Log</a>` : '<span></span>'}
+                        ${logLinkHtml}
                         <a href="javascript:void(0)" onclick="document.getElementById('ai-reviews').scrollIntoView({behavior: 'smooth'})" style="font-size: 0.95em; color: var(--text-dim); text-decoration: none;">↑ Back to Summary</a>
                     </div>
-                    ` : ''}
                 </div>
             `;
         }
@@ -2843,6 +3280,18 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 try { logs = JSON.parse(data.logs || '[]'); } catch (e) { }
             }
 
+            // While a review runs the complete log does not exist yet; the
+            // daemon streams a truncated preview instead. Shaped to match the
+            // finished log so the same renderer handles both.
+            const isLive = !logs.length && Array.isArray(data.live_log) && data.live_log.length > 0;
+            if (isLive) {
+                logs = data.live_log.map(e => ({
+                    role: e.role,
+                    content: e.content,
+                    _stage: e.stage,
+                }));
+            }
+
             let logsHtml = '';
             if (!logs.length) {
                 logsHtml = '<div style="padding:20px; text-align:center; color:var(--text-dim);">No logs recorded.</div>';
@@ -2916,8 +3365,36 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         <span class="status-badge status-${(data.status || '').replace(/ /g, '')}">${data.status}</span>
                     </span>
                 </h1>
+                ${isLive ? `<div class="section" style="margin-bottom:12px; color:var(--text-muted);">
+                    Live preview — this review is still running, so entries are
+                    truncated and still arriving. The complete log replaces this
+                    when it finishes.
+                </div>` : ''}
                 <div>${logsHtml}</div>
             `;
+
+            // Poll while the review is still producing entries, on the same
+            // pattern as the activity panel. Stops as soon as it is not live.
+            stopLogPolling();
+            if (isLive) {
+                logTimer = setInterval(() => {
+                    // Bail out if the user navigated away.
+                    if (!location.hash.startsWith('#/log/')) {
+                        stopLogPolling();
+                        return;
+                    }
+                    renderLogView(id).catch(() => stopLogPolling());
+                }, 5000);
+            }
+        }
+
+        let logTimer = null;
+
+        function stopLogPolling() {
+            if (logTimer !== null) {
+                clearInterval(logTimer);
+                logTimer = null;
+            }
         }
 
         // Custom preview formatters for common tools

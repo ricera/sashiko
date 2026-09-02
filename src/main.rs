@@ -389,10 +389,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
 
+    // A fetch cannot survive a restart, so anything still marked 'Fetching' is
+    // orphaned — nothing will ever deliver its parts. Left alone it sits there
+    // indefinitely, which is the state that made patchsets look permanently hung.
+    // A daemon killed mid-review never reaches its own cleanup, so streamed log
+    // entries for finished reviews can outlive them.
+    match db.sweep_orphan_review_log_entries().await {
+        Ok(n) if n > 0 => info!("Cleared {} orphaned review log entr(ies)", n),
+        Ok(_) => {}
+        Err(e) => error!("Failed to sweep orphaned review log entries: {}", e),
+    }
+
+    match db.fail_stranded_fetching_patchsets().await {
+        Ok(n) if n > 0 => warn!("Failed {} patchset(s) stranded mid-fetch by a restart", n),
+        Ok(_) => {}
+        Err(e) => error!("Failed to sweep stranded fetches: {}", e),
+    }
+
     // Create internal task queues
     // raw_tx -> Parser -> parsed_tx -> DB Worker
     let (raw_tx, mut raw_rx) = mpsc::channel::<Event>(1000);
     let (parsed_tx, mut parsed_rx) = mpsc::channel::<ParsedArticle>(1000);
+
+    // Shared live-activity state. Written by the fetch agent and the reviewer,
+    // read by the API so a stuck patchset can explain what it is waiting on.
+    // Writes through to the database so work interrupted by a restart still
+    // explains itself, even though nothing is live to report.
+    let activity = sashiko::activity::ActivityRegistry::with_persistence(db.clone());
+
+    // Signal path from a cancel request to the review it should interrupt.
+    // Shared because the API and reviewer run as separate tasks.
+    let cancels = sashiko::cancel::CancelRegistry::new();
 
     // Initialize FetchAgent
     let repo_path = std::path::PathBuf::from(&settings.git.repository_path);
@@ -400,6 +427,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         repo_path,
         raw_tx.clone(),
         settings.forge.api_token.clone(),
+        activity.clone(),
+        cancels.clone(),
     );
 
     // Spawn FetchAgent
@@ -478,6 +507,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 mr_url: None,
                                 mr_title: None,
                                 mr_number: None,
+                                cover_letter: None,
                             })
                             .await
                         {
@@ -499,6 +529,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mr_url,
                         mr_title,
                         mr_number,
+                        is_cover_letter,
                     } => {
                         let root_msg_id = format!("{}@sashiko.local", article_id);
 
@@ -527,12 +558,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             body: message.clone(),
                         };
 
-                        let patch = Some(sashiko::patch::Patch {
-                            message_id,
-                            body: message,
-                            diff,
-                            part_index: index,
-                        });
+                        // A cover letter is not a patch: creating no patch row
+                        // is exactly what the mailing-list path does for a 0/N
+                        // cover letter, and it keeps the empty commit out of
+                        // review entirely.
+                        // Keep the prose b4 wrote above its tracking block;
+                        // `None` when only trailers remain, so an empty cover
+                        // letter never occupies a prompt section.
+                        let cover_letter = if is_cover_letter {
+                            sashiko::patch::extract_b4_cover_letter(&message)
+                        } else {
+                            None
+                        };
+
+                        let patch = if is_cover_letter {
+                            None
+                        } else {
+                            Some(sashiko::patch::Patch {
+                                message_id,
+                                body: message,
+                                diff,
+                                part_index: index,
+                            })
+                        };
 
                         let source = if group.starts_with("git-import") {
                             MessageSource::GitImport
@@ -554,6 +602,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 mr_url,
                                 mr_title,
                                 mr_number,
+                                cover_letter,
                             })
                             .await
                         {
@@ -622,6 +671,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             mr_url: None,
                                             mr_title: None,
                                             mr_number: None,
+                                            cover_letter: None,
                                         })
                                         .await
                                     {
@@ -680,6 +730,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         mr_url: None,
                                         mr_title: None,
                                         mr_number: None,
+                                        cover_letter: None,
                                     })
                                     .await
                                 {
@@ -785,6 +836,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_db = db.clone();
     let api_tx = raw_tx.clone();
     let api_fetch_tx = fetch_tx.clone();
+    let api_activity = activity.clone();
+    let api_cancels = cancels.clone();
     let allow_all_submit = cli.enable_unsafe_all_submit;
     let smtp_enabled = settings.smtp.is_some();
     let dry_run = settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false);
@@ -797,6 +850,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             allow_all_submit,
             smtp_enabled,
             dry_run,
+            api_activity,
+            api_cancels,
         )
         .await
         {
@@ -904,7 +959,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Start Reviewer Service
-    let reviewer = Reviewer::new(db.clone(), settings.clone()).await;
+    let reviewer = Reviewer::new(
+        db.clone(),
+        settings.clone(),
+        activity.clone(),
+        cancels.clone(),
+    )
+    .await;
     tokio::spawn(async move {
         reviewer.start().await;
     });
@@ -1426,11 +1487,31 @@ async fn handle_review_command(
                 s.total_turns += 1;
                 render_progress(&mut s);
             }
+            // The local CLI progress display tracks stages and turns, not what a
+            // turn is blocked on; that distinction is for the daemon's activity
+            // view, where work runs unattended.
+            // The local CLI prints the conversation itself; the streamed copy
+            // exists for the daemon, where nobody is watching the terminal.
+            ProgressEvent::AiReviewStageTools { .. }
+            | ProgressEvent::AiReviewStageBackoff { .. }
+            | ProgressEvent::AiReviewLogEntry { .. } => {}
             ProgressEvent::AiReviewStageFinished { patch_index, stage } => {
                 if let Some(p) = s.patches.get_mut(&patch_index) {
                     p.active_stages.remove(&stage);
                     p.active_stage_turns.remove(&stage);
                     p.completed_stages += 1;
+                    render_progress(&mut s);
+                }
+            }
+            // Stops being active, but does not count as completed: the review
+            // ran with less coverage than it planned, and the summary would be
+            // wrong to say otherwise.
+            ProgressEvent::AiReviewStageFailed {
+                patch_index, stage, ..
+            } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.active_stages.remove(&stage);
+                    p.active_stage_turns.remove(&stage);
                     render_progress(&mut s);
                 }
             }
@@ -1714,6 +1795,7 @@ async fn process_parsed_article(
     subsystem_mapping: &[sashiko::settings::SubsystemMapping],
 ) -> ProcessStatus {
     let ParsedArticle {
+        cover_letter,
         group,
         article_id,
         source,
@@ -2045,6 +2127,14 @@ async fn process_parsed_article(
         } else {
             None
         };
+
+        // Attach the cover letter to the message the patchset points at, so the
+        // reviewer's existing get_message_body call picks it up.
+        if let (Some(cover), Some(cl_id)) = (cover_letter.as_deref(), cover_letter_id)
+            && let Err(e) = worker_db.set_message_body(cl_id, cover).await
+        {
+            error!("Failed to store cover letter for {}: {}", cl_id, e);
+        }
 
         match worker_db
             .create_patchset(

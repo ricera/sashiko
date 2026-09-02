@@ -449,9 +449,54 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                             max_turns,
                         });
                     }
+                })
+                .with_tools_callback(move |tools, turn, max_turns| {
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::StageTools {
+                            stage_name,
+                            tools: tools.to_vec(),
+                            turn,
+                            max_turns,
+                        });
+                    }
+                })
+                .with_backoff_callback(move |retry_in_seconds, turn, max_turns| {
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::StageBackoff {
+                            stage_name,
+                            retry_in_seconds,
+                            turn,
+                            max_turns,
+                        });
+                    }
+                })
+                .with_message_callback(move |message| {
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::StageMessage {
+                            stage_name,
+                            message: message.clone(),
+                        });
+                    }
                 });
 
-            runner.run(&mut session).await?
+            // Reported here rather than by the caller: a failed stage that says
+            // nothing leaves its last turn frozen on display, indistinguishable
+            // from one still waiting on the model.
+            match runner.run(&mut session).await {
+                Ok(result) => result,
+                Err(e) => {
+                    if let Some(cb) = event_cb {
+                        let reason = format!("{:#}", e);
+                        let cancelled = reason.contains(crate::ai::session::SESSION_CANCELLED);
+                        cb(WorkflowEvent::StageFailed {
+                            stage_name,
+                            reason,
+                            cancelled,
+                        });
+                    }
+                    return Err(e);
+                }
+            }
         };
 
         let tokens_in = result.usage.prompt_tokens as u32;
@@ -688,6 +733,102 @@ mod tests {
             replies[1].contains("Duplicate tool call blocked"),
             "the repeat is blocked: {}",
             replies[1]
+        );
+    }
+
+    /// A provider that always asks for another tool call, so the stage can only
+    /// end by running out of turns.
+    struct NeverFinishesProvider;
+
+    #[async_trait]
+    impl AiProvider for NeverFinishesProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            Ok(AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_0".to_string(),
+                    function_name: "git_read_files".to_string(),
+                    arguments: json!({ "files": [{ "path": "a" }] }),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// The turn cap fires between round trips: turn N is reported, the request
+    /// returns, and the loop bails. Without a failure event the last thing ever
+    /// said about the stage is "turn N/N", and the idle clock climbs from there
+    /// -- which reads as a hung connection, at exactly the turn number that
+    /// proves it was not one.
+    #[tokio::test]
+    async fn a_stage_that_hits_the_turn_cap_reports_the_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = WorkflowEnv {
+            provider: Arc::new(NeverFinishesProvider),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("stage_2_turn_cap")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .policy(StagePolicy {
+                max_turns: 3,
+                ..StagePolicy::default()
+            })
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let events: Mutex<Vec<WorkflowEvent>> = Mutex::new(Vec::new());
+        let record = |e: WorkflowEvent| events.lock().unwrap().push(e);
+
+        let res = stage
+            .execute_isolated(&env, &EmptyState, Some(&record))
+            .await;
+        assert!(res.is_err(), "the cap must still fail the stage");
+
+        let recorded = events.lock().unwrap();
+        let failed = recorded
+            .iter()
+            .find_map(|e| match e {
+                WorkflowEvent::StageFailed {
+                    stage_name,
+                    reason,
+                    cancelled,
+                } => Some((*stage_name, reason.clone(), *cancelled)),
+                _ => None,
+            })
+            .expect("a stage that hit its turn cap must say so");
+
+        assert_eq!(failed.0, "stage_2_turn_cap");
+        assert!(
+            failed.1.contains("max turns"),
+            "the reason must name the cap, got {:?}",
+            failed.1
+        );
+        assert!(!failed.2, "running out of turns is not a cancellation");
+
+        // The last word on this stage must not be a turn that never completed.
+        assert!(
+            !matches!(recorded.last(), Some(WorkflowEvent::StageTurn { .. })),
+            "a stalled-looking turn must not be the final event, got {:?}",
+            recorded.last()
         );
     }
 

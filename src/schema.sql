@@ -86,12 +86,26 @@ CREATE TABLE IF NOT EXISTS patchsets (
     embargo_until INTEGER,
     embargo_release_started_at INTEGER,
     slug TEXT, -- URL-friendly slug like "reponame-725" (repo-mrnum)
+    review_duration_seconds INTEGER, -- wall time from entering review to a final result
     FOREIGN KEY(thread_id) REFERENCES threads(id),
     FOREIGN KEY(cover_letter_message_id) REFERENCES messages(message_id),
     FOREIGN KEY(baseline_id) REFERENCES baselines(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_patchsets_status ON patchsets(status);
+
+-- Last known activity per unit of work, so a patchset stranded by a daemon
+-- restart can still explain what it was doing. Live state lives in memory;
+-- this is the durable fallback, and rows are deleted when work completes.
+CREATE TABLE IF NOT EXISTS patchset_activity (
+    key TEXT PRIMARY KEY,        -- "patchset:42", "patchset:42/patch:7/stage:5", "commit:<sha>"
+    patchset_id INTEGER,         -- NULL for commit-keyed fetch work
+    phase TEXT NOT NULL,         -- serialized Phase
+    description TEXT NOT NULL,   -- human-readable summary
+    updated_at INTEGER NOT NULL  -- unix seconds of the last report
+);
+
+CREATE INDEX IF NOT EXISTS idx_patchset_activity_patchset ON patchset_activity(patchset_id);
 
 
 CREATE TABLE IF NOT EXISTS patches (
@@ -118,6 +132,10 @@ CREATE TABLE IF NOT EXISTS reviews (
     status TEXT DEFAULT 'Pending', -- Pending, In Review, Cancelled, Reviewed, Failed
     logs TEXT,
     inline_review TEXT,
+    stage_failures TEXT,  -- JSON array of stages that did not complete
+    attempt INTEGER,      -- 1-based; which retry of this patch produced this row
+    duration_seconds INTEGER,  -- wall time from the first attempt to this result, retries included
+    stage_durations TEXT,      -- JSON array of {stage, seconds} for this attempt
     baseline_id INTEGER,
     model TEXT,
     prompts_hash TEXT,
@@ -127,6 +145,21 @@ CREATE TABLE IF NOT EXISTS reviews (
     FOREIGN KEY(interaction_id) REFERENCES ai_interactions(id),
     FOREIGN KEY(baseline_id) REFERENCES baselines(id)
 );
+
+-- Conversation streamed while a review runs, so it can be read before it
+-- finishes. Truncated previews only: the complete log lands in reviews.logs at
+-- completion, and these rows are deleted then.
+CREATE TABLE IF NOT EXISTS review_log_entries (
+    id INTEGER PRIMARY KEY,
+    review_id INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    stage INTEGER,
+    role TEXT NOT NULL,
+    content TEXT,
+    created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_review_log_entries_review ON review_log_entries(review_id, seq);
 
 CREATE TABLE IF NOT EXISTS findings (
     id INTEGER PRIMARY KEY,
