@@ -3479,7 +3479,7 @@ dependencies = [
 
 [[package]]
 name = "sashiko"
-version = "0.3.3"
+version = "0.3.3+ricera"
 dependencies = [
  "anyhow",
  "async-trait",
