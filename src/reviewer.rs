@@ -2513,6 +2513,19 @@ async fn run_review_tool_with_cmd(
                                                                         call.arguments.to_string(),
                                                                     ),
                                                                     output_length: 0,
+                                                                    // Read from the call rather than
+                                                                    // assumed, so the default staying
+                                                                    // "review" is the tool's decision
+                                                                    // and not restated here.
+                                                                    repo: Some(
+                                                                        call.arguments
+                                                                            [crate::toolbox::REPO_ARG]
+                                                                            .as_str()
+                                                                            .unwrap_or(
+                                                                                crate::toolbox::REPO_ARG_REVIEW,
+                                                                            )
+                                                                            .to_string(),
+                                                                    ),
                                                                 })
                                                                 .await;
                                                         }

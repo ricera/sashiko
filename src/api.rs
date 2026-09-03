@@ -1102,11 +1102,25 @@ async fn get_patchset_activity(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchsetActivityQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Counted here rather than only in the patchset payload because this is the
+    // endpoint that gets polled while a review runs; the payload is fetched once
+    // at page load, so counts carried only there would sit frozen at whatever
+    // was true before the review started looking at anything.
+    let tool_calls = state
+        .db
+        .get_tool_call_counts(query.id)
+        .await
+        .unwrap_or_else(|e| {
+            error!("Failed to count tool calls for {}: {}", query.id, e);
+            serde_json::Value::Object(Default::default())
+        });
+
     let live = state.activity.patchset_snapshot(query.id);
     if !live.is_empty() {
         return Ok(Json(serde_json::json!({
             "live": true,
             "entries": live,
+            "tool_calls": tool_calls,
         })));
     }
 
@@ -1122,6 +1136,7 @@ async fn get_patchset_activity(
     Ok(Json(serde_json::json!({
         "live": false,
         "entries": last,
+        "tool_calls": tool_calls,
     })))
 }
 

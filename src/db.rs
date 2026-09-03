@@ -159,6 +159,9 @@ pub struct ToolUsage {
     pub tool_name: String,
     pub arguments: Option<String>,
     pub output_length: i64,
+    /// Which repository the call read. Derived from the call's own `repo`
+    /// argument, so it stays right if the default ever changes.
+    pub repo: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -631,6 +634,7 @@ impl Database {
         let _ = self
             .try_add_column("reviews", "inline_review", "TEXT")
             .await;
+        let _ = self.try_add_column("tool_usages", "repo", "TEXT").await;
         let _ = self
             .try_add_column("reviews", "stage_failures", "TEXT")
             .await;
@@ -1446,8 +1450,8 @@ impl Database {
 
     pub async fn create_tool_usage(&self, usage: ToolUsage) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tool_usages (review_id, provider, model, tool_name, arguments, output_length, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO tool_usages (review_id, provider, model, tool_name, arguments, output_length, repo, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             libsql::params![
                 usage.review_id,
                 usage.provider,
@@ -1455,6 +1459,7 @@ impl Database {
                 usage.tool_name,
                 usage.arguments,
                 usage.output_length,
+                usage.repo,
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs() as i64
             ],
         ).await?;
@@ -1762,6 +1767,43 @@ impl Database {
             "total_failures": total_failures,
             "reviews": stats
         }))
+    }
+
+    /// Tool calls made by each review of a patchset, so far.
+    ///
+    /// Keyed by review id and counted live: rows are written as each call is
+    /// dispatched, so this rises while a review runs. The reference count is
+    /// broken out separately because "how much did it look at the kernel" and
+    /// "how much did it look at all" answer different questions -- on an
+    /// out-of-tree review, a reference count of zero means the grounding was
+    /// available and unused.
+    pub async fn get_tool_call_counts(&self, patchset_id: i64) -> Result<serde_json::Value> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT r.id,
+                        COUNT(tu.id),
+                        COALESCE(SUM(CASE WHEN tu.repo = 'kernel' THEN 1 ELSE 0 END), 0)
+                 FROM reviews r
+                 LEFT JOIN tool_usages tu ON tu.review_id = r.id
+                 WHERE r.patchset_id = ?
+                 GROUP BY r.id",
+                libsql::params![patchset_id],
+            )
+            .await?;
+
+        let mut counts = serde_json::Map::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let review_id: i64 = row.get(0)?;
+            counts.insert(
+                review_id.to_string(),
+                json!({
+                    "total": row.get::<i64>(1).unwrap_or(0),
+                    "reference": row.get::<i64>(2).unwrap_or(0),
+                }),
+            );
+        }
+        Ok(serde_json::Value::Object(counts))
     }
 
     pub async fn get_tool_usage_stats(&self) -> Result<serde_json::Value> {
@@ -3406,7 +3448,9 @@ impl Database {
             }
             let query_str = format!(
                 "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.stage_failures, r.attempt, r.duration_seconds, r.stage_durations
+                        r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.stage_failures, r.attempt, r.duration_seconds, r.stage_durations,
+                        (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id) AS tool_calls,
+                        (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id AND tu.repo = 'kernel') AS reference_tool_calls
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -3442,6 +3486,11 @@ impl Database {
                     "duration_seconds": r.get::<Option<i64>>(15).ok().flatten(),
                     "stage_durations": r.get::<Option<String>>(16).ok().flatten()
                         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    // How much looking the review did, and how much of it was at
+                    // the reference kernel rather than at the code under review.
+                    // The two answer different questions.
+                    "tool_calls": r.get::<i64>(17).ok(),
+                    "reference_tool_calls": r.get::<i64>(18).ok(),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -3660,7 +3709,9 @@ impl Database {
             }
             let query_str = format!(
                 "SELECT r.summary, r.created_at, ai.output_raw, 
-                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.stage_failures, r.attempt, r.duration_seconds, r.stage_durations
+                        r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.stage_failures, r.attempt, r.duration_seconds, r.stage_durations,
+                        (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id) AS tool_calls,
+                        (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id AND tu.repo = 'kernel') AS reference_tool_calls
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -3696,6 +3747,10 @@ impl Database {
                     "duration_seconds": r.get::<Option<i64>>(13).ok().flatten(),
                     "stage_durations": r.get::<Option<String>>(14).ok().flatten()
                         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                    // How much looking the review did, and how much of it was at
+                    // the reference kernel rather than at the code under review.
+                    "tool_calls": r.get::<i64>(15).ok(),
+                    "reference_tool_calls": r.get::<i64>(16).ok(),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -8513,6 +8568,7 @@ mod tests {
             tool_name: "git_grep".to_string(),
             arguments: Some("{\"pattern\":\"gup_fast\"}".to_string()),
             output_length: 0,
+            repo: None,
         })
         .await
         .unwrap();
@@ -8731,6 +8787,76 @@ mod tests {
             .await
             .unwrap();
         rows.next().await.unwrap().unwrap().get(0).ok()
+    }
+
+    /// Counts have to rise while a review runs, not appear once it ends: the
+    /// number is most useful as a sign of life on a review that looks stuck.
+    #[tokio::test]
+    async fn tool_calls_are_counted_per_review_and_split_by_repository() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover", thread_id, None, "a@e", "Cover", 100, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = add_part(&db, thread_id, 1, None).await;
+        let patch_id = db
+            .create_patch(ps_id, "msg_1", 1, "diff --git a/x.c b/x.c\n+int x;")
+            .await
+            .unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+
+        // A review that has not looked at anything yet still reports, as zero
+        // rather than as absent.
+        let counts = db.get_tool_call_counts(ps_id).await.unwrap();
+        assert_eq!(counts[review_id.to_string()]["total"], 0);
+        assert_eq!(counts[review_id.to_string()]["reference"], 0);
+
+        for (tool, repo) in [
+            ("git_grep", "review"),
+            ("git_show", "review"),
+            ("git_grep", "kernel"),
+        ] {
+            db.create_tool_usage(ToolUsage {
+                review_id,
+                provider: "mock".to_string(),
+                model: "mock".to_string(),
+                tool_name: tool.to_string(),
+                arguments: Some(format!(r#"{{"repo":"{repo}"}}"#)),
+                output_length: 0,
+                repo: Some(repo.to_string()),
+            })
+            .await
+            .unwrap();
+        }
+
+        let counts = db.get_tool_call_counts(ps_id).await.unwrap();
+        assert_eq!(counts[review_id.to_string()]["total"], 3);
+        assert_eq!(
+            counts[review_id.to_string()]["reference"],
+            1,
+            "only the call against the kernel tree counts as reference"
+        );
+
+        // And the same numbers reach the patchset payload the page is built
+        // from, so a fresh load agrees with what the poll has been showing.
+        let details = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        let review = details["reviews"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"].as_i64() == Some(review_id))
+            .expect("review present");
+        assert_eq!(review["tool_calls"], 3);
+        assert_eq!(review["reference_tool_calls"], 1);
     }
 
     /// A pull request is not one unit of review: every force-push is a
