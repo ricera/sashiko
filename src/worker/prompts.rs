@@ -146,21 +146,59 @@ fn compact_args(args: &Value) -> String {
 
 /// Unwraps a tool result envelope for display.
 ///
-/// Tool results reach the model as a JSON envelope -- `{"content": "...",
-/// "truncated": ..., ...}` -- serialised with `to_string()`, so every quote and
-/// newline in a diff arrives backslash-escaped. That is right for the model and
-/// unreadable for a person, which is all this preview is for. Anything that is
-/// not that envelope is passed through untouched.
+/// Tool results reach the model as a JSON envelope serialised with
+/// `to_string()`, so every quote and newline in a diff arrives
+/// backslash-escaped. That is right for the model, which needs the envelope to
+/// tell content from metadata, and unreadable for a person, which is all this
+/// preview is for.
+///
+/// Three envelope shapes are in use and all of them need unwrapping:
+/// `{"content": ...}` from most tools, `{"results": [...]}` from
+/// `git_read_files`, and `{"entries": [...]}` from `git_ls`. Anything else is
+/// passed through untouched rather than guessed at.
 fn unwrap_tool_envelope(body: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    let content = parsed.get("content")?.as_str()?;
+    let parsed: Value = serde_json::from_str(body).ok()?;
+    let obj = parsed.as_object()?;
+
+    let rendered = if let Some(content) = obj.get("content").and_then(Value::as_str) {
+        content.to_string()
+    } else if let Some(results) = obj.get("results").and_then(Value::as_array) {
+        // One entry per file requested, each with its own content or error.
+        // Headed by path: a run of files with no separator reads as one file
+        // whose contents make no sense together.
+        results
+            .iter()
+            .map(|r| {
+                let path = r["path"].as_str().unwrap_or("(unknown path)");
+                match (r["error"].as_str(), r["content"].as_str()) {
+                    (Some(error), _) => format!("--- {path}: {error}"),
+                    (None, Some(content)) => format!("--- {path}\n{content}"),
+                    (None, None) => format!("--- {path}"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else if let Some(entries) = obj.get("entries").and_then(Value::as_array) {
+        entries
+            .iter()
+            .map(|e| match (e["name"].as_str(), e["type"].as_str()) {
+                (Some(name), Some("tree")) => format!("{name}/"),
+                (Some(name), _) => name.to_string(),
+                (None, _) => e.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        return None;
+    };
+
     // Truncation is the one flag worth keeping: without it a clipped result
     // reads as a complete one.
     Some(
-        if parsed.get("truncated").and_then(Value::as_bool) == Some(true) {
-            format!("{content}\n[truncated]")
+        if obj.get("truncated").and_then(Value::as_bool) == Some(true) {
+            format!("{rendered}\n[truncated]")
         } else {
-            content.to_string()
+            rendered
         },
     )
 }

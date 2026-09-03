@@ -4070,6 +4070,74 @@ done
         assert_eq!(content, "not json at all");
     }
 
+    /// git_read_files and git_ls do not use the `{"content": ...}` envelope the
+    /// other tools do, so unwrapping only that shape left their results
+    /// backslash-escaped -- reported as stray `\` at the start of every line.
+    #[test]
+    fn streamed_multi_file_and_listing_results_are_unwrapped() {
+        use crate::worker::prompts::log_entry_event_for_test;
+
+        fn preview(envelope: serde_json::Value) -> String {
+            let msg = crate::ai::AiMessage {
+                role: crate::ai::AiRole::Tool,
+                content: Some(envelope.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: Some("c0".to_string()),
+            };
+            let crate::worker::prompts::WorkerProgressEvent::LogEntry { content, .. } =
+                log_entry_event_for_test(4, &msg)
+            else {
+                panic!("expected a log entry");
+            };
+            content
+        }
+
+        // git_read_files: one entry per file, and a per-file error is not the
+        // same thing as an empty file.
+        let content = preview(serde_json::json!({
+            "results": [
+                {
+                    "path": "drivers/net/x.c",
+                    "content": "int main(void)\n{\n\tchar *s = \"hi\";\n}\n",
+                    "total_lines": 4,
+                },
+                { "path": "drivers/net/missing.c", "error": "does not exist at HEAD" },
+            ]
+        }));
+        assert!(
+            !content.contains(r#"\""#),
+            "quotes must arrive unescaped: {content}"
+        );
+        assert!(!content.contains("\\n"), "newlines must be real: {content}");
+        assert!(content.contains("--- drivers/net/x.c"), "{content}");
+        assert!(content.contains("char *s = \"hi\";"), "{content}");
+        assert!(
+            content.contains("--- drivers/net/missing.c: does not exist at HEAD"),
+            "a per-file failure must still be visible: {content}"
+        );
+
+        // git_ls: entries, with directories distinguishable from files.
+        let content = preview(serde_json::json!({
+            "entries": [
+                { "name": "ionic", "type": "tree" },
+                { "name": "Makefile", "type": "file" },
+            ],
+            "truncated": true,
+        }));
+        assert!(content.contains("ionic/"), "{content}");
+        assert!(content.contains("Makefile"), "{content}");
+        assert!(
+            content.contains("[truncated]"),
+            "a clipped listing must not read as complete: {content}"
+        );
+
+        // An envelope shape we do not know is passed through, not mangled.
+        let content = preview(serde_json::json!({ "surprise": 1 }));
+        assert!(content.contains("surprise"), "{content}");
+    }
+
     /// The reported bug: a commit with a message but no file changes was
     /// reviewed, failed to apply, and retried three more times to fail
     /// identically. `extract_files_from_diff` returning nothing is the signal.
