@@ -21,6 +21,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
+use tracing::warn;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -402,6 +403,51 @@ impl ForgeProvider for GitLabForge {
 }
 
 /// Extract repository name from a URL
+/// The clone URL of the repository at `repo_path`, for fetching forge refs.
+///
+/// Prefers `origin`, then any other remote. Returns `None` when nothing usable
+/// is configured, which the caller reports rather than silently proceeding.
+async fn base_repository_url(repo_path: &std::path::Path) -> Option<String> {
+    let remotes = tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["remote"])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+
+    let listed = String::from_utf8_lossy(&remotes.stdout);
+    let names: Vec<&str> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    // `origin` first; the rest in whatever order git lists them.
+    for name in names
+        .iter()
+        .filter(|n| **n == "origin")
+        .chain(names.iter().filter(|n| **n != "origin"))
+    {
+        let output = tokio::process::Command::new("git")
+            .current_dir(repo_path)
+            .args(["remote", "get-url", name])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            continue;
+        }
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if is_safe_repo_url(&url) {
+            return Some(url);
+        }
+    }
+
+    None
+}
+
 /// Resolves a pull request number to the same metadata a webhook would carry.
 ///
 /// Shells out to `gh` rather than calling the forge API directly: run inside the
@@ -466,18 +512,23 @@ pub async fn resolve_pull_request(
         ));
     }
 
-    // Only set for a cross-fork PR; for a same-repo PR the commits are already
-    // reachable and the fetcher needs no remote.
-    let repo_url = match (
-        pr["headRepositoryOwner"]["login"].as_str(),
-        pr["headRepository"]["name"].as_str(),
-    ) {
-        (Some(owner), Some(name)) => {
-            let url = format!("https://github.com/{owner}/{name}.git");
-            is_safe_repo_url(&url).then_some(url)
-        }
-        _ => None,
-    };
+    // The *base* repository, which is this one -- `gh` was run inside it. That
+    // is deliberately not the head repository: a forge publishes the pull
+    // request ref (refs/pull/<n>/head) on the base, so a fork PR is fetched from
+    // here, not from the fork. Reading the remote locally also keeps this
+    // working on a self-hosted forge, which a hardcoded github.com URL would
+    // not.
+    //
+    // Without a URL the fetcher takes its "local repository, cannot fetch"
+    // branch and never fetches anything, so this is what makes the PR's commits
+    // reachable at all.
+    let repo_url = base_repository_url(repo_path).await;
+    if repo_url.is_none() {
+        warn!(
+            "No usable remote URL for {}; PR #{number} commits can only be reviewed if they are already present locally",
+            repo_path.display()
+        );
+    }
 
     Ok(ForgeMetadata {
         repo_url,
@@ -990,5 +1041,66 @@ mod tests {
         headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
         let body = Bytes::from("{}");
         assert!(forge.validate_event(&headers, &body, None).is_ok());
+    }
+
+    /// Without a URL here the fetcher takes its "local repository, cannot fetch"
+    /// branch and never fetches anything -- the PR's commits then have to
+    /// already be present, which for a pull request they are not.
+    #[tokio::test]
+    async fn base_repository_url_prefers_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        let git = |args: Vec<&str>| {
+            let status = std::process::Command::new("git")
+                .current_dir(repo)
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(vec!["init", "-q"]);
+
+        assert_eq!(
+            base_repository_url(repo).await,
+            None,
+            "a repository with no remotes has no URL to offer"
+        );
+
+        // Added second, chosen first: origin is the forge repository, and the
+        // pull request refs live there.
+        git(vec![
+            "remote",
+            "add",
+            "fork",
+            "https://example.invalid/fork.git",
+        ]);
+        git(vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/org/repo.git",
+        ]);
+        assert_eq!(
+            base_repository_url(repo).await.as_deref(),
+            Some("https://github.com/org/repo.git")
+        );
+
+        // A loopback remote is rejected rather than fetched from.
+        let dir2 = tempfile::tempdir().unwrap();
+        let repo2 = dir2.path();
+        let status = std::process::Command::new("git")
+            .current_dir(repo2)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .current_dir(repo2)
+            .args(["remote", "add", "origin", "http://127.0.0.1/evil.git"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(base_repository_url(repo2).await, None);
     }
 }

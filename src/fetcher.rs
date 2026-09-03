@@ -371,7 +371,11 @@ impl FetchAgent {
                     // optimistic fetch nor the all-heads fallback can see it.
                     // Best-effort: a remote that is not a forge simply has no
                     // such refs, which is not an error worth failing over.
-                    self.fetch_pull_refs(&remote_name, &missing_commits, &batch_tokens)
+                    // Keyed off `commit_list`, not `missing_commits`: a range is
+                    // split into its two endpoints for the presence check, so
+                    // the bare SHAs there never match the range the pull request
+                    // metadata is filed under.
+                    self.fetch_pull_refs(&remote_name, &commit_list, &batch_tokens)
                         .await;
 
                     if let Err(e) = self
@@ -732,10 +736,10 @@ impl FetchAgent {
     async fn fetch_pull_refs(
         &self,
         remote: &str,
-        missing: &[String],
+        commits: &[String],
         tokens: &[tokio_util::sync::CancellationToken],
     ) {
-        for commit_or_range in missing {
+        for commit_or_range in commits {
             let Some(number) = self
                 .mr_metadata
                 .get(commit_or_range)
@@ -1093,6 +1097,96 @@ mod tests {
 
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("git version"));
+        Ok(())
+    }
+
+    /// A pull request head lives outside refs/heads, so neither the optimistic
+    /// fetch nor the all-heads fallback can reach it. This is the only thing
+    /// that does.
+    ///
+    /// Also pins the keying: the presence check splits `base..head` into its two
+    /// endpoints, so the pull request metadata -- filed under the range -- is
+    /// not findable from the list of missing SHAs.
+    #[tokio::test]
+    async fn pull_request_heads_are_fetched_from_the_forge_ref() -> Result<()> {
+        let upstream_dir = tempfile::tempdir()?;
+        let upstream = upstream_dir.path().to_path_buf();
+        let local_dir = tempfile::tempdir()?;
+        let local = local_dir.path().to_path_buf();
+
+        let git = async |repo: &std::path::Path, args: Vec<&str>| -> Result<String> {
+            let out = Command::new("git")
+                .current_dir(repo)
+                .args(&args)
+                .output()
+                .await?;
+            assert!(
+                out.status.success(),
+                "git {args:?}: {:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+
+        for repo in [&upstream, &local] {
+            git(repo, vec!["init", "-q"]).await?;
+            git(repo, vec!["config", "user.name", "T"]).await?;
+            git(repo, vec!["config", "user.email", "t@e"]).await?;
+        }
+
+        git(
+            &upstream,
+            vec!["commit", "-q", "--allow-empty", "-m", "base"],
+        )
+        .await?;
+        let base = git(&upstream, vec!["rev-parse", "HEAD"]).await?;
+
+        // The PR head exists only under refs/pull/7/head, exactly as a forge
+        // publishes it for a fork PR: not on any branch.
+        git(&upstream, vec!["checkout", "-q", "-b", "pr-work"]).await?;
+        git(
+            &upstream,
+            vec!["commit", "-q", "--allow-empty", "-m", "pr commit"],
+        )
+        .await?;
+        let head = git(&upstream, vec!["rev-parse", "HEAD"]).await?;
+        git(&upstream, vec!["update-ref", "refs/pull/7/head", &head]).await?;
+        git(&upstream, vec!["checkout", "-q", "master"]).await?;
+        git(&upstream, vec!["branch", "-q", "-D", "pr-work"]).await?;
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (mut agent, _) = FetchAgent::new(
+            local.clone(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+            CancelRegistry::new(),
+        );
+
+        git(
+            &local,
+            vec!["remote", "add", "origin", upstream.to_str().unwrap()],
+        )
+        .await?;
+        git(&local, vec!["fetch", "-q", "origin"]).await?;
+
+        let range = format!("{base}..{head}");
+        assert!(
+            !agent.is_present(&range).await,
+            "the PR head must not be reachable from refs/heads alone"
+        );
+
+        agent
+            .mr_metadata
+            .insert(range.clone(), (None, None, Some(7)));
+        agent
+            .fetch_pull_refs("origin", std::slice::from_ref(&range), &[])
+            .await;
+
+        assert!(
+            agent.is_present(&range).await,
+            "the forge ref must make the range resolvable"
+        );
         Ok(())
     }
 
