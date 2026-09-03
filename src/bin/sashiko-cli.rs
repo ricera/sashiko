@@ -161,8 +161,14 @@ enum Commands {
     },
     /// Request a re-review of a completed patchset
     Rerun {
-        /// ID of the patchset to re-review
-        id: i64,
+        /// ID of the patchset to re-review. Omit when using --pr.
+        id: Option<i64>,
+
+        /// Re-review a pull request by number, e.g. --pr 20. Resolves the PR's
+        /// current head first, so a force-pushed PR is reviewed as it is now
+        /// rather than as it was.
+        #[arg(long, conflicts_with = "id")]
+        pr: Option<i64>,
     },
     /// Cancel a pending review
     Cancel {
@@ -336,7 +342,13 @@ async fn run_command(
             };
             handle_show(client, base_url, id, watch, format, opts).await
         }
-        Commands::Rerun { id } => handle_rerun(client, base_url, id, format).await,
+        Commands::Rerun { id, pr } => match (id, pr) {
+            (_, Some(number)) => handle_pr_review(client, base_url, number, format).await,
+            (Some(id), None) => handle_rerun(client, base_url, id, format).await,
+            (None, None) => Err(anyhow::anyhow!(
+                "Give a patchset id or --pr <number>: `sashiko-cli rerun 42` or `sashiko-cli rerun --pr 20`"
+            )),
+        },
         Commands::Cancel { id, force } => handle_cancel(client, base_url, id, force, format).await,
         Commands::Local {
             input,
@@ -377,6 +389,15 @@ async fn handle_submit(
     b4_cover_letter: bool,
     format: OutputFormat,
 ) -> Result<()> {
+    // A pull request reference is not a git object, so it is recognised before
+    // type detection rather than inside it: `#20` would otherwise fall through
+    // to "assume commit ref" and fail against the repository.
+    if explicit_type.is_none()
+        && let Some(number) = input.as_deref().and_then(parse_pr_reference)
+    {
+        return handle_pr_review(client, base_url, number, format).await;
+    }
+
     let url = format!("{}/api/submit", base_url);
 
     // DWIM Detection Logic
@@ -1847,6 +1868,101 @@ async fn handle_rerun(
     Ok(())
 }
 
+/// Reviews or re-reviews a pull request by number.
+///
+/// The daemon does the resolving: it is the process that knows which repository
+/// it watches and has credentials for the forge, and routing through it keeps a
+/// hand-triggered review identical to the one the webhook would have run.
+/// Recognises the ways someone refers to a pull request.
+///
+/// Accepts `#20`, `pr/20`, `PR20`, and a full GitHub or GitLab URL. A bare `20`
+/// is deliberately not accepted: it is a valid git revision, and silently
+/// treating it as a pull request would review the wrong thing without saying so.
+fn parse_pr_reference(input: &str) -> Option<i64> {
+    let input = input.trim();
+
+    if let Some(rest) = input.strip_prefix('#') {
+        return rest.parse().ok().filter(|n| *n > 0);
+    }
+
+    let lowered = input.to_ascii_lowercase();
+    for prefix in ["pr/", "pr#", "pr-", "pr"] {
+        if let Some(rest) = lowered.strip_prefix(prefix)
+            && let Ok(number) = rest.parse::<i64>()
+            && number > 0
+        {
+            return Some(number);
+        }
+    }
+
+    // .../pull/20, .../pull/20/files, .../-/merge_requests/20
+    if lowered.starts_with("http://") || lowered.starts_with("https://") {
+        let parts: Vec<&str> = lowered.trim_end_matches('/').split('/').collect();
+        for (i, part) in parts.iter().enumerate() {
+            if matches!(*part, "pull" | "pulls" | "merge_requests")
+                && let Some(number) = parts.get(i + 1).and_then(|n| n.parse::<i64>().ok())
+                && number > 0
+            {
+                return Some(number);
+            }
+        }
+    }
+
+    None
+}
+
+async fn handle_pr_review(
+    client: &Client,
+    base_url: &str,
+    number: i64,
+    format: OutputFormat,
+) -> Result<()> {
+    let url = format!("{}/api/pr/review?number={}", base_url, number);
+    let resp = client.post(&url).send().await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!(
+            "Could not review PR #{} ({}): {}",
+            number,
+            status,
+            text
+        ));
+    }
+
+    let result: serde_json::Value = resp.json().await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&result)?),
+        OutputFormat::Text => {
+            let message = result["message"].as_str();
+            match result["status"].as_str() {
+                Some("accepted") => {
+                    print_colored(Color::Green, "Queued: ");
+                    println!("{}", message.unwrap_or("Pull request queued for review."));
+                }
+                _ => {
+                    print_colored(Color::Yellow, "Not queued: ");
+                    println!(
+                        "{}",
+                        message
+                            .or(result["reason"].as_str())
+                            .unwrap_or("The pull request could not be queued.")
+                    );
+                }
+            }
+            // A stale re-review reports the PR number it was asked for, so say
+            // plainly that it may not be the PR's current code.
+            if result["stale"].as_bool() == Some(true) {
+                print_colored(Color::Yellow, "Warning: ");
+                println!("reviewing the last known range; new commits may be missing.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn handle_cancel(
     client: &Client,
     base_url: &str,
@@ -2484,6 +2600,40 @@ fn format_timestamp(ts: i64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn pr_references_are_recognised_without_swallowing_git_revisions() {
+        for (input, expected) in [
+            ("#20", 20),
+            (" #20 ", 20),
+            ("pr/20", 20),
+            ("PR20", 20),
+            ("pr#20", 20),
+            ("https://github.com/ricera/sashiko/pull/20", 20),
+            ("https://github.com/ricera/sashiko/pull/20/files", 20),
+            ("https://gitlab.com/org/repo/-/merge_requests/7", 7),
+        ] {
+            assert_eq!(parse_pr_reference(input), Some(expected), "{input}");
+        }
+
+        // A bare number is a valid git revision. Treating it as a pull request
+        // would review something other than what was asked for, silently.
+        assert_eq!(parse_pr_reference("20"), None);
+        // Ordinary submit inputs must fall through to type detection untouched.
+        for input in [
+            "HEAD",
+            "HEAD~3..HEAD",
+            "ffad4278c2ac",
+            "ffad4278c2ac^..11016c795eec",
+            "/tmp/series.mbox",
+            "20260101.abcdef@lore.kernel.org",
+            "#0",
+            "#-1",
+            "#abc",
+        ] {
+            assert_eq!(parse_pr_reference(input), None, "{input}");
+        }
+    }
 
     #[test]
     fn test_format_subject_handles_multibyte_cutoff() {

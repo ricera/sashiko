@@ -75,6 +75,17 @@ git format-patch --stdout HEAD~2..HEAD | sashiko-cli submit
 sashiko-cli submit https://lore.kernel.org/linux-kernel/some-msgid/
 ```
 
+A pull request reference is recognised and routed to the same path as
+`rerun --pr`: `#20`, `pr/20`, or a full pull request URL.
+
+```
+sashiko-cli submit '#20'
+sashiko-cli submit https://github.com/org/repo/pull/20
+```
+
+A bare `20` is *not* treated as a pull request — it is a valid git revision, and
+guessing there would review the wrong thing without saying so.
+
 ### status
 
 Show server status and queue statistics.
@@ -128,13 +139,40 @@ sashiko-cli show [OPTIONS] [ID]
 
 ### rerun
 
-Request a re-review of a completed patchset.
+Request a re-review of a completed patchset, or of a pull request.
 
 ```
 sashiko-cli rerun <ID>
+sashiko-cli rerun --pr <NUMBER>
 ```
 
 `ID` is a numeric patchset ID.
+
+**Options:**
+
+| Flag | Description |
+|------|-------------|
+| `--pr <NUMBER>` | Review or re-review a pull request by number, against the repository the daemon watches. Mutually exclusive with `ID`. |
+
+`--pr` resolves the pull request's current head before doing anything, so a
+force-pushed PR is reviewed as it is now rather than as it was. If that head
+matches a patchset already ingested, the existing one is re-run; if the PR has
+new commits, or was never seen, it is queued as a new review through the same
+path the webhook uses.
+
+Resolving a PR needs the GitHub CLI (`gh`) installed and authenticated on the
+**daemon** host — it runs inside the configured repository, so it infers the
+owner and name from the git remote. If `gh` is unavailable but the PR has been
+reviewed before, the last known range is re-run and the output says so:
+
+```
+Not queued: Could not reach the forge to check PR #20 for new commits; ...
+Warning: reviewing the last known range; new commits may be missing.
+```
+
+Note that pull requests are normally ingested automatically by the forge
+webhook (see [GITHUB_SETUP.md](GITHUB_SETUP.md)); `--pr` is for re-reviewing on
+demand, and for repositories where no webhook is configured.
 
 ### cancel
 

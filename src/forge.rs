@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::http::{HeaderMap, StatusCode};
 use base64::Engine;
 use bytes::Bytes;
@@ -402,6 +402,93 @@ impl ForgeProvider for GitLabForge {
 }
 
 /// Extract repository name from a URL
+/// Resolves a pull request number to the same metadata a webhook would carry.
+///
+/// Shells out to `gh` rather than calling the forge API directly: run inside the
+/// configured repository, `gh` infers owner and name from the git remote and
+/// reuses the operator's existing credentials, so this needs neither a repo slug
+/// in the settings nor a second copy of the token plumbing.
+///
+/// The SHAs come back as `baseRefOid`/`headRefOid` -- the resolved commits, not
+/// the branch names. A branch name would re-resolve at fetch time and could name
+/// a different commit than the one the review claims to have looked at.
+pub async fn resolve_pull_request(
+    repo_path: &std::path::Path,
+    number: i64,
+) -> Result<ForgeMetadata> {
+    if number <= 0 {
+        return Err(anyhow!(
+            "Pull request number must be positive, got {number}"
+        ));
+    }
+
+    let output = tokio::process::Command::new("gh")
+        .current_dir(repo_path)
+        .args(["pr", "view", &number.to_string()])
+        .args([
+            "--json",
+            "number,title,url,baseRefOid,headRefOid,headRepository,headRepositoryOwner",
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to run `gh` to resolve PR #{number}: {e}.                  Reviewing a pull request sashiko has not already ingested needs the GitHub CLI                  installed and authenticated on the daemon host."
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh pr view {number} failed in {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let pr: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow!("Could not parse `gh pr view` output for #{number}: {e}"))?;
+
+    let base_sha = pr["baseRefOid"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gh returned no baseRefOid for PR #{number}"))?
+        .to_string();
+    let head_sha = pr["headRefOid"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gh returned no headRefOid for PR #{number}"))?
+        .to_string();
+
+    // Same validation the webhook applies; `gh` output is not more trusted than
+    // a payload just because we asked for it.
+    if !is_valid_git_sha(&base_sha) || !is_valid_git_sha(&head_sha) {
+        return Err(anyhow!(
+            "gh returned a malformed SHA for PR #{number}: {base_sha}..{head_sha}"
+        ));
+    }
+
+    // Only set for a cross-fork PR; for a same-repo PR the commits are already
+    // reachable and the fetcher needs no remote.
+    let repo_url = match (
+        pr["headRepositoryOwner"]["login"].as_str(),
+        pr["headRepository"]["name"].as_str(),
+    ) {
+        (Some(owner), Some(name)) => {
+            let url = format!("https://github.com/{owner}/{name}.git");
+            is_safe_repo_url(&url).then_some(url)
+        }
+        _ => None,
+    };
+
+    Ok(ForgeMetadata {
+        repo_url,
+        base_sha,
+        head_sha,
+        pr_number: number,
+        pr_title: pr["title"].as_str().map(str::to_string),
+        pr_url: pr["url"].as_str().map(str::to_string),
+    })
+}
+
 pub fn extract_repo_name_from_url(url: &str) -> String {
     url.trim_end_matches('/')
         .split('/')

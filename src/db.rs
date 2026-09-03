@@ -4327,6 +4327,54 @@ impl Database {
         self.rerun_patchset(patchset_id).await
     }
 
+    /// Finds the patchset ingested for one exact pull request range.
+    ///
+    /// The range is part of the identity on purpose: after a force-push, PR #20
+    /// names different code than it did, and re-reviewing the stored patchset
+    /// would review commits that are no longer in the pull request.
+    pub async fn get_patchset_id_by_pr_range(
+        &self,
+        mr_number: i64,
+        commit_range: &str,
+    ) -> Result<Option<i64>> {
+        let placeholder_id = format!("mr-{}-{}", mr_number, commit_range);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM patchsets WHERE cover_letter_message_id = ? ORDER BY id DESC LIMIT 1",
+                libsql::params![placeholder_id],
+            )
+            .await?;
+
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<i64>(0).ok(),
+            None => None,
+        })
+    }
+
+    /// Finds the patchset already ingested for a pull request number.
+    ///
+    /// Newest first: a PR that was force-pushed produces one patchset per range
+    /// it has had, and the current head is the one a re-review means. Failed and
+    /// cancelled rows are excluded so a re-review after a failure starts fresh
+    /// rather than reusing the record that failed.
+    pub async fn get_patchset_id_by_mr_number(&self, mr_number: i64) -> Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM patchsets WHERE mr_number = ? \
+                 AND status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') \
+                 ORDER BY id DESC LIMIT 1",
+                libsql::params![mr_number],
+            )
+            .await?;
+
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<i64>(0).ok(),
+            None => None,
+        })
+    }
+
     pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
         let candidates = Self::get_msgid_candidates(msgid);
         for clid in &candidates {
