@@ -570,7 +570,7 @@ impl Reviewer {
         let (found_baseline, patch_commits, logs) =
             Self::prepare_baseline_worktree(&ctx, patchset_id, &candidates, &diffs).await;
 
-        let prompts_hash = Some(env!("GIT_HASH"));
+        let prompts_hash = Some(crate::prompt_bundle::GIT_HASH);
 
         // Save findings to patchset
         if let Some((resolution, baseline_id, worktree)) = found_baseline {

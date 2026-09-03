@@ -1323,7 +1323,7 @@ async fn get_config(
         "project_description": state.settings.project.description,
         "forge_enabled": state.settings.forge.enabled,
         "version": env!("CARGO_PKG_VERSION"),
-        "git_hash": env!("GIT_HASH"),
+        "git_hash": crate::prompt_bundle::GIT_HASH,
     })))
 }
 
