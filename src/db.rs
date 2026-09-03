@@ -2657,6 +2657,31 @@ impl Database {
                         .await?;
                 }
 
+                // Forge identity moves with the rest. The slug is what the web
+                // UI links to, so losing it with the row turns every existing
+                // link into a 404 and leaves the surviving patchset reachable
+                // only by its numeric id.
+                //
+                // Read before the delete and written after it, because `slug`
+                // is UNIQUE: assigning it to the target while the source still
+                // holds it fails the constraint and aborts the whole merge.
+                let mut identity = self
+                    .conn
+                    .query(
+                        "SELECT slug, mr_url, mr_title, mr_number FROM patchsets WHERE id = ?",
+                        libsql::params![merge_from_id],
+                    )
+                    .await?;
+                let identity = match identity.next().await? {
+                    Some(row) => (
+                        row.get::<Option<String>>(0).ok().flatten(),
+                        row.get::<Option<String>>(1).ok().flatten(),
+                        row.get::<Option<String>>(2).ok().flatten(),
+                        row.get::<Option<i64>>(3).ok().flatten(),
+                    ),
+                    None => (None, None, None, None),
+                };
+
                 // Delete the merged patchset
                 self.conn
                     .execute(
@@ -2664,6 +2689,23 @@ impl Database {
                         libsql::params![merge_from_id],
                     )
                     .await?;
+
+                // COALESCE so a target that already knows who it is keeps its
+                // own answer rather than adopting the merged row's.
+                let (slug, mr_url, mr_title, mr_number) = identity;
+                if slug.is_some() || mr_url.is_some() || mr_title.is_some() || mr_number.is_some() {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET
+                                slug = COALESCE(slug, ?),
+                                mr_url = COALESCE(mr_url, ?),
+                                mr_title = COALESCE(mr_title, ?),
+                                mr_number = COALESCE(mr_number, ?)
+                             WHERE id = ?",
+                            libsql::params![slug, mr_url, mr_title, mr_number, target_id],
+                        )
+                        .await?;
+                }
             }
 
             // Update the target patchset
@@ -8987,6 +9029,67 @@ mod tests {
             Some(base),
             "the merged-away patchset's baseline must survive the merge"
         );
+    }
+
+    /// The reported symptom: a review reachable by numeric id but 404 by its
+    /// link, with the log saying "Patchset not found: 25-25".
+    ///
+    /// The merge carries patches, reviews, subsystems and the baseline to the
+    /// surviving row, then deletes the other. Forge identity was not on that
+    /// list, so when the merged-away row was the one holding the slug, every
+    /// link built from it pointed at a row that no longer existed.
+    #[tokio::test]
+    async fn forge_identity_survives_patchset_merge() {
+        let db = setup_db().await;
+        let thread_hi = db
+            .create_thread("root_hi", "Subject", 100_000)
+            .await
+            .unwrap();
+        let thread_lo = db
+            .create_thread("root_lo", "Subject", 250_000)
+            .await
+            .unwrap();
+        let thread_mid = db
+            .create_thread("root_mid", "Subject", 175_000)
+            .await
+            .unwrap();
+
+        let ps_hi = add_unthreaded_part(&db, thread_hi, 2, 100_000, None).await;
+        let ps_lo = add_unthreaded_part(&db, thread_lo, 1, 250_000, None).await;
+        assert_ne!(ps_hi, ps_lo);
+
+        // The row that will be merged away is the one that knows it is a pull
+        // request -- the placeholder the forge created.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET slug = ?, mr_url = ?, mr_title = ?, mr_number = ? WHERE id = ?",
+                libsql::params![
+                    "linux-pds-25",
+                    "https://github.com/org/linux-pds/pull/25",
+                    "pds: fixes",
+                    25_i64,
+                    ps_lo
+                ],
+            )
+            .await
+            .unwrap();
+
+        let ps_id = add_unthreaded_part(&db, thread_mid, 3, 175_000, None).await;
+        assert_eq!(ps_id, ps_hi, "the merge keeps the patchset created first");
+
+        let details = db
+            .get_patchset_details_by_slug("linux-pds-25", None, None)
+            .await
+            .unwrap()
+            .expect("the slug must still resolve after the merge");
+        assert_eq!(details["id"].as_i64(), Some(ps_id));
+        assert_eq!(
+            details["mr_url"].as_str(),
+            Some("https://github.com/org/linux-pds/pull/25")
+        );
+
+        let id = db.get_patchset_id_by_mr_number(25).await.unwrap();
+        assert_eq!(id, Some(ps_id), "a re-review must find the surviving row");
     }
 
     /// Verify that a commit SHA submitted as a singleton does NOT steal
