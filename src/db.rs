@@ -225,6 +225,20 @@ pub struct PatchworkOutboxRow {
     pub created_at: i64,
 }
 
+/// Cover-letter id for the patchset a pull request is reviewed in.
+///
+/// The `@sashiko.local` suffix is not decoration. Ingestion derives a patchset's
+/// cover-letter id with `resolve_root_msg_id`, which appends it to the article
+/// id for every GitFetch article. A placeholder created without it can never be
+/// matched, so the review builds a fresh patchset beside it and the placeholder
+/// sits in "Fetching" forever -- two rows for one pull request.
+///
+/// Both the writer (`enqueue_pull_request`) and the reader
+/// (`get_patchset_id_by_pr_range`) go through here so they cannot drift.
+pub fn pr_placeholder_id(mr_number: i64, commit_range: &str) -> String {
+    format!("mr-{}-{}@sashiko.local", mr_number, commit_range)
+}
+
 impl Database {
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
@@ -4350,7 +4364,7 @@ impl Database {
         mr_number: i64,
         commit_range: &str,
     ) -> Result<Option<i64>> {
-        let placeholder_id = format!("mr-{}-{}", mr_number, commit_range);
+        let placeholder_id = pr_placeholder_id(mr_number, commit_range);
         let mut rows = self
             .conn
             .query(
@@ -8583,6 +8597,96 @@ mod tests {
             .await
             .unwrap();
         rows.next().await.unwrap().unwrap().get(0).ok()
+    }
+
+    /// The reported symptom: two rows per pull request, one stuck forever in
+    /// "Fetching GitHub PR/MR: ..." and a second carrying the actual review.
+    ///
+    /// The placeholder is adopted by cover-letter id, and ingestion derives that
+    /// id for a GitFetch article by appending `@sashiko.local`. A placeholder
+    /// created without the suffix can never be matched, so the review builds a
+    /// fresh patchset beside it.
+    #[tokio::test]
+    async fn pull_request_placeholder_is_adopted_not_duplicated() {
+        let db = setup_db().await;
+        let range = "aaaa..bbbb";
+        let number = 941;
+
+        // Exactly as enqueue_pull_request creates it.
+        let placeholder_id = pr_placeholder_id(number, range);
+        let placeholder = db
+            .create_fetching_patchset(
+                &placeholder_id,
+                "Fetching GitHub PR/MR: ionic: fixes",
+                None,
+                None,
+                Some("https://github.com/org/repo/pull/941"),
+                Some("ionic: fixes"),
+                Some(number),
+                Some("repo-941"),
+            )
+            .await
+            .unwrap();
+
+        // And exactly as ingestion addresses it: resolve_root_msg_id appends the
+        // suffix to the fetcher's article id for every GitFetch article.
+        let article_id = format!("mr-{number}-{range}");
+        let root_msg_id = format!("{article_id}@sashiko.local");
+        let thread_id = db
+            .create_thread(&root_msg_id, "Subject", 100)
+            .await
+            .unwrap();
+        db.create_message(
+            "sha1",
+            thread_id,
+            Some(&root_msg_id),
+            "a@e",
+            "p",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let adopted = db
+            .create_patchset(
+                thread_id,
+                Some(&root_msg_id),
+                "sha1",
+                "!941: ionic: fixes",
+                "a@e",
+                100,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+
+        assert_eq!(
+            adopted, placeholder,
+            "the review must land in the placeholder, not beside it"
+        );
+
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM patchsets", ())
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 1, "one pull request must not produce two rows");
     }
 
     /// A pull request's base is stated by the forge, not inferred. It has to

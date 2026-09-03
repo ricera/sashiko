@@ -1466,7 +1466,7 @@ async fn enqueue_pull_request(
     let subject = metadata.pr_title.as_deref().unwrap_or(&default_subject);
 
     let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
-    let placeholder_id = format!("mr-{}-{}", metadata.pr_number, commit_range);
+    let placeholder_id = crate::db::pr_placeholder_id(metadata.pr_number, &commit_range);
 
     let slug = metadata.pr_url.as_ref().map(|url| {
         let repo = crate::forge::extract_repo_name_from_url(url);

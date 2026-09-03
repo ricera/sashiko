@@ -748,6 +748,7 @@ impl FetchAgent {
                 continue;
             };
 
+            let mut failures = Vec::new();
             for namespace in ["pull", "merge-requests"] {
                 let refspec = format!(
                     "+refs/{}/{}/head:refs/sashiko/{}/{}",
@@ -773,6 +774,7 @@ impl FetchAgent {
                 match fetched {
                     Ok(()) => {
                         info!("Fetched {} #{} head from {}", namespace, number, remote);
+                        failures.clear();
                         break;
                     }
                     Err(e) if is_cancellation(&e) => return,
@@ -784,8 +786,26 @@ impl FetchAgent {
                             remote,
                             e.to_string().trim()
                         );
+                        failures.push(format!("{}: {}", namespace, e.to_string().trim()));
                     }
                 }
+            }
+
+            // We know this is a pull request -- it has a number -- so both
+            // namespaces failing is worth saying out loud. Left at debug, a
+            // private repository with no credentials on the host looks
+            // identical to a healthy fetch until the range fails to resolve two
+            // stages later, naming a SHA instead of the reason.
+            if !failures.is_empty() {
+                warn!(
+                    "Could not fetch the forge ref for #{} from {}; if {} is private, the daemon \
+                     host needs git credentials for it (`gh auth login && gh auth setup-git`, or \
+                     an SSH remote). Tried {}",
+                    number,
+                    remote,
+                    remote,
+                    failures.join("; ")
+                );
             }
         }
     }
