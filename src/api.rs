@@ -1478,13 +1478,15 @@ async fn enqueue_pull_request(
     let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
     let placeholder_id = crate::db::pr_placeholder_id(metadata.pr_number, &commit_range);
 
-    // The slug is what the web UI puts in its links, so a wrong one is a link
-    // that resolves to nothing.
+    // Per revision, not per pull request: a force-push or an added commit is a
+    // different range and gets its own patchset, and each keeps a link that
+    // never moves. `<repo>-<number>` is resolved to the newest of them at
+    // lookup time rather than being stored on any one row.
     let slug = metadata
         .pr_url
         .as_ref()
         .and_then(|url| crate::forge::extract_repo_name_from_request_url(url))
-        .map(|repo| format!("{}-{}", repo, metadata.pr_number));
+        .map(|repo| crate::db::pr_slug(&repo, metadata.pr_number, &metadata.head_sha));
 
     // Captured so the fetch agent can tie this commit to a cancellable patchset.
     let placeholder_patchset_id = state
@@ -1532,6 +1534,18 @@ async fn enqueue_pull_request(
         warn!(
             "Could not record declared baseline {} for patchset {}: {}",
             metadata.base_sha, placeholder_patchset_id, e
+        );
+    }
+
+    // Earlier revisions stay browsable, but must not read as current.
+    if let Err(e) = state
+        .db
+        .mark_superseded_pr_revisions(metadata.pr_number, placeholder_patchset_id)
+        .await
+    {
+        warn!(
+            "Could not mark earlier revisions of #{} as superseded: {}",
+            metadata.pr_number, e
         );
     }
 

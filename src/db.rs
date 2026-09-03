@@ -225,6 +225,22 @@ pub struct PatchworkOutboxRow {
     pub created_at: i64,
 }
 
+/// Permanent slug for one pull request revision.
+///
+/// The head SHA is part of the identity because a pull request is not one
+/// unit of review: every force-push or added commit is a different range, and
+/// each gets its own patchset. A slug of `<repo>-<number>` alone could name
+/// only one of them, and moving it as the pull request advanced would break
+/// every link already handed out for the older review.
+///
+/// The bare `<repo>-<number>` form is deliberately never stored. It is resolved
+/// at lookup time to whichever revision is newest -- see
+/// [`Database::resolve_patchset_slug`].
+pub fn pr_slug(repo: &str, mr_number: i64, head_sha: &str) -> String {
+    let short: String = head_sha.chars().take(8).collect();
+    format!("{}-{}-{}", repo, mr_number, short)
+}
+
 /// Cover-letter id for the patchset a pull request is reviewed in.
 ///
 /// The `@sashiko.local` suffix is not decoration. Ingestion derives a patchset's
@@ -3785,12 +3801,15 @@ impl Database {
         Ok(None)
     }
 
-    pub async fn get_patchset_details_by_slug(
-        &self,
-        slug: &str,
-        page: Option<u32>,
-        limit: Option<u32>,
-    ) -> Result<Option<serde_json::Value>> {
+    /// Maps a slug from a URL onto a patchset id.
+    ///
+    /// An exact match wins, so a stored slug always resolves to its own row --
+    /// including for a repository whose name happens to end in digits. Failing
+    /// that, a trailing `-<number>` is read as a pull request number and
+    /// resolved to the newest revision of it, which is what makes
+    /// `<repo>-<number>` a stable link to "the current review of this PR"
+    /// without any row having to own that name.
+    pub async fn resolve_patchset_slug(&self, slug: &str) -> Result<Option<i64>> {
         let mut rows = self
             .conn
             .query(
@@ -3799,11 +3818,93 @@ impl Database {
             )
             .await?;
         if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
+            return Ok(row.get::<i64>(0).ok());
         }
 
-        Ok(None)
+        let Some(number) = slug
+            .rsplit_once('-')
+            .and_then(|(_, tail)| tail.parse::<i64>().ok())
+            .filter(|n| *n > 0)
+        else {
+            return Ok(None);
+        };
+
+        // Newest revision, whatever its status: a link to the current review
+        // should still resolve while that review is failing or cancelled.
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM patchsets WHERE mr_number = ? ORDER BY id DESC LIMIT 1",
+                libsql::params![number],
+            )
+            .await?;
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<i64>(0).ok(),
+            None => None,
+        })
+    }
+
+    /// Marks earlier revisions of a pull request so they cannot be mistaken for
+    /// the current one.
+    ///
+    /// `!25: subject` becomes `!25 (8a99c730): subject`, the SHA taken from the
+    /// row's own slug, which already carries it. Only the newest revision keeps
+    /// the unqualified form, which is also the one `<repo>-25` resolves to.
+    pub async fn mark_superseded_pr_revisions(&self, mr_number: i64, keep_id: i64) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, slug, subject FROM patchsets WHERE mr_number = ? AND id != ?",
+                libsql::params![mr_number, keep_id],
+            )
+            .await?;
+
+        let mut updates = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            let slug: Option<String> = row.get(1).ok();
+            let subject: Option<String> = row.get(2).ok();
+            let (Some(slug), Some(subject)) = (slug, subject) else {
+                continue;
+            };
+            let Some((_, head)) = slug.rsplit_once('-') else {
+                continue;
+            };
+            // Idempotent: re-running must not stack qualifiers.
+            if head.is_empty() || subject.contains(&format!("({head})")) {
+                continue;
+            }
+            // Ingestion writes `!25: subject`; qualify in place so the number
+            // still reads first and the line still sorts with its siblings.
+            let marker = format!("!{}:", mr_number);
+            if let Some(rest) = subject.strip_prefix(&marker) {
+                updates.push((id, format!("!{} ({}):{}", mr_number, head, rest)));
+            } else {
+                updates.push((id, format!("({}) {}", head, subject)));
+            }
+        }
+
+        for (id, subject) in updates {
+            self.conn
+                .execute(
+                    "UPDATE patchsets SET subject = ? WHERE id = ?",
+                    libsql::params![subject, id],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_patchset_details_by_slug(
+        &self,
+        slug: &str,
+        page: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Option<serde_json::Value>> {
+        match self.resolve_patchset_slug(slug).await? {
+            Some(id) => self.get_patchset_details(id, page, limit).await,
+            None => Ok(None),
+        }
     }
 
     pub async fn get_patchset_summary_by_slug(
@@ -3812,19 +3913,10 @@ impl Database {
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patchsets WHERE slug = ?",
-                libsql::params![slug],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
+        match self.resolve_patchset_slug(slug).await? {
+            Some(id) => self.get_patchset_summary(id, page, limit).await,
+            None => Ok(None),
         }
-
-        Ok(None)
     }
 
     pub async fn get_review_details(&self, id: i64) -> Result<Option<serde_json::Value>> {
@@ -8639,6 +8731,110 @@ mod tests {
             .await
             .unwrap();
         rows.next().await.unwrap().unwrap().get(0).ok()
+    }
+
+    /// A pull request is not one unit of review: every force-push is a
+    /// different range and gets its own patchset. Older ones stay reachable by
+    /// their own slug, and `<repo>-<number>` follows the newest.
+    #[tokio::test]
+    async fn pr_revisions_each_keep_a_link_and_the_bare_slug_follows_the_newest() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover", thread_id, None, "a@e", "Cover", 100, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+
+        let first = add_part(&db, thread_id, 1, None).await;
+        db.conn
+            .execute(
+                "UPDATE patchsets SET slug = ?, mr_number = 25, subject = '!25: pds: fixes' WHERE id = ?",
+                libsql::params![pr_slug("linux-pds", 25, "8a99c7301a6c7071"), first],
+            )
+            .await
+            .unwrap();
+
+        // A second revision of the same pull request, as a separate row.
+        let thread2 = db.create_thread("root2", "Subject", 200).await.unwrap();
+        db.create_message(
+            "cover2", thread2, None, "a@e", "Cover", 200, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let second = db
+            .create_fetching_patchset(
+                &pr_placeholder_id(25, "cccc..dddd"),
+                "!25: pds: fixes",
+                None,
+                None,
+                Some("https://github.com/org/linux-pds/pull/25"),
+                Some("pds: fixes"),
+                Some(25),
+                Some(&pr_slug("linux-pds", 25, "dddd1234567890")),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first, second, "a new range must not reuse the old row");
+
+        // Each revision keeps its own permanent link.
+        assert_eq!(
+            db.resolve_patchset_slug("linux-pds-25-8a99c730")
+                .await
+                .unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            db.resolve_patchset_slug("linux-pds-25-dddd1234")
+                .await
+                .unwrap(),
+            Some(second)
+        );
+
+        // And the bare form points at the newest.
+        assert_eq!(
+            db.resolve_patchset_slug("linux-pds-25").await.unwrap(),
+            Some(second),
+            "the unqualified slug must follow the current revision"
+        );
+
+        // The older row is labelled so the list cannot mislead.
+        db.mark_superseded_pr_revisions(25, second).await.unwrap();
+        let older = db
+            .get_patchset_details(first, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            older["subject"].as_str(),
+            Some("!25 (8a99c730): pds: fixes"),
+            "an older revision must not read as the current one"
+        );
+        let newest = db
+            .get_patchset_details(second, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newest["subject"].as_str(), Some("!25: pds: fixes"));
+
+        // Idempotent: marking again must not stack qualifiers.
+        db.mark_superseded_pr_revisions(25, second).await.unwrap();
+        let older = db
+            .get_patchset_details(first, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            older["subject"].as_str(),
+            Some("!25 (8a99c730): pds: fixes")
+        );
+
+        // An unknown pull request number resolves to nothing rather than to
+        // whatever happens to be newest.
+        assert_eq!(
+            db.resolve_patchset_slug("linux-pds-99").await.unwrap(),
+            None
+        );
     }
 
     /// The reported symptom: two rows per pull request, one stuck forever in
