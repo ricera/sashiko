@@ -417,6 +417,67 @@ async fn test_submit_rejects_empty_mbox() {
 // ── Database-Backed Query Tests ─────────────────────────────────────────
 
 #[tokio::test]
+async fn patchset_endpoints_agree_on_how_a_patchset_is_addressed() {
+    // The reported symptom: a pull request review reachable at /api/patchset?id=2
+    // but 404 at ?id=linux-pds-25, with the row present and correctly slugged.
+    //
+    // Two endpoints serve a patchset page and each parsed the identifier
+    // itself. /api/patch understood numeric ids, slugs and message ids;
+    // /api/patchset understood numeric ids and message ids only, so the one
+    // identifier the UI has for a forge patchset worked on one and not the
+    // other.
+    let server = spawn_test_server(false).await;
+
+    server
+        .db
+        .conn
+        .execute(
+            "INSERT INTO messages (message_id, subject, author, date) \
+             VALUES ('<pds-1@example.com>', 'pds: fixes', 'Author <a@b.com>', 1234567890)",
+            (),
+        )
+        .await
+        .unwrap();
+
+    server
+        .db
+        .conn
+        .execute(
+            "INSERT INTO patchsets (id, status, subject, author, date, slug, mr_number) \
+             VALUES (2, 'In Review', '!25: pds: fixes', 'Author <a@b.com>', 1234567890, 'linux-pds-25', 25)",
+            (),
+        )
+        .await
+        .unwrap();
+
+    server
+        .db
+        .conn
+        .execute(
+            "INSERT INTO patches (id, patchset_id, message_id, part_index) \
+             VALUES (1, 2, '<pds-1@example.com>', 1)",
+            (),
+        )
+        .await
+        .unwrap();
+
+    for path in ["api/patchset", "api/patch"] {
+        for id in ["2", "linux-pds-25"] {
+            let resp = reqwest::get(format!("{}/{}?id={}", server.base_url, path, id))
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "/{path}?id={id} must resolve the patchset"
+            );
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["id"].as_i64(), Some(2), "/{path}?id={id}");
+        }
+    }
+}
+
+#[tokio::test]
 #[ignore]
 async fn test_patchsets_returned_after_insert() {
     let server = spawn_test_server(false).await;

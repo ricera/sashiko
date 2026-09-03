@@ -914,11 +914,21 @@ async fn get_patchset_summary(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Same three forms the details endpoint accepts. The web UI addresses a
+    // patchset by one identifier and calls both endpoints with it, so a form
+    // understood by only one of them is a page that 404s on a patchset that
+    // exists -- which is what a slug did until this branch was added.
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
         info!("Fetching summary for patchset id: {}", id_val);
         state
             .db
             .get_patchset_summary(id_val, query.page, query.per_page)
+            .await
+    } else if query.id.contains('-') && !query.id.contains('@') {
+        info!("Fetching summary for patchset slug: {}", query.id);
+        state
+            .db
+            .get_patchset_summary_by_slug(&query.id, query.page, query.per_page)
             .await
     } else {
         info!("Fetching summary for patchset msgid: {}", query.id);
