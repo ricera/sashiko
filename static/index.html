@@ -2327,9 +2327,19 @@
                 ...(done ? [`${done} done`] : []),
                 ...(stopped ? [`${stopped} stopped`] : []),
             ].join(', ');
-            summary.textContent = live
+            // Tool calls belong here rather than only on the finished review
+            // card: before a review completes, this element is the only thing
+            // on screen for the patch, so a count carried solely by the card
+            // would be invisible for the whole run -- which is when a count
+            // that keeps climbing is the useful signal.
+            const patchId = host.id.replace('stage-progress-', '');
+            summary.innerHTML = (live
                 ? `Stage progress (${counts})`
-                : 'Stage progress (stopped)';
+                : 'Stage progress (stopped)')
+                // Filled by applyToolCallCounts, which runs after this so the
+                // slot exists. Keeping the count out of here leaves this
+                // function dependent on its arguments alone.
+                + `<span id="stage-tool-calls-${patchId}"></span>`;
             // Persisted entries describe what the work *was* doing when the
             // daemon stopped. Worth keeping — it says where a failed patch got to
             // — but phrased as an observation, not a cause: the work stopped
@@ -2364,10 +2374,27 @@
         }
 
         function applyToolCallCounts(counts) {
-            if (!counts) return;
-            for (const [reviewId, c] of Object.entries(counts)) {
-                const el = document.getElementById(`tool-calls-${reviewId}`);
+            if (!Array.isArray(counts)) return;
+
+            const byPatch = {};
+            for (const c of counts) {
+                // A finished review's card, keyed by review.
+                const el = document.getElementById(`tool-calls-${c.review_id}`);
                 if (el) el.textContent = formatToolCalls(c.total, c.reference);
+
+                // The live element is keyed by patch, and a patch can have more
+                // than one review after a retry: what has this patch cost so
+                // far, not what did one attempt cost.
+                if (c.patch_id == null) continue;
+                const acc = byPatch[c.patch_id] || { total: 0, reference: 0 };
+                acc.total += c.total || 0;
+                acc.reference += c.reference || 0;
+                byPatch[c.patch_id] = acc;
+            }
+
+            for (const [patchId, c] of Object.entries(byPatch)) {
+                const el = document.getElementById(`stage-tool-calls-${patchId}`);
+                if (el) el.textContent = ` — ${formatToolCalls(c.total, c.reference)} tool calls`;
             }
         }
 
@@ -2381,16 +2408,14 @@
 
             let entries = [];
             let live = true;
+            let toolCalls = null;
             try {
                 const res = await fetch(`/api/patchset/activity?id=${encodeURIComponent(patchsetId)}`);
                 if (!res.ok) return;
                 const data = await res.json();
                 entries = data.entries || [];
                 live = data.live !== false;
-                // Counts ride the poll that is already running, so they climb
-                // while the review works rather than sitting at whatever was
-                // true when the page was opened.
-                applyToolCallCounts(data.tool_calls);
+                toolCalls = data.tool_calls;
             } catch (e) {
                 return; // Advisory only; leave the last known value in place.
             }
@@ -2420,6 +2445,12 @@
                 if (!byPatch.has(host)) host.style.display = 'none';
             });
             byPatch.forEach((patchEntries, host) => paintStageProgress(host, patchEntries, live));
+
+            // After painting: the counts ride the poll that is already running,
+            // so they climb while the review works rather than sitting at
+            // whatever was true when the page was opened. Painting first means
+            // the slots they fill exist by now, including on the first poll.
+            applyToolCallCounts(toolCalls);
 
             if (general.length === 0) {
                 row.style.display = 'none';

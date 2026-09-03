@@ -39,7 +39,7 @@ function grab(name) {
 const NAMES = ['escapeHtml', 'formatDuration', 'describeStageWait', 'summarizeReason',
                'renderLiveStageRow', 'paintStageProgress', 'refreshActivity',
                'stopActivityPolling', 'renderReviewCard', 'hostForPatch',
-               'stageBreakdownLabel'];
+               'stageBreakdownLabel', 'formatToolCalls', 'applyToolCallCounts'];
 const ctx = {};
 new Function('ctx', NAMES.map(grab).join('\n\n') +
     `\n;` + NAMES.map(n => `ctx.${n} = ${n};`).join(''))(ctx);
@@ -56,6 +56,19 @@ class El {
     get innerHTML() { return this._html; }
     set innerHTML(v) {
         this._html = v;
+        // A browser keeps textContent in step with innerHTML. Without that here,
+        // rewriting a check from textContent to innerHTML in the page silently
+        // empties textContent in the harness alone, and an assertion on it fails
+        // for a reason that does not exist in the product.
+        this.textContent = v.replace(/<[^>]*>/g, '');
+        // A browser makes elements written as innerHTML reachable by id. The
+        // page relies on that: paintStageProgress writes a slot, and
+        // applyToolCallCounts finds it with getElementById afterwards. Nodes are
+        // recreated rather than reused, as replacing innerHTML does.
+        for (const m of v.matchAll(/id="([^"]+)"/g)) {
+            const el = new El(m[1], 'span');
+            byId.set(m[1], el);
+        }
         // Only the shape hostForPatch builds; enough for paintStageProgress to
         // find its summary and body.
         if (v.includes('stage-progress-body')) {
@@ -402,6 +415,43 @@ const one = ctx.renderReviewCard({
 // noise, and "longest 90s, 90s summed" reads as a bug.
 check('a single stage just states its duration',
     one.includes('Stage breakdown (1 stage, 90s)'), one.slice(0, 400));
+
+// ---- case 11: tool call counts reach the live element --------------------
+// Before a review finishes there is no review card, so the stage-progress
+// summary is the only place a count can appear. A count that only ever renders
+// on the finished card is invisible for the whole run, which is exactly when a
+// climbing number is worth having.
+console.log('case 11: live tool call counts');
+const h20 = mkHost(20);
+ctx.paintStageProgress(h20, [
+    { patch_id: 20, stage: 1, description: 'Stage 1', phase: { kind: 'stage_turn' } },
+], true);
+check('the summary leaves a slot for the count',
+    h20.querySelector('summary').innerHTML.includes('id="stage-tool-calls-20"'),
+    h20.querySelector('summary').innerHTML);
+
+ctx.applyToolCallCounts([
+    { review_id: 5, patch_id: 20, total: 40, reference: 0 },
+    { review_id: 6, patch_id: 20, total: 7, reference: 3 },
+]);
+const slot20 = byId.get('stage-tool-calls-20');
+// Summed across attempts: what has this patch cost, not what did one try cost.
+check('counts land on the live element and sum across attempts',
+    slot20 && slot20.textContent === ' — 47 (3 to the kernel tree) tool calls',
+    slot20 && slot20.textContent);
+
+// A patch that never touched the reference tree says so by omission, not by a
+// zero that an in-tree review could never move off.
+ctx.applyToolCallCounts([{ review_id: 5, patch_id: 20, total: 12, reference: 0 }]);
+check('no reference calls means no reference clause',
+    byId.get('stage-tool-calls-20').textContent === ' — 12 tool calls',
+    byId.get('stage-tool-calls-20').textContent);
+
+check('a payload without counts is ignored rather than clearing the slot',
+    (() => {
+        ctx.applyToolCallCounts(undefined);
+        return byId.get('stage-tool-calls-20').textContent === ' — 12 tool calls';
+    })());
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);

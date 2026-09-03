@@ -635,6 +635,7 @@ impl Database {
             .try_add_column("reviews", "inline_review", "TEXT")
             .await;
         let _ = self.try_add_column("tool_usages", "repo", "TEXT").await;
+        let _ = self.backfill_tool_usage_repo().await;
         let _ = self
             .try_add_column("reviews", "stage_failures", "TEXT")
             .await;
@@ -1769,6 +1770,34 @@ impl Database {
         }))
     }
 
+    /// Fills in `repo` for calls recorded before the column existed.
+    ///
+    /// Nothing is guessed: the repository was already part of the arguments
+    /// every call was stored with, so this reads it back rather than inventing
+    /// it. Without the backfill, a review that ran minutes before an upgrade
+    /// reports zero reference calls -- which is exactly what the display uses
+    /// to mean "the kernel tree was there and was never consulted". A false
+    /// alarm, and the one alarm this count exists to raise.
+    ///
+    /// Rows older than the `repo` argument itself become `review`, which is
+    /// simply true: there was only one repository to read.
+    async fn backfill_tool_usage_repo(&self) -> Result<()> {
+        self.conn
+            .execute(
+                r#"UPDATE tool_usages SET repo = 'kernel'
+                   WHERE repo IS NULL AND arguments LIKE '%"repo":"kernel"%'"#,
+                (),
+            )
+            .await?;
+        self.conn
+            .execute(
+                "UPDATE tool_usages SET repo = 'review' WHERE repo IS NULL",
+                (),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Tool calls made by each review of a patchset, so far.
     ///
     /// Keyed by review id and counted live: rows are written as each call is
@@ -1778,10 +1807,15 @@ impl Database {
     /// out-of-tree review, a reference count of zero means the grounding was
     /// available and unused.
     pub async fn get_tool_call_counts(&self, patchset_id: i64) -> Result<serde_json::Value> {
+        // Carries `patch_id` as well as `review_id` because the two consumers
+        // index differently: a finished review's card is keyed by review, while
+        // the live stage-progress element -- the only thing on screen before a
+        // review finishes -- is keyed by patch.
         let mut rows = self
             .conn
             .query(
                 "SELECT r.id,
+                        r.patch_id,
                         COUNT(tu.id),
                         COALESCE(SUM(CASE WHEN tu.repo = 'kernel' THEN 1 ELSE 0 END), 0)
                  FROM reviews r
@@ -1792,18 +1826,16 @@ impl Database {
             )
             .await?;
 
-        let mut counts = serde_json::Map::new();
+        let mut counts = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
-            let review_id: i64 = row.get(0)?;
-            counts.insert(
-                review_id.to_string(),
-                json!({
-                    "total": row.get::<i64>(1).unwrap_or(0),
-                    "reference": row.get::<i64>(2).unwrap_or(0),
-                }),
-            );
+            counts.push(json!({
+                "review_id": row.get::<i64>(0)?,
+                "patch_id": row.get::<Option<i64>>(1).ok().flatten(),
+                "total": row.get::<i64>(2).unwrap_or(0),
+                "reference": row.get::<i64>(3).unwrap_or(0),
+            }));
         }
-        Ok(serde_json::Value::Object(counts))
+        Ok(serde_json::Value::Array(counts))
     }
 
     pub async fn get_tool_usage_stats(&self) -> Result<serde_json::Value> {
@@ -8789,6 +8821,72 @@ mod tests {
         rows.next().await.unwrap().unwrap().get(0).ok()
     }
 
+    /// A review that ran before the column existed must not report zero
+    /// reference calls, because that is what the display uses to mean "the
+    /// kernel tree was available and never consulted".
+    #[tokio::test]
+    async fn tool_usage_repo_is_backfilled_from_recorded_arguments() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover", thread_id, None, "a@e", "Cover", 100, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = add_part(&db, thread_id, 1, None).await;
+        let review_id = db
+            .create_review(ps_id, None, "mock", "mock", None, None)
+            .await
+            .unwrap();
+
+        // Rows as the old binary wrote them: repo unset, but the arguments it
+        // recorded still say which repository was read.
+        for args in [
+            r#"{"pattern":"x","repo":"kernel","revision":"v6.12"}"#,
+            r#"{"pattern":"y","repo":"review","revision":"HEAD"}"#,
+            r#"{"pattern":"z","revision":"HEAD"}"#,
+        ] {
+            db.conn
+                .execute(
+                    "INSERT INTO tool_usages (review_id, provider, model, tool_name, arguments, output_length, created_at)
+                     VALUES (?, 'mock', 'mock', 'git_grep', ?, 0, 0)",
+                    libsql::params![review_id, args],
+                )
+                .await
+                .unwrap();
+        }
+
+        let counts = db.get_tool_call_counts(ps_id).await.unwrap();
+        assert_eq!(counts[0]["reference"], 0, "not yet run");
+
+        db.backfill_tool_usage_repo().await.unwrap();
+
+        let counts = db.get_tool_call_counts(ps_id).await.unwrap();
+        assert_eq!(counts[0]["total"], 3);
+        assert_eq!(
+            counts[0]["reference"], 1,
+            "the reference call must be recovered from its arguments"
+        );
+
+        // A row predating the argument entirely is `review`: there was only one
+        // repository to read.
+        let mut rows = db
+            .conn
+            .query(
+                r#"SELECT COUNT(*) FROM tool_usages WHERE repo = 'review'"#,
+                (),
+            )
+            .await
+            .unwrap();
+        let reviewed: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(reviewed, 2);
+
+        // Idempotent: a second migration must not reclassify anything.
+        db.backfill_tool_usage_repo().await.unwrap();
+        let counts = db.get_tool_call_counts(ps_id).await.unwrap();
+        assert_eq!(counts[0]["reference"], 1);
+    }
+
     /// Counts have to rise while a review runs, not appear once it ends: the
     /// number is most useful as a sign of life on a review that looks stuck.
     #[tokio::test]
@@ -8813,8 +8911,8 @@ mod tests {
         // A review that has not looked at anything yet still reports, as zero
         // rather than as absent.
         let counts = db.get_tool_call_counts(ps_id).await.unwrap();
-        assert_eq!(counts[review_id.to_string()]["total"], 0);
-        assert_eq!(counts[review_id.to_string()]["reference"], 0);
+        assert_eq!(counts[0]["total"], 0);
+        assert_eq!(counts[0]["reference"], 0);
 
         for (tool, repo) in [
             ("git_grep", "review"),
@@ -8835,10 +8933,9 @@ mod tests {
         }
 
         let counts = db.get_tool_call_counts(ps_id).await.unwrap();
-        assert_eq!(counts[review_id.to_string()]["total"], 3);
+        assert_eq!(counts[0]["total"], 3);
         assert_eq!(
-            counts[review_id.to_string()]["reference"],
-            1,
+            counts[0]["reference"], 1,
             "only the call against the kernel tree counts as reference"
         );
 
