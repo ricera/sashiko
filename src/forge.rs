@@ -540,6 +540,43 @@ pub async fn resolve_pull_request(
     })
 }
 
+/// Repository name out of a pull request or merge request URL.
+///
+/// Not the same job as [`extract_repo_name_from_url`], which takes the last path
+/// segment -- for `https://host/org/repo/pull/25` that is `25`, and the slug
+/// built from it reads `25-25`. The repository is the segment before the
+/// forge's request marker, skipping GitLab's `/-/` separator.
+///
+/// Returns `None` rather than guessing when there is no marker, so a caller can
+/// tell "not a request URL" from a name it should use.
+pub fn extract_repo_name_from_request_url(url: &str) -> Option<String> {
+    // Strip scheme and query so neither can be mistaken for a path segment.
+    let path = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+
+    let segments: Vec<&str> = path
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let marker = segments
+        .iter()
+        .rposition(|s| matches!(*s, "pull" | "pulls" | "merge_requests"))?;
+
+    segments[..marker]
+        .iter()
+        .rev()
+        // GitLab writes `org/repo/-/merge_requests/25`; the `-` is a separator,
+        // not the repository.
+        .find(|s| **s != "-")
+        .map(|s| s.trim_end_matches(".git").to_string())
+}
+
 pub fn extract_repo_name_from_url(url: &str) -> String {
     url.trim_end_matches('/')
         .split('/')
@@ -1102,5 +1139,50 @@ mod tests {
             .unwrap();
         assert!(status.success());
         assert_eq!(base_repository_url(repo2).await, None);
+    }
+
+    /// The reported symptom: a review linked as `25-25`. The slug is what the
+    /// web UI puts in its links, so a name taken from the wrong path segment is
+    /// a link that resolves to nothing.
+    #[test]
+    fn repository_name_comes_from_before_the_request_marker() {
+        for (url, expected) in [
+            ("https://github.com/org/linux-pds/pull/25", "linux-pds"),
+            (
+                "https://github.com/org/linux-pds/pull/25/files",
+                "linux-pds",
+            ),
+            ("https://github.example.com/org/repo/pulls/7", "repo"),
+            ("https://gitlab.com/org/repo/-/merge_requests/10", "repo"),
+            (
+                "https://gitlab.example.com/group/sub/repo/-/merge_requests/3",
+                "repo",
+            ),
+            ("https://github.com/org/repo.git/pull/25", "repo"),
+            ("https://github.com/org/repo/pull/25?w=1", "repo"),
+        ] {
+            assert_eq!(
+                extract_repo_name_from_request_url(url).as_deref(),
+                Some(expected),
+                "{url}"
+            );
+        }
+
+        // Not a request URL: say so rather than returning a segment that
+        // happens to be there.
+        for url in [
+            "https://github.com/org/repo",
+            "https://github.com/org/repo.git",
+            "",
+        ] {
+            assert_eq!(extract_repo_name_from_request_url(url), None, "{url}");
+        }
+
+        // The old behaviour, kept for other callers, is exactly the trap: the
+        // last segment of a pull request URL is the number.
+        assert_eq!(
+            extract_repo_name_from_url("https://github.com/org/repo/pull/25"),
+            "25"
+        );
     }
 }
