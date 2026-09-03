@@ -59,12 +59,27 @@ pub struct BaselineRegistry {
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
     pub repo_path: std::path::PathBuf,
     mainline_remote: Option<(String, String)>, // (URL, local remote name)
+    /// See [`BaselineRegistry::with_options`].
+    mainline_fallback: bool,
 }
 
 impl BaselineRegistry {
     pub fn new(
         repo_path: &Path,
         custom_remotes: Option<Vec<CustomRemoteSettings>>,
+    ) -> Result<Self> {
+        Self::with_options(repo_path, custom_remotes, true)
+    }
+
+    /// `mainline_fallback` false drops the hardcoded linux-next and mainline
+    /// candidates. They are right for a kernel tree and wrong for anything else:
+    /// an out-of-tree module's patches can apply to linux-next while being
+    /// reviewed against a tree they have nothing to do with, and the review
+    /// reports success either way.
+    pub fn with_options(
+        repo_path: &Path,
+        custom_remotes: Option<Vec<CustomRemoteSettings>>,
+        mainline_fallback: bool,
     ) -> Result<Self> {
         let remote_map = Self::load_git_remotes(repo_path).unwrap_or_default();
 
@@ -129,6 +144,7 @@ impl BaselineRegistry {
             custom_remotes,
             repo_path: repo_path.to_path_buf(),
             mainline_remote,
+            mainline_fallback,
         })
     }
 
@@ -335,22 +351,34 @@ impl BaselineRegistry {
             }
         }
 
-        // 4. Linux Next
-        let linux_next_url = "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
-        candidates.push(self.resolve_url(linux_next_url, None));
+        // 4 and 5 are mainline trees, which only make sense when the repository
+        // under review is one. For an out-of-tree module they are actively
+        // harmful: the patches may well apply to linux-next, and the review then
+        // runs against a tree the code has nothing to do with and reports
+        // success. Better to run out of candidates and fail.
+        if self.mainline_fallback {
+            // 4. Linux Next
+            let linux_next_url =
+                "https://git.kernel.org/pub/scm/linux/kernel/git/next/linux-next.git";
+            candidates.push(self.resolve_url(linux_next_url, None));
 
-        // 5. Mainline
-        // Use the identified mainline remote (Linus tree or origin) as a
-        // RemoteTarget so that ensure_remote fetches it before use. A bare
-        // LocalRef("HEAD") would resolve to the local checkout, which nothing
-        // in Sashiko ever advances after fetching.
-        if let Some((url, name)) = &self.mainline_remote {
-            candidates.push(BaselineResolution::RemoteTarget {
-                url: url.clone(),
-                name: name.clone(),
-                branch: Some("master".to_string()),
-            });
+            // 5. Mainline
+            // Use the identified mainline remote (Linus tree or origin) as a
+            // RemoteTarget so that ensure_remote fetches it before use. A bare
+            // LocalRef("HEAD") would resolve to the local checkout, which nothing
+            // in Sashiko ever advances after fetching.
+            if let Some((url, name)) = &self.mainline_remote {
+                candidates.push(BaselineResolution::RemoteTarget {
+                    url: url.clone(),
+                    name: name.clone(),
+                    branch: Some("master".to_string()),
+                });
+            } else {
+                candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
+            }
         } else {
+            // HEAD of the repository under review is still a legitimate last
+            // resort -- it is that repository, unlike linux-next.
             candidates.push(BaselineResolution::LocalRef("HEAD".to_string()));
         }
 
@@ -614,6 +642,7 @@ mod tests {
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
             mainline_remote: None,
+            mainline_fallback: true,
         }
     }
 
@@ -656,6 +685,7 @@ mod tests {
                 "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git".to_string(),
                 "origin".to_string(),
             )),
+            mainline_fallback: true,
         };
 
         let candidates = registry.resolve_candidates(&[], "Subject", None).await;
@@ -688,6 +718,7 @@ mod tests {
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
             mainline_remote: None,
+            mainline_fallback: true,
         };
 
         let candidates = registry.resolve_candidates(&[], "Subject", None).await;
@@ -715,6 +746,69 @@ F: patterns/
         assert_eq!(entries[0].trees[0].1, Some("branch".to_string()));
     }
 
+    /// An out-of-tree module's patches can apply cleanly to linux-next while
+    /// being reviewed against a tree they have nothing to do with, and the
+    /// review reports success either way. Running out of candidates is the
+    /// better outcome.
+    #[tokio::test]
+    async fn mainline_candidates_are_omitted_when_the_fallback_is_off() {
+        let registry = BaselineRegistry {
+            entries: Vec::new(),
+            remote_map: HashMap::new(),
+            custom_remotes: None,
+            repo_path: std::path::PathBuf::from("."),
+            mainline_remote: Some((
+                "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git".to_string(),
+                "origin".to_string(),
+            )),
+            mainline_fallback: false,
+        };
+
+        let candidates = registry
+            .resolve_candidates(
+                &["drivers/eth/ionic/ionic_main.c".to_string()],
+                "ionic: fix",
+                None,
+            )
+            .await;
+
+        assert!(
+            !candidates.iter().any(|c| c.as_str().contains("linux-next")),
+            "linux-next must not be offered: {candidates:?}"
+        );
+        assert!(
+            !candidates.iter().any(|c| matches!(
+                c,
+                BaselineResolution::RemoteTarget { url, .. }
+                    if url.contains("torvalds/linux.git")
+            )),
+            "the mainline remote must not be offered: {candidates:?}"
+        );
+        assert_eq!(
+            candidates,
+            vec![BaselineResolution::LocalRef("HEAD".to_string())],
+            "HEAD of the repository under review is still a legitimate last resort"
+        );
+
+        // With the fallback on, the same inputs still reach mainline, so this
+        // only changes behaviour where it was asked to.
+        let with_fallback = BaselineRegistry {
+            mainline_fallback: true,
+            ..registry
+        };
+        let candidates = with_fallback
+            .resolve_candidates(
+                &["drivers/eth/ionic/ionic_main.c".to_string()],
+                "ionic: fix",
+                None,
+            )
+            .await;
+        assert!(
+            candidates.iter().any(|c| c.as_str().contains("linux-next")),
+            "{candidates:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_resolve_linux_mm() {
         let entries = vec![MaintainersEntry {
@@ -737,6 +831,7 @@ F: patterns/
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
             mainline_remote: None,
+            mainline_fallback: true,
         };
 
         let files = vec!["mm/memory.c".to_string()];
@@ -805,6 +900,7 @@ F: patterns/
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
             mainline_remote: None,
+            mainline_fallback: true,
         };
 
         let files = vec!["tools/perf/builtin-report.c".to_string()];
@@ -851,6 +947,7 @@ F: patterns/
             custom_remotes: None,
             repo_path: std::path::PathBuf::from("."),
             mainline_remote: None,
+            mainline_fallback: true,
         };
 
         let files = vec!["net/core.c".to_string()];
@@ -918,6 +1015,7 @@ F: patterns/
             }]),
             repo_path: repo_path.to_path_buf(),
             mainline_remote: None,
+            mainline_fallback: true,
         };
 
         let candidates = registry.resolve_candidates(&[], "Subject", None).await;
@@ -957,6 +1055,7 @@ F: patterns/
             }]),
             repo_path: repo_path.to_path_buf(),
             mainline_remote: None,
+            mainline_fallback: true,
         };
 
         let candidates = registry.resolve_candidates(&[], "Subject", None).await;

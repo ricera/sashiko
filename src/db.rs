@@ -2225,6 +2225,19 @@ impl Database {
     /// unknown, as for a row written before the column existed. Unknown
     /// ranks below every part: any part displaces it, and it displaces
     /// only an unset or equally unknown baseline.
+    /// Records a baseline the caller knows authoritatively, ahead of anything
+    /// inferred from the commits themselves.
+    ///
+    /// A forge tells us exactly what a pull request is based on. Part index 0
+    /// means no later inference can displace it -- `record_series_baseline`
+    /// keeps the lowest index, and a patch's parent is only ever a guess at the
+    /// series base.
+    pub async fn set_declared_baseline(&self, patchset_id: i64, commit: &str) -> Result<()> {
+        let baseline_id = self.create_baseline(None, None, Some(commit)).await?;
+        self.record_series_baseline(patchset_id, baseline_id, Some(0))
+            .await
+    }
+
     async fn record_series_baseline(
         &self,
         patchset_id: i64,
@@ -8570,6 +8583,62 @@ mod tests {
             .await
             .unwrap();
         rows.next().await.unwrap().unwrap().get(0).ok()
+    }
+
+    /// A pull request's base is stated by the forge, not inferred. It has to
+    /// outrank every parent the commit walk later reports, or the review falls
+    /// back to searching for a baseline it was already given -- whose last
+    /// resort is a mainline tree that can apply cleanly and still be the wrong
+    /// context entirely.
+    #[tokio::test]
+    async fn declared_baseline_outranks_inferred_parents() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover",
+            thread_id,
+            None,
+            "author@example.com",
+            "Cover",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The placeholder exists before any commit has been looked at.
+        let ps_id = add_part(&db, thread_id, 1, None).await;
+        db.set_declared_baseline(ps_id, "pr_base_sha")
+            .await
+            .unwrap();
+
+        let declared = patchset_baseline(&db, ps_id).await.expect("baseline set");
+        assert_eq!(
+            db.get_baseline_commit(declared).await.unwrap().as_deref(),
+            Some("pr_base_sha")
+        );
+
+        // Parents inferred from the commits arrive afterwards, at every part
+        // index a real series can produce, and none may displace it.
+        for part in [1u32, 2, 3] {
+            let inferred = db
+                .create_baseline(None, None, Some(&format!("parent_of_{part}")))
+                .await
+                .unwrap();
+            db.record_series_baseline(ps_id, inferred, Some(part))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            patchset_baseline(&db, ps_id).await,
+            Some(declared),
+            "the forge's answer must survive the commit walk"
+        );
     }
 
     #[tokio::test]

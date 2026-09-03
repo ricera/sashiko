@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Timeout for network-bound git operations (fetching from a remote).
 const NETWORK_OP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -364,6 +364,16 @@ impl FetchAgent {
                         },
                     );
                     let batch_tokens = self.tokens_for(&commit_list);
+
+                    // Pull request heads live outside refs/heads. A PR from a
+                    // fork -- or from a branch since deleted -- is reachable
+                    // only through the forge's own ref namespace, so neither the
+                    // optimistic fetch nor the all-heads fallback can see it.
+                    // Best-effort: a remote that is not a forge simply has no
+                    // such refs, which is not an error worth failing over.
+                    self.fetch_pull_refs(&remote_name, &missing_commits, &batch_tokens)
+                        .await;
+
                     if let Err(e) = self
                         .fetch_with_cancel(
                             self.fetch_commits(&remote_name, &missing_commits),
@@ -704,6 +714,76 @@ impl FetchAgent {
             }
         }
         Ok(())
+    }
+
+    /// Fetches the forge ref for any pull request in this batch.
+    ///
+    /// `git fetch <remote>` fetches `refs/heads/*`. A pull request head is not
+    /// there: GitHub publishes it at `refs/pull/<n>/head` and GitLab at
+    /// `refs/merge-requests/<n>/head`. Without this, a same-repository PR works
+    /// by accident -- its branch is in refs/heads -- and a fork PR fails to
+    /// resolve its range at all.
+    ///
+    /// Both namespaces are tried because the fetcher does not know which forge a
+    /// remote belongs to, and a missing ref fails the whole fetch, so they
+    /// cannot be combined into one call. Failures are logged, not propagated:
+    /// most remotes have neither namespace, and the caller's own fetch is what
+    /// decides whether the commits arrived.
+    async fn fetch_pull_refs(
+        &self,
+        remote: &str,
+        missing: &[String],
+        tokens: &[tokio_util::sync::CancellationToken],
+    ) {
+        for commit_or_range in missing {
+            let Some(number) = self
+                .mr_metadata
+                .get(commit_or_range)
+                .and_then(|(_, _, number)| *number)
+            else {
+                continue;
+            };
+
+            for namespace in ["pull", "merge-requests"] {
+                let refspec = format!(
+                    "+refs/{}/{}/head:refs/sashiko/{}/{}",
+                    namespace, number, namespace, number
+                );
+                let fetched = self
+                    .fetch_with_cancel(
+                        async {
+                            let output = self.fetch_with_graph_retry(&[remote, &refspec]).await?;
+                            if output.status.success() {
+                                Ok(())
+                            } else {
+                                Err(anyhow!(
+                                    "{}",
+                                    String::from_utf8_lossy(&output.stderr).trim()
+                                ))
+                            }
+                        },
+                        tokens,
+                    )
+                    .await;
+
+                match fetched {
+                    Ok(()) => {
+                        info!("Fetched {} #{} head from {}", namespace, number, remote);
+                        break;
+                    }
+                    Err(e) if is_cancellation(&e) => return,
+                    Err(e) => {
+                        debug!(
+                            "No {} ref for #{} on {}: {}",
+                            namespace,
+                            number,
+                            remote,
+                            e.to_string().trim()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Runs one `git fetch`, dropping a stale commit-graph and trying

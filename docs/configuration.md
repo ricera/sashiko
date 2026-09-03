@@ -144,6 +144,7 @@ Settings for the Kiro CLI provider (`provider = "kiro-cli"`).
 | `repository_path` | string | -- | Path to the kernel git repository used for patch application and context. |
 | `reference_repository_path` | string | unset | Optional read-only second repository consulted for grounding. See [Reviewing out-of-tree modules](#reviewing-out-of-tree-modules). |
 | `reference_revision` | string | `HEAD` | Revision to read the reference repository at. |
+| `mainline_baseline_fallback` | bool | `true` | Whether a series with no resolvable baseline may fall back to linux-next and then the mainline remote. Set `false` for an out-of-tree repository. |
 
 #### Reviewing out-of-tree modules
 
@@ -184,6 +185,14 @@ Notes:
   block is added to the prompt.
 - For `sashiko-cli local` against an ad-hoc repository, use `--reference-repo`
   and `--reference-revision`; a `--repo` override bypasses the `[git]` section.
+- **Set `mainline_baseline_fallback = false`.** When a series has no resolvable
+  baseline, the candidate search ends at linux-next and then the mainline
+  remote. For an out-of-tree module those are the wrong tree: the patches may
+  well *apply* to linux-next, and the review then runs against a kernel the code
+  has nothing to do with and reports success. It also drags a full mainline
+  clone onto the host, which `GitSyncWorker` then refetches on a timer, because
+  `ensure_remote` adds every remote it tries. With the fallback off, an
+  unresolvable baseline fails the review instead.
 
 #### `[[git.custom_remotes]]`
 

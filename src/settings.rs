@@ -426,6 +426,16 @@ pub struct GitSettings {
     /// whatever was last fetched -- pin it to keep reviews reproducible.
     #[serde(default)]
     pub reference_revision: Option<String>,
+    /// Whether a series with no resolvable baseline may fall back to mainline
+    /// trees (linux-next, then Linus/origin).
+    ///
+    /// Right for a kernel tree, wrong for anything else: an out-of-tree module's
+    /// patches can *apply* to linux-next while being reviewed in a context that
+    /// has nothing to do with where they belong, and "applies cleanly" is not
+    /// "is the right base". Set false and an unresolvable baseline fails the
+    /// review instead of silently reviewing against a foreign tree.
+    #[serde(default = "default_true")]
+    pub mainline_baseline_fallback: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]

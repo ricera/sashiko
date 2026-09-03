@@ -1504,6 +1504,24 @@ async fn enqueue_pull_request(
         mr_number: Some(metadata.pr_number),
     };
 
+    // The forge told us what this pull request is based on, so use that rather
+    // than letting the reviewer search for a baseline. The search has no way to
+    // know the answer it is looking for is already known, and its last resort is
+    // a mainline tree -- which can apply cleanly and still be the wrong context
+    // entirely.
+    if let Err(e) = state
+        .db
+        .set_declared_baseline(placeholder_patchset_id, &metadata.base_sha)
+        .await
+    {
+        // Not fatal: the reviewer falls back to resolving one, which is what it
+        // did before this existed.
+        warn!(
+            "Could not record declared baseline {} for patchset {}: {}",
+            metadata.base_sha, placeholder_patchset_id, e
+        );
+    }
+
     state.fetch_sender.send(req).await.map_err(|e| {
         error!("Failed to send fetch request to queue: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
