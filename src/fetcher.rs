@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Timeout for network-bound git operations (fetching from a remote).
 const NETWORK_OP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -364,6 +364,20 @@ impl FetchAgent {
                         },
                     );
                     let batch_tokens = self.tokens_for(&commit_list);
+
+                    // Pull request heads live outside refs/heads. A PR from a
+                    // fork -- or from a branch since deleted -- is reachable
+                    // only through the forge's own ref namespace, so neither the
+                    // optimistic fetch nor the all-heads fallback can see it.
+                    // Best-effort: a remote that is not a forge simply has no
+                    // such refs, which is not an error worth failing over.
+                    // Keyed off `commit_list`, not `missing_commits`: a range is
+                    // split into its two endpoints for the presence check, so
+                    // the bare SHAs there never match the range the pull request
+                    // metadata is filed under.
+                    self.fetch_pull_refs(&remote_name, &commit_list, &batch_tokens)
+                        .await;
+
                     if let Err(e) = self
                         .fetch_with_cancel(
                             self.fetch_commits(&remote_name, &missing_commits),
@@ -706,6 +720,96 @@ impl FetchAgent {
         Ok(())
     }
 
+    /// Fetches the forge ref for any pull request in this batch.
+    ///
+    /// `git fetch <remote>` fetches `refs/heads/*`. A pull request head is not
+    /// there: GitHub publishes it at `refs/pull/<n>/head` and GitLab at
+    /// `refs/merge-requests/<n>/head`. Without this, a same-repository PR works
+    /// by accident -- its branch is in refs/heads -- and a fork PR fails to
+    /// resolve its range at all.
+    ///
+    /// Both namespaces are tried because the fetcher does not know which forge a
+    /// remote belongs to, and a missing ref fails the whole fetch, so they
+    /// cannot be combined into one call. Failures are logged, not propagated:
+    /// most remotes have neither namespace, and the caller's own fetch is what
+    /// decides whether the commits arrived.
+    async fn fetch_pull_refs(
+        &self,
+        remote: &str,
+        commits: &[String],
+        tokens: &[tokio_util::sync::CancellationToken],
+    ) {
+        for commit_or_range in commits {
+            let Some(number) = self
+                .mr_metadata
+                .get(commit_or_range)
+                .and_then(|(_, _, number)| *number)
+            else {
+                continue;
+            };
+
+            let mut failures = Vec::new();
+            for namespace in ["pull", "merge-requests"] {
+                let refspec = format!(
+                    "+refs/{}/{}/head:refs/sashiko/{}/{}",
+                    namespace, number, namespace, number
+                );
+                let fetched = self
+                    .fetch_with_cancel(
+                        async {
+                            let output = self.fetch_with_graph_retry(&[remote, &refspec]).await?;
+                            if output.status.success() {
+                                Ok(())
+                            } else {
+                                Err(anyhow!(
+                                    "{}",
+                                    String::from_utf8_lossy(&output.stderr).trim()
+                                ))
+                            }
+                        },
+                        tokens,
+                    )
+                    .await;
+
+                match fetched {
+                    Ok(()) => {
+                        info!("Fetched {} #{} head from {}", namespace, number, remote);
+                        failures.clear();
+                        break;
+                    }
+                    Err(e) if is_cancellation(&e) => return,
+                    Err(e) => {
+                        debug!(
+                            "No {} ref for #{} on {}: {}",
+                            namespace,
+                            number,
+                            remote,
+                            e.to_string().trim()
+                        );
+                        failures.push(format!("{}: {}", namespace, e.to_string().trim()));
+                    }
+                }
+            }
+
+            // We know this is a pull request -- it has a number -- so both
+            // namespaces failing is worth saying out loud. Left at debug, a
+            // private repository with no credentials on the host looks
+            // identical to a healthy fetch until the range fails to resolve two
+            // stages later, naming a SHA instead of the reason.
+            if !failures.is_empty() {
+                warn!(
+                    "Could not fetch the forge ref for #{} from {}; if {} is private, the daemon \
+                     host needs git credentials for it (`gh auth login && gh auth setup-git`, or \
+                     an SSH remote). Tried {}",
+                    number,
+                    remote,
+                    remote,
+                    failures.join("; ")
+                );
+            }
+        }
+    }
+
     /// Runs one `git fetch`, dropping a stale commit-graph and trying
     /// again when that is what turned the fetch away.  Fetch-pack
     /// rejects the graph before it opens a connection, so that retry
@@ -1013,6 +1117,96 @@ mod tests {
 
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("git version"));
+        Ok(())
+    }
+
+    /// A pull request head lives outside refs/heads, so neither the optimistic
+    /// fetch nor the all-heads fallback can reach it. This is the only thing
+    /// that does.
+    ///
+    /// Also pins the keying: the presence check splits `base..head` into its two
+    /// endpoints, so the pull request metadata -- filed under the range -- is
+    /// not findable from the list of missing SHAs.
+    #[tokio::test]
+    async fn pull_request_heads_are_fetched_from_the_forge_ref() -> Result<()> {
+        let upstream_dir = tempfile::tempdir()?;
+        let upstream = upstream_dir.path().to_path_buf();
+        let local_dir = tempfile::tempdir()?;
+        let local = local_dir.path().to_path_buf();
+
+        let git = async |repo: &std::path::Path, args: Vec<&str>| -> Result<String> {
+            let out = Command::new("git")
+                .current_dir(repo)
+                .args(&args)
+                .output()
+                .await?;
+            assert!(
+                out.status.success(),
+                "git {args:?}: {:?}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+
+        for repo in [&upstream, &local] {
+            git(repo, vec!["init", "-q"]).await?;
+            git(repo, vec!["config", "user.name", "T"]).await?;
+            git(repo, vec!["config", "user.email", "t@e"]).await?;
+        }
+
+        git(
+            &upstream,
+            vec!["commit", "-q", "--allow-empty", "-m", "base"],
+        )
+        .await?;
+        let base = git(&upstream, vec!["rev-parse", "HEAD"]).await?;
+
+        // The PR head exists only under refs/pull/7/head, exactly as a forge
+        // publishes it for a fork PR: not on any branch.
+        git(&upstream, vec!["checkout", "-q", "-b", "pr-work"]).await?;
+        git(
+            &upstream,
+            vec!["commit", "-q", "--allow-empty", "-m", "pr commit"],
+        )
+        .await?;
+        let head = git(&upstream, vec!["rev-parse", "HEAD"]).await?;
+        git(&upstream, vec!["update-ref", "refs/pull/7/head", &head]).await?;
+        git(&upstream, vec!["checkout", "-q", "master"]).await?;
+        git(&upstream, vec!["branch", "-q", "-D", "pr-work"]).await?;
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (mut agent, _) = FetchAgent::new(
+            local.clone(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+            CancelRegistry::new(),
+        );
+
+        git(
+            &local,
+            vec!["remote", "add", "origin", upstream.to_str().unwrap()],
+        )
+        .await?;
+        git(&local, vec!["fetch", "-q", "origin"]).await?;
+
+        let range = format!("{base}..{head}");
+        assert!(
+            !agent.is_present(&range).await,
+            "the PR head must not be reachable from refs/heads alone"
+        );
+
+        agent
+            .mr_metadata
+            .insert(range.clone(), (None, None, Some(7)));
+        agent
+            .fetch_pull_refs("origin", std::slice::from_ref(&range), &[])
+            .await;
+
+        assert!(
+            agent.is_present(&range).await,
+            "the forge ref must make the range resolvable"
+        );
         Ok(())
     }
 

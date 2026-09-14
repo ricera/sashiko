@@ -326,6 +326,7 @@ pub fn build_router(
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
+        .route("/api/pr/review", post(review_pull_request))
         .route("/api/webhook/{provider}", post(forge_webhook))
         .route("/", get_service(ServeFile::new("static/index.html")))
         .nest_service("/static", ServeDir::new("static"))
@@ -913,11 +914,21 @@ async fn get_patchset_summary(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    // Same three forms the details endpoint accepts. The web UI addresses a
+    // patchset by one identifier and calls both endpoints with it, so a form
+    // understood by only one of them is a page that 404s on a patchset that
+    // exists -- which is what a slug did until this branch was added.
     let result = if let Ok(id_val) = query.id.parse::<i64>() {
         info!("Fetching summary for patchset id: {}", id_val);
         state
             .db
             .get_patchset_summary(id_val, query.page, query.per_page)
+            .await
+    } else if query.id.contains('-') && !query.id.contains('@') {
+        info!("Fetching summary for patchset slug: {}", query.id);
+        state
+            .db
+            .get_patchset_summary_by_slug(&query.id, query.page, query.per_page)
             .await
     } else {
         info!("Fetching summary for patchset msgid: {}", query.id);
@@ -1301,6 +1312,99 @@ async fn get_config(
     })))
 }
 
+#[derive(Deserialize)]
+struct PrQuery {
+    number: i64,
+}
+
+/// Reviews or re-reviews a pull request by number, without the caller knowing
+/// any SHAs.
+///
+/// The current head is resolved first, then matched against what has already
+/// been ingested. That order matters: after a force-push, PR #20 names different
+/// code than the stored patchset does, and re-running the stored one would
+/// review commits no longer in the pull request while reporting the PR number.
+///
+/// Resolution needs `gh`. When it is unavailable but the PR has been ingested
+/// before, fall back to re-running that -- a re-review of possibly-stale code is
+/// still more useful than an error, provided the response says so.
+async fn review_pull_request(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PrQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    if state.read_only {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    if !state.allow_all_submit && !addr.ip().to_canonical().is_loopback() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    let repo_path = std::path::PathBuf::from(&state.settings.git.repository_path);
+    let resolved = crate::forge::resolve_pull_request(&repo_path, query.number).await;
+
+    let metadata = match resolved {
+        Ok(metadata) => metadata,
+        Err(e) => {
+            warn!("Could not resolve PR #{}: {}", query.number, e);
+            let Ok(Some(id)) = state.db.get_patchset_id_by_mr_number(query.number).await else {
+                error!("PR #{} is unknown and unresolvable", query.number);
+                return Err(StatusCode::BAD_REQUEST);
+            };
+            let requeued = state.db.rerun_patchset(id).await.map_err(|e| {
+                error!("Failed to rerun patchset {}: {}", id, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            return Ok(Json(serde_json::json!({
+                "status": if requeued { "accepted" } else { "not_modified" },
+                "id": id,
+                "stale": true,
+                "message": format!(
+                    "Could not reach the forge to check PR #{} for new commits; \
+                     re-running the last range sashiko ingested for it. ({e})",
+                    query.number
+                ),
+            })));
+        }
+    };
+
+    let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
+
+    // Same range as an existing patchset: this is a genuine re-review, so reuse
+    // the record rather than accumulating a duplicate per invocation.
+    if let Ok(Some(id)) = state
+        .db
+        .get_patchset_id_by_pr_range(query.number, &commit_range)
+        .await
+    {
+        let requeued = state.db.rerun_patchset(id).await.map_err(|e| {
+            error!("Failed to rerun patchset {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+
+        return Ok(Json(if requeued {
+            serde_json::json!({
+                "status": "accepted",
+                "id": id,
+                "message": format!("PR #{} queued for re-review", query.number),
+            })
+        } else {
+            serde_json::json!({
+                "status": "not_modified",
+                "id": id,
+                "reason": RERUN_IN_PROGRESS_REASON,
+            })
+        }));
+    }
+
+    info!(
+        "PR #{} resolved to {} (not yet ingested); queueing",
+        query.number, commit_range
+    );
+    enqueue_pull_request(&state, "GitHub", metadata, "pull request").await
+}
+
 async fn forge_webhook(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     State(state): State<Arc<AppState>>,
@@ -1353,23 +1457,43 @@ async fn forge_webhook(
         metadata.pr_url.as_deref().unwrap_or("(no url)")
     );
 
-    let default_subject = format!("{} #{}", forge.name(), metadata.pr_number);
+    enqueue_pull_request(&state, forge.name(), metadata, &action).await
+}
+
+/// Queues a pull request for review from its resolved metadata.
+///
+/// Shared by the webhook and the manual `--pr` path so a hand-triggered review
+/// is the same review the webhook would have run: same range derivation, same
+/// placeholder, same slug. A second copy would drift, and the difference would
+/// only show up as two reviews of one PR disagreeing.
+async fn enqueue_pull_request(
+    state: &Arc<AppState>,
+    forge_name: &str,
+    metadata: crate::forge::ForgeMetadata,
+    action: &str,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let default_subject = format!("{} #{}", forge_name, metadata.pr_number);
     let subject = metadata.pr_title.as_deref().unwrap_or(&default_subject);
 
     let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
-    let placeholder_id = format!("mr-{}-{}", metadata.pr_number, commit_range);
+    let placeholder_id = crate::db::pr_placeholder_id(metadata.pr_number, &commit_range);
 
-    let slug = metadata.repo_url.as_ref().map(|url| {
-        let repo = crate::forge::extract_repo_name_from_url(url);
-        format!("{}-{}", repo, metadata.pr_number)
-    });
+    // Per revision, not per pull request: a force-push or an added commit is a
+    // different range and gets its own patchset, and each keeps a link that
+    // never moves. `<repo>-<number>` is resolved to the newest of them at
+    // lookup time rather than being stored on any one row.
+    let slug = metadata
+        .pr_url
+        .as_ref()
+        .and_then(|url| crate::forge::extract_repo_name_from_request_url(url))
+        .map(|repo| crate::db::pr_slug(&repo, metadata.pr_number, &metadata.head_sha));
 
     // Captured so the fetch agent can tie this commit to a cancellable patchset.
     let placeholder_patchset_id = state
         .db
         .create_fetching_patchset(
             &placeholder_id,
-            &format!("Fetching {} PR/MR: {}", forge.name(), subject),
+            &format!("Fetching {} PR/MR: {}", forge_name, subject),
             None,
             None,
             metadata.pr_url.as_deref(),
@@ -1395,6 +1519,36 @@ async fn forge_webhook(
         mr_number: Some(metadata.pr_number),
     };
 
+    // The forge told us what this pull request is based on, so use that rather
+    // than letting the reviewer search for a baseline. The search has no way to
+    // know the answer it is looking for is already known, and its last resort is
+    // a mainline tree -- which can apply cleanly and still be the wrong context
+    // entirely.
+    if let Err(e) = state
+        .db
+        .set_declared_baseline(placeholder_patchset_id, &metadata.base_sha)
+        .await
+    {
+        // Not fatal: the reviewer falls back to resolving one, which is what it
+        // did before this existed.
+        warn!(
+            "Could not record declared baseline {} for patchset {}: {}",
+            metadata.base_sha, placeholder_patchset_id, e
+        );
+    }
+
+    // Earlier revisions stay browsable, but must not read as current.
+    if let Err(e) = state
+        .db
+        .mark_superseded_pr_revisions(metadata.pr_number, placeholder_patchset_id)
+        .await
+    {
+        warn!(
+            "Could not mark earlier revisions of #{} as superseded: {}",
+            metadata.pr_number, e
+        );
+    }
+
     state.fetch_sender.send(req).await.map_err(|e| {
         error!("Failed to send fetch request to queue: {}", e);
         StatusCode::INTERNAL_SERVER_ERROR
@@ -1402,7 +1556,8 @@ async fn forge_webhook(
 
     Ok(Json(serde_json::json!({
         "status": "accepted",
-        "message": format!("{} {} queued for review", forge.name(), action)
+        "id": placeholder_patchset_id,
+        "message": format!("{} {} queued for review", forge_name, action)
     })))
 }
 
