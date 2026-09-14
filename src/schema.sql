@@ -264,6 +264,10 @@ CREATE TABLE IF NOT EXISTS tool_usages (
     arguments TEXT,
     output_length INTEGER,
     created_at INTEGER,
+    -- Which repository the call read: "review" for the code under review,
+    -- "kernel" for the reference tree. NULL on rows written before the
+    -- reference repository existed.
+    repo TEXT,
     FOREIGN KEY(review_id) REFERENCES reviews(id)
 );
 CREATE INDEX IF NOT EXISTS idx_tool_usages_review ON tool_usages(review_id);
