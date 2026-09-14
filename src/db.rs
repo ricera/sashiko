@@ -225,6 +225,36 @@ pub struct PatchworkOutboxRow {
     pub created_at: i64,
 }
 
+/// Permanent slug for one pull request revision.
+///
+/// The head SHA is part of the identity because a pull request is not one
+/// unit of review: every force-push or added commit is a different range, and
+/// each gets its own patchset. A slug of `<repo>-<number>` alone could name
+/// only one of them, and moving it as the pull request advanced would break
+/// every link already handed out for the older review.
+///
+/// The bare `<repo>-<number>` form is deliberately never stored. It is resolved
+/// at lookup time to whichever revision is newest -- see
+/// [`Database::resolve_patchset_slug`].
+pub fn pr_slug(repo: &str, mr_number: i64, head_sha: &str) -> String {
+    let short: String = head_sha.chars().take(8).collect();
+    format!("{}-{}-{}", repo, mr_number, short)
+}
+
+/// Cover-letter id for the patchset a pull request is reviewed in.
+///
+/// The `@sashiko.local` suffix is not decoration. Ingestion derives a patchset's
+/// cover-letter id with `resolve_root_msg_id`, which appends it to the article
+/// id for every GitFetch article. A placeholder created without it can never be
+/// matched, so the review builds a fresh patchset beside it and the placeholder
+/// sits in "Fetching" forever -- two rows for one pull request.
+///
+/// Both the writer (`enqueue_pull_request`) and the reader
+/// (`get_patchset_id_by_pr_range`) go through here so they cannot drift.
+pub fn pr_placeholder_id(mr_number: i64, commit_range: &str) -> String {
+    format!("mr-{}-{}@sashiko.local", mr_number, commit_range)
+}
+
 impl Database {
     pub async fn get_oldest_message_timestamp(&self) -> Result<Option<i64>> {
         let mut rows = self
@@ -2225,6 +2255,19 @@ impl Database {
     /// unknown, as for a row written before the column existed. Unknown
     /// ranks below every part: any part displaces it, and it displaces
     /// only an unset or equally unknown baseline.
+    /// Records a baseline the caller knows authoritatively, ahead of anything
+    /// inferred from the commits themselves.
+    ///
+    /// A forge tells us exactly what a pull request is based on. Part index 0
+    /// means no later inference can displace it -- `record_series_baseline`
+    /// keeps the lowest index, and a patch's parent is only ever a guess at the
+    /// series base.
+    pub async fn set_declared_baseline(&self, patchset_id: i64, commit: &str) -> Result<()> {
+        let baseline_id = self.create_baseline(None, None, Some(commit)).await?;
+        self.record_series_baseline(patchset_id, baseline_id, Some(0))
+            .await
+    }
+
     async fn record_series_baseline(
         &self,
         patchset_id: i64,
@@ -2630,6 +2673,31 @@ impl Database {
                         .await?;
                 }
 
+                // Forge identity moves with the rest. The slug is what the web
+                // UI links to, so losing it with the row turns every existing
+                // link into a 404 and leaves the surviving patchset reachable
+                // only by its numeric id.
+                //
+                // Read before the delete and written after it, because `slug`
+                // is UNIQUE: assigning it to the target while the source still
+                // holds it fails the constraint and aborts the whole merge.
+                let mut identity = self
+                    .conn
+                    .query(
+                        "SELECT slug, mr_url, mr_title, mr_number FROM patchsets WHERE id = ?",
+                        libsql::params![merge_from_id],
+                    )
+                    .await?;
+                let identity = match identity.next().await? {
+                    Some(row) => (
+                        row.get::<Option<String>>(0).ok().flatten(),
+                        row.get::<Option<String>>(1).ok().flatten(),
+                        row.get::<Option<String>>(2).ok().flatten(),
+                        row.get::<Option<i64>>(3).ok().flatten(),
+                    ),
+                    None => (None, None, None, None),
+                };
+
                 // Delete the merged patchset
                 self.conn
                     .execute(
@@ -2637,6 +2705,23 @@ impl Database {
                         libsql::params![merge_from_id],
                     )
                     .await?;
+
+                // COALESCE so a target that already knows who it is keeps its
+                // own answer rather than adopting the merged row's.
+                let (slug, mr_url, mr_title, mr_number) = identity;
+                if slug.is_some() || mr_url.is_some() || mr_title.is_some() || mr_number.is_some() {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET
+                                slug = COALESCE(slug, ?),
+                                mr_url = COALESCE(mr_url, ?),
+                                mr_title = COALESCE(mr_title, ?),
+                                mr_number = COALESCE(mr_number, ?)
+                             WHERE id = ?",
+                            libsql::params![slug, mr_url, mr_title, mr_number, target_id],
+                        )
+                        .await?;
+                }
             }
 
             // Update the target patchset
@@ -3716,12 +3801,15 @@ impl Database {
         Ok(None)
     }
 
-    pub async fn get_patchset_details_by_slug(
-        &self,
-        slug: &str,
-        page: Option<u32>,
-        limit: Option<u32>,
-    ) -> Result<Option<serde_json::Value>> {
+    /// Maps a slug from a URL onto a patchset id.
+    ///
+    /// An exact match wins, so a stored slug always resolves to its own row --
+    /// including for a repository whose name happens to end in digits. Failing
+    /// that, a trailing `-<number>` is read as a pull request number and
+    /// resolved to the newest revision of it, which is what makes
+    /// `<repo>-<number>` a stable link to "the current review of this PR"
+    /// without any row having to own that name.
+    pub async fn resolve_patchset_slug(&self, slug: &str) -> Result<Option<i64>> {
         let mut rows = self
             .conn
             .query(
@@ -3730,11 +3818,93 @@ impl Database {
             )
             .await?;
         if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
+            return Ok(row.get::<i64>(0).ok());
         }
 
-        Ok(None)
+        let Some(number) = slug
+            .rsplit_once('-')
+            .and_then(|(_, tail)| tail.parse::<i64>().ok())
+            .filter(|n| *n > 0)
+        else {
+            return Ok(None);
+        };
+
+        // Newest revision, whatever its status: a link to the current review
+        // should still resolve while that review is failing or cancelled.
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM patchsets WHERE mr_number = ? ORDER BY id DESC LIMIT 1",
+                libsql::params![number],
+            )
+            .await?;
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<i64>(0).ok(),
+            None => None,
+        })
+    }
+
+    /// Marks earlier revisions of a pull request so they cannot be mistaken for
+    /// the current one.
+    ///
+    /// `!25: subject` becomes `!25 (8a99c730): subject`, the SHA taken from the
+    /// row's own slug, which already carries it. Only the newest revision keeps
+    /// the unqualified form, which is also the one `<repo>-25` resolves to.
+    pub async fn mark_superseded_pr_revisions(&self, mr_number: i64, keep_id: i64) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, slug, subject FROM patchsets WHERE mr_number = ? AND id != ?",
+                libsql::params![mr_number, keep_id],
+            )
+            .await?;
+
+        let mut updates = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let id: i64 = row.get(0)?;
+            let slug: Option<String> = row.get(1).ok();
+            let subject: Option<String> = row.get(2).ok();
+            let (Some(slug), Some(subject)) = (slug, subject) else {
+                continue;
+            };
+            let Some((_, head)) = slug.rsplit_once('-') else {
+                continue;
+            };
+            // Idempotent: re-running must not stack qualifiers.
+            if head.is_empty() || subject.contains(&format!("({head})")) {
+                continue;
+            }
+            // Ingestion writes `!25: subject`; qualify in place so the number
+            // still reads first and the line still sorts with its siblings.
+            let marker = format!("!{}:", mr_number);
+            if let Some(rest) = subject.strip_prefix(&marker) {
+                updates.push((id, format!("!{} ({}):{}", mr_number, head, rest)));
+            } else {
+                updates.push((id, format!("({}) {}", head, subject)));
+            }
+        }
+
+        for (id, subject) in updates {
+            self.conn
+                .execute(
+                    "UPDATE patchsets SET subject = ? WHERE id = ?",
+                    libsql::params![subject, id],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_patchset_details_by_slug(
+        &self,
+        slug: &str,
+        page: Option<u32>,
+        limit: Option<u32>,
+    ) -> Result<Option<serde_json::Value>> {
+        match self.resolve_patchset_slug(slug).await? {
+            Some(id) => self.get_patchset_details(id, page, limit).await,
+            None => Ok(None),
+        }
     }
 
     pub async fn get_patchset_summary_by_slug(
@@ -3743,19 +3913,10 @@ impl Database {
         page: Option<u32>,
         limit: Option<u32>,
     ) -> Result<Option<serde_json::Value>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patchsets WHERE slug = ?",
-                libsql::params![slug],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
+        match self.resolve_patchset_slug(slug).await? {
+            Some(id) => self.get_patchset_summary(id, page, limit).await,
+            None => Ok(None),
         }
-
-        Ok(None)
     }
 
     pub async fn get_review_details(&self, id: i64) -> Result<Option<serde_json::Value>> {
@@ -4325,6 +4486,54 @@ impl Database {
         // Even if the user requested a specific patch, we increment the set's target count
         // to allow the reviewer service to proceed.
         self.rerun_patchset(patchset_id).await
+    }
+
+    /// Finds the patchset ingested for one exact pull request range.
+    ///
+    /// The range is part of the identity on purpose: after a force-push, PR #20
+    /// names different code than it did, and re-reviewing the stored patchset
+    /// would review commits that are no longer in the pull request.
+    pub async fn get_patchset_id_by_pr_range(
+        &self,
+        mr_number: i64,
+        commit_range: &str,
+    ) -> Result<Option<i64>> {
+        let placeholder_id = pr_placeholder_id(mr_number, commit_range);
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM patchsets WHERE cover_letter_message_id = ? ORDER BY id DESC LIMIT 1",
+                libsql::params![placeholder_id],
+            )
+            .await?;
+
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<i64>(0).ok(),
+            None => None,
+        })
+    }
+
+    /// Finds the patchset already ingested for a pull request number.
+    ///
+    /// Newest first: a PR that was force-pushed produces one patchset per range
+    /// it has had, and the current head is the one a re-review means. Failed and
+    /// cancelled rows are excluded so a re-review after a failure starts fresh
+    /// rather than reusing the record that failed.
+    pub async fn get_patchset_id_by_mr_number(&self, mr_number: i64) -> Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM patchsets WHERE mr_number = ? \
+                 AND status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') \
+                 ORDER BY id DESC LIMIT 1",
+                libsql::params![mr_number],
+            )
+            .await?;
+
+        Ok(match rows.next().await? {
+            Some(row) => row.get::<i64>(0).ok(),
+            None => None,
+        })
     }
 
     pub async fn has_patchset_by_msgid(&self, msgid: &str) -> Result<bool> {
@@ -8530,6 +8739,256 @@ mod tests {
         rows.next().await.unwrap().unwrap().get(0).ok()
     }
 
+    /// A pull request is not one unit of review: every force-push is a
+    /// different range and gets its own patchset. Older ones stay reachable by
+    /// their own slug, and `<repo>-<number>` follows the newest.
+    #[tokio::test]
+    async fn pr_revisions_each_keep_a_link_and_the_bare_slug_follows_the_newest() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover", thread_id, None, "a@e", "Cover", 100, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+
+        let first = add_part(&db, thread_id, 1, None).await;
+        db.conn
+            .execute(
+                "UPDATE patchsets SET slug = ?, mr_number = 25, subject = '!25: pds: fixes' WHERE id = ?",
+                libsql::params![pr_slug("linux-pds", 25, "8a99c7301a6c7071"), first],
+            )
+            .await
+            .unwrap();
+
+        // A second revision of the same pull request, as a separate row.
+        let thread2 = db.create_thread("root2", "Subject", 200).await.unwrap();
+        db.create_message(
+            "cover2", thread2, None, "a@e", "Cover", 200, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let second = db
+            .create_fetching_patchset(
+                &pr_placeholder_id(25, "cccc..dddd"),
+                "!25: pds: fixes",
+                None,
+                None,
+                Some("https://github.com/org/linux-pds/pull/25"),
+                Some("pds: fixes"),
+                Some(25),
+                Some(&pr_slug("linux-pds", 25, "dddd1234567890")),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first, second, "a new range must not reuse the old row");
+
+        // Each revision keeps its own permanent link.
+        assert_eq!(
+            db.resolve_patchset_slug("linux-pds-25-8a99c730")
+                .await
+                .unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            db.resolve_patchset_slug("linux-pds-25-dddd1234")
+                .await
+                .unwrap(),
+            Some(second)
+        );
+
+        // And the bare form points at the newest.
+        assert_eq!(
+            db.resolve_patchset_slug("linux-pds-25").await.unwrap(),
+            Some(second),
+            "the unqualified slug must follow the current revision"
+        );
+
+        // The older row is labelled so the list cannot mislead.
+        db.mark_superseded_pr_revisions(25, second).await.unwrap();
+        let older = db
+            .get_patchset_details(first, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            older["subject"].as_str(),
+            Some("!25 (8a99c730): pds: fixes"),
+            "an older revision must not read as the current one"
+        );
+        let newest = db
+            .get_patchset_details(second, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(newest["subject"].as_str(), Some("!25: pds: fixes"));
+
+        // Idempotent: marking again must not stack qualifiers.
+        db.mark_superseded_pr_revisions(25, second).await.unwrap();
+        let older = db
+            .get_patchset_details(first, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            older["subject"].as_str(),
+            Some("!25 (8a99c730): pds: fixes")
+        );
+
+        // An unknown pull request number resolves to nothing rather than to
+        // whatever happens to be newest.
+        assert_eq!(
+            db.resolve_patchset_slug("linux-pds-99").await.unwrap(),
+            None
+        );
+    }
+
+    /// The reported symptom: two rows per pull request, one stuck forever in
+    /// "Fetching GitHub PR/MR: ..." and a second carrying the actual review.
+    ///
+    /// The placeholder is adopted by cover-letter id, and ingestion derives that
+    /// id for a GitFetch article by appending `@sashiko.local`. A placeholder
+    /// created without the suffix can never be matched, so the review builds a
+    /// fresh patchset beside it.
+    #[tokio::test]
+    async fn pull_request_placeholder_is_adopted_not_duplicated() {
+        let db = setup_db().await;
+        let range = "aaaa..bbbb";
+        let number = 941;
+
+        // Exactly as enqueue_pull_request creates it.
+        let placeholder_id = pr_placeholder_id(number, range);
+        let placeholder = db
+            .create_fetching_patchset(
+                &placeholder_id,
+                "Fetching GitHub PR/MR: ionic: fixes",
+                None,
+                None,
+                Some("https://github.com/org/repo/pull/941"),
+                Some("ionic: fixes"),
+                Some(number),
+                Some("repo-941"),
+            )
+            .await
+            .unwrap();
+
+        // And exactly as ingestion addresses it: resolve_root_msg_id appends the
+        // suffix to the fetcher's article id for every GitFetch article.
+        let article_id = format!("mr-{number}-{range}");
+        let root_msg_id = format!("{article_id}@sashiko.local");
+        let thread_id = db
+            .create_thread(&root_msg_id, "Subject", 100)
+            .await
+            .unwrap();
+        db.create_message(
+            "sha1",
+            thread_id,
+            Some(&root_msg_id),
+            "a@e",
+            "p",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let adopted = db
+            .create_patchset(
+                thread_id,
+                Some(&root_msg_id),
+                "sha1",
+                "!941: ionic: fixes",
+                "a@e",
+                100,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                false,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+
+        assert_eq!(
+            adopted, placeholder,
+            "the review must land in the placeholder, not beside it"
+        );
+
+        let mut rows = db
+            .conn
+            .query("SELECT COUNT(*) FROM patchsets", ())
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 1, "one pull request must not produce two rows");
+    }
+
+    /// A pull request's base is stated by the forge, not inferred. It has to
+    /// outrank every parent the commit walk later reports, or the review falls
+    /// back to searching for a baseline it was already given -- whose last
+    /// resort is a mainline tree that can apply cleanly and still be the wrong
+    /// context entirely.
+    #[tokio::test]
+    async fn declared_baseline_outranks_inferred_parents() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "cover",
+            thread_id,
+            None,
+            "author@example.com",
+            "Cover",
+            100,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The placeholder exists before any commit has been looked at.
+        let ps_id = add_part(&db, thread_id, 1, None).await;
+        db.set_declared_baseline(ps_id, "pr_base_sha")
+            .await
+            .unwrap();
+
+        let declared = patchset_baseline(&db, ps_id).await.expect("baseline set");
+        assert_eq!(
+            db.get_baseline_commit(declared).await.unwrap().as_deref(),
+            Some("pr_base_sha")
+        );
+
+        // Parents inferred from the commits arrive afterwards, at every part
+        // index a real series can produce, and none may displace it.
+        for part in [1u32, 2, 3] {
+            let inferred = db
+                .create_baseline(None, None, Some(&format!("parent_of_{part}")))
+                .await
+                .unwrap();
+            db.record_series_baseline(ps_id, inferred, Some(part))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            patchset_baseline(&db, ps_id).await,
+            Some(declared),
+            "the forge's answer must survive the commit walk"
+        );
+    }
+
     #[tokio::test]
     async fn test_baseline_comes_from_lowest_part() {
         // A later part must not overwrite the first patch's parent,
@@ -8772,6 +9231,67 @@ mod tests {
             Some(base),
             "the merged-away patchset's baseline must survive the merge"
         );
+    }
+
+    /// The reported symptom: a review reachable by numeric id but 404 by its
+    /// link, with the log saying "Patchset not found: 25-25".
+    ///
+    /// The merge carries patches, reviews, subsystems and the baseline to the
+    /// surviving row, then deletes the other. Forge identity was not on that
+    /// list, so when the merged-away row was the one holding the slug, every
+    /// link built from it pointed at a row that no longer existed.
+    #[tokio::test]
+    async fn forge_identity_survives_patchset_merge() {
+        let db = setup_db().await;
+        let thread_hi = db
+            .create_thread("root_hi", "Subject", 100_000)
+            .await
+            .unwrap();
+        let thread_lo = db
+            .create_thread("root_lo", "Subject", 250_000)
+            .await
+            .unwrap();
+        let thread_mid = db
+            .create_thread("root_mid", "Subject", 175_000)
+            .await
+            .unwrap();
+
+        let ps_hi = add_unthreaded_part(&db, thread_hi, 2, 100_000, None).await;
+        let ps_lo = add_unthreaded_part(&db, thread_lo, 1, 250_000, None).await;
+        assert_ne!(ps_hi, ps_lo);
+
+        // The row that will be merged away is the one that knows it is a pull
+        // request -- the placeholder the forge created.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET slug = ?, mr_url = ?, mr_title = ?, mr_number = ? WHERE id = ?",
+                libsql::params![
+                    "linux-pds-25",
+                    "https://github.com/org/linux-pds/pull/25",
+                    "pds: fixes",
+                    25_i64,
+                    ps_lo
+                ],
+            )
+            .await
+            .unwrap();
+
+        let ps_id = add_unthreaded_part(&db, thread_mid, 3, 175_000, None).await;
+        assert_eq!(ps_id, ps_hi, "the merge keeps the patchset created first");
+
+        let details = db
+            .get_patchset_details_by_slug("linux-pds-25", None, None)
+            .await
+            .unwrap()
+            .expect("the slug must still resolve after the merge");
+        assert_eq!(details["id"].as_i64(), Some(ps_id));
+        assert_eq!(
+            details["mr_url"].as_str(),
+            Some("https://github.com/org/linux-pds/pull/25")
+        );
+
+        let id = db.get_patchset_id_by_mr_number(25).await.unwrap();
+        assert_eq!(id, Some(ps_id), "a re-review must find the surviving row");
     }
 
     /// Verify that a commit SHA submitted as a singleton does NOT steal

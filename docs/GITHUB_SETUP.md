@@ -47,6 +47,46 @@ Server running on http://127.0.0.1:8080
 curl http://localhost:8080/
 ```
 
+### Step 2b: Give the host access to the repository
+
+Sashiko fetches pull requests with plain `git`, using whatever credentials the
+daemon host already has. It holds no GitHub token of its own: `forge.api_token`
+is only injected into `gitlab.com` HTTPS URLs, not GitHub ones, deliberately —
+a token in a remote URL ends up in `git remote -v`, in logs, and in the stored
+config.
+
+**A public repository needs nothing here.** For a private one, give the daemon
+user credentials in one of two ways:
+
+```bash
+# Either: the GitHub CLI as git's credential helper
+gh auth login
+gh auth setup-git
+
+# Or: an SSH remote, authenticated by the daemon user's key
+git -C /path/to/repo remote set-url origin git@github.com:org/repo.git
+```
+
+Check it works as the user the daemon runs as:
+
+```bash
+git -C /path/to/repo ls-remote origin 'refs/pull/*/head' | head
+```
+
+That listing is the thing that matters. A pull request head is published at
+`refs/pull/<n>/head`, outside `refs/heads/*`, so it is not covered by an
+ordinary `git fetch`. Sashiko fetches it explicitly; if credentials are missing
+the log says so:
+
+```
+WARN Could not fetch the forge ref for #941 from origin; if origin is private,
+     the daemon host needs git credentials for it ...
+```
+
+Without it, a pull request from a fork — or from a branch since deleted —
+cannot resolve its commit range, and the review fails with a SHA rather than a
+reason.
+
 ### Step 3: Test with a Pull Request
 
 #### Option A: Test with Real GitHub PR

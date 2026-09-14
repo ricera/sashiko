@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use axum::http::{HeaderMap, StatusCode};
 use base64::Engine;
 use bytes::Bytes;
@@ -21,6 +21,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
+use tracing::warn;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -402,6 +403,180 @@ impl ForgeProvider for GitLabForge {
 }
 
 /// Extract repository name from a URL
+/// The clone URL of the repository at `repo_path`, for fetching forge refs.
+///
+/// Prefers `origin`, then any other remote. Returns `None` when nothing usable
+/// is configured, which the caller reports rather than silently proceeding.
+async fn base_repository_url(repo_path: &std::path::Path) -> Option<String> {
+    let remotes = tokio::process::Command::new("git")
+        .current_dir(repo_path)
+        .args(["remote"])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()?;
+
+    let listed = String::from_utf8_lossy(&remotes.stdout);
+    let names: Vec<&str> = listed
+        .lines()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .collect();
+
+    // `origin` first; the rest in whatever order git lists them.
+    for name in names
+        .iter()
+        .filter(|n| **n == "origin")
+        .chain(names.iter().filter(|n| **n != "origin"))
+    {
+        let output = tokio::process::Command::new("git")
+            .current_dir(repo_path)
+            .args(["remote", "get-url", name])
+            .kill_on_drop(true)
+            .output()
+            .await
+            .ok()?;
+        if !output.status.success() {
+            continue;
+        }
+        let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if is_safe_repo_url(&url) {
+            return Some(url);
+        }
+    }
+
+    None
+}
+
+/// Resolves a pull request number to the same metadata a webhook would carry.
+///
+/// Shells out to `gh` rather than calling the forge API directly: run inside the
+/// configured repository, `gh` infers owner and name from the git remote and
+/// reuses the operator's existing credentials, so this needs neither a repo slug
+/// in the settings nor a second copy of the token plumbing.
+///
+/// The SHAs come back as `baseRefOid`/`headRefOid` -- the resolved commits, not
+/// the branch names. A branch name would re-resolve at fetch time and could name
+/// a different commit than the one the review claims to have looked at.
+pub async fn resolve_pull_request(
+    repo_path: &std::path::Path,
+    number: i64,
+) -> Result<ForgeMetadata> {
+    if number <= 0 {
+        return Err(anyhow!(
+            "Pull request number must be positive, got {number}"
+        ));
+    }
+
+    let output = tokio::process::Command::new("gh")
+        .current_dir(repo_path)
+        .args(["pr", "view", &number.to_string()])
+        .args([
+            "--json",
+            "number,title,url,baseRefOid,headRefOid,headRepository,headRepositoryOwner",
+        ])
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "Failed to run `gh` to resolve PR #{number}: {e}.                  Reviewing a pull request sashiko has not already ingested needs the GitHub CLI                  installed and authenticated on the daemon host."
+            )
+        })?;
+
+    if !output.status.success() {
+        return Err(anyhow!(
+            "gh pr view {number} failed in {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let pr: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow!("Could not parse `gh pr view` output for #{number}: {e}"))?;
+
+    let base_sha = pr["baseRefOid"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gh returned no baseRefOid for PR #{number}"))?
+        .to_string();
+    let head_sha = pr["headRefOid"]
+        .as_str()
+        .ok_or_else(|| anyhow!("gh returned no headRefOid for PR #{number}"))?
+        .to_string();
+
+    // Same validation the webhook applies; `gh` output is not more trusted than
+    // a payload just because we asked for it.
+    if !is_valid_git_sha(&base_sha) || !is_valid_git_sha(&head_sha) {
+        return Err(anyhow!(
+            "gh returned a malformed SHA for PR #{number}: {base_sha}..{head_sha}"
+        ));
+    }
+
+    // The *base* repository, which is this one -- `gh` was run inside it. That
+    // is deliberately not the head repository: a forge publishes the pull
+    // request ref (refs/pull/<n>/head) on the base, so a fork PR is fetched from
+    // here, not from the fork. Reading the remote locally also keeps this
+    // working on a self-hosted forge, which a hardcoded github.com URL would
+    // not.
+    //
+    // Without a URL the fetcher takes its "local repository, cannot fetch"
+    // branch and never fetches anything, so this is what makes the PR's commits
+    // reachable at all.
+    let repo_url = base_repository_url(repo_path).await;
+    if repo_url.is_none() {
+        warn!(
+            "No usable remote URL for {}; PR #{number} commits can only be reviewed if they are already present locally",
+            repo_path.display()
+        );
+    }
+
+    Ok(ForgeMetadata {
+        repo_url,
+        base_sha,
+        head_sha,
+        pr_number: number,
+        pr_title: pr["title"].as_str().map(str::to_string),
+        pr_url: pr["url"].as_str().map(str::to_string),
+    })
+}
+
+/// Repository name out of a pull request or merge request URL.
+///
+/// Not the same job as [`extract_repo_name_from_url`], which takes the last path
+/// segment -- for `https://host/org/repo/pull/25` that is `25`, and the slug
+/// built from it reads `25-25`. The repository is the segment before the
+/// forge's request marker, skipping GitLab's `/-/` separator.
+///
+/// Returns `None` rather than guessing when there is no marker, so a caller can
+/// tell "not a request URL" from a name it should use.
+pub fn extract_repo_name_from_request_url(url: &str) -> Option<String> {
+    // Strip scheme and query so neither can be mistaken for a path segment.
+    let path = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
+
+    let segments: Vec<&str> = path
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let marker = segments
+        .iter()
+        .rposition(|s| matches!(*s, "pull" | "pulls" | "merge_requests"))?;
+
+    segments[..marker]
+        .iter()
+        .rev()
+        // GitLab writes `org/repo/-/merge_requests/25`; the `-` is a separator,
+        // not the repository.
+        .find(|s| **s != "-")
+        .map(|s| s.trim_end_matches(".git").to_string())
+}
+
 pub fn extract_repo_name_from_url(url: &str) -> String {
     url.trim_end_matches('/')
         .split('/')
@@ -903,5 +1078,111 @@ mod tests {
         headers.insert("x-gitlab-event", "Merge Request Hook".parse().unwrap());
         let body = Bytes::from("{}");
         assert!(forge.validate_event(&headers, &body, None).is_ok());
+    }
+
+    /// Without a URL here the fetcher takes its "local repository, cannot fetch"
+    /// branch and never fetches anything -- the PR's commits then have to
+    /// already be present, which for a pull request they are not.
+    #[tokio::test]
+    async fn base_repository_url_prefers_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+
+        let git = |args: Vec<&str>| {
+            let status = std::process::Command::new("git")
+                .current_dir(repo)
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(vec!["init", "-q"]);
+
+        assert_eq!(
+            base_repository_url(repo).await,
+            None,
+            "a repository with no remotes has no URL to offer"
+        );
+
+        // Added second, chosen first: origin is the forge repository, and the
+        // pull request refs live there.
+        git(vec![
+            "remote",
+            "add",
+            "fork",
+            "https://example.invalid/fork.git",
+        ]);
+        git(vec![
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/org/repo.git",
+        ]);
+        assert_eq!(
+            base_repository_url(repo).await.as_deref(),
+            Some("https://github.com/org/repo.git")
+        );
+
+        // A loopback remote is rejected rather than fetched from.
+        let dir2 = tempfile::tempdir().unwrap();
+        let repo2 = dir2.path();
+        let status = std::process::Command::new("git")
+            .current_dir(repo2)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let status = std::process::Command::new("git")
+            .current_dir(repo2)
+            .args(["remote", "add", "origin", "http://127.0.0.1/evil.git"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(base_repository_url(repo2).await, None);
+    }
+
+    /// The reported symptom: a review linked as `25-25`. The slug is what the
+    /// web UI puts in its links, so a name taken from the wrong path segment is
+    /// a link that resolves to nothing.
+    #[test]
+    fn repository_name_comes_from_before_the_request_marker() {
+        for (url, expected) in [
+            ("https://github.com/org/linux-pds/pull/25", "linux-pds"),
+            (
+                "https://github.com/org/linux-pds/pull/25/files",
+                "linux-pds",
+            ),
+            ("https://github.example.com/org/repo/pulls/7", "repo"),
+            ("https://gitlab.com/org/repo/-/merge_requests/10", "repo"),
+            (
+                "https://gitlab.example.com/group/sub/repo/-/merge_requests/3",
+                "repo",
+            ),
+            ("https://github.com/org/repo.git/pull/25", "repo"),
+            ("https://github.com/org/repo/pull/25?w=1", "repo"),
+        ] {
+            assert_eq!(
+                extract_repo_name_from_request_url(url).as_deref(),
+                Some(expected),
+                "{url}"
+            );
+        }
+
+        // Not a request URL: say so rather than returning a segment that
+        // happens to be there.
+        for url in [
+            "https://github.com/org/repo",
+            "https://github.com/org/repo.git",
+            "",
+        ] {
+            assert_eq!(extract_repo_name_from_request_url(url), None, "{url}");
+        }
+
+        // The old behaviour, kept for other callers, is exactly the trap: the
+        // last segment of a pull request URL is the number.
+        assert_eq!(
+            extract_repo_name_from_url("https://github.com/org/repo/pull/25"),
+            "25"
+        );
     }
 }
