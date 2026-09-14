@@ -981,6 +981,10 @@ Example Output:
             tools: ToolScope::All,
             max_turns,
             temperature,
+            // Runs even when the review has run out of time: this is the stage
+            // that turns gathered concerns into findings, so stopping it is
+            // what would make a salvage pointless.
+            interruptible: false,
             ..Default::default()
         })
         .reduce(|state, out: StageConcernsOutput| {
@@ -1044,6 +1048,10 @@ Example Output:
             tools: ToolScope::All,
             max_turns,
             temperature,
+            // Runs even when the review has run out of time: this is the stage
+            // that turns gathered concerns into findings, so stopping it is
+            // what would make a salvage pointless.
+            interruptible: false,
             ..Default::default()
         })
         .reduce(|state, out: ConflictResolutionOutput| {
@@ -1105,6 +1113,10 @@ Example Output:
             tools: ToolScope::All,
             max_turns,
             temperature,
+            // Runs even when the review has run out of time: this is the stage
+            // that turns gathered concerns into findings, so stopping it is
+            // what would make a salvage pointless.
+            interruptible: false,
             ..Default::default()
         })
         .reduce(|state, out: VerificationOutput| {
@@ -1141,6 +1153,9 @@ Return raw text output, not JSON."#
             recitation_policy: RecitationPolicy::FallbackToFreeForm {
                 reminder: "Do not quote code verbatim. Summarize your review directly.".to_string(),
             },
+            // Runs even when the review has run out of time: without the report
+            // there is nothing to show for the salvage.
+            interruptible: false,
             ..Default::default()
         })
         .reduce(|state, out: String| {
@@ -1466,6 +1481,50 @@ mod tests {
                 "{without}\n\n<custom_instructions>\nCheck the locking.\n</custom_instructions>"
             ),
             "the custom prompt closes the system prompt"
+        );
+    }
+
+    /// Salvaging a review that ran out of time depends entirely on which stages
+    /// a wind-down is allowed to stop.
+    ///
+    /// The analysis stages gather concerns and are worth cutting short, because
+    /// the fan-out is `BestEffort` and what they already found survives. The
+    /// consolidation stages are what turn those concerns into findings, so
+    /// stopping them would leave the salvage with nothing to show -- the review
+    /// would still end up reporting nothing, which is the bug this exists to
+    /// fix.
+    #[test]
+    fn test_consolidation_stages_survive_a_wind_down() {
+        for (name, interruptible) in [
+            (
+                deduplication_stage(20, 0.0).name,
+                deduplication_stage(20, 0.0).policy.interruptible,
+            ),
+            (
+                conflict_resolution_stage(20, 0.0).name,
+                conflict_resolution_stage(20, 0.0).policy.interruptible,
+            ),
+            (
+                verification_stage(20, 0.0).name,
+                verification_stage(20, 0.0).policy.interruptible,
+            ),
+            (
+                report_stage(20, 0.0).name,
+                report_stage(20, 0.0).policy.interruptible,
+            ),
+        ] {
+            assert!(
+                !interruptible,
+                "consolidation stage '{name}' must run even after the deadline passes"
+            );
+        }
+
+        // The analysis stages take the default, which is what makes them the
+        // ones a wind-down stops.
+        assert!(
+            StagePolicy::default().interruptible,
+            "a stage that does not opt out must be interruptible, or a wind-down \
+             would stop nothing"
         );
     }
 }

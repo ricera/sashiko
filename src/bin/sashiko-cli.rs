@@ -1084,14 +1084,16 @@ fn print_coverage_warning(review: &Value) {
     print_colored(
         Color::Red,
         &format!(
-            "Incomplete coverage: {} stage(s) did not run\n",
+            "Incomplete coverage: {} stage(s) did not complete\n",
             failures.len()
         ),
     );
     for f in failures {
         let stage = f["stage"].as_str().unwrap_or("?");
+        // "stopped" rather than "cancelled": the flag also covers a stage the
+        // review ran out of time for, which nobody asked to cancel.
         let what = if f["cancelled"].as_bool().unwrap_or(false) {
-            "cancelled"
+            "stopped"
         } else {
             "failed"
         };

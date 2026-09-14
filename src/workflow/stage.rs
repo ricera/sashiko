@@ -450,6 +450,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
 
             let runner = SessionRunner::new(env.provider.as_ref())
                 .with_max_turns(self.policy.max_turns)
+                .with_interruptible(self.policy.interruptible)
                 .with_max_validation_attempts(self.policy.max_validation_attempts)
                 .with_turn_callback(move |turn, max_turns| {
                     if let Some(cb) = event_cb {

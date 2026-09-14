@@ -473,5 +473,55 @@ check('a payload without counts is ignored rather than clearing the slot',
         return byId.get('stage-tool-calls-20').textContent === ' — 12 tool calls';
     })());
 
+// ---- case 12: a failed review must not claim to have succeeded ------------
+// Every attempt after the first read "succeeded on attempt N" regardless of
+// status, so four consecutive three-hour timeouts each reported success. The
+// recorded duration is cumulative across attempts, so a later attempt also has
+// to say the figure is a total rather than what that attempt alone cost.
+console.log('case 12: failed review cards');
+const failedCard = ctx.renderReviewCard({
+    id: 9, status: 'Failed', patch_id: 10, attempt: 4, duration_seconds: 43200,
+    result: 'Tool error: Review tool timed out (active time exceeded)',
+    stage_durations: [
+        { stage: 'goal', seconds: 120, turns: 3 },
+        { stage: 'implementation', seconds: 300, turns: 6 },
+    ],
+    stage_failures: [
+        { stage: 'locking', reason: 'still running when the review stopped, after 2h 58m and 47 turn(s)', cancelled: true },
+    ],
+});
+
+check('a failed review never claims to have succeeded',
+    !failedCard.includes('succeeded'), failedCard.slice(0, 300));
+check('it says it failed, and how long it took',
+    failedCard.includes('Failed after 12h'), failedCard.slice(0, 300));
+check('the cumulative duration is labelled as a total',
+    failedCard.includes('total'), failedCard.slice(0, 300));
+check('the attempt is still reported', failedCard.includes('on attempt 4'));
+check('the stages that did finish are still listed',
+    failedCard.includes('Stage goal') && failedCard.includes('Stage implementation'));
+// The whole point of the report: which stage was running when time ran out.
+check('the stage that did not finish is named',
+    failedCard.includes('Stage locking') && failedCard.includes('2h 58m'),
+    failedCard.slice(0, 600));
+check('an unfinished stage is not called a failure',
+    failedCard.includes('Stage locking stopped'), failedCard.slice(0, 600));
+check('the coverage gap is stated',
+    failedCard.includes('did not complete'), failedCard.slice(0, 600));
+check('partial findings are not presented as a full review',
+    failedCard.includes('only from the stages that finished'));
+
+// A first-attempt success is the common case and must stay unchanged: no
+// attempt number, and no "total" qualifier on a duration that is one run.
+const cleanCard = ctx.renderReviewCard({
+    id: 10, status: 'Reviewed', patch_id: 11, attempt: 1, duration_seconds: 90,
+});
+check('a first-attempt review still reads plainly',
+    cleanCard.includes('Reviewed in 90s') && !cleanCard.includes('total')
+        && !cleanCard.includes('attempt'), cleanCard.slice(0, 300));
+check('a retried success still says it succeeded',
+    ctx.renderReviewCard({ id: 11, status: 'Reviewed', patch_id: 11, attempt: 2, duration_seconds: 90 })
+        .includes('succeeded on attempt 2'));
+
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);

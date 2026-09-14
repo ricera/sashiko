@@ -851,6 +851,21 @@ pub fn worker_cancel_token() -> &'static tokio_util::sync::CancellationToken {
     WORKER_CANCEL.get_or_init(tokio_util::sync::CancellationToken::new)
 }
 
+/// Process-wide signal that the review has run out of time and should salvage
+/// what it has.
+///
+/// Distinct from [`worker_cancel_token`] because the two mean opposite things
+/// to the stages that follow. A cancellation stops everything: the supervisor
+/// wants the review to stop costing money now. Winding down stops only the
+/// analysis stages, so the consolidation stages can still turn the concerns
+/// already gathered into findings -- a review that is out of time is worth
+/// strictly more finished than abandoned.
+pub fn worker_wind_down_token() -> &'static tokio_util::sync::CancellationToken {
+    static WORKER_WIND_DOWN: std::sync::OnceLock<tokio_util::sync::CancellationToken> =
+        std::sync::OnceLock::new();
+    WORKER_WIND_DOWN.get_or_init(tokio_util::sync::CancellationToken::new)
+}
+
 pub(crate) fn ipc_writer() -> Arc<AtomicWriter> {
     IPC_WRITER
         .get_or_init(|| Arc::new(AtomicWriter::new()))
@@ -917,6 +932,15 @@ pub(crate) fn start_stdin_reader(registry: Arc<IpcRegistry>) -> tokio::task::Joi
                         // reported; the supervisor kills us if we take too long.
                         tracing::info!("Cancellation requested by supervisor");
                         worker_cancel_token().cancel();
+                    }
+                    "wind_down" => {
+                        // Out of time, not unwanted. Stop the analysis stages but
+                        // let the consolidation stages run, so the concerns
+                        // gathered so far still become findings rather than being
+                        // thrown away. The supervisor has extended our deadline to
+                        // cover exactly that tail.
+                        tracing::info!("Wind-down requested by supervisor: salvaging findings");
+                        worker_wind_down_token().cancel();
                     }
                     unknown => {
                         eprintln!("CRITICAL PROTOCOL ERROR: Unknown message type: {}", unknown);

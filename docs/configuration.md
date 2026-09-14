@@ -244,7 +244,8 @@ pass.
 | `concurrency` | integer | -- | Number of concurrent reviews. |
 | `worktree_dir` | string | -- | Directory for git worktrees used during review. |
 | `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). |
-| `max_retries` | integer | `3` | Retry count on transient failures. |
+| `salvage_seconds` | integer | `900` | Extra time granted once `timeout_seconds` is exhausted, so the review can turn the concerns it already gathered into findings instead of reporting nothing. The analysis stages stop; the consolidation stages run. The review is still recorded as failed, with the stages that did not finish named, and the patch marked `Partial`. Set to 0 to fail immediately instead. |
+| `max_retries` | integer | `3` | Retry count on transient failures. A review that exhausts its deadline is not retried: the next attempt gets the same budget that has already proved too small. |
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |
 | `max_files_touched` | integer | `200` | Skip patches touching more files than this. |
 | `ignore_files` | list | `[]` | File patterns to skip during review (e.g. `MAINTAINERS`). |

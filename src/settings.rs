@@ -461,6 +461,16 @@ pub struct ReviewSettings {
     pub worktree_dir: String,
     #[serde(default = "default_review_timeout")]
     pub timeout_seconds: u64,
+    /// Extra time granted, after `timeout_seconds` is exhausted, for the review
+    /// to consolidate the concerns it already gathered into findings.
+    ///
+    /// A review that runs out of time is worth strictly more finished than
+    /// abandoned, but the salvage itself has to be bounded or the deadline
+    /// means nothing. Fixed rather than a fraction of `timeout_seconds`, so the
+    /// worst-case overrun is a known quantity however long the review is
+    /// allowed to run.
+    #[serde(default = "default_salvage_seconds")]
+    pub salvage_seconds: u64,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     #[serde(default = "default_max_lines_changed")]
@@ -504,6 +514,13 @@ fn default_max_files_touched() -> usize {
 
 fn default_review_timeout() -> u64 {
     3600
+}
+
+/// Fifteen minutes: enough for the four consolidation stages to run once over
+/// concerns that are already gathered, without letting a stuck review double
+/// its own deadline.
+fn default_salvage_seconds() -> u64 {
+    900
 }
 
 fn default_max_retries() -> u32 {
