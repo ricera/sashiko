@@ -1,6 +1,6 @@
 [package]
 name = "sashiko"
-version = "0.3.4"
+version = "0.3.4+ricera"
 edition = "2024"
 default-run = "sashiko"
 description = "Agentic code review system for Linux kernel"

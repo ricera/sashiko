@@ -37,7 +37,14 @@ fn main() {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string()));
 
-    println!("cargo:rustc-env=GIT_HASH={}", git_hash);
+    // Deliberately NOT `cargo:rustc-env`. The build script has to rerun on
+    // every git operation to notice a new commit -- the reflog it watches is
+    // rewritten by fetch, checkout, stash, and pulls that change nothing -- and
+    // a rerun that re-emits an env var makes Cargo rebuild the crate whether or
+    // not the value moved. That is a full recompile of 60k lines for a `git
+    // status`. Writing the hash into the generated file instead means the rerun
+    // stays cheap and the crate is rebuilt only when the commit actually
+    // changed, because the guard below leaves the file untouched otherwise.
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let prompts_dir = manifest_dir.join("third_party/prompts");
@@ -54,6 +61,12 @@ fn main() {
         .to_string();
 
     let mut generated_bytes = Vec::new();
+    writeln!(
+        generated_bytes,
+        "pub const GIT_HASH: &str = {:?};",
+        git_hash
+    )
+    .unwrap();
     writeln!(
         generated_bytes,
         "pub const PROMPT_BUNDLE_REVISION: &str = {:?};",
@@ -95,9 +108,15 @@ fn track_git_changes() {
             && let Some(ref_name) = head_content.strip_prefix("ref: ")
         {
             let ref_name = ref_name.trim();
-            if let Some(ref_path) = get_git_path(ref_name)
-                && ref_path.exists()
-            {
+            // Emitted whether or not the loose ref exists yet. Under packed
+            // refs it does not, and a commit is what creates it -- which is
+            // exactly the change we need to notice. Guarding on `exists()`
+            // here is why the reflog had to be watched instead, and the reflog
+            // is rewritten by every fetch, checkout and stash, so the build
+            // script reran constantly. Cargo reruns a script when a tracked
+            // path appears, so the unguarded form covers the packed case
+            // without the hair trigger.
+            if let Some(ref_path) = get_git_path(ref_name) {
                 println!("cargo:rerun-if-changed={}", ref_path.display());
             }
         }
@@ -106,11 +125,6 @@ fn track_git_changes() {
         && packed.exists()
     {
         println!("cargo:rerun-if-changed={}", packed.display());
-    }
-    if let Some(reflog) = get_git_path("logs/HEAD")
-        && reflog.exists()
-    {
-        println!("cargo:rerun-if-changed={}", reflog.display());
     }
     if let Some(reftable) = get_git_path("reftable/tables.list")
         && reftable.exists()
