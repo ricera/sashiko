@@ -49,6 +49,7 @@
             --status-reviewed: #22863a;
             --status-failed: #d73a49;
             --status-embargoed: #6f42c1;
+            --status-partial: #bf8700;
             --tag-bg: #e0f7fa;
             --tag-text: #006064;
             --diff-add-bg: #e6ffec;
@@ -100,6 +101,7 @@
                 --status-reviewed: #3fb950;
                 --status-failed: #f85149;
                 --status-embargoed: #d2a8ff;
+                --status-partial: #d29922;
                 --tag-bg: #032f62;
                 --tag-text: #79c0ff;
                 --diff-add-bg: rgba(46, 160, 67, 0.15);
@@ -125,6 +127,7 @@
             --status-reviewed: #004D73;  /* Dark Blue */
             --status-failed: #803800;    /* Dark Vermilion */
             --status-embargoed: #7A4864; /* Dark Reddish Purple */
+            --status-partial: #787221;   /* Dark Yellow/Olive */
 
             --sev-critical: #803800;     /* Dark Vermilion */
             --sev-high: #8A5F00;         /* Dark Orange */
@@ -140,6 +143,7 @@
                 --status-reviewed: #0072B2;  /* Blue */
                 --status-failed: #D55E00;    /* Vermilion */
                 --status-embargoed: #CC79A7; /* Reddish Purple */
+                --status-partial: #F0E442;   /* Yellow */
 
                 --sev-critical: #D55E00;     /* Vermilion */
                 --sev-high: #E69F00;         /* Orange */
@@ -155,6 +159,7 @@
             --status-reviewed: #004D73;
             --status-failed: #803800;
             --status-embargoed: #7A4864;
+            --status-partial: #787221;
 
             --sev-critical: #803800;
             --sev-high: #8A5F00;
@@ -169,6 +174,7 @@
             --status-reviewed: #0072B2;
             --status-failed: #D55E00;
             --status-embargoed: #CC79A7;
+            --status-partial: #F0E442;
 
             --sev-critical: #D55E00;
             --sev-high: #E69F00;
@@ -211,6 +217,7 @@
             --status-reviewed: #22863a;
             --status-failed: #d73a49;
             --status-embargoed: #6f42c1;
+            --status-partial: #bf8700;
             --tag-bg: #e0f7fa;
             --tag-text: #006064;
             --diff-add-bg: #e6ffec;
@@ -259,6 +266,7 @@
             --status-reviewed: #3fb950;
             --status-failed: #f85149;
             --status-embargoed: #d2a8ff;
+            --status-partial: #d29922;
             --tag-bg: #032f62;
             --tag-text: #79c0ff;
             --diff-add-bg: rgba(46, 160, 67, 0.15);
@@ -452,6 +460,14 @@
             color: var(--status-failed);
         }
 
+        /* Reviewed, but not fully: the review ran out of time and salvaged what
+           its finished stages had found. Distinct from both Reviewed and Failed
+           because it is neither -- there are findings worth reading, and there
+           is coverage missing. */
+        .status-Partial {
+            color: var(--status-partial);
+        }
+
         .status-Cancelled,
         .status-Skipped {
             color: var(--thought-color);
@@ -546,6 +562,7 @@
         .status-dot.status-InReview { background-color: var(--status-inreview); }
         .status-dot.status-Reviewed { background-color: var(--status-reviewed); }
         .status-dot.status-Failed { background-color: var(--status-failed); }
+        .status-dot.status-Partial { background-color: var(--status-partial); }
         .status-dot.status-FailedToApply { background-color: var(--status-failed); }
         .status-dot.status-Embargoed { background-color: var(--status-embargoed); }
         .status-dot.status-Cancelled { background-color: var(--thought-color); }
@@ -2960,6 +2977,11 @@
         function renderReviewCard(r, emailHtml = '') {
             const uniqueId = Math.random().toString(36).substr(2, 9);
 
+            const statusRaw = r.status || 'Finished';
+            const s = statusRaw.toLowerCase();
+            const showDetails = s === 'reviewed' || s === 'finished' || s === 'failed' || s === 'skipped';
+            const failed = s === 'failed';
+
             // Incomplete coverage must be stated, not inferred. A review missing
             // (say) the security stage but presenting as clean is worse than one
             // that failed outright, because nothing signals the gap.
@@ -2968,19 +2990,23 @@
             // took more than one go — otherwise it is noise on every card.
             const runNotes = [];
             if (typeof r.duration_seconds === 'number') {
-                runNotes.push(`Reviewed in ${formatDuration(r.duration_seconds)}`);
+                // The recorded duration covers every attempt, not just the one
+                // this row describes, so a retried review has to say so.
+                // Otherwise the fourth attempt of a three-hour timeout reads as
+                // a single twelve-hour one.
+                const total = typeof r.attempt === 'number' && r.attempt > 1 ? ' total' : '';
+                const verb = failed ? 'Failed after' : 'Reviewed in';
+                runNotes.push(`${verb} ${formatDuration(r.duration_seconds)}${total}`);
             }
-            // Only worth saying when it took more than one go.
+            // Only worth saying when it took more than one go. A failed review
+            // did not succeed on any of them, so it only states which one it
+            // was.
             if (typeof r.attempt === 'number' && r.attempt > 1) {
-                runNotes.push(`succeeded on attempt ${r.attempt}`);
+                runNotes.push(failed ? `on attempt ${r.attempt}` : `succeeded on attempt ${r.attempt}`);
             }
             const attemptHtml = runNotes.length
                 ? `<div style="color:var(--text-muted); font-size:0.9em;">${escapeHtml(runNotes.join(', '))}</div>`
                 : '';
-
-            const statusRaw = r.status || 'Finished';
-            const s = statusRaw.toLowerCase();
-            const showDetails = s === 'reviewed' || s === 'finished' || s === 'failed' || s === 'skipped';
 
             // One element covers both halves of a review's life. While the
             // stages run it holds live per-stage progress; once they finish it
@@ -3037,13 +3063,17 @@
             let coverageHtml = '';
             if (Array.isArray(r.stage_failures) && r.stage_failures.length > 0) {
                 const parts = r.stage_failures.map(f => {
-                    const what = f.cancelled ? 'cancelled' : 'failed';
+                    const what = f.cancelled ? 'stopped' : 'failed';
                     const why = f.reason ? `: ${escapeHtml(String(f.reason))}` : '';
                     return `<div>Stage ${escapeHtml(String(f.stage))} ${what}${why}</div>`;
                 }).join('');
+                // "did not complete" rather than "did not run": a stage killed
+                // by the deadline did run, and saying otherwise hides the work
+                // it got through.
                 coverageHtml = `<div style="margin:8px 0; padding:8px; border-radius:6px;`
                     + ` border:1px solid var(--status-failed); color:var(--status-failed);">`
-                    + `<strong>Incomplete coverage — ${r.stage_failures.length} stage(s) did not run</strong>`
+                    + `<strong>Incomplete coverage — ${r.stage_failures.length} stage(s) did not complete</strong>`
+                    + (failed ? `<div>Any findings below come only from the stages that finished.</div>` : '')
                     + parts
                     + `</div>`;
             }

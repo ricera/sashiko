@@ -60,6 +60,18 @@ pub struct StagePolicy {
     pub tools: ToolScope,
     /// Policy for handling recitation errors.
     pub recitation_policy: RecitationPolicy,
+    /// Whether this stage may be stopped early to salvage a review that has run
+    /// out of time.
+    ///
+    /// The analysis stages gather concerns and are worth cutting short: what
+    /// they already found survives, because the fan-out is `BestEffort`. The
+    /// consolidation stages that follow are what turn those concerns into
+    /// findings, so stopping them is what would make the salvage pointless --
+    /// they run even after the deadline has passed.
+    ///
+    /// A hard cancellation ignores this and stops everything; the distinction
+    /// only applies to winding a review down.
+    pub interruptible: bool,
 }
 
 impl Default for StagePolicy {
@@ -76,6 +88,7 @@ impl Default for StagePolicy {
                  quote only short snippets (1-2 lines). Re-emit your JSON output now."
                     .to_string(),
             ),
+            interruptible: true,
         }
     }
 }

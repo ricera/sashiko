@@ -1411,7 +1411,13 @@ impl Reviewer {
                 .await;
 
             match result {
-                Ok(json_output) => {
+                Ok(ReviewToolOutcome {
+                    output: json_output,
+                    // Set when the worker produced this result only because it
+                    // was asked to wind down early. Its coverage is short of
+                    // what was planned however complete the output looks.
+                    timed_out: salvaged,
+                }) => {
                     let patches_status = json_output["patches"].as_array();
                     let target_applied = patches_status
                         .and_then(|arr| arr.iter().find(|p| p["index"] == index))
@@ -1508,7 +1514,7 @@ impl Reviewer {
                                 )
                                 .await;
 
-                            if retries < max_retries {
+                            if retries < max_retries && !salvaged {
                                 retries += 1;
                                 continue;
                             } else {
@@ -1547,6 +1553,49 @@ impl Reviewer {
 
                                 let summary =
                                     review_content["summary"].as_str().unwrap_or("").to_string();
+
+                                // Salvaged, not finished. The findings above are
+                                // real and worth keeping -- they are why the
+                                // wind-down happens at all -- but the review did
+                                // not cover what it planned to, so it must not
+                                // read as one that did. Recorded as Failed so
+                                // every gate that asks "was this reviewed?"
+                                // still answers no, with the patch marked
+                                // Partial to say there is something here worth
+                                // opening.
+                                if salvaged {
+                                    let inline_review = json_output["inline_review"].as_str();
+                                    let _ = ctx
+                                        .db
+                                        .complete_review(
+                                            review_id,
+                                            ReviewStatus::Failed.as_str(),
+                                            "Tool error: Review tool timed out (active time \
+                                             exceeded); findings salvaged from the stages that \
+                                             had completed",
+                                            Some(&summary),
+                                            interaction_id.as_deref(),
+                                            inline_review,
+                                            logs_str.as_deref(),
+                                        )
+                                        .await;
+                                    warn!(
+                                        "Review {} timed out; salvaged {} finding(s) from the \
+                                         stages that completed",
+                                        review_id,
+                                        review_content
+                                            .get("findings")
+                                            .and_then(|f| f.as_array())
+                                            .map(|f| f.len())
+                                            .unwrap_or(0)
+                                    );
+                                    let _ = ctx.db.update_patch_status(patch_id, "Partial").await;
+                                    // No retry: the deadline was already spent
+                                    // once, and an identical second attempt has
+                                    // no more room than the first had.
+                                    return Ok(PatchResult::ReviewFailed);
+                                }
+
                                 let result_desc = "Review completed successfully.";
 
                                 let inline_review = json_output["inline_review"].as_str();
@@ -1662,7 +1711,7 @@ impl Reviewer {
                                         logs_str.as_deref(),
                                     )
                                     .await;
-                                if retries < max_retries {
+                                if retries < max_retries && !salvaged {
                                     retries += 1;
                                     continue;
                                 } else {
@@ -1706,7 +1755,7 @@ impl Reviewer {
                                 logs_str.as_deref(),
                             )
                             .await;
-                        if retries < max_retries {
+                        if retries < max_retries && !salvaged {
                             retries += 1;
                             continue;
                         }
@@ -1716,6 +1765,10 @@ impl Reviewer {
                 }
                 Err(e) => {
                     error!("Review execution failed for {}: {}", patchset_id, e);
+                    // The stage timings and the streamed conversation were
+                    // already written against this review by the tool itself,
+                    // so they survive being completed here with nothing else.
+                    let timed_out = e.downcast_ref::<ReviewTimedOut>().is_some();
                     let _ = ctx
                         .db
                         .complete_review(
@@ -1728,7 +1781,11 @@ impl Reviewer {
                             None,
                         )
                         .await;
-                    if retries < max_retries {
+                    // A review that exhausted its deadline is not retried: the
+                    // next attempt gets the same budget that has already proved
+                    // too small, and four of them is how one patch came to
+                    // spend twelve hours producing nothing.
+                    if retries < max_retries && !timed_out {
                         retries += 1;
                         continue;
                     }
@@ -1747,6 +1804,82 @@ const GRACEFUL_CANCEL_WAIT: std::time::Duration = std::time::Duration::from_secs
 /// Error text when a worker ignored the cancel request and had to be killed.
 /// Distinguished from a plain timeout so the log says what actually happened.
 const CANCEL_IGNORED: &str = "Review tool ignored cancellation and was killed";
+
+/// Why the worker was asked to stop.
+///
+/// The two are handled differently on purpose. A cancellation means the review
+/// is not wanted, so it stops as soon as the worker reports what it already
+/// finished. A timeout means the review wanted more time than it was given, so
+/// the worker is granted a bounded extension to turn the concerns it gathered
+/// into findings -- abandoning that work is how a three-hour review comes to
+/// produce nothing at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindDown {
+    Cancelled,
+    TimedOut,
+}
+
+/// A review that exhausted its deadline.
+///
+/// Typed rather than a bare message so the caller can recognise it without
+/// matching on text; the `Display` text is unchanged from what it replaced, so
+/// what is stored and shown stays the same.
+#[derive(Debug, thiserror::Error)]
+#[error("Review tool timed out (active time exceeded)")]
+struct ReviewTimedOut;
+
+/// What a run of the review tool produced, and whether it had to be salvaged.
+///
+/// `timed_out` cannot be read off the output: the worker reports a normal
+/// result either way, and only the daemon knows it asked for that result early.
+#[derive(Debug)]
+struct ReviewToolOutcome {
+    output: serde_json::Value,
+    timed_out: bool,
+}
+
+/// Renders an elapsed duration the way the rest of the review reports time.
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+        (0, 0, s) => format!("{}s", s),
+        (0, m, s) => format!("{}m {}s", m, s),
+        (h, m, _) => format!("{}h {}m", h, m),
+    }
+}
+
+/// Copies a review's streamed preview into its durable `logs` column.
+///
+/// Only for a review that ended without the worker's own history. The preview
+/// is truncated per entry and capped per review, so it is not the conversation
+/// the model saw -- it says so in a leading entry rather than letting a partial
+/// log pass for a complete one.
+async fn promote_live_log_to_review(db: &Arc<Database>, review_id: i64) -> Result<()> {
+    if db.review_has_logs(review_id).await? {
+        return Ok(());
+    }
+
+    let entries = db.get_review_log_entries(review_id).await?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    let mut log = vec![serde_json::json!({
+        "role": "system",
+        "content": "[The review did not finish, so its full conversation was never saved. \
+                    What follows is the truncated live preview: each entry is clipped, and \
+                    only the first entries of the review are kept.]",
+    })];
+    log.extend(entries.into_iter().map(|e| {
+        serde_json::json!({
+            "role": e.get("role").and_then(|r| r.as_str()).unwrap_or("unknown"),
+            "content": e.get("content").and_then(|c| c.as_str()).unwrap_or(""),
+        })
+    }));
+
+    db.set_review_logs(review_id, &serde_json::Value::Array(log).to_string())
+        .await
+}
 
 /// Resolves when the token fires; never resolves when there is no token.
 ///
@@ -2017,7 +2150,7 @@ async fn run_review_tool(
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     attempt: u32,
     max_attempts: u32,
-) -> Result<serde_json::Value> {
+) -> Result<ReviewToolOutcome> {
     let cmd = default_worker_command()?;
     run_review_tool_with_cmd(
         cmd,
@@ -2087,7 +2220,7 @@ async fn run_review_tool_with_cmd(
     cancel_token: Option<tokio_util::sync::CancellationToken>,
     attempt: u32,
     max_attempts: u32,
-) -> Result<serde_json::Value> {
+) -> Result<ReviewToolOutcome> {
     // Cap concurrent model calls with the shared limiter instead of taking the
     // semaphore by hand around each call. This also releases the permit as soon
     // as the call returns, so a request that is backing off no longer occupies
@@ -2213,6 +2346,11 @@ async fn run_review_tool_with_cmd(
         TokioInstant::now() + Duration::from_secs(settings.review.timeout_seconds),
     ));
 
+    // Extra time granted once, after the deadline expires, for the worker to
+    // consolidate what it gathered. Zero disables the salvage, which makes a
+    // timeout fail immediately as it used to.
+    let salvage_seconds = settings.review.salvage_seconds;
+
     // Retry rate-limited and transient failures with the shared limiter rather
     // than an open-coded loop. A review is bounded by its activity deadline
     // rather than an attempt count, and time spent waiting out a rate limit is
@@ -2227,6 +2365,23 @@ async fn run_review_tool_with_cmd(
         ));
 
     let mut spawned_tasks = Vec::new();
+    // Per-stage timing, derived from the progress events the worker already
+    // emits. Doing it here rather than in the worker covers every stage
+    // uniformly, including the consolidation stages that run outside the
+    // concurrent block.
+    //
+    // Declared outside the interaction block so they survive its failure. A
+    // review that ran out of time is exactly when the question "which stage was
+    // this stuck in?" is worth answering, and these are the only record of it.
+    let mut stage_starts: std::collections::HashMap<String, TokioInstant> =
+        std::collections::HashMap::new();
+    // Highest turn number seen per stage, which is how many LLM round trips
+    // that stage needed before it finished.
+    let mut stage_turns: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut stage_stats: Vec<(String, u64, u64)> = Vec::new();
+    // Set when the daemon asks the worker to stop, for the same reason.
+    let mut wind_down: Option<WindDown> = None;
+
     let interaction_result =
         async {
             // Send initial payload
@@ -2247,19 +2402,7 @@ async fn run_review_tool_with_cmd(
             let total_output_tokens_used = Arc::new(AtomicUsize::new(0));
 
             let (abort_tx, mut abort_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
-            let mut cancel_requested = false;
 
-            // Per-stage timing, derived from the progress events the worker
-            // already emits. Doing it here rather than in the worker covers every
-            // stage uniformly, including the consolidation stages that run
-            // outside the concurrent block.
-            let mut stage_starts: std::collections::HashMap<String, TokioInstant> =
-                std::collections::HashMap::new();
-            // Highest turn number seen per stage, which is how many LLM round
-            // trips that stage needed before it finished.
-            let mut stage_turns: std::collections::HashMap<String, u64> =
-                std::collections::HashMap::new();
-            let mut stage_stats: Vec<(String, u64, u64)> = Vec::new();
             // Ordering for streamed log entries; the table is append-only and
             // read back by this number.
             let mut log_seq: i64 = 0;
@@ -2275,9 +2418,11 @@ async fn run_review_tool_with_cmd(
                         return Err(err);
                     }
                     // Guarded so it fires once: a cancelled token stays ready
-                    // forever and would otherwise spin this arm.
-                    _ = wait_for_cancel(&cancel_token), if !cancel_requested => {
-                        cancel_requested = true;
+                    // forever and would otherwise spin this arm. A cancellation
+                    // overrides an in-progress salvage -- someone asking for the
+                    // review to stop outranks finishing it.
+                    _ = wait_for_cancel(&cancel_token), if wind_down != Some(WindDown::Cancelled) => {
+                        wind_down = Some(WindDown::Cancelled);
                         info!(
                             "Cancellation requested for patchset {}; asking worker to wind down",
                             patchset_id
@@ -2303,13 +2448,43 @@ async fn run_review_tool_with_cmd(
                     line_res = timeout_at(current_deadline, lines.next_line()) => {
                         let line_result = match line_res {
                             Ok(res) => res,
-                            Err(_) if cancel_requested => {
+                            // Already winding down and still silent: the worker
+                            // had its window and did not use it.
+                            Err(_) if wind_down == Some(WindDown::Cancelled) => {
                                 return Err(anyhow::anyhow!("{}", CANCEL_IGNORED));
                             }
+                            Err(_) if wind_down == Some(WindDown::TimedOut) => {
+                                return Err(ReviewTimedOut.into());
+                            }
+                            // Out of time on the first expiry. Rather than
+                            // abandoning the worker -- which throws away every
+                            // stage it already finished -- ask it to stop
+                            // analysing and consolidate what it has, and grant
+                            // exactly enough extra time for that tail to run.
+                            Err(_) if salvage_seconds == 0 => {
+                                return Err(ReviewTimedOut.into());
+                            }
                             Err(_) => {
-                                return Err(anyhow::anyhow!(
-                                    "Review tool timed out (active time exceeded)"
-                                ));
+                                wind_down = Some(WindDown::TimedOut);
+                                warn!(
+                                    "Review for patchset {} ran out of time; asking worker to \
+                                     salvage its findings within {}s",
+                                    patchset_id, salvage_seconds
+                                );
+
+                                let msg = "{\"type\":\"wind_down\",\"tx_id\":0,\"payload\":null}\n";
+                                {
+                                    let mut writer = stdin_writer.lock().await;
+                                    let _ = writer.write_all(msg.as_bytes()).await;
+                                    let _ = writer.flush().await;
+                                }
+
+                                {
+                                    let mut d = deadline.lock().unwrap();
+                                    *d = TokioInstant::now()
+                                        + std::time::Duration::from_secs(salvage_seconds);
+                                }
+                                continue;
                             }
                         };
 
@@ -2688,19 +2863,16 @@ async fn run_review_tool_with_cmd(
 
             // Return result
             if let Some(res) = final_result {
-                Ok((res, stage_stats))
+                Ok(res)
             } else {
                 Err(anyhow::anyhow!("Review tool finished without valid result"))
             }
         }
         .await;
 
-    // Split the timings back off; everything below deals in the result alone.
-    let (interaction_result, stage_stats) = match interaction_result {
-        Ok((res, stats)) => (Ok(res), stats),
-        Err(e) => (Err(e), Vec::new()),
-    };
-
+    // Recorded however the run ended. On the failure path these are the only
+    // account of what the review was doing, which is precisely when someone
+    // needs to know.
     if !stage_stats.is_empty() {
         let payload: Vec<serde_json::Value> = stage_stats
             .iter()
@@ -2711,6 +2883,45 @@ async fn run_review_tool_with_cmd(
         let _ = db
             .set_review_stage_durations(review_id, &serde_json::Value::Array(payload).to_string())
             .await;
+    }
+
+    // Stages that started and never reported finishing. On a timeout this is
+    // the answer to "which stage was it stuck in?", which nothing else records:
+    // the activity registry is cleared when the review ends, and the worker
+    // cannot report a stage it never got to the end of.
+    if interaction_result.is_err() && !stage_starts.is_empty() {
+        let mut unfinished: Vec<(&String, &TokioInstant)> = stage_starts.iter().collect();
+        unfinished
+            .sort_by_key(|(stage, _)| crate::worker::kernel_workflow::stage_order(stage.as_str()));
+        let failures: Vec<serde_json::Value> = unfinished
+            .iter()
+            .map(|(stage, started)| {
+                let turns = stage_turns.get(*stage).copied().unwrap_or(0);
+                serde_json::json!({
+                    "stage": stage,
+                    "reason": format!(
+                        "still running when the review stopped, after {} and {} turn(s)",
+                        format_elapsed(started.elapsed()),
+                        turns
+                    ),
+                    // Not a fault in the stage: it was cut short, not broken.
+                    "cancelled": true,
+                })
+            })
+            .collect();
+        let _ = db
+            .set_review_stage_failures(review_id, &serde_json::Value::Array(failures).to_string())
+            .await;
+    }
+
+    // A failed review never reaches the worker's own history, so the streamed
+    // preview is the only conversation that survives it. Promote it into the
+    // durable column before the rows go: retaining them would not work, because
+    // the startup sweep drops entries for any review that is no longer running.
+    if interaction_result.is_err()
+        && let Err(e) = promote_live_log_to_review(&db, review_id).await
+    {
+        tracing::debug!("Failed to preserve streamed log entries: {}", e);
     }
 
     // Unconditional: the streamed preview has served its purpose however the
@@ -2734,13 +2945,10 @@ async fn run_review_tool_with_cmd(
     drop(stdin_writer);
 
     let (timed_out, cancel_ignored) = match &interaction_result {
-        Err(e) => {
-            let msg = e.to_string();
-            (
-                msg.contains("Review tool timed out (active time exceeded)"),
-                msg.contains(CANCEL_IGNORED),
-            )
-        }
+        Err(e) => (
+            e.downcast_ref::<ReviewTimedOut>().is_some(),
+            e.to_string().contains(CANCEL_IGNORED),
+        ),
         Ok(_) => (false, false),
     };
 
@@ -2755,8 +2963,9 @@ async fn run_review_tool_with_cmd(
             );
         } else {
             error!(
-                "Review tool timed out after {} active seconds. Killing process.",
-                settings.review.timeout_seconds
+                "Review tool timed out after {} active seconds and did not salvage its \
+                 findings within a further {}s. Killing process.",
+                settings.review.timeout_seconds, salvage_seconds
             );
         }
         let _ = child.start_kill();
@@ -2810,7 +3019,10 @@ async fn run_review_tool_with_cmd(
                     }
                 }
             }
-            Ok(json)
+            Ok(ReviewToolOutcome {
+                output: json,
+                timed_out: wind_down == Some(WindDown::TimedOut),
+            })
         }
         Err(e) => Err(e),
     }
@@ -3526,14 +3738,30 @@ mod tests {
         mock_script: &str,
         provider: Arc<dyn AiProvider>,
     ) -> Result<Value> {
-        run_single_ai_request_mock_with_cancel(mock_script, provider, None).await
+        Ok(
+            run_single_ai_request_mock_with_cancel(mock_script, provider, None)
+                .await?
+                .output,
+        )
     }
 
     async fn run_single_ai_request_mock_with_cancel(
         mock_script: &str,
         provider: Arc<dyn AiProvider>,
         cancel_token: Option<tokio_util::sync::CancellationToken>,
-    ) -> Result<Value> {
+    ) -> Result<ReviewToolOutcome> {
+        run_single_ai_request_mock_configured(mock_script, provider, cancel_token, |_| {}).await
+    }
+
+    /// As above, but lets a test set the deadlines that drive the salvage path.
+    /// Both are seconds, and the real defaults are far too long for a test to
+    /// wait out.
+    async fn run_single_ai_request_mock_configured(
+        mock_script: &str,
+        provider: Arc<dyn AiProvider>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        configure: impl FnOnce(&mut Settings),
+    ) -> Result<ReviewToolOutcome> {
         let temp_dir = tempdir()?;
         let bin_path = temp_dir.path().join("mock_review");
 
@@ -3543,6 +3771,7 @@ mod tests {
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.review.timeout_seconds = 5;
+        configure(&mut settings);
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
@@ -3625,10 +3854,15 @@ done
         let token = tokio_util::sync::CancellationToken::new();
         token.cancel();
 
-        let result =
+        let outcome =
             run_single_ai_request_mock_with_cancel(mock, Arc::new(MockProvider), Some(token))
                 .await?;
+        let result = outcome.output;
 
+        assert!(
+            !outcome.timed_out,
+            "a cancellation is not a timeout, and must not be reported as one"
+        );
         assert_eq!(
             result["cancelled"], true,
             "the worker should have been told to stop"
@@ -3642,6 +3876,82 @@ done
         assert_eq!(
             failures[0]["cancelled"], true,
             "a cancelled stage must not be reported as a genuine failure"
+        );
+
+        Ok(())
+    }
+
+    /// Running out of time asks the worker to salvage rather than abandoning it.
+    ///
+    /// The old behaviour returned the moment the deadline passed, throwing away
+    /// every stage the review had already finished -- which is how a three-hour
+    /// review came to report nothing at all.
+    #[tokio::test]
+    async fn test_timeout_asks_worker_to_salvage_its_findings() -> Result<()> {
+        // Never answers the initial payload, so the deadline is reached, then
+        // reports findings once asked to wind down.
+        let mock = r#"#!/bin/sh
+read -r _payload
+while read -r msg; do
+  case "$msg" in
+    *'"type":"wind_down"'*)
+      echo '{"patchset_id":1,"patches":[],"stage_failures":[{"stage":"locking","reason":"Stage stopped: the review ran out of time","cancelled":true}],"review":{"findings":[{"severity":"High","problem":"salvaged"}]}}'
+      exit 0
+      ;;
+  esac
+done
+"#;
+
+        let outcome =
+            run_single_ai_request_mock_configured(mock, Arc::new(MockProvider), None, |settings| {
+                settings.review.timeout_seconds = 1;
+                settings.review.salvage_seconds = 10;
+            })
+            .await?;
+
+        assert!(
+            outcome.timed_out,
+            "the caller has to know this result was produced under a wind-down, \
+             because nothing in the output itself says so"
+        );
+
+        let findings = outcome.output["review"]["findings"]
+            .as_array()
+            .expect("findings gathered before the deadline must survive it");
+        assert_eq!(findings.len(), 1);
+
+        let failures = outcome.output["stage_failures"]
+            .as_array()
+            .expect("the stages that did not finish must be reported");
+        assert_eq!(failures[0]["stage"], "locking");
+
+        Ok(())
+    }
+
+    /// A worker that ignores the wind-down still fails as a timeout.
+    ///
+    /// Typed rather than matched on text, so the caller can tell a timeout from
+    /// any other tool error and decline to retry it.
+    #[tokio::test]
+    async fn test_timeout_is_typed_when_the_worker_never_salvages() -> Result<()> {
+        // Reads the payload and then ignores everything, including the
+        // wind-down request.
+        let mock = r#"#!/bin/sh
+read -r _payload
+sleep 30
+"#;
+
+        let err =
+            run_single_ai_request_mock_configured(mock, Arc::new(MockProvider), None, |settings| {
+                settings.review.timeout_seconds = 1;
+                settings.review.salvage_seconds = 1;
+            })
+            .await
+            .expect_err("a worker that never reports must not look like a success");
+
+        assert!(
+            err.downcast_ref::<ReviewTimedOut>().is_some(),
+            "a timeout must be recognisable without matching on its message: {err}"
         );
 
         Ok(())
@@ -4316,6 +4626,10 @@ fi
         Ok(())
     }
 
+    /// A worker that ignores the wind-down request is still killed and reaped.
+    ///
+    /// The salvage window bounds how long that takes: this mock never reads its
+    /// stdin, so it can neither answer the request nor exit on its own.
     #[tokio::test]
     async fn test_run_review_tool_timeout_reaps_stuck_child() -> Result<()> {
         let temp_dir = tempdir()?;
@@ -4331,6 +4645,7 @@ sleep 30
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.review.timeout_seconds = 1;
+        settings.review.salvage_seconds = 1;
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;

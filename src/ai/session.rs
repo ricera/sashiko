@@ -141,6 +141,15 @@ pub trait LlmSession: Send {
 /// which parts of the review did not run.
 pub const SESSION_CANCELLED: &str = "Session cancelled by supervisor";
 
+/// Marker in the error text of an analysis stage stopped because the review ran
+/// out of time.
+///
+/// Kept distinct from [`SESSION_CANCELLED`] because the two call for different
+/// responses from whoever reads the report: a cancelled review was not wanted,
+/// whereas this one wanted more time than it was given. Both are coverage gaps
+/// rather than stage bugs.
+pub const SESSION_WOUND_DOWN: &str = "Stage stopped: the review ran out of time";
+
 /// Fired around tool execution with the tool names, current turn, and turn cap.
 /// An empty name slice signals the tools finished.
 type ToolsCallback<'a> = dyn Fn(&[String], usize, usize) + Send + Sync + 'a;
@@ -169,6 +178,17 @@ pub struct SessionRunner<'a> {
     /// Called as each message joins the log, so the conversation can be watched
     /// while it happens rather than only after it ends.
     on_message: Option<Box<MessageCallback<'a>>>,
+    /// Whether a wind-down stops this session. Defaults to true; the stages that
+    /// turn gathered concerns into findings set it false so a salvage has
+    /// something to salvage.
+    interruptible: bool,
+    /// Overrides the process-wide wind-down signal.
+    ///
+    /// Only tests set this. The real signal is global because stages run
+    /// concurrently across the process and all must observe the one request,
+    /// which also means a test cannot trip it without affecting every other test
+    /// in the binary.
+    wind_down_token: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -184,6 +204,8 @@ impl<'a> SessionRunner<'a> {
             on_tools: None,
             on_backoff: None,
             on_message: None,
+            interruptible: true,
+            wind_down_token: None,
         }
     }
 
@@ -197,6 +219,27 @@ impl<'a> SessionRunner<'a> {
     pub fn with_max_turns(mut self, turns: usize) -> Self {
         self.max_turns = turns;
         self
+    }
+
+    /// Sets whether a wind-down stops this session.
+    pub fn with_interruptible(mut self, interruptible: bool) -> Self {
+        self.interruptible = interruptible;
+        self
+    }
+
+    /// Test-only override for the process-wide wind-down signal.
+    #[cfg(test)]
+    fn with_wind_down_token(mut self, token: tokio_util::sync::CancellationToken) -> Self {
+        self.wind_down_token = Some(token);
+        self
+    }
+
+    /// The signal that says the review has run out of time.
+    fn wind_down_requested(&self) -> bool {
+        match &self.wind_down_token {
+            Some(token) => token.is_cancelled(),
+            None => crate::ai::worker_wind_down_token().is_cancelled(),
+        }
     }
 
     /// Configures the maximum transient and rate-limit retries.
@@ -303,6 +346,12 @@ impl<'a> SessionRunner<'a> {
             // so a cancelled review stops costing money immediately.
             if crate::ai::worker_cancel_token().is_cancelled() {
                 anyhow::bail!("{}", SESSION_CANCELLED);
+            }
+            // A wind-down only stops the stages that gather concerns. The stages
+            // that consolidate them into findings run on, which is the whole
+            // point of winding down rather than cancelling.
+            if self.interruptible && self.wind_down_requested() {
+                anyhow::bail!("{}", SESSION_WOUND_DOWN);
             }
 
             turns += 1;
@@ -476,5 +525,124 @@ impl<'a> SessionRunner<'a> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::ProviderCapabilities;
+
+    /// Answers anything with a fixed body, and counts how often it was asked.
+    struct CountingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiProvider for CountingProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(AiResponse {
+                content: Some("done".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "counting".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    struct EchoSession;
+
+    #[async_trait]
+    impl LlmSession for EchoSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "user".to_string()
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            Ok(response.content.clone().unwrap_or_default())
+        }
+    }
+
+    /// A wind-down stops the stages that gather concerns.
+    ///
+    /// Checked before the request goes out, so a review that is out of time
+    /// stops spending on analysis immediately.
+    #[tokio::test]
+    async fn test_wind_down_stops_an_interruptible_session_before_it_spends() {
+        let provider = CountingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let err = match SessionRunner::new(&provider)
+            .with_interruptible(true)
+            .with_wind_down_token(token)
+            .run(&mut EchoSession)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("an interruptible session must stop when the review runs out of time"),
+        };
+
+        assert!(
+            err.to_string().contains(SESSION_WOUND_DOWN),
+            "the reason must say it ran out of time, not that the stage failed: {err}"
+        );
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "stopping after paying for the turn would defeat the point"
+        );
+    }
+
+    /// The consolidation stages run on, which is what makes a salvage possible.
+    ///
+    /// Without this the wind-down would stop the very stages that turn gathered
+    /// concerns into findings, and the review would still report nothing.
+    #[tokio::test]
+    async fn test_wind_down_lets_a_non_interruptible_session_finish() {
+        let provider = CountingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let token = tokio_util::sync::CancellationToken::new();
+        token.cancel();
+
+        let output = match SessionRunner::new(&provider)
+            .with_interruptible(false)
+            .with_wind_down_token(token)
+            .run(&mut EchoSession)
+            .await
+        {
+            Ok(result) => result.output,
+            Err(e) => panic!("a non-interruptible session must survive a wind-down: {e}"),
+        };
+
+        assert_eq!(output, "done");
+        assert_eq!(
+            provider.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "it has to actually reach the model to produce anything"
+        );
     }
 }

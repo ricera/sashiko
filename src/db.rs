@@ -1191,6 +1191,42 @@ impl Database {
         Ok(out)
     }
 
+    /// Whether a review already has its conversation stored.
+    ///
+    /// Guards the salvage path: a review that reported its own history must not
+    /// have it replaced with the truncated preview.
+    pub async fn review_has_logs(&self, review_id: i64) -> Result<bool> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT logs IS NOT NULL FROM reviews WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<i64>(0).unwrap_or(0) != 0),
+            None => Ok(false),
+        }
+    }
+
+    /// Stores a review's conversation without touching its status or result.
+    ///
+    /// [`complete_review`](Self::complete_review) writes the log as part of
+    /// reaching a terminal state, which is no use to a review that already
+    /// failed and only now has a log worth keeping.
+    pub async fn set_review_logs(&self, review_id: i64, logs: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET logs = ? WHERE id = ?",
+                libsql::params![
+                    crate::compression::compress_string_if_needed(logs),
+                    review_id
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Drops a review's streamed entries once the complete log is persisted.
     ///
     /// Without this the table grows without bound; the failure mode is slow
@@ -5779,6 +5815,46 @@ mod tests {
         db.create_review(ps_id, Some(p_id), "mock", "mock", None, None)
             .await
             .unwrap()
+    }
+
+    /// A review that never reported its own conversation can still be given
+    /// one, without disturbing the status it already reached.
+    #[tokio::test]
+    async fn test_logs_can_be_stored_after_a_review_has_failed() {
+        let db = setup_db().await;
+        let review_id = review_fixture(&db, "latelog").await;
+
+        assert!(
+            !db.review_has_logs(review_id).await.unwrap(),
+            "a fresh review has nothing to show"
+        );
+
+        db.complete_review(
+            review_id,
+            "Failed",
+            "Tool error: timed out",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !db.review_has_logs(review_id).await.unwrap(),
+            "failing is exactly the case that leaves the log unset"
+        );
+
+        db.set_review_logs(review_id, r#"[{"role":"user","content":"hi"}]"#)
+            .await
+            .unwrap();
+        assert!(db.review_has_logs(review_id).await.unwrap());
+
+        // The status and result the review already reached are untouched: this
+        // adds the log, it does not re-complete the review.
+        let details = db.get_review_details(review_id).await.unwrap().unwrap();
+        assert_eq!(details["status"], "Failed");
+        assert_eq!(details["result"], "Tool error: timed out");
     }
 
     #[tokio::test]

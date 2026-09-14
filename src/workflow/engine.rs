@@ -207,8 +207,18 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                     }
                     Err(err) => {
                         let reason = format!("{:#}", err);
-                        let cancelled = reason.contains(crate::ai::session::SESSION_CANCELLED);
-                        if cancelled {
+                        // Neither a cancellation nor a wind-down is a fault in
+                        // the stage, so neither is reported as one -- but both
+                        // are coverage the review did not get.
+                        let wound_down = reason.contains(crate::ai::session::SESSION_WOUND_DOWN);
+                        let cancelled =
+                            wound_down || reason.contains(crate::ai::session::SESSION_CANCELLED);
+                        if wound_down {
+                            info!(
+                                "Parallel stage '{}' stopped: the review ran out of time",
+                                stage.name()
+                            );
+                        } else if cancelled {
                             info!("Parallel stage '{}' cancelled", stage.name());
                         } else {
                             warn!(
