@@ -12,16 +12,52 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::activity::{ActivityKey, ActivityRegistry, Phase};
+use crate::cancel::CancelRegistry;
 use crate::events::{Event, MessageSource};
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::{Output, Stdio};
+use std::process::Output;
+use std::sync::Arc;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
+
+/// Timeout for network-bound git operations (fetching from a remote).
+const NETWORK_OP_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Timeout for local metadata operations (rev-parse, remote get-url, ...).
+/// These never touch the network, so anything slow here is pathological.
+const LOCAL_OP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Error text for a fetch abandoned because everything waiting on it was cancelled.
+const FETCH_CANCELLED: &str = "Fetch cancelled: every patchset waiting on it was cancelled";
+
+/// Whether an error came from cancellation rather than a genuine fetch failure.
+fn is_cancellation(e: &anyhow::Error) -> bool {
+    e.to_string().contains(FETCH_CANCELLED)
+}
+
+/// Runs a git command to completion under a timeout.
+///
+/// Without this, a `git fetch` against an unreachable remote hangs forever, and
+/// because `FetchAgent::run` awaits `process_queue` inline, that wedges the whole
+/// agent: no patchset ever fetches again. `kill_on_drop` matters as much as the
+/// timeout — when the timeout fires the future is dropped, and without it the
+/// stuck subprocess would survive us giving up on it.
+///
+/// Mirrors the pattern already used by `GitSyncWorker` in `git_ops.rs`.
+async fn run_git(mut cmd: Command, limit: Duration, what: &str) -> Result<std::process::Output> {
+    cmd.kill_on_drop(true);
+    match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(anyhow!("Failed to execute {}: {}", what, e)),
+        Err(_) => Err(anyhow!("{} timed out after {}s", what, limit.as_secs())),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FetchRequest {
@@ -30,6 +66,12 @@ pub struct FetchRequest {
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
+    /// The placeholder patchset waiting on this fetch, so the work can be
+    /// cancelled. `None` for requests with no patchset behind them.
+    pub patchset_id: Option<i64>,
+    /// Adopt an empty first commit as the series cover letter (b4 prep style)
+    /// rather than reviewing it.
+    pub b4_cover_letter: bool,
 }
 
 pub struct FetchAgent {
@@ -39,6 +81,15 @@ pub struct FetchAgent {
     #[allow(clippy::type_complexity)]
     mr_metadata: HashMap<String, (Option<String>, Option<String>, Option<i64>)>,
     gitlab_token: Option<String>,
+    activity: Arc<ActivityRegistry>,
+    cancels: Arc<CancelRegistry>,
+    /// Which patchset each queued commit belongs to. Needed because the queue
+    /// batches by repository, so a commit is otherwise anonymous by the time it
+    /// is fetched.
+    commit_owners: HashMap<String, i64>,
+    /// Ranges whose submitter asked for an empty first commit to be adopted as
+    /// the series cover letter.
+    b4_cover_requests: HashSet<String>,
 }
 
 impl FetchAgent {
@@ -46,6 +97,8 @@ impl FetchAgent {
         repo_path: PathBuf,
         main_tx: mpsc::Sender<Event>,
         gitlab_token: Option<String>,
+        activity: Arc<ActivityRegistry>,
+        cancels: Arc<CancelRegistry>,
     ) -> (Self, mpsc::Sender<FetchRequest>) {
         let (tx, rx) = mpsc::channel(100);
         (
@@ -55,9 +108,101 @@ impl FetchAgent {
                 main_tx,
                 mr_metadata: HashMap::new(),
                 gitlab_token,
+                activity,
+                cancels,
+                commit_owners: HashMap::new(),
+                b4_cover_requests: HashSet::new(),
             },
             tx,
         )
+    }
+
+    /// Whether the patchset waiting on this commit has been cancelled.
+    ///
+    /// A commit with no known patchset is never considered cancelled — there is
+    /// nobody to have cancelled it.
+    fn is_cancelled(&self, commit: &str) -> bool {
+        self.commit_owners
+            .get(commit)
+            .and_then(|id| self.cancels.token_for(*id))
+            .map(|t| t.is_cancelled())
+            .unwrap_or(false)
+    }
+
+    /// Cancellation tokens for every patchset behind this batch of commits.
+    fn tokens_for(&self, commits: &[String]) -> Vec<tokio_util::sync::CancellationToken> {
+        commits
+            .iter()
+            .filter_map(|c| self.commit_owners.get(c))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .filter_map(|id| self.cancels.token_for(*id))
+            .collect()
+    }
+
+    /// Runs a fetch, aborting it only once every patchset behind it is cancelled.
+    ///
+    /// A batch is shared: several patchsets can be waiting on the same
+    /// repository. Killing the fetch because one of them was cancelled would
+    /// sabotage the others, so the abort waits for all of them. `run_git` sets
+    /// `kill_on_drop`, so dropping the future here terminates the `git fetch`
+    /// process.
+    ///
+    /// Known limitation: git spawns helper processes (`git-remote-http`) that
+    /// are not in our child's process group and so survive it, holding the
+    /// connection until the kernel times the socket out. Signalling the whole
+    /// process group would reach them, but is not safe here: the child is
+    /// reaped before the group is signalled, and a recycled pid belonging to a
+    /// shell — which is itself a process-group leader — is indistinguishable
+    /// from our own dead child. Killing that group would take out an unrelated
+    /// session. A bounded, self-healing leak is the better trade.
+    async fn fetch_with_cancel<F>(
+        &self,
+        fetch: F,
+        tokens: &[tokio_util::sync::CancellationToken],
+    ) -> Result<()>
+    where
+        F: std::future::Future<Output = Result<()>>,
+    {
+        if tokens.is_empty() {
+            return fetch.await;
+        }
+
+        let all_cancelled = async {
+            futures::future::join_all(tokens.iter().map(|t| t.cancelled())).await;
+        };
+
+        tokio::select! {
+            result = fetch => result,
+            _ = all_cancelled => Err(anyhow!("{}", FETCH_CANCELLED)),
+        }
+    }
+
+    /// Releases the cancellation entries for commits this agent is done with.
+    fn release(&mut self, commits: &[String]) {
+        for commit in commits {
+            if let Some(id) = self.commit_owners.remove(commit) {
+                self.cancels.unregister(id);
+            }
+        }
+    }
+
+    /// Reports the same phase for every commit in a batch.
+    ///
+    /// Fetch work is batched per repository, so a single git operation covers
+    /// many commits at once; each is tracked separately so a caller holding only
+    /// a patchset's SHA can still find out what is happening.
+    fn mark(&self, commits: &[String], phase: Phase) {
+        for commit in commits {
+            self.activity
+                .update(ActivityKey::Commit(commit.clone()), phase.clone());
+        }
+    }
+
+    fn clear_marks(&self, commits: &[String]) {
+        for commit in commits {
+            self.activity.clear(&ActivityKey::Commit(commit.clone()));
+        }
     }
 
     pub async fn run(mut self) {
@@ -74,6 +219,19 @@ impl FetchAgent {
                             (req.mr_url.clone(), req.mr_title.clone(), req.mr_number)
                         );
                     }
+                    self.activity.update(
+                        ActivityKey::Commit(req.commit_hash.clone()),
+                        Phase::Queued,
+                    );
+                    // Register before queueing so a cancel arriving in the gap
+                    // before the fetch starts is still observed.
+                    if let Some(ps_id) = req.patchset_id {
+                        self.commit_owners.insert(req.commit_hash.clone(), ps_id);
+                        self.cancels.register(ps_id);
+                    }
+                    if req.b4_cover_letter {
+                        self.b4_cover_requests.insert(req.commit_hash.clone());
+                    }
                     queue.entry(req.repo_url)
                         .or_default()
                         .insert(req.commit_hash);
@@ -87,7 +245,7 @@ impl FetchAgent {
         }
     }
 
-    async fn process_queue(&self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
+    async fn process_queue(&mut self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
         info!("Processing fetch queue with {} repos", queue.len());
 
         for (url_opt, commits) in queue.drain() {
@@ -95,8 +253,21 @@ impl FetchAgent {
                 continue;
             }
 
-            let commit_list: Vec<String> = commits.into_iter().collect();
+            let all_commits: Vec<String> = commits.into_iter().collect();
             let url_display = url_opt.as_deref().unwrap_or("local");
+
+            // Checkpoint 1: drop anything already cancelled before spending work
+            // on it. If that empties the batch there is nothing left to fetch.
+            let (commit_list, dropped): (Vec<String>, Vec<String>) =
+                all_commits.into_iter().partition(|c| !self.is_cancelled(c));
+            if !dropped.is_empty() {
+                info!("Skipping {} cancelled commit(s)", dropped.len());
+                self.clear_marks(&dropped);
+                self.release(&dropped);
+            }
+            if commit_list.is_empty() {
+                continue;
+            }
 
             info!(
                 "Processing {} commits for remote {}",
@@ -117,6 +288,13 @@ impl FetchAgent {
                     commits_to_check.push(commit_or_range.clone());
                 }
             }
+
+            self.mark(
+                &commit_list,
+                Phase::GitOp {
+                    op: "git rev-parse (checking commit presence)".to_string(),
+                },
+            );
 
             let mut missing_commits = Vec::new();
             for commit in &commits_to_check {
@@ -154,8 +332,16 @@ impl FetchAgent {
                     );
                     // Do not continue here; let it fall through to Step 3 where it will fail individually
                 } else {
+                    self.mark(
+                        &commit_list,
+                        Phase::GitOp {
+                            op: format!("git remote setup for {}", redact_secret(&url)),
+                        },
+                    );
                     if let Err(e) = self.ensure_remote(&remote_name, &url).await {
                         error!("Failed to ensure remote {}: {}", url, e);
+                        self.clear_marks(&commit_list);
+                        self.release(&commit_list);
                         for commit in &missing_commits {
                             let _ = self
                                 .main_tx
@@ -170,14 +356,57 @@ impl FetchAgent {
                     }
 
                     // 1. Try optimistic fetch (fetch specific commits)
-                    if let Err(e) = self.fetch_commits(&remote_name, &missing_commits).await {
+                    self.mark(
+                        &commit_list,
+                        Phase::Fetching {
+                            remote: redact_secret(&url),
+                            commits: missing_commits.len(),
+                        },
+                    );
+                    let batch_tokens = self.tokens_for(&commit_list);
+                    if let Err(e) = self
+                        .fetch_with_cancel(
+                            self.fetch_commits(&remote_name, &missing_commits),
+                            &batch_tokens,
+                        )
+                        .await
+                    {
+                        // A cancelled fetch is not a reason to try a bigger one.
+                        if is_cancellation(&e) {
+                            info!("Fetch for {} cancelled; not falling back", url);
+                            self.clear_marks(&commit_list);
+                            self.release(&commit_list);
+                            for commit in &missing_commits {
+                                let _ = self
+                                    .main_tx
+                                    .send(Event::IngestionFailed {
+                                        article_id: commit.clone(),
+                                        error: format!("Fetch cancelled for {}", url),
+                                        source: MessageSource::GitFetch,
+                                    })
+                                    .await;
+                            }
+                            continue;
+                        }
                         warn!(
                             "Optimistic fetch failed for {}: {}. Falling back to full fetch.",
                             url, e
                         );
                         // 2. Fallback: Fetch everything (heads)
-                        if let Err(e) = self.fetch_all(&remote_name).await {
+                        self.mark(
+                            &commit_list,
+                            Phase::Fetching {
+                                remote: format!("{} (all heads)", redact_secret(&url)),
+                                commits: missing_commits.len(),
+                            },
+                        );
+                        if let Err(e) = self
+                            .fetch_with_cancel(self.fetch_all(&remote_name), &batch_tokens)
+                            .await
+                        {
                             error!("Full fetch failed for {}: {}", url, e);
+                            self.clear_marks(&commit_list);
+                            self.release(&commit_list);
                             for commit in &missing_commits {
                                 let _ = self
                                     .main_tx
@@ -200,7 +429,33 @@ impl FetchAgent {
                 );
             }
 
+            // Checkpoint 3: a cancel can land during a long fetch, so re-check
+            // before turning anything into patches. Otherwise a cancelled
+            // patchset would still be queued for review.
+            let (commit_list, dropped_late): (Vec<String>, Vec<String>) =
+                commit_list.into_iter().partition(|c| !self.is_cancelled(c));
+            if !dropped_late.is_empty() {
+                info!(
+                    "Dropping {} commit(s) cancelled during the fetch",
+                    dropped_late.len()
+                );
+                self.clear_marks(&dropped_late);
+                self.release(&dropped_late);
+            }
+            if commit_list.is_empty() {
+                continue;
+            }
+
             // 3. Process each commit or range
+            self.mark(
+                &commit_list,
+                Phase::GitOp {
+                    op: "extracting patch metadata".to_string(),
+                },
+            );
+            // The loop consumes commit_list, so keep a copy to clear afterwards.
+            let processed = commit_list.clone();
+
             for commit_or_range in commit_list {
                 if commit_or_range.contains("..") {
                     // It's a range
@@ -236,16 +491,48 @@ impl FetchAgent {
                         range.to_string()
                     };
 
+                    // Decided before the loop rather than per commit, because
+                    // adopting the tracker changes how many parts the series has.
+                    // A patchset whose received parts never reach its total sits
+                    // in Incomplete forever and is never reviewed at all.
+                    //
+                    // Only the first commit is ever adopted (a b4 tracker is
+                    // first by convention), it must genuinely be empty, and a
+                    // lone commit is never adopted — that would leave nothing to
+                    // review.
+                    let adopt_cover = self.b4_cover_requests.contains(range)
+                        && count > 1
+                        && match shas.first() {
+                            Some(first) => {
+                                crate::git_ops::extract_patch_metadata(&self.repo_path, first)
+                                    .await
+                                    .map(|m| m.diff.trim().is_empty())
+                                    .unwrap_or(false)
+                            }
+                            None => false,
+                        };
+
+                    // The cover letter is not one of the parts, matching how a
+                    // mailing-list 0/N cover letter is counted.
+                    let total_parts = if adopt_cover { count - 1 } else { count };
+
                     for (i, sha) in shas.iter().enumerate() {
                         match self
                             .extract_patch(
                                 sha,
                                 &article_id,
-                                (i + 1) as u32,
-                                count,
+                                // Cover letter at 0, real patches from 1, as the
+                                // mailing-list path numbers them.
+                                if adopt_cover {
+                                    i as u32
+                                } else {
+                                    (i + 1) as u32
+                                },
+                                total_parts,
                                 mr_url.as_ref(),
                                 mr_title.as_ref(),
                                 mr_number,
+                                adopt_cover && i == 0,
                             )
                             .await
                         {
@@ -307,6 +594,10 @@ impl FetchAgent {
                             mr_url.as_ref(),
                             mr_title.as_ref(),
                             mr_number,
+                            // A lone commit cannot be a series cover letter;
+                            // adopting it would leave nothing to review. If it is
+                            // empty, the reviewer skips it.
+                            false,
                         )
                         .await
                     {
@@ -337,6 +628,11 @@ impl FetchAgent {
                     }
                 }
             }
+
+            // Fetch work for this repo is done, however it went. Anything still
+            // outstanding is now the reviewer's concern, not the fetcher's.
+            self.clear_marks(&processed);
+            self.release(&processed);
         }
     }
 
@@ -362,24 +658,17 @@ impl FetchAgent {
             url.to_string()
         };
 
-        // Check if remote exists
-        let status = Command::new("git")
+        // Check if remote exists. A single get-url serves both purposes: exit
+        // status tells us whether it exists, stdout tells us where it points.
+        let mut get_url = Command::new("git");
+        get_url
             .current_dir(&self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
-            .args(["remote", "get-url", name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await?;
+            .args(["remote", "get-url", name]);
+        let existing = run_git(get_url, LOCAL_OP_TIMEOUT, "git remote get-url").await?;
 
-        if status.success() {
-            let output = Command::new("git")
-                .current_dir(&self.repo_path)
-                .args(["-c", "safe.bareRepository=all"])
-                .args(["remote", "get-url", name])
-                .output()
-                .await?;
-            let current_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if existing.status.success() {
+            let current_url = String::from_utf8_lossy(&existing.stdout).trim().to_string();
 
             if current_url != authenticated_url {
                 info!(
@@ -388,12 +677,12 @@ impl FetchAgent {
                     redact_secret(&current_url),
                     redact_secret(&authenticated_url)
                 );
-                Command::new("git")
+                let mut set_url = Command::new("git");
+                set_url
                     .current_dir(&self.repo_path)
                     .args(["-c", "safe.bareRepository=all"])
-                    .args(["remote", "set-url", name, &authenticated_url])
-                    .output()
-                    .await?;
+                    .args(["remote", "set-url", name, &authenticated_url]);
+                run_git(set_url, LOCAL_OP_TIMEOUT, "git remote set-url").await?;
             }
         } else {
             info!(
@@ -401,12 +690,11 @@ impl FetchAgent {
                 name,
                 redact_secret(&authenticated_url)
             );
-            let output = Command::new("git")
-                .current_dir(&self.repo_path)
+            let mut add = Command::new("git");
+            add.current_dir(&self.repo_path)
                 .args(["-c", "safe.bareRepository=all"])
-                .args(["remote", "add", name, &authenticated_url])
-                .output()
-                .await?;
+                .args(["remote", "add", name, &authenticated_url]);
+            let output = run_git(add, LOCAL_OP_TIMEOUT, "git remote add").await?;
 
             if !output.status.success() {
                 return Err(anyhow!(
@@ -428,13 +716,13 @@ impl FetchAgent {
         let mut dropped_graph = false;
 
         loop {
-            let output = Command::new("git")
-                .current_dir(&self.repo_path)
+            let mut cmd = Command::new("git");
+            cmd.current_dir(&self.repo_path)
                 .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
                 .arg("fetch")
-                .args(args)
-                .output()
-                .await?;
+                .args(args);
+
+            let output = run_git(cmd, NETWORK_OP_TIMEOUT, "git fetch").await?;
 
             if output.status.success() || dropped_graph {
                 if dropped_graph {
@@ -495,11 +783,9 @@ impl FetchAgent {
             args.extend(["rev-parse", "--verify", &arg_str]);
         };
 
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
-            .args(&args)
-            .output()
-            .await;
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.repo_path).args(&args);
+        let output = run_git(cmd, LOCAL_OP_TIMEOUT, "git rev-parse/rev-list").await;
 
         match output {
             Ok(s) => {
@@ -523,12 +809,11 @@ impl FetchAgent {
     }
 
     async fn resolve_sha(&self, commit: &str) -> Result<String> {
-        let output = Command::new("git")
-            .current_dir(&self.repo_path)
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&self.repo_path)
             .args(["-c", "safe.bareRepository=all"])
-            .args(["rev-parse", "--verify", commit])
-            .output()
-            .await?;
+            .args(["rev-parse", "--verify", commit]);
+        let output = run_git(cmd, LOCAL_OP_TIMEOUT, "git rev-parse --verify").await?;
 
         if !output.status.success() {
             return Err(anyhow!(
@@ -550,8 +835,16 @@ impl FetchAgent {
         mr_url: Option<&String>,
         mr_title: Option<&String>,
         mr_number: Option<i64>,
+        is_cover_letter: bool,
     ) -> Result<Event> {
         let meta = crate::git_ops::extract_patch_metadata(&self.repo_path, commit).await?;
+
+        if is_cover_letter {
+            info!(
+                "Adopting empty commit {} as the series cover letter",
+                commit
+            );
+        }
 
         Ok(Event::PatchSubmitted {
             group: "git-fetch".to_string(),
@@ -568,6 +861,7 @@ impl FetchAgent {
             mr_url: mr_url.cloned(),
             mr_title: mr_title.cloned(),
             mr_number,
+            is_cover_letter,
         })
     }
 }
@@ -582,7 +876,178 @@ mod tests {
     async fn test_fetch_agent_lifecycle() {
         let (tx, _rx) = mpsc::channel(1);
         let repo_path = PathBuf::from("/tmp");
-        let (_agent, _sender) = FetchAgent::new(repo_path, tx, None);
+        let (_agent, _sender) = FetchAgent::new(
+            repo_path,
+            tx,
+            None,
+            ActivityRegistry::new(),
+            CancelRegistry::new(),
+        );
+    }
+
+    /// One fetch batch can serve several patchsets, so cancelling one must not
+    /// abort a fetch the others are still waiting on.
+    #[tokio::test]
+    async fn test_batch_fetch_aborts_only_when_every_patchset_is_cancelled() {
+        let cancels = CancelRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (agent, _) = FetchAgent::new(
+            PathBuf::from("/tmp"),
+            tx,
+            None,
+            ActivityRegistry::new(),
+            cancels.clone(),
+        );
+
+        let a = cancels.register(1);
+        let b = cancels.register(2);
+        let tokens = vec![a.clone(), b.clone()];
+
+        // One cancelled, one still waiting: the fetch must be allowed to finish.
+        a.cancel();
+        let mut cmd = Command::new("true");
+        let started = std::time::Instant::now();
+        let result = agent
+            .fetch_with_cancel(
+                async {
+                    run_git(cmd, LOCAL_OP_TIMEOUT, "true").await?;
+                    Ok(())
+                },
+                &tokens,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a peer still needs this fetch: {:?}",
+            result.err()
+        );
+
+        // Both cancelled: now the fetch may be abandoned, promptly.
+        b.cancel();
+        cmd = Command::new("sleep");
+        cmd.arg("60");
+        let result = agent
+            .fetch_with_cancel(
+                async {
+                    run_git(cmd, NETWORK_OP_TIMEOUT, "sleep").await?;
+                    Ok(())
+                },
+                &tokens,
+            )
+            .await;
+        let err = result.expect_err("nothing wants this fetch any more");
+        assert!(err.to_string().contains("cancelled"), "got: {}", err);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "abort must not wait out the fetch timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_commits_are_recognised() {
+        let cancels = CancelRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let (mut agent, _) = FetchAgent::new(
+            PathBuf::from("/tmp"),
+            tx,
+            None,
+            ActivityRegistry::new(),
+            cancels.clone(),
+        );
+
+        agent.commit_owners.insert("aaa".to_string(), 1);
+        agent.commit_owners.insert("bbb".to_string(), 2);
+        cancels.register(1);
+        cancels.register(2);
+
+        assert!(!agent.is_cancelled("aaa"));
+        cancels.cancel(1);
+        assert!(agent.is_cancelled("aaa"));
+        assert!(
+            !agent.is_cancelled("bbb"),
+            "cancelling one must not affect another"
+        );
+
+        // A commit with no known patchset has nobody to cancel it.
+        assert!(!agent.is_cancelled("unknown"));
+
+        // Releasing drops both the mapping and the registry entry, so a later
+        // review of the same patchset starts from a clean slate.
+        agent.release(&["aaa".to_string()]);
+        assert!(!agent.is_cancelled("aaa"));
+        assert!(!cancels.is_registered(1));
+        assert!(cancels.is_registered(2));
+    }
+
+    #[tokio::test]
+    async fn test_run_git_times_out_instead_of_hanging() {
+        // `sleep` stands in for a `git fetch` against a blackholed remote: it never
+        // returns on its own, so only the timeout can end it. Before this guard,
+        // such a command wedged the entire FetchAgent.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+
+        let started = std::time::Instant::now();
+        let result = run_git(cmd, Duration::from_millis(200), "sleep").await;
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("a hung command must return an error");
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected a timeout error, got: {}",
+            err
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "run_git waited {:?}; it should have given up at the limit",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_git_returns_output_on_success() -> Result<()> {
+        let mut cmd = Command::new("git");
+        cmd.arg("--version");
+
+        let output = run_git(cmd, LOCAL_OP_TIMEOUT, "git --version").await?;
+
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("git version"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_all_reports_unreachable_remote_as_error() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let repo_path = temp_dir.path().to_path_buf();
+
+        Command::new("git")
+            .current_dir(&repo_path)
+            .arg("init")
+            .output()
+            .await?;
+
+        let (tx, _rx) = mpsc::channel(1);
+        let (agent, _) = FetchAgent::new(
+            repo_path.clone(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+            CancelRegistry::new(),
+        );
+
+        // Port 1 on loopback refuses immediately, so this exercises the failure
+        // path without waiting out NETWORK_OP_TIMEOUT.
+        agent
+            .ensure_remote("broken", "http://127.0.0.1:1/nonexistent.git")
+            .await?;
+
+        let result = agent.fetch_all("broken").await;
+        assert!(
+            result.is_err(),
+            "fetch against an unreachable remote must surface an error"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -623,7 +1088,13 @@ mod tests {
             .await?;
 
         let (tx, _rx) = mpsc::channel(1);
-        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
+        let (agent, _) = FetchAgent::new(
+            repo_path.clone(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+            CancelRegistry::new(),
+        );
 
         let output = Command::new("git")
             .current_dir(&repo_path)
@@ -633,7 +1104,7 @@ mod tests {
         let head = String::from_utf8(output.stdout)?.trim().to_string();
 
         let event = agent
-            .extract_patch(&head, &head, 1, 1, None, None, None)
+            .extract_patch(&head, &head, 1, 1, None, None, None, false)
             .await?;
 
         match event {
@@ -695,7 +1166,13 @@ mod tests {
             .await?;
 
         let (tx, _rx) = mpsc::channel(1);
-        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
+        let (agent, _) = FetchAgent::new(
+            repo_path.clone(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+            CancelRegistry::new(),
+        );
 
         let output = Command::new("git")
             .current_dir(&repo_path)

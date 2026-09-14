@@ -493,6 +493,73 @@ pub fn extract_changelog_from_body(body: &str) -> Option<String> {
     None
 }
 
+/// Marker `b4 prep` appends to a series tracker commit's message.
+pub const B4_TRACKING_MARKER: &str = "--- b4-submit-tracking ---";
+
+/// Extracts the cover letter a `b4 prep` tracker commit carries, if any.
+///
+/// b4 keeps the series cover letter in the tracker commit's message above
+/// [`B4_TRACKING_MARKER`], with its own bookkeeping JSON below. Everything from
+/// the marker onward is dropped.
+///
+/// Returns `None` when nothing but trailers remains. The message passed here is
+/// git's `%b`, which excludes the subject line, so a tracker for a series b4
+/// never wrote a cover letter for contains only a `Signed-off-by:`. Storing that
+/// would put an empty section in the review prompt, which is worse than having
+/// no cover letter at all.
+pub fn extract_b4_cover_letter(body: &str) -> Option<String> {
+    let above_marker = match body.find(B4_TRACKING_MARKER) {
+        Some(pos) => &body[..pos],
+        None => body,
+    };
+
+    let has_prose = above_marker
+        .lines()
+        .any(|line| !line.trim().is_empty() && !is_trailer_line(line));
+    if !has_prose {
+        return None;
+    }
+
+    Some(above_marker.trim().to_string())
+}
+
+/// Trailer keys treated as bookkeeping rather than prose.
+///
+/// The conventional kernel and git set. Not exhaustive by design — see
+/// [`is_trailer_line`] for why an unknown key is treated as prose.
+const KNOWN_TRAILERS: &[&str] = &[
+    "signed-off-by",
+    "co-developed-by",
+    "reviewed-by",
+    "acked-by",
+    "tested-by",
+    "reported-by",
+    "suggested-by",
+    "cc",
+    "fixes",
+    "link",
+    "closes",
+    "change-id",
+    "message-id",
+    "reviewed-on",
+];
+
+/// Whether a line is a git trailer rather than prose.
+///
+/// Matched against a known set rather than by shape. Shape cannot work: `Note:`
+/// is indistinguishable from `Cc:`, and the two errors are not symmetric.
+/// Mistaking prose for a trailer silently discards a real cover letter;
+/// mistaking an unusual trailer for prose merely lets a thin cover letter
+/// through. So anything unrecognised counts as prose.
+fn is_trailer_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    let Some((key, _)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let key = key.trim().to_ascii_lowercase();
+    KNOWN_TRAILERS.contains(&key.as_str())
+}
+
 pub fn inject_changelog_into_git_show(git_show: &str, changelog: &str) -> String {
     if let Some(pos) = git_show.find("diff --git ") {
         let (header, diff) = git_show.split_at(pos);
@@ -703,6 +770,64 @@ Body";
             meta.is_patch_or_cover,
             "Single patch without diff should still be parsed due to [PATCH] tag"
         );
+    }
+
+    #[test]
+    fn test_b4_cover_letter_drops_the_tracking_block() {
+        let body = "Adds hwstamp teardown so queues are freed on disable.\n\n                    Second paragraph of series intent.\n\n                    Signed-off-by: Eric Joyner <eric.joyner@amd.com>\n\n                    --- b4-submit-tracking ---\n                    # This section is used internally by b4 prep.\n                    {\n  \"series\": { \"revision\": 1 }\n}\n";
+
+        let cover =
+            extract_b4_cover_letter(body).expect("prose above the marker is a cover letter");
+        assert!(cover.contains("hwstamp teardown"));
+        assert!(cover.contains("Second paragraph"));
+        assert!(
+            !cover.contains("b4-submit-tracking") && !cover.contains("revision"),
+            "b4 bookkeeping must not reach the prompt: {cover}"
+        );
+    }
+
+    /// The commit that prompted this feature: b4 never wrote a cover letter, so
+    /// the tracker's message is a signoff and nothing else.
+    #[test]
+    fn test_b4_cover_letter_is_none_when_only_trailers_remain() {
+        let body = "Signed-off-by: Eric Joyner <eric.joyner@amd.com>\n\n                    --- b4-submit-tracking ---\n                    # This section is used internally by b4 prep for tracking purposes.\n                    {\n  \"series\": {\n    \"revision\": 1\n  }\n}\n";
+
+        assert!(
+            extract_b4_cover_letter(body).is_none(),
+            "a signoff alone is not a cover letter"
+        );
+
+        // Several trailers are still no prose.
+        let trailers = "Signed-off-by: A <a@x>\nReviewed-by: B <b@x>\nCc: C <c@x>\n";
+        assert!(extract_b4_cover_letter(trailers).is_none());
+
+        // Neither is an empty body.
+        assert!(extract_b4_cover_letter("").is_none());
+        assert!(extract_b4_cover_letter("\n\n  \n").is_none());
+    }
+
+    #[test]
+    fn test_b4_cover_letter_without_a_marker() {
+        // A commit that is not a b4 tracker still yields its prose.
+        let body = "Real prose here.\n\nSigned-off-by: A <a@x>\n";
+        let cover = extract_b4_cover_letter(body).expect("prose is a cover letter");
+        assert!(cover.starts_with("Real prose here."));
+    }
+
+    #[test]
+    fn test_trailer_detection_does_not_swallow_prose() {
+        // Prose containing a colon must not be mistaken for a trailer, or a real
+        // cover letter would be discarded as empty.
+        assert!(!is_trailer_line(
+            "This fixes the following: queues leak on disable."
+        ));
+        assert!(!is_trailer_line(
+            "Note: see the discussion upstream for why."
+        ));
+        assert!(is_trailer_line("Signed-off-by: A <a@x>"));
+        assert!(is_trailer_line("Reviewed-by: B <b@x>"));
+        assert!(is_trailer_line("Cc: stable@vger.kernel.org"));
+        assert!(!is_trailer_line("no colon at all"));
     }
 
     #[test]

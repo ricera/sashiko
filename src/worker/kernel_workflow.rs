@@ -40,6 +40,9 @@ pub struct KernelReviewState {
     pub prefetched_context: String,
     /// Source prefetch failed; stages must gather target context through Git tools.
     pub prefetch_failed: bool,
+    /// The series cover letter, when the submission had one. Context about
+    /// intent, not something to review.
+    pub cover_letter: Option<String>,
     pub series_range: Option<String>,
     pub follow_up_series_context: Option<String>,
 
@@ -138,7 +141,7 @@ The following documents contain the official technical patterns, architectural r
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
 Baseline SHA: {{{{baseline_sha}}}}
-===========================
+==========================={{{{cover_letter_block}}}}
 
 Target Commit:
 {diff_var}
@@ -162,6 +165,18 @@ Target Commit:
                 s.prefetched_context
             )
         }
+    })
+    // The author's description of the series as a whole. Labelled as intent
+    // rather than as a patch, so the model does not go looking for code in it,
+    // and truncated so a long cover letter cannot crowd out the diff.
+    .with_var("cover_letter_block", |s: &KernelReviewState| {
+        s.cover_letter.as_deref().map(str::trim).filter(|c| !c.is_empty()).map_or_else(String::new, |c| {
+            let trimmed = crate::ai::truncator::Truncator::truncate_sequential(c, crate::worker::prompts::COVER_LETTER_TOKENS);
+            format!(
+                "\n\n=== Series Cover Letter ===\nThe author's description of this series. Context for intent only — it is not part of the patch under review and contains no code to inspect.\n\n{}\n===========================",
+                trimmed.content
+            )
+        })
     })
     .with_var("custom_prompt_block", |s: &KernelReviewState| {
         s.custom_prompt.as_deref().map(str::trim).filter(|p| !p.is_empty()).map_or_else(String::new, |p| {
@@ -730,6 +745,27 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
     consolidation_stage_by_name(name).map(|s| s.short)
 }
 
+/// Rank of a stage in the order the pipeline runs them: the analysis stages in
+/// table order, then the consolidation stages that always follow.
+///
+/// Stage identity is a name rather than a number, so listing stages in the
+/// order a reader expects has to come from the table rather than from the
+/// identifier. A name the tables do not know sorts last instead of being
+/// dropped, so an unrecognised stage stays visible.
+pub fn stage_order(name: &str) -> usize {
+    let normalized = normalize_stage_name(name);
+    if let Some(i) = ANALYSIS_STAGES.iter().position(|s| s.name == normalized) {
+        return i;
+    }
+    match CONSOLIDATION_STAGES
+        .iter()
+        .position(|s| s.name == normalized)
+    {
+        Some(i) => ANALYSIS_STAGES.len() + i,
+        None => usize::MAX,
+    }
+}
+
 /// Whether a guide belongs to one stage rather than to the shared context.
 ///
 /// The pre-screen offers a guide to the whole review, but a guide some stage
@@ -1097,7 +1133,12 @@ pub fn build_kernel_review_workflow_with_options(
         .dynamic_parallel(
             planning_stage(),
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),
-            ParallelPolicy::FailFast,
+            // `BestEffort`, not `FailFast`: fail-fast discards every sibling
+            // result, so one failing or cancelled analysis stage would throw
+            // away all the work the others had already completed. The failures
+            // are recorded in the outcome, so the lost coverage is reported
+            // rather than silently absorbed.
+            ParallelPolicy::BestEffort,
         )
         .early_exit_if(
             |s| s.all_concerns.is_empty(),

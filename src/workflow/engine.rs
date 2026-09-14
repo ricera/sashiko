@@ -33,6 +33,20 @@ pub struct WorkflowOutcome {
     pub history: Vec<AiMessage>,
     pub early_exit: bool,
     pub early_exit_reason: Option<&'static str>,
+    /// Stages that did not complete, under `BestEffort`. Recorded rather than
+    /// only logged: a review that silently skipped a stage but presents as
+    /// complete is worse than one that fails outright, because nothing signals
+    /// the missing coverage.
+    pub stage_failures: Vec<StageFailure>,
+}
+
+/// A stage that failed or was cancelled while its siblings kept running.
+#[derive(Debug, Clone)]
+pub struct StageFailure {
+    pub stage_name: &'static str,
+    pub reason: String,
+    /// Cancellation is not a defect, and is classified apart from one.
+    pub cancelled: bool,
 }
 
 /// The runtime engine that drives workflow execution.
@@ -116,6 +130,7 @@ impl WorkflowEngine {
                     outcome.tokens_out += branch_outcome.tokens_out;
                     outcome.tokens_cached += branch_outcome.tokens_cached;
                     outcome.history.extend(branch_outcome.history);
+                    outcome.stage_failures.extend(branch_outcome.stage_failures);
 
                     if branch_outcome.early_exit {
                         outcome.early_exit = true;
@@ -191,11 +206,22 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                         outcome.history.extend(stage_outcome.history);
                     }
                     Err(err) => {
-                        warn!(
-                            "Parallel stage '{}' failed under BestEffort policy: {}",
-                            stage.name(),
-                            err
-                        );
+                        let reason = format!("{:#}", err);
+                        let cancelled = reason.contains(crate::ai::session::SESSION_CANCELLED);
+                        if cancelled {
+                            info!("Parallel stage '{}' cancelled", stage.name());
+                        } else {
+                            warn!(
+                                "Parallel stage '{}' failed under BestEffort policy: {}",
+                                stage.name(),
+                                reason
+                            );
+                        }
+                        outcome.stage_failures.push(StageFailure {
+                            stage_name: stage.name(),
+                            reason,
+                            cancelled,
+                        });
                     }
                 }
             }

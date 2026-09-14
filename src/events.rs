@@ -49,6 +49,10 @@ pub enum Event {
         mr_url: Option<String>,
         mr_title: Option<String>,
         mr_number: Option<i64>,
+        /// This commit is the series cover letter, not a patch to review.
+        /// Ingestion creates no patch row for it, as it does for a mailing-list
+        /// cover letter.
+        is_cover_letter: bool,
     },
     RawMboxSubmitted {
         raw: String,
@@ -84,4 +88,8 @@ pub struct ParsedArticle {
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
+    /// The series cover letter, already stripped of b4 bookkeeping. Set only
+    /// for an article adopted as one, and stored against the patchset so the
+    /// review can use it as series context.
+    pub cover_letter: Option<String>,
 }
