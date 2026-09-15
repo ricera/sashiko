@@ -305,14 +305,21 @@ console.log('case 6: log link availability');
 for (const status of ['In Review', 'Pending']) {
     const card = ctx.renderReviewCard({ id: 42, status, patch_id: 10 });
     check(`link is present while ${status}`, card.includes('#/log/42'), card);
-    check(`link says it is live while ${status}`, card.includes('View Live Log'));
     // Things that genuinely do not exist yet must stay hidden.
     check(`no token count while ${status}`, !card.includes('Tokens used'));
 }
 const done = ctx.renderReviewCard({ id: 42, status: 'Reviewed', patch_id: 10 });
 check('finished review still links to its log', done.includes('#/log/42'));
-check('finished review says raw, not live',
-    done.includes('View Raw Log') && !done.includes('View Live Log'));
+
+// One destination, so one name. Two labels for one href read as two different
+// places, and the live and finished views now render the same messages the same
+// way, so there is no difference left for the wording to carry.
+const running = ctx.renderReviewCard({ id: 42, status: 'In Review', patch_id: 10 });
+check('the log link reads the same whatever the status',
+    running.includes('>View Log<') && done.includes('>View Log<'),
+    running.slice(0, 300));
+check('the old split naming is gone',
+    !running.includes('View Live Log') && !done.includes('View Raw Log'));
 check('finished review still shows its token count', done.includes('Tokens used'));
 // A review with no row yet has nothing to link to, and must not emit a dead href.
 const noId = ctx.renderReviewCard({ status: 'In Review', patch_id: 10 });

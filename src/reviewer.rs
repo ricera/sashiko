@@ -1848,34 +1848,30 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
     }
 }
 
-/// Copies a review's streamed preview into its durable `logs` column.
+/// Copies a review's streamed conversation into its durable `logs` column.
 ///
-/// Only for a review that ended without the worker's own history. The preview
-/// is truncated per entry and capped per review, so it is not the conversation
-/// the model saw -- it says so in a leading entry rather than letting a partial
-/// log pass for a complete one.
+/// Only for a review that ended without the worker reporting its own history.
+/// The streamed entries are whole messages, so what lands here has the same
+/// shape as a log the worker would have reported -- but it ends wherever the
+/// review stopped, so it says where it came from rather than passing for a
+/// complete record.
 async fn promote_live_log_to_review(db: &Arc<Database>, review_id: i64) -> Result<()> {
     if db.review_has_logs(review_id).await? {
         return Ok(());
     }
 
-    let entries = db.get_review_log_entries(review_id).await?;
+    let entries = db.get_review_log_entries(review_id, None).await?;
     if entries.is_empty() {
         return Ok(());
     }
 
     let mut log = vec![serde_json::json!({
         "role": "system",
-        "content": "[The review did not finish, so its full conversation was never saved. \
-                    What follows is the truncated live preview: each entry is clipped, and \
-                    only the first entries of the review are kept.]",
+        "content": "[The review did not finish, so the worker never reported its own \
+                    conversation. What follows was streamed while it ran, and stops at \
+                    whatever had arrived by then.]",
     })];
-    log.extend(entries.into_iter().map(|e| {
-        serde_json::json!({
-            "role": e.get("role").and_then(|r| r.as_str()).unwrap_or("unknown"),
-            "content": e.get("content").and_then(|c| c.as_str()).unwrap_or(""),
-        })
-    }));
+    log.extend(entries);
 
     db.set_review_logs(review_id, &serde_json::Value::Array(log).to_string())
         .await
@@ -2704,12 +2700,18 @@ async fn run_review_tool_with_cmd(
                                         // failed insert must never disturb the
                                         // review.
                                         if p["kind"] == "log_entry" {
-                                            let role = p["role"].as_str().unwrap_or("unknown");
-                                            let content = p["content"].as_str().unwrap_or_default();
+                                            let message = &p["message"];
+                                            let role = message["role"]
+                                                .as_str()
+                                                .unwrap_or("unknown");
                                             let stage = p["stage"].as_str();
                                             if let Err(e) = db
                                                 .append_review_log_entry(
-                                                    review_id, log_seq, stage, role, content,
+                                                    review_id,
+                                                    log_seq,
+                                                    stage,
+                                                    role,
+                                                    &message.to_string(),
                                                 )
                                                 .await
                                             {
@@ -4206,8 +4208,14 @@ sleep 30
         let line = encode_progress(&ProgressEvent::AiReviewLogEntry {
             patch_index: 0,
             stage: "locking".to_string(),
-            role: "tool".to_string(),
-            content: "git_grep output".to_string(),
+            message: crate::ai::AiMessage {
+                role: crate::ai::AiRole::Tool,
+                content: Some("git_grep output".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
         })
         .expect("log entries must be forwarded");
 
@@ -4215,8 +4223,9 @@ sleep 30
         assert_eq!(parsed["type"], "progress");
         assert_eq!(parsed["payload"]["kind"], "log_entry");
         assert_eq!(parsed["payload"]["stage"], "locking");
-        assert_eq!(parsed["payload"]["role"], "tool");
-        assert_eq!(parsed["payload"]["content"], "git_grep output");
+        // The message crosses whole, in the shape the finished log stores.
+        assert_eq!(parsed["payload"]["message"]["role"], "tool");
+        assert_eq!(parsed["payload"]["message"]["content"], "git_grep output");
 
         // Log entries are not activity updates; decoding one as a phase must
         // yield nothing rather than corrupting the stage display.
@@ -4226,7 +4235,7 @@ sleep 30
     /// A single tool result can be a whole kernel file. Streaming that verbatim
     /// every turn would push megabytes through the IPC pipe.
     #[test]
-    fn streamed_log_entries_are_truncated_before_leaving_the_worker() {
+    fn streamed_log_entries_carry_their_content_whole() {
         use crate::ai::{AiMessage, AiRole};
         use crate::worker::prompts::log_entry_event_for_test;
 
@@ -4241,21 +4250,24 @@ sleep 30
         };
 
         let event = log_entry_event_for_test("security".to_string(), &msg);
-        let crate::worker::WorkerProgressEvent::LogEntry { content, role, .. } = event else {
+        let crate::worker::WorkerProgressEvent::LogEntry { message, .. } = event else {
             panic!("expected a log entry");
         };
-        assert_eq!(role, "tool");
-        assert!(
-            content.len() < huge.len() / 10,
-            "streamed content should be a preview, got {} bytes",
-            content.len()
+        assert_eq!(message.role, AiRole::Tool);
+        // Clipping this bought little: the daemon proxies every request, so the
+        // same tool result already crosses the pipe as part of the history.
+        // What it cost was a live view that disagreed with the finished one.
+        assert_eq!(
+            message.content.unwrap_or_default().len(),
+            huge.len(),
+            "the streamed entry must hold what the finished log would hold"
         );
     }
 
     /// A tool call with no arguments says a search happened but not what was
     /// searched for, which is the only part worth watching live.
     #[test]
-    fn streamed_tool_calls_name_their_arguments() {
+    fn streamed_tool_calls_stay_structured() {
         use crate::worker::prompts::log_entry_event_for_test;
 
         let msg = crate::ai::AiMessage {
@@ -4277,29 +4289,40 @@ sleep 30
                 crate::ai::ToolCall {
                     id: "c1".to_string(),
                     function_name: "git_show".to_string(),
-                    arguments: serde_json::json!({ "path": "drivers/net/x.c" }),
+                    arguments: serde_json::json!({ "path": "x".repeat(400) }),
                     thought_signature: None,
                 },
             ]),
             tool_call_id: None,
         };
 
-        let crate::worker::prompts::WorkerProgressEvent::LogEntry { content, .. } =
+        let crate::worker::prompts::WorkerProgressEvent::LogEntry { message, .. } =
             log_entry_event_for_test("resources".to_string(), &msg)
         else {
             panic!("expected a log entry");
         };
 
+        // Flattening these into the content string is what made the live view
+        // a wall of prose where the finished view has expandable calls. The
+        // renderer was never the difference; what it was handed was.
+        let calls = message.tool_calls.expect("the calls must survive as calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function_name, "git_grep");
+        assert_eq!(calls[0].arguments["pattern"], "ionic_hwstamp_replay");
+        assert_eq!(calls[0].arguments["revision"], "HEAD");
         assert!(
-            content.contains("pattern=ionic_hwstamp_replay"),
-            "the search term must be visible: {content}"
+            calls[0].arguments.get("unset").is_none(),
+            "an absent argument is noise, not information"
         );
-        assert!(content.contains("revision=HEAD"), "{content}");
-        assert!(content.contains("path=drivers/net/x.c"), "{content}");
+
+        // Bounded per argument, so one long value cannot crowd out the rest.
+        let path = calls[1].arguments["path"].as_str().unwrap();
         assert!(
-            !content.contains("unset"),
-            "an absent argument is noise, not information: {content}"
+            path.len() < 200,
+            "a long argument must be clipped: {}",
+            path.len()
         );
+        assert!(path.ends_with("..."), "and must say that it was: {path}");
     }
 
     /// Tool results reach the model as a JSON envelope, so a diff arrives with
@@ -4324,11 +4347,12 @@ sleep 30
             tool_call_id: Some("c0".to_string()),
         };
 
-        let crate::worker::prompts::WorkerProgressEvent::LogEntry { content, .. } =
+        let crate::worker::prompts::WorkerProgressEvent::LogEntry { message, .. } =
             log_entry_event_for_test("resources".to_string(), &msg)
         else {
             panic!("expected a log entry");
         };
+        let content = message.content.unwrap_or_default();
 
         assert!(
             content.contains("strcpy(buf, \"name\");"),
@@ -4348,11 +4372,12 @@ sleep 30
             content: Some("not json at all".to_string()),
             ..msg
         };
-        let crate::worker::prompts::WorkerProgressEvent::LogEntry { content, .. } =
+        let crate::worker::prompts::WorkerProgressEvent::LogEntry { message, .. } =
             log_entry_event_for_test("resources".to_string(), &plain)
         else {
             panic!("expected a log entry");
         };
+        let content = message.content.unwrap_or_default();
         assert_eq!(content, "not json at all");
     }
 
@@ -4372,12 +4397,12 @@ sleep 30
                 tool_calls: None,
                 tool_call_id: Some("c0".to_string()),
             };
-            let crate::worker::prompts::WorkerProgressEvent::LogEntry { content, .. } =
+            let crate::worker::prompts::WorkerProgressEvent::LogEntry { message, .. } =
                 log_entry_event_for_test("resources".to_string(), &msg)
             else {
                 panic!("expected a log entry");
             };
-            content
+            message.content.unwrap_or_default()
         }
 
         // git_read_files: one entry per file, and a per-file error is not the

@@ -100,47 +100,46 @@ pub struct WorkerConfig {
 /// out the diff that is actually under review.
 pub(crate) const COVER_LETTER_TOKENS: usize = 2000;
 
-/// Rough token budget for one streamed log entry.
-///
-/// The live view is a preview; the complete conversation is persisted when the
-/// review ends. A single tool result can be a whole kernel file, and streaming
-/// those verbatim would mean megabytes crossing the IPC pipe every turn.
-const LIVE_LOG_ENTRY_TOKENS: usize = 1000;
-
 /// Test-only accessor for [`log_entry_event`].
 #[cfg(test)]
 pub fn log_entry_event_for_test(stage: String, msg: &crate::ai::AiMessage) -> WorkerProgressEvent {
     log_entry_event(stage, msg)
 }
 
-/// Renders tool-call arguments on one line, dropping any that are absent.
+/// Bounds tool-call arguments for the wire while keeping their shape.
 ///
 /// Bounded per argument rather than as a whole: a long `pattern` must not push
-/// the `revision` that gives it meaning off the end.
-fn compact_args(args: &Value) -> String {
+/// the `revision` that gives it meaning off the end. The object structure
+/// survives, because the log view renders arguments as fields rather than as a
+/// sentence -- flattening them to text here is what made the live log look
+/// nothing like the finished one.
+fn compact_args(args: &Value) -> Value {
     const MAX_ARG_CHARS: usize = 120;
 
+    fn clip(value: &Value) -> Value {
+        match value {
+            Value::String(s) if s.chars().count() > MAX_ARG_CHARS => {
+                let head: String = s.chars().take(MAX_ARG_CHARS).collect();
+                Value::String(format!("{head}..."))
+            }
+            Value::Array(items) => Value::Array(items.iter().map(clip).collect()),
+            Value::Object(fields) => {
+                Value::Object(fields.iter().map(|(k, v)| (k.clone(), clip(v))).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
     let Some(obj) = args.as_object() else {
-        return args.to_string();
+        return clip(args);
     };
 
-    obj.iter()
-        .filter(|(_, v)| !v.is_null())
-        .map(|(k, v)| {
-            let rendered = match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-            let clipped = if rendered.chars().count() > MAX_ARG_CHARS {
-                let head: String = rendered.chars().take(MAX_ARG_CHARS).collect();
-                format!("{head}...")
-            } else {
-                rendered
-            };
-            format!("{k}={clipped}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    Value::Object(
+        obj.iter()
+            .filter(|(_, v)| !v.is_null())
+            .map(|(k, v)| (k.clone(), clip(v)))
+            .collect(),
+    )
 }
 
 /// Unwraps a tool result envelope for display.
@@ -212,24 +211,26 @@ fn log_entry_event(stage: String, msg: &crate::ai::AiMessage) -> WorkerProgressE
         body = unwrapped;
     }
 
-    if let Some(calls) = &msg.tool_calls {
-        // Tool calls carry no content of their own, so surface what was asked --
-        // arguments included. "git_grep" alone says a search happened but not
-        // what was searched for, which is the only part worth watching.
-        let calls: Vec<String> = calls
-            .iter()
-            .map(|c| format!("{}({})", c.function_name, compact_args(&c.arguments)))
-            .collect();
-        body = format!("{}[tool calls: {}]", body, calls.join(", "));
-    }
-
-    let truncated =
-        crate::ai::truncator::Truncator::truncate_sequential(&body, LIVE_LOG_ENTRY_TOKENS);
-
     WorkerProgressEvent::LogEntry {
         stage,
-        role: format!("{:?}", msg.role).to_lowercase(),
-        content: truncated.content,
+        message: AiMessage {
+            role: msg.role.clone(),
+            content: Some(body),
+            thought: msg.thought.clone(),
+            thought_signature: None,
+            tool_calls: msg.tool_calls.as_ref().map(|calls| {
+                calls
+                    .iter()
+                    .map(|c| crate::ai::ToolCall {
+                        id: c.id.clone(),
+                        function_name: c.function_name.clone(),
+                        arguments: compact_args(&c.arguments),
+                        thought_signature: None,
+                    })
+                    .collect()
+            }),
+            tool_call_id: msg.tool_call_id.clone(),
+        },
     }
 }
 
@@ -263,10 +264,16 @@ pub enum WorkerProgressEvent {
     },
     /// One message joining the conversation log, streamed so a running review
     /// can be read before it finishes. `content` is already truncated.
+    /// One message joining the conversation log, streamed so a running review
+    /// can be read before it finishes.
+    ///
+    /// Carries the message itself rather than a flattened rendering of it. The
+    /// finished log stores `AiMessage`s, so sharing the type is what keeps the
+    /// live view and the finished view from drifting apart -- they drifted
+    /// before precisely because nothing tied the two shapes together.
     LogEntry {
         stage: String,
-        role: String,
-        content: String,
+        message: AiMessage,
     },
     /// A stage is backing off after the provider asked us to slow down.
     /// `retry_in_seconds` is `None` once the wait is over.

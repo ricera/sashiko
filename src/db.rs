@@ -731,13 +731,20 @@ impl Database {
                     id INTEGER PRIMARY KEY,
                     review_id INTEGER NOT NULL,
                     seq INTEGER NOT NULL,
-                    stage INTEGER,
+                    stage TEXT,
                     role TEXT NOT NULL,
-                    content TEXT,
+                    message TEXT,
                     created_at INTEGER NOT NULL
                 )",
                 (),
             )
+            .await;
+        // Existing databases have the older `content TEXT` shape. The table is
+        // scratch space -- rows are deleted when a review ends and swept at
+        // startup -- so the old column is simply left behind rather than
+        // migrated.
+        let _ = self
+            .try_add_column("review_log_entries", "message", "TEXT")
             .await;
         let _ = self
             .try_create_index(
@@ -1142,13 +1149,15 @@ impl Database {
     ///
     /// Capped per review: a runaway review must not be able to flood the table,
     /// and the live view is a preview rather than the record of account.
+    /// `message` is a serialised [`crate::ai::AiMessage`], the same type the
+    /// finished log stores, so the two views cannot drift apart.
     pub async fn append_review_log_entry(
         &self,
         review_id: i64,
         seq: i64,
         stage: Option<&str>,
         role: &str,
-        content: &str,
+        message: &str,
     ) -> Result<()> {
         if seq >= MAX_LIVE_LOG_ENTRIES {
             return Ok(());
@@ -1159,34 +1168,65 @@ impl Database {
             .as_secs() as i64;
         self.conn
             .execute(
-                "INSERT INTO review_log_entries (review_id, seq, stage, role, content, created_at)
+                "INSERT INTO review_log_entries (review_id, seq, stage, role, message, created_at)
                  VALUES (?, ?, ?, ?, ?, ?)",
-                libsql::params![review_id, seq, stage, role, content, now],
+                libsql::params![review_id, seq, stage, role, message, now],
             )
             .await?;
         Ok(())
     }
 
     /// The streamed conversation for a review, in order.
-    pub async fn get_review_log_entries(&self, review_id: i64) -> Result<Vec<serde_json::Value>> {
+    ///
+    /// Each entry is the stored message with `seq` and `stage` added, so it is a
+    /// superset of a finished-log entry and renders through the same path.
+    /// `after_seq` returns only what follows a sequence already held, which is
+    /// what keeps a poll on a long review from refetching the whole thing.
+    pub async fn get_review_log_entries(
+        &self,
+        review_id: i64,
+        after_seq: Option<i64>,
+    ) -> Result<Vec<serde_json::Value>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT seq, stage, role, content, created_at FROM review_log_entries
-                 WHERE review_id = ? ORDER BY seq",
-                libsql::params![review_id],
+                "SELECT seq, stage, role, message, created_at FROM review_log_entries
+                 WHERE review_id = ? AND seq > ? ORDER BY seq",
+                libsql::params![review_id, after_seq.unwrap_or(-1)],
             )
             .await?;
 
         let mut out = Vec::new();
         while let Ok(Some(row)) = rows.next().await {
-            out.push(serde_json::json!({
-                "seq": row.get::<i64>(0).unwrap_or_default(),
-                "stage": row.get::<Option<String>>(1).ok().flatten(),
-                "role": row.get::<String>(2).unwrap_or_default(),
-                "content": row.get::<Option<String>>(3).ok().flatten(),
-                "created_at": row.get::<i64>(4).unwrap_or_default(),
-            }));
+            let stored = row.get::<Option<String>>(3).ok().flatten();
+            let mut entry = stored
+                .as_deref()
+                .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                .filter(|v| v.is_object())
+                .unwrap_or_else(|| {
+                    // A row written before the column existed. Those belong to a
+                    // review that was already running, and are swept shortly
+                    // after; reporting the role alone beats dropping them.
+                    serde_json::json!({
+                        "role": row.get::<String>(2).unwrap_or_default(),
+                        "content": stored,
+                    })
+                });
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert(
+                    "seq".to_string(),
+                    serde_json::json!(row.get::<i64>(0).unwrap_or_default()),
+                );
+                obj.insert(
+                    "stage".to_string(),
+                    serde_json::json!(row.get::<Option<String>>(1).ok().flatten()),
+                );
+                obj.insert(
+                    "created_at".to_string(),
+                    serde_json::json!(row.get::<i64>(4).unwrap_or_default()),
+                );
+            }
+            out.push(entry);
         }
         Ok(out)
     }
@@ -5862,24 +5902,46 @@ mod tests {
         let db = setup_db().await;
         let review_id = review_fixture(&db, "log1").await;
 
+        let msg = |role: &str, content: &str| {
+            serde_json::json!({ "role": role, "content": content }).to_string()
+        };
+
         // Inserted out of order to prove the read is ordered by seq, not rowid.
-        db.append_review_log_entry(review_id, 2, Some("execution-flow"), "tool", "tool output")
-            .await
-            .unwrap();
-        db.append_review_log_entry(review_id, 0, Some("execution-flow"), "user", "the prompt")
-            .await
-            .unwrap();
+        db.append_review_log_entry(
+            review_id,
+            2,
+            Some("execution-flow"),
+            "tool",
+            &msg("tool", "tool output"),
+        )
+        .await
+        .unwrap();
+        db.append_review_log_entry(
+            review_id,
+            0,
+            Some("execution-flow"),
+            "user",
+            &msg("user", "the prompt"),
+        )
+        .await
+        .unwrap();
+        // Carries the calls as data, exactly as the finished log stores them.
         db.append_review_log_entry(
             review_id,
             1,
             Some("execution-flow"),
             "assistant",
-            "thinking",
+            &serde_json::json!({
+                "role": "assistant",
+                "content": "thinking",
+                "tool_calls": [{"function_name": "git_grep", "arguments": {"pattern": "x"}}],
+            })
+            .to_string(),
         )
         .await
         .unwrap();
 
-        let entries = db.get_review_log_entries(review_id).await.unwrap();
+        let entries = db.get_review_log_entries(review_id, None).await.unwrap();
         let roles: Vec<&str> = entries
             .iter()
             .map(|e| e["role"].as_str().unwrap_or_default())
@@ -5887,6 +5949,19 @@ mod tests {
         assert_eq!(roles, vec!["user", "assistant", "tool"]);
         assert_eq!(entries[0]["content"], "the prompt");
         assert_eq!(entries[2]["stage"], "execution-flow");
+
+        // The stored message survives whole, so the live view renders a tool
+        // call the same way the finished log does.
+        assert_eq!(
+            entries[1]["tool_calls"][0]["function_name"], "git_grep",
+            "a structured call must not be flattened on the way through"
+        );
+
+        // Only what follows a sequence already held, so a poll on a long review
+        // does not refetch the conversation every few seconds.
+        let tail = db.get_review_log_entries(review_id, Some(0)).await.unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0]["seq"], 1);
     }
 
     /// The live preview is scratch space; leaving it behind grows the table
@@ -5897,15 +5972,21 @@ mod tests {
         let review_id = review_fixture(&db, "log2").await;
 
         for seq in 0..5 {
-            db.append_review_log_entry(review_id, seq, Some("goal"), "user", "x")
+            db.append_review_log_entry(review_id, seq, Some("goal"), "user", r#"{"role":"user"}"#)
                 .await
                 .unwrap();
         }
-        assert_eq!(db.get_review_log_entries(review_id).await.unwrap().len(), 5);
+        assert_eq!(
+            db.get_review_log_entries(review_id, None)
+                .await
+                .unwrap()
+                .len(),
+            5
+        );
 
         db.delete_review_log_entries(review_id).await.unwrap();
         assert!(
-            db.get_review_log_entries(review_id)
+            db.get_review_log_entries(review_id, None)
                 .await
                 .unwrap()
                 .is_empty()
@@ -5935,7 +6016,7 @@ mod tests {
         .await
         .unwrap();
 
-        let entries = db.get_review_log_entries(review_id).await.unwrap();
+        let entries = db.get_review_log_entries(review_id, None).await.unwrap();
         assert_eq!(entries.len(), 1, "only the in-cap entry should be stored");
         assert_eq!(entries[0]["content"], "last");
     }
@@ -5964,13 +6045,16 @@ mod tests {
         let swept = db.sweep_orphan_review_log_entries().await.unwrap();
         assert_eq!(swept, 1);
         assert!(
-            db.get_review_log_entries(finished)
+            db.get_review_log_entries(finished, None)
                 .await
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(
-            db.get_review_log_entries(running).await.unwrap().len(),
+            db.get_review_log_entries(running, None)
+                .await
+                .unwrap()
+                .len(),
             1,
             "a review still in flight must keep its live preview"
         );

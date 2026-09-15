@@ -178,6 +178,8 @@ pub struct PatchQuery {
 pub struct ReviewQuery {
     pub id: Option<i64>,
     pub patchset_id: Option<i64>,
+    /// Only stream live log entries after this sequence number.
+    pub after_seq: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -891,10 +893,12 @@ async fn get_review(
             let has_final_log = details.get("logs").map(|l| !l.is_null()).unwrap_or(false);
             if !has_final_log
                 && let Some(id) = details.get("id").and_then(|v| v.as_i64())
-                && let Ok(entries) = state.db.get_review_log_entries(id).await
-                && !entries.is_empty()
+                && let Ok(entries) = state.db.get_review_log_entries(id, query.after_seq).await
                 && let Some(obj) = details.as_object_mut()
             {
+                // Sent even when empty, so a poll asking for what follows a
+                // sequence it already holds can tell "nothing new" from "this
+                // review has no live log".
                 obj.insert("live_log".to_string(), serde_json::Value::Array(entries));
             }
             Ok(Json(details))
