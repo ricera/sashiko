@@ -640,9 +640,16 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         .unwrap_or(false);
 
     if truncated {
+        // The output count says which ceiling was actually reached, which the
+        // bare fact of truncation does not. `max_tokens` is what this client
+        // asked for, but a gateway in front of the API can lower it, and
+        // extended thinking spends the same budget before any answer is
+        // emitted. A stop well short of the configured value means the limit
+        // that bit was not the one that was configured.
         tracing::warn!(
-            "{}Claude response truncated due to max_tokens.",
-            crate::ai::get_log_prefix()
+            "{}Claude response truncated at max_tokens after {} output tokens.",
+            crate::ai::get_log_prefix(),
+            resp.usage.output_tokens
         );
     }
 
