@@ -3203,17 +3203,19 @@
                 `;
             }
 
-            // The conversation is streamed while the review runs, so the link is
-            // offered throughout. Named for what it opens: mid-review the log
-            // view shows a live preview that is still arriving, and calling that
-            // "raw log" would promise a complete one.
+            // One name, because there is one destination. It was "View Raw Log"
+            // or "View Live Log" depending on status, which read as two links to
+            // two places when both have always opened the same page -- and now
+            // that a running review streams the same messages in the same
+            // format, the two names no longer describe a difference at all. The
+            // page itself says whether entries are still arriving.
             //
             // Rendered outside the showDetails block below. It used to be inside
             // it, which meant the link existed for every status except the ones
             // it was added to serve.
             const logLinkHtml = !r.id
                 ? '<span></span>'
-                : `<a href="#/log/${r.id}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">${showDetails ? 'View Raw Log' : 'View Live Log'}</a>`;
+                : `<a href="#/log/${r.id}" style="font-weight:600; color:var(--text-dim); text-decoration:none;" onmouseover="this.style.textDecoration='underline'" onmouseout="this.style.textDecoration='none'">View Log</a>`;
 
             return `
                 <div class="review-card">
@@ -3374,6 +3376,71 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
         // =====================================================================
         // LOG VIEW
         // =====================================================================
+        // One log entry's markup. Shared by the initial render and by the
+        // append that follows it, so a streamed entry and a finished one cannot
+        // come out looking different.
+        //
+        // `jsonCounter` is module state rather than a local: the expandable
+        // blocks are keyed by it, and an append must keep numbering where the
+        // last render left off or it would collide with what is already on the
+        // page.
+        let logJsonCounter = 0;
+
+        function renderLogEntry(entry) {
+            const role = (entry.role || 'unknown').toLowerCase();
+            const parts = entry.parts || [];
+            let rowClass = 'log-entry';
+            if (role === 'user') rowClass += ' role-user';
+            else if (role === 'model' || role === 'assistant') rowClass += ' role-model';
+            else if (role === 'tool' || role === 'function') rowClass += ' role-tool';
+            else rowClass += ' role-system';
+
+            let label = (role === 'model' || role === 'assistant') ? 'LLM' : (role === 'tool' || role === 'function') ? 'TOOL' : role.toUpperCase();
+
+            let content = '';
+
+            // Unified format: direct content and tool_calls
+            if (entry.thought && typeof entry.thought === 'string') {
+                content += `<div class="thought-block">${escapeHtml(entry.thought)}</div>`;
+            }
+            
+            if (entry.content && typeof entry.content === 'string') {
+                if (role === 'tool') {
+                    content += formatJsonExpandable(entry.content, logJsonCounter++);
+                } else {
+                    content += `<div>${escapeHtml(entry.content)}</div>`;
+                }
+            }
+            if (entry.tool_calls && Array.isArray(entry.tool_calls)) {
+                entry.tool_calls.forEach(call => {
+                    const callId = logJsonCounter++;
+                    content += formatFuncCallExpandable(call.function_name, call.arguments, callId);
+                });
+            }
+
+            // Gemini format: parts array
+            parts.forEach(part => {
+                if (part.text) {
+                    if (part.thought) {
+                        content += `<div class="thought-block">${escapeHtml(part.text)}</div>`;
+                    } else {
+                        content += `<div>${escapeHtml(part.text)}</div>`;
+                    }
+                } else if (part.functionCall || part.function_call) {
+                    const fc = part.functionCall || part.function_call;
+                    const callId = logJsonCounter++;
+                    const callHtml = formatFuncCallExpandable(fc.name, fc.args, callId);
+                    content += callHtml;
+                } else if (part.functionResponse || part.function_response) {
+                    const fr = part.functionResponse || part.function_response;
+                    const respHtml = formatJsonExpandable(fr.response, logJsonCounter++);
+                    content += `<div><span style="opacity:0.6">→ ${escapeHtml(fr.name)}:</span> ${respHtml}</div>`;
+                }
+            });
+
+            return `<div class="${rowClass}"><div class="log-gutter">${label}</div><div class="log-content">${content}</div></div>`;
+        }
+
         async function renderLogView(id) {
             const res = await fetch(`/api/review?id=${id}`);
             if (!res.ok) throw new Error('Review not found');
@@ -3386,78 +3453,19 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 try { logs = JSON.parse(data.logs || '[]'); } catch (e) { }
             }
 
-            // While a review runs the complete log does not exist yet; the
-            // daemon streams a truncated preview instead. Shaped to match the
-            // finished log so the same renderer handles both.
-            const isLive = !logs.length && Array.isArray(data.live_log) && data.live_log.length > 0;
+            // While a review runs the complete log does not exist yet, so the
+            // daemon streams the conversation as it happens. Keyed on the
+            // status rather than on there being entries yet: a review that has
+            // not produced its first one is still live, and one that ended
+            // without any is not, and must not be polled forever.
+            const isLive = !logs.length && Array.isArray(data.live_log) && isRunningStatus(data.status);
             if (isLive) {
-                logs = data.live_log.map(e => ({
-                    role: e.role,
-                    content: e.content,
-                    _stage: e.stage,
-                }));
+                logs = data.live_log;
             }
 
-            let logsHtml = '';
-            if (!logs.length) {
-                logsHtml = '<div style="padding:20px; text-align:center; color:var(--text-dim);">No logs recorded.</div>';
-            } else {
-                let jsonCounter = 0;
-                logsHtml = logs.map((entry, idx) => {
-                    const role = (entry.role || 'unknown').toLowerCase();
-                    const parts = entry.parts || [];
-                    let rowClass = 'log-entry';
-                    if (role === 'user') rowClass += ' role-user';
-                    else if (role === 'model' || role === 'assistant') rowClass += ' role-model';
-                    else if (role === 'tool' || role === 'function') rowClass += ' role-tool';
-                    else rowClass += ' role-system';
-
-                    let label = (role === 'model' || role === 'assistant') ? 'LLM' : (role === 'tool' || role === 'function') ? 'TOOL' : role.toUpperCase();
-
-                    let content = '';
-
-                    // Unified format: direct content and tool_calls
-                    if (entry.thought && typeof entry.thought === 'string') {
-                        content += `<div class="thought-block">${escapeHtml(entry.thought)}</div>`;
-                    }
-                    
-                    if (entry.content && typeof entry.content === 'string') {
-                        if (role === 'tool') {
-                            content += formatJsonExpandable(entry.content, jsonCounter++);
-                        } else {
-                            content += `<div>${escapeHtml(entry.content)}</div>`;
-                        }
-                    }
-                    if (entry.tool_calls && Array.isArray(entry.tool_calls)) {
-                        entry.tool_calls.forEach(call => {
-                            const callId = jsonCounter++;
-                            content += formatFuncCallExpandable(call.function_name, call.arguments, callId);
-                        });
-                    }
-
-                    // Gemini format: parts array
-                    parts.forEach(part => {
-                        if (part.text) {
-                            if (part.thought) {
-                                content += `<div class="thought-block">${escapeHtml(part.text)}</div>`;
-                            } else {
-                                content += `<div>${escapeHtml(part.text)}</div>`;
-                            }
-                        } else if (part.functionCall || part.function_call) {
-                            const fc = part.functionCall || part.function_call;
-                            const callId = jsonCounter++;
-                            const callHtml = formatFuncCallExpandable(fc.name, fc.args, callId);
-                            content += callHtml;
-                        } else if (part.functionResponse || part.function_response) {
-                            const fr = part.functionResponse || part.function_response;
-                            const respHtml = formatJsonExpandable(fr.response, jsonCounter++);
-                            content += `<div><span style="opacity:0.6">→ ${escapeHtml(fr.name)}:</span> ${respHtml}</div>`;
-                        }
-                    });
-
-                    return `<div class="${rowClass}"><div class="log-gutter">${label}</div><div class="log-content">${content}</div></div>`;
-                }).join('');
-            }
+            const logsHtml = logs.length
+                ? logs.map(renderLogEntry).join('')
+                : '<div style="padding:20px; text-align:center; color:var(--text-dim);">No logs recorded.</div>';
 
             document.getElementById('app').innerHTML = `
                 <div class="nav"><a href="#/" onclick="event.preventDefault(); goBack();">← Back</a></div>
@@ -3472,12 +3480,12 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     </span>
                 </h1>
                 ${isLive ? `<div class="section" style="margin-bottom:12px; color:var(--text-muted);">
-                    Live preview — this review is still running, so entries are
-                    truncated and still arriving. The complete log replaces this
-                    when it finishes.
+                    This review is still running, so entries are still arriving.
                 </div>` : ''}
-                <div>${logsHtml}</div>
+                <div id="log-entries">${logsHtml}</div>
             `;
+
+            logView = { id, lastSeq: lastSeqOf(logs), empty: !logs.length };
 
             // Poll while the review is still producing entries, on the same
             // pattern as the activity panel. Stops as soon as it is not live.
@@ -3489,10 +3497,55 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         stopLogPolling();
                         return;
                     }
-                    renderLogView(id).catch(() => stopLogPolling());
+                    appendNewLogEntries(id).catch(() => stopLogPolling());
                 }, 5000);
             }
         }
+
+        function isRunningStatus(status) {
+            return status === 'Pending' || status === 'In Review';
+        }
+
+        function lastSeqOf(entries) {
+            return entries.reduce(
+                (max, e) => (typeof e.seq === 'number' && e.seq > max ? e.seq : max),
+                -1);
+        }
+
+        // Adds whatever has arrived since the last poll, rather than rebuilding
+        // the page.
+        //
+        // Rebuilding threw away every expanded block and the scroll position on
+        // a five-second timer, because both live only in the DOM. It also grew
+        // more expensive the longer the review ran: a rerender of several
+        // hundred entries, every five seconds, to add one.
+        async function appendNewLogEntries(id) {
+            const res = await fetch(`/api/review?id=${id}&after_seq=${logView.lastSeq}`);
+            if (!res.ok) throw new Error('Review not found');
+            const data = await res.json();
+
+            // The finished log replaces the streamed one wholesale, so that one
+            // transition is the only time the page is rebuilt. A review that
+            // ended without one stops here too, rather than polling forever.
+            if (data.logs != null || !isRunningStatus(data.status)) {
+                await renderLogView(id);
+                return;
+            }
+
+            const fresh = Array.isArray(data.live_log) ? data.live_log : [];
+            if (!fresh.length) return;
+
+            const host = document.getElementById('log-entries');
+            if (!host) return;
+            if (logView.empty) {
+                host.innerHTML = '';
+                logView.empty = false;
+            }
+            host.insertAdjacentHTML('beforeend', fresh.map(renderLogEntry).join(''));
+            logView.lastSeq = Math.max(logView.lastSeq, lastSeqOf(fresh));
+        }
+
+        let logView = { id: null, lastSeq: -1, empty: true };
 
         let logTimer = null;
 

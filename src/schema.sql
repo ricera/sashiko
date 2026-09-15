@@ -155,7 +155,7 @@ CREATE TABLE IF NOT EXISTS review_log_entries (
     seq INTEGER NOT NULL,
     stage TEXT,
     role TEXT NOT NULL,
-    content TEXT,
+    message TEXT,
     created_at INTEGER NOT NULL
 );
 

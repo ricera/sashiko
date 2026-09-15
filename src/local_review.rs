@@ -167,8 +167,7 @@ pub enum ProgressEvent {
     AiReviewLogEntry {
         patch_index: i64,
         stage: String,
-        role: String,
-        content: String,
+        message: crate::ai::AiMessage,
     },
     AiReviewStageBackoff {
         patch_index: i64,
@@ -690,16 +689,11 @@ async fn review_single_patch(
                         max_turns,
                     });
                 }
-                crate::worker::WorkerProgressEvent::LogEntry {
-                    stage,
-                    role,
-                    content,
-                } => {
+                crate::worker::WorkerProgressEvent::LogEntry { stage, message } => {
                     cb(ProgressEvent::AiReviewLogEntry {
                         patch_index: p_index,
                         stage,
-                        role,
-                        content,
+                        message,
                     });
                 }
                 crate::worker::WorkerProgressEvent::StageBackoff {
@@ -1183,16 +1177,10 @@ pub fn encode_progress(event: &ProgressEvent) -> Option<String> {
             "turn": turn,
             "max_turns": max_turns,
         }),
-        ProgressEvent::AiReviewLogEntry {
-            stage,
-            role,
-            content,
-            ..
-        } => json!({
+        ProgressEvent::AiReviewLogEntry { stage, message, .. } => json!({
             "kind": "log_entry",
             "stage": stage,
-            "role": role,
-            "content": content,
+            "message": message,
         }),
         ProgressEvent::AiReviewStageBackoff {
             stage,
