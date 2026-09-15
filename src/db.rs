@@ -30,6 +30,30 @@ pub struct Database {
     pub conn: libsql::Connection,
 }
 
+/// Which patches a rerun should put back through review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerunScope {
+    /// Every patch, however its last review ended.
+    All,
+    /// Only patches with no successful review: whatever failed, was cancelled,
+    /// or produced findings without completing. A patch that was reviewed is
+    /// left alone, along with the hours it cost.
+    Unreviewed,
+}
+
+/// What a rerun request did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RerunOutcome {
+    /// The patchset is queued and the reviewer will pick it up.
+    Queued,
+    /// A review is already running, so nothing was changed.
+    InProgress,
+    /// Every patch the request covers has already been reviewed. Distinct from
+    /// `Queued` because requeueing would have looked identical while reviewing
+    /// nothing at all.
+    NothingToDo,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Subsystem {
     pub id: i64,
@@ -4551,31 +4575,56 @@ impl Database {
         Ok(count)
     }
 
-    /// Requeues a patchset for a fresh review.
+    /// Requeues a patchset for review.
     ///
-    /// Returns `false` without changing anything when a review is already
-    /// running. Requeueing mid-review would let the reviewer pick the patchset
-    /// up while the existing worker is still going, leaving two workers on one
-    /// patchset writing to the same rows. Cancel it first, then rerun.
-    pub async fn rerun_patchset(&self, id: i64) -> Result<bool> {
+    /// Reports [`RerunOutcome::InProgress`] without changing anything when a
+    /// review is already running. Requeueing mid-review would let the reviewer
+    /// pick the patchset up while the existing worker is still going, leaving
+    /// two workers on one patchset writing to the same rows. Cancel it first,
+    /// then rerun.
+    pub async fn rerun_patchset(&self, id: i64, scope: RerunScope) -> Result<RerunOutcome> {
         if self.get_patchset_status(id).await?.as_deref() == Some("In Review") {
-            return Ok(false);
+            return Ok(RerunOutcome::InProgress);
+        }
+
+        // Nothing to redo is reported rather than performed. Left to run, the
+        // patchset would go Pending, skip every patch, and return to a terminal
+        // state having reviewed nothing -- which looks identical to a rerun that
+        // worked.
+        if scope == RerunScope::Unreviewed && self.count_unreviewed_patches(id).await? == 0 {
+            return Ok(RerunOutcome::NothingToDo);
         }
 
         // 1. Reset patchset status to Pending, and the review clock with it.
         //
         // The clock accumulates across runs so that a review interrupted by a
-        // restart reports what it actually cost. A rerun is a new review rather
-        // than a continuation of the old one, so it starts from zero; carrying
-        // the previous cycle's time forward would make "review time" grow
-        // without bound and stop describing any single review.
-        self.conn
-            .execute(
-                "UPDATE patchsets SET status = 'Pending', review_duration_seconds = NULL
-                 WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
+        // restart reports what it actually cost. A full rerun is a new review
+        // rather than a continuation of the old one, so it starts from zero;
+        // carrying the previous cycle's time forward would make "review time"
+        // grow without bound and stop describing any single review.
+        //
+        // Redoing only the unreviewed patches is the other case: the patches
+        // that succeeded keep their reviews, exactly as they do after a restart,
+        // so the time they cost is still part of what this patchset cost.
+        match scope {
+            RerunScope::All => {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET status = 'Pending', review_duration_seconds = NULL
+                         WHERE id = ?",
+                        libsql::params![id],
+                    )
+                    .await?;
+            }
+            RerunScope::Unreviewed => {
+                self.conn
+                    .execute(
+                        "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
+                        libsql::params![id],
+                    )
+                    .await?;
+            }
+        }
 
         // 2. Raise target_review_count above what any patch has already achieved.
         //
@@ -4604,14 +4653,21 @@ impl Database {
             _ => 0,
         };
 
-        // Never lower an existing target: a patchset deliberately configured for
-        // several reviews should keep that setting.
-        self.conn
-            .execute(
-                "UPDATE patchsets SET target_review_count = MAX(COALESCE(target_review_count, 1), ?) WHERE id = ?",
-                libsql::params![max_successful + 1, id],
-            )
-            .await?;
+        // Raising the target is what puts every patch back below it, which is
+        // how a full rerun reviews them all again. Redoing only the unreviewed
+        // ones is therefore the same operation with this step left out: a patch
+        // that already met the target still meets it and is skipped, and one
+        // that never did is still short and gets another go.
+        if scope == RerunScope::All {
+            // Never lower an existing target: a patchset deliberately configured
+            // for several reviews should keep that setting.
+            self.conn
+                .execute(
+                    "UPDATE patchsets SET target_review_count = MAX(COALESCE(target_review_count, 1), ?) WHERE id = ?",
+                    libsql::params![max_successful + 1, id],
+                )
+                .await?;
+        }
 
         // 4. Delete associated tool usages and findings for failed reviews that block retrying
         self.conn
@@ -4640,15 +4696,39 @@ impl Database {
             )
             .await?;
 
-        Ok(true)
+        Ok(RerunOutcome::Queued)
     }
 
-    /// Returns `false` when a review is already running; see [`Self::rerun_patchset`].
-    pub async fn rerun_patch(&self, patchset_id: i64, _patch_id: i64) -> Result<bool> {
+    /// Patches of this patchset with no successful review to their name.
+    ///
+    /// The ones a rerun would redo when asked to leave the reviewed patches
+    /// alone: whatever failed, was cancelled, or only ever salvaged partial
+    /// findings.
+    pub async fn count_unreviewed_patches(&self, patchset_id: i64) -> Result<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM patches p
+                 WHERE p.patchset_id = ?
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews r
+                       WHERE r.patch_id = p.id AND r.status = 'Reviewed'
+                   )",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        match rows.next().await {
+            Ok(Some(row)) => Ok(row.get(0).unwrap_or(0)),
+            _ => Ok(0),
+        }
+    }
+
+    /// See [`Self::rerun_patchset`] for what the outcome means.
+    pub async fn rerun_patch(&self, patchset_id: i64, _patch_id: i64) -> Result<RerunOutcome> {
         // NOTE: Currently we only support re-running the entire patchset to trigger more reviews.
         // Even if the user requested a specific patch, we increment the set's target count
         // to allow the reviewer service to proceed.
-        self.rerun_patchset(patchset_id).await
+        self.rerun_patchset(patchset_id, RerunScope::All).await
     }
 
     /// Finds the patchset ingested for one exact pull request range.
@@ -5379,6 +5459,139 @@ mod tests {
         }
     }
 
+    /// Redoing only the unreviewed patches leaves the reviewed ones alone.
+    ///
+    /// The whole point: a patchset where one patch timed out and the rest
+    /// succeeded should cost one patch's review to put right, not ten. The
+    /// reviewer skips a patch whose successful count has reached the target, so
+    /// leaving the target where it is skips exactly the patches that already
+    /// met it.
+    #[tokio::test]
+    async fn test_rerun_can_leave_the_reviewed_patches_alone() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("r", "Subject", 1000).await.unwrap();
+        for msg in ["m1", "m2"] {
+            db.create_message(
+                msg, thread_id, None, "A", "Subject", 1000, "Body", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "r", "Subject", "A", 1000, 2, 2, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let reviewed = db.create_patch(ps_id, "m1", 1, "diff").await.unwrap();
+        let failed = db.create_patch(ps_id, "m2", 2, "diff").await.unwrap();
+
+        // One patch got a review; the other never did.
+        let review_id = db
+            .create_review(ps_id, Some(reviewed), "mock", "mock", None, None)
+            .await
+            .unwrap();
+        db.complete_review(review_id, "Reviewed", "ok", None, None, None, None)
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_id, "Failed").await.unwrap();
+
+        assert_eq!(db.count_unreviewed_patches(ps_id).await.unwrap(), 1);
+        assert_eq!(
+            db.rerun_patchset(ps_id, RerunScope::Unreviewed)
+                .await
+                .unwrap(),
+            RerunOutcome::Queued
+        );
+
+        // The target is untouched, which is what makes the reviewed patch meet
+        // it and the unreviewed one fall short.
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT COALESCE(target_review_count, 1) FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        let target: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(target, 1, "raising it is what redoes everything");
+
+        assert_eq!(
+            db.count_successful_reviews(ps_id, reviewed, None)
+                .await
+                .unwrap() as i64,
+            target,
+            "the reviewed patch has met the target, so it is skipped"
+        );
+        assert_eq!(
+            db.count_successful_reviews(ps_id, failed, None)
+                .await
+                .unwrap(),
+            0,
+            "the unreviewed one is still short, so it runs"
+        );
+        assert_eq!(
+            db.get_patchset_status(ps_id).await.unwrap().as_deref(),
+            Some("Pending"),
+            "and the patchset has to be picked up for any of that to happen"
+        );
+    }
+
+    /// Asking to redo the unreviewed patches when there are none says so.
+    ///
+    /// Requeueing would look identical to a rerun that worked: Pending, every
+    /// patch skipped, back to a terminal state having reviewed nothing.
+    #[tokio::test]
+    async fn test_rerun_reports_when_there_is_nothing_left_to_redo() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("r", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "m1", thread_id, None, "A", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "r", "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let p_id = db.create_patch(ps_id, "m1", 1, "diff").await.unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+        db.complete_review(review_id, "Reviewed", "ok", None, None, None, None)
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+
+        assert_eq!(
+            db.rerun_patchset(ps_id, RerunScope::Unreviewed)
+                .await
+                .unwrap(),
+            RerunOutcome::NothingToDo
+        );
+        assert_eq!(
+            db.get_patchset_status(ps_id).await.unwrap().as_deref(),
+            Some("Reviewed"),
+            "a request that does nothing must not leave the patchset Pending"
+        );
+
+        // Asked for everything, the same patchset does have work to do.
+        assert_eq!(
+            db.rerun_patchset(ps_id, RerunScope::All).await.unwrap(),
+            RerunOutcome::Queued
+        );
+    }
+
     /// Rerun must actually force another review pass.
     ///
     /// `process_patch_review` skips a patch when its successful review count has
@@ -5416,7 +5629,7 @@ mod tests {
                 .unwrap();
             db.update_patchset_status(ps_id, status).await.unwrap();
 
-            db.rerun_patchset(ps_id).await.unwrap();
+            db.rerun_patchset(ps_id, RerunScope::All).await.unwrap();
 
             let successful = db
                 .count_successful_reviews(ps_id, p_id, None)
@@ -5526,7 +5739,10 @@ mod tests {
         db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
         db.set_patchset_review_duration(ps_id, 3_600).await.unwrap();
 
-        assert!(db.rerun_patchset(ps_id).await.unwrap());
+        assert_eq!(
+            db.rerun_patchset(ps_id, RerunScope::All).await.unwrap(),
+            RerunOutcome::Queued
+        );
         assert_eq!(
             db.get_patchset_review_duration(ps_id).await.unwrap(),
             0,
@@ -5579,7 +5795,7 @@ mod tests {
             )
             .await
             .unwrap();
-        db.rerun_patchset(ps_id).await.unwrap();
+        db.rerun_patchset(ps_id, RerunScope::All).await.unwrap();
         assert_eq!(target(db.clone()).await, 5);
 
         // Each completed review makes the next rerun ask for one more.
@@ -5607,7 +5823,7 @@ mod tests {
                     .unwrap();
             }
 
-            db.rerun_patchset(ps_id).await.unwrap();
+            db.rerun_patchset(ps_id, RerunScope::All).await.unwrap();
             assert_eq!(
                 target(db.clone()).await,
                 expected,
@@ -5803,8 +6019,9 @@ mod tests {
             .expect("patchset");
 
         db.update_patchset_status(ps_id, "In Review").await.unwrap();
-        assert!(
-            !db.rerun_patchset(ps_id).await.unwrap(),
+        assert_eq!(
+            db.rerun_patchset(ps_id, RerunScope::All).await.unwrap(),
+            RerunOutcome::InProgress,
             "rerun must refuse while a review is in flight"
         );
         assert_eq!(
@@ -5815,7 +6032,10 @@ mod tests {
 
         // Once cancelled, the rerun goes through — the documented sequence.
         assert!(db.cancel_patchset(ps_id, true).await.unwrap());
-        assert!(db.rerun_patchset(ps_id).await.unwrap());
+        assert_eq!(
+            db.rerun_patchset(ps_id, RerunScope::All).await.unwrap(),
+            RerunOutcome::Queued
+        );
         assert_eq!(
             db.get_patchset_status(ps_id).await.unwrap().as_deref(),
             Some("Pending")
@@ -8266,7 +8486,9 @@ mod tests {
         // so one pass is what is needed; the target used to become 2 here purely
         // because the status said "Reviewed", which asked for two review passes
         // on a patchset that had never been reviewed at all.
-        db.rerun_patchset(ps_reviewed).await.unwrap();
+        db.rerun_patchset(ps_reviewed, RerunScope::All)
+            .await
+            .unwrap();
         let mut rows = db
             .conn
             .query(
@@ -8280,7 +8502,7 @@ mod tests {
         assert_eq!(target, 1);
 
         // RERUN Failed patchset -> no successful reviews, so still one pass
-        db.rerun_patchset(ps_failed).await.unwrap();
+        db.rerun_patchset(ps_failed, RerunScope::All).await.unwrap();
         let mut rows = db
             .conn
             .query(

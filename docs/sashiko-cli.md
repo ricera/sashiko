@@ -153,6 +153,14 @@ sashiko-cli rerun --pr <NUMBER>
 | Flag | Description |
 |------|-------------|
 | `--pr <NUMBER>` | Review or re-review a pull request by number, against the repository the daemon watches. Mutually exclusive with `ID`. |
+| `--skip-reviewed` | Review only the patches that have no successful review yet. |
+
+`--skip-reviewed` is for a patchset that partly succeeded: the patches already
+reviewed keep their reviews, and only the ones that failed, were cancelled, or
+never completed go round again. Without it a rerun redoes everything, which on
+a large series means hours of work to get at the one patch that timed out. If
+every patch has already been reviewed the command says so rather than queueing
+a run that would review nothing.
 
 `--pr` resolves the pull request's current head before doing anything, so a
 force-pushed PR is reviewed as it is now rather than as it was. If that head
