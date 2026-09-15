@@ -172,6 +172,9 @@ pub struct PatchQuery {
     pub id: String,
     pub page: Option<u32>,
     pub per_page: Option<u32>,
+    /// Redo only the patches with no successful review.
+    #[serde(default)]
+    pub skip_reviewed: bool,
 }
 
 #[derive(Deserialize)]
@@ -1212,19 +1215,48 @@ async fn rerun_patchset(
         .parse::<i64>()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let requeued = state.db.rerun_patchset(id).await.map_err(|e| {
-        error!("Failed to rerun patchset {}: {}", id, e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let outcome = state
+        .db
+        .rerun_patchset(id, scope_for(query.skip_reviewed))
+        .await
+        .map_err(|e| {
+            error!("Failed to rerun patchset {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    if requeued {
-        Ok(Json(serde_json::json!({ "status": "accepted" })))
+    Ok(Json(rerun_response(outcome, None)))
+}
+
+/// Maps the request flag onto what the rerun should cover.
+fn scope_for(skip_reviewed: bool) -> crate::db::RerunScope {
+    if skip_reviewed {
+        crate::db::RerunScope::Unreviewed
     } else {
-        Ok(Json(serde_json::json!({
+        crate::db::RerunScope::All
+    }
+}
+
+/// Renders a rerun outcome for the API.
+///
+/// "Nothing to do" is reported as its own status rather than as success: a
+/// caller that asked to redo the unreviewed patches and had none needs to hear
+/// that, not a cheerful "accepted" followed by no work.
+fn rerun_response(outcome: crate::db::RerunOutcome, id: Option<i64>) -> serde_json::Value {
+    let mut body = match outcome {
+        crate::db::RerunOutcome::Queued => serde_json::json!({ "status": "accepted" }),
+        crate::db::RerunOutcome::InProgress => serde_json::json!({
             "status": "not_modified",
             "reason": RERUN_IN_PROGRESS_REASON,
-        })))
+        }),
+        crate::db::RerunOutcome::NothingToDo => serde_json::json!({
+            "status": "not_modified",
+            "reason": "Every patch has already been reviewed; nothing was left to redo.",
+        }),
+    };
+    if let (Some(id), Some(obj)) = (id, body.as_object_mut()) {
+        obj.insert("id".to_string(), serde_json::json!(id));
     }
+    body
 }
 
 /// Explains a refused rerun. Requeueing a running review would put a second
@@ -1305,14 +1337,7 @@ async fn rerun_patch(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    if requeued {
-        Ok(Json(serde_json::json!({ "status": "accepted" })))
-    } else {
-        Ok(Json(serde_json::json!({
-            "status": "not_modified",
-            "reason": RERUN_IN_PROGRESS_REASON,
-        })))
-    }
+    Ok(Json(rerun_response(requeued, None)))
 }
 
 async fn health_check() -> StatusCode {
@@ -1334,6 +1359,9 @@ async fn get_config(
 #[derive(Deserialize)]
 struct PrQuery {
     number: i64,
+    /// Redo only the patches with no successful review.
+    #[serde(default)]
+    skip_reviewed: bool,
 }
 
 /// Reviews or re-reviews a pull request by number, without the caller knowing
@@ -1371,20 +1399,27 @@ async fn review_pull_request(
                 error!("PR #{} is unknown and unresolvable", query.number);
                 return Err(StatusCode::BAD_REQUEST);
             };
-            let requeued = state.db.rerun_patchset(id).await.map_err(|e| {
-                error!("Failed to rerun patchset {}: {}", id, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-            return Ok(Json(serde_json::json!({
-                "status": if requeued { "accepted" } else { "not_modified" },
-                "id": id,
-                "stale": true,
-                "message": format!(
-                    "Could not reach the forge to check PR #{} for new commits; \
-                     re-running the last range sashiko ingested for it. ({e})",
-                    query.number
-                ),
-            })));
+            let outcome = state
+                .db
+                .rerun_patchset(id, scope_for(query.skip_reviewed))
+                .await
+                .map_err(|e| {
+                    error!("Failed to rerun patchset {}: {}", id, e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            let mut body = rerun_response(outcome, Some(id));
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("stale".to_string(), serde_json::json!(true));
+                obj.insert(
+                    "message".to_string(),
+                    serde_json::json!(format!(
+                        "Could not reach the forge to check PR #{} for new commits; \
+                         re-running the last range sashiko ingested for it. ({e})",
+                        query.number
+                    )),
+                );
+            }
+            return Ok(Json(body));
         }
     };
 
@@ -1397,24 +1432,32 @@ async fn review_pull_request(
         .get_patchset_id_by_pr_range(query.number, &commit_range)
         .await
     {
-        let requeued = state.db.rerun_patchset(id).await.map_err(|e| {
-            error!("Failed to rerun patchset {}: {}", id, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+        let outcome = state
+            .db
+            .rerun_patchset(id, scope_for(query.skip_reviewed))
+            .await
+            .map_err(|e| {
+                error!("Failed to rerun patchset {}: {}", id, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
-        return Ok(Json(if requeued {
-            serde_json::json!({
-                "status": "accepted",
-                "id": id,
-                "message": format!("PR #{} queued for re-review", query.number),
-            })
-        } else {
-            serde_json::json!({
-                "status": "not_modified",
-                "id": id,
-                "reason": RERUN_IN_PROGRESS_REASON,
-            })
-        }));
+        let mut body = rerun_response(outcome, Some(id));
+        if outcome == crate::db::RerunOutcome::Queued
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert(
+                "message".to_string(),
+                serde_json::json!(if query.skip_reviewed {
+                    format!(
+                        "PR #{} queued; patches already reviewed will be skipped",
+                        query.number
+                    )
+                } else {
+                    format!("PR #{} queued for re-review", query.number)
+                }),
+            );
+        }
+        return Ok(Json(body));
     }
 
     info!(

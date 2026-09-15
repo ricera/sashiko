@@ -169,6 +169,13 @@ enum Commands {
         /// rather than as it was.
         #[arg(long, conflicts_with = "id")]
         pr: Option<i64>,
+
+        /// Review only the patches that have no successful review yet, leaving
+        /// the ones already reviewed alone. Useful after a partial failure: a
+        /// patch that took hours to review is not redone to get at the one
+        /// beside it that timed out.
+        #[arg(long)]
+        skip_reviewed: bool,
     },
     /// Cancel a pending review
     Cancel {
@@ -342,9 +349,15 @@ async fn run_command(
             };
             handle_show(client, base_url, id, watch, format, opts).await
         }
-        Commands::Rerun { id, pr } => match (id, pr) {
-            (_, Some(number)) => handle_pr_review(client, base_url, number, format).await,
-            (Some(id), None) => handle_rerun(client, base_url, id, format).await,
+        Commands::Rerun {
+            id,
+            pr,
+            skip_reviewed,
+        } => match (id, pr) {
+            (_, Some(number)) => {
+                handle_pr_review(client, base_url, number, skip_reviewed, format).await
+            }
+            (Some(id), None) => handle_rerun(client, base_url, id, skip_reviewed, format).await,
             (None, None) => Err(anyhow::anyhow!(
                 "Give a patchset id or --pr <number>: `sashiko-cli rerun 42` or `sashiko-cli rerun --pr 20`"
             )),
@@ -395,7 +408,9 @@ async fn handle_submit(
     if explicit_type.is_none()
         && let Some(number) = input.as_deref().and_then(parse_pr_reference)
     {
-        return handle_pr_review(client, base_url, number, format).await;
+        // A submit asks for the pull request to be reviewed, so it reviews all
+        // of it. Skipping what is already done is a rerun's business.
+        return handle_pr_review(client, base_url, number, false, format).await;
     }
 
     let url = format!("{}/api/submit", base_url);
@@ -1851,9 +1866,13 @@ async fn handle_rerun(
     client: &Client,
     base_url: &str,
     id: i64,
+    skip_reviewed: bool,
     format: OutputFormat,
 ) -> Result<()> {
-    let url = format!("{}/api/patchset/rerun?id={}", base_url, id);
+    let url = format!(
+        "{}/api/patchset/rerun?id={}&skip_reviewed={}",
+        base_url, id, skip_reviewed
+    );
     let resp = client.post(&url).send().await?;
 
     if resp.status().is_success() {
@@ -1866,7 +1885,14 @@ async fn handle_rerun(
                 // would hide a refused rerun.
                 if result["status"] == "accepted" {
                     print_colored(Color::Green, "Rerun queued: ");
-                    println!("Patchset {} has been re-added to the review queue.", id);
+                    if skip_reviewed {
+                        println!(
+                            "Patchset {} requeued; patches already reviewed will be skipped.",
+                            id
+                        );
+                    } else {
+                        println!("Patchset {} has been re-added to the review queue.", id);
+                    }
                 } else {
                     print_colored(Color::Yellow, "Not rerun: ");
                     println!(
@@ -1934,9 +1960,13 @@ async fn handle_pr_review(
     client: &Client,
     base_url: &str,
     number: i64,
+    skip_reviewed: bool,
     format: OutputFormat,
 ) -> Result<()> {
-    let url = format!("{}/api/pr/review?number={}", base_url, number);
+    let url = format!(
+        "{}/api/pr/review?number={}&skip_reviewed={}",
+        base_url, number, skip_reviewed
+    );
     let resp = client.post(&url).send().await?;
 
     if !resp.status().is_success() {
