@@ -1535,6 +1535,17 @@ impl Reviewer {
                                         let severity_explanation = f["severity_explanation"]
                                             .as_str()
                                             .map(|s| s.to_string());
+                                        // Absent on every review recorded before
+                                        // the prompt began asking for it, and on
+                                        // any run where the model skips it --
+                                        // the stage has no validator. Readers
+                                        // fall back to `problem` rather than
+                                        // showing an empty row.
+                                        let headline = f["headline"]
+                                            .as_str()
+                                            .map(str::trim)
+                                            .filter(|s| !s.is_empty())
+                                            .map(|s| s.to_string());
                                         let preexisting = f["preexisting"].as_bool();
                                         let locations = f.get("locations").cloned();
 
@@ -1543,6 +1554,7 @@ impl Reviewer {
                                                 review_id,
                                                 severity,
                                                 severity_explanation,
+                                                headline,
                                                 problem,
                                                 preexisting,
                                                 locations,

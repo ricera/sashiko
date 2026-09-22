@@ -1793,6 +1793,216 @@
             }
         }
 
+        // One finding's detail row. Not toggleCollapsible: that one flips the
+        // .collapsible class, whose display:block would take a <tr> out of the
+        // table it belongs to.
+        function toggleFindingReasoning(id, btn) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            const open = el.style.display !== 'none';
+            el.style.display = open ? 'none' : 'table-row';
+            if (btn) btn.innerText = open ? '▶' : '▼';
+        }
+
+        // The verification stage writes its severity calibration into
+        // severity_explanation as a paragraph led by "Consequence:", "Triggering
+        // path:" and "Reachability:" -- see third_party/prompts/kernel/severity.md,
+        // which tells it to state that reasoning first so the label is auditable.
+        // Split on those labels so each step can be read on its own.
+        //
+        // Only labels acting as section headers count: a bare prose mention such
+        // as "reachability is speculative" must not start a new section, hence
+        // the leading-boundary group. That boundary is matched rather than looked
+        // behind, because a lookbehind here would be a regex literal in a
+        // top-level script block and would break this entire page on a browser
+        // that does not support it.
+        //
+        // The regex is built per call rather than held in a const: a /g regex
+        // carries lastIndex between calls, and one forgotten reset silently skips
+        // the first section of the next finding.
+        //
+        // Explanations predating this format have no labels and come back as a
+        // single preamble, which is how every review recorded before it renders.
+        function parseSeverityCalibration(text) {
+            if (!text || !text.trim()) return null;
+            const labels = /(^|[\s.;—-])(?:\(?[a-z0-9]\)?[.)]\s*)?(Consequence|Triggering path|Reachability)\s*[:—-]\s*/gi;
+            const trimmed = text.trim();
+            const marks = [];
+            let m;
+            while ((m = labels.exec(trimmed)) !== null) {
+                const label = m[2].toLowerCase();
+                // Keep only the first occurrence of each label; later ones are
+                // back-references within the prose, not a second section.
+                if (marks.some(mark => mark.label === label)) continue;
+                marks.push({
+                    label,
+                    // The boundary character belongs to the preceding section,
+                    // not to this label, so the section starts after it.
+                    start: m.index + m[1].length,
+                    bodyStart: m.index + m[0].length,
+                });
+            }
+            if (!marks.length) return { preamble: trimmed, sections: [] };
+
+            const sections = marks.map((mark, i) => ({
+                label: mark.label,
+                body: trimmed.slice(mark.bodyStart, i + 1 < marks.length ? marks[i + 1].start : undefined).trim(),
+            })).filter(section => section.body);
+
+            return { preamble: trimmed.slice(0, marks[0].start).trim(), sections };
+        }
+
+        function renderSeverityCalibration(text) {
+            const parsed = parseSeverityCalibration(text);
+            if (!parsed) return '';
+            const blocks = [];
+            if (parsed.preamble) {
+                blocks.push(`<div style="margin-bottom:6px;">${escapeHtml(parsed.preamble)}</div>`);
+            }
+            for (const section of parsed.sections) {
+                // Capitalising the parsed label reproduces the rubric's own
+                // wording exactly, so no table of display names is needed.
+                const title = section.label.charAt(0).toUpperCase() + section.label.slice(1);
+                blocks.push(`<div style="margin-bottom:6px;">`
+                    + `<span style="color:var(--text-muted); font-weight:600;">${escapeHtml(title)}: </span>`
+                    + `${escapeHtml(section.body)}</div>`);
+            }
+            return blocks.join('');
+        }
+
+        // The rubric caps a finding at Medium when the model cannot establish
+        // that the bug is real, and says so in the explanation. Surface that: the
+        // level alone cannot distinguish it from a genuinely Medium-consequence
+        // bug.
+        //
+        // Severity gates the check, because the cap only ever produces Low or
+        // Medium -- a High or Critical finding was by definition not capped, and
+        // explanations at those levels routinely argue the opposite ("not capped
+        // as speculative"), which text matching alone reads backwards.
+        //
+        // Within Low/Medium the cap phrasing is decisive and never negated, so it
+        // is checked first: an explanation may cap the finding and separately
+        // call some other clause of its reasoning "not speculative". Only the
+        // weaker "is/marked speculative" wording is subject to that veto.
+        function isSpeculativeFinding(text, severity) {
+            if (!text) return false;
+            const level = String(severity || '').toLowerCase();
+            if (level === 'high' || level === 'critical') return false;
+            const lower = text.toLowerCase();
+            if (/capped at medium/.test(lower)) return true;
+            if (/not\s+speculative/.test(lower)) return false;
+            return /(?:is|as|marked?(?:\s+it)?)\s+speculative/.test(lower);
+        }
+
+        // The one line that names a finding in a list.
+        //
+        // `problem` is an argument, not a label -- it runs to hundreds of
+        // characters -- so the review prompt asks for a one-sentence `headline`
+        // alongside it. Every finding recorded before it did, and any run where
+        // the model skipped the key, falls back to a clipped `problem`. One
+        // function decides, so the row and its tooltip cannot disagree.
+        function findingHeadline(finding) {
+            const headline = (finding.headline || '').trim();
+            if (headline) return headline;
+            const problem = (finding.problem || '').trim();
+            if (!problem) return '(no description)';
+            return problem.length > 160 ? problem.slice(0, 160).trimEnd() + '…' : problem;
+        }
+
+        // Where a finding lives, compactly enough to sit in a table cell. The
+        // code snippets each location carries are left to the inline review:
+        // multi-line blocks here would bury the reasoning they sit beside.
+        function renderFindingLocations(locations) {
+            if (!Array.isArray(locations) || !locations.length) return '';
+            const lines = locations.map(loc => {
+                if (!loc || typeof loc !== 'object') return '';
+                return [loc.file, loc.function_or_symbol, loc.line]
+                    .filter(part => part !== null && part !== undefined && String(part).trim() !== '')
+                    .join(':');
+            }).filter(Boolean);
+            if (!lines.length) return '';
+            return `<div style="margin-top:6px;">`
+                + lines.map(line =>
+                    `<div style="font-family:monospace; font-size:0.9em; color:var(--text-muted);">`
+                    + `${escapeHtml(line)}</div>`).join('')
+                + `</div>`;
+        }
+
+        // Every finding of one review, severest first, each row expanding to the
+        // reasoning behind its level.
+        //
+        // Ranked rather than left in the model's order: the order findings were
+        // written in says nothing, and a Critical below three Lows is easy to
+        // miss. Sorting by index keeps findings of equal severity in the order
+        // the review produced them.
+        function renderFindingsTable(findings, uniqueId) {
+            if (!Array.isArray(findings) || !findings.length) return '';
+            const RANK = { critical: 0, high: 1, medium: 2, low: 3 };
+            const rankOf = f => {
+                const r = RANK[String(f.severity || '').toLowerCase()];
+                return r === undefined ? RANK.low : r;
+            };
+            const ordered = findings
+                .map((f, i) => ({ f, i }))
+                .sort((a, b) => rankOf(a.f) - rankOf(b.f) || a.i - b.i)
+                .map(entry => entry.f);
+
+            const rows = ordered.map((f, i) => {
+                const severity = String(f.severity || 'Low');
+                const level = severity.toLowerCase();
+                const explanation = f.severity_explanation || '';
+                const reasoning = renderSeverityCalibration(explanation);
+                const locations = renderFindingLocations(f.locations);
+                const headline = findingHeadline(f);
+                const problem = (f.problem || '').trim();
+                // Only when it says something the row does not. A headline that
+                // is just the clipped problem would print it twice.
+                const fullProblem = problem && problem !== headline
+                    ? `<div style="margin-bottom:6px;">${escapeHtml(problem)}</div>`
+                    : '';
+
+                const tags = [];
+                if (isSpeculativeFinding(explanation, severity)) {
+                    tags.push(`<span title="The reviewer could not establish that the bug is real, so the level is capped at Medium"`
+                        + ` style="font-weight:normal; font-size:0.85em; color:var(--text-muted);"> (speculative)</span>`);
+                }
+                if (f.preexisting) {
+                    tags.push(`<span title="Already present before this patchset; not a regression"`
+                        + ` style="font-weight:normal; font-size:0.85em; color:var(--text-muted);"> (preexisting)</span>`);
+                }
+
+                const detail = fullProblem + reasoning + locations;
+                const detailId = `finding-${uniqueId}-${i}`;
+                // No toggle on a row with nothing behind it: a control that
+                // opens an empty box is worse than no control.
+                const toggle = detail
+                    ? `<button class="toggle-btn" onclick="toggleFindingReasoning('${detailId}', this)" title="Show the reasoning behind this severity">▶</button>`
+                    : '';
+
+                const mainRow = `<tr>`
+                    + `<td style="padding:2px 6px 2px 0; vertical-align:top; width:1em;">${toggle}</td>`
+                    + `<td style="padding:2px 12px 2px 0; vertical-align:top; white-space:nowrap;`
+                    + ` color:var(--sev-${level}); font-weight:bold;">${escapeHtml(severity)}${tags.join('')}</td>`
+                    + `<td style="padding:2px 0; vertical-align:top;">${escapeHtml(headline)}</td></tr>`;
+                const detailRow = detail
+                    ? `<tr id="${detailId}" style="display:none;">`
+                      + `<td></td><td colspan="2" style="padding:4px 0 10px 0; color:var(--text-muted);">`
+                      + `${detail}</td></tr>`
+                    : '';
+                return mainRow + detailRow;
+            });
+
+            return `<div style="margin-top:8px;">`
+                + `<button class="toggle-btn" onclick="toggleCollapsible('findings-${uniqueId}', this)">`
+                + `▶ Findings (${ordered.length})</button>`
+                + `<div id="findings-${uniqueId}" class="collapsible">`
+                + `<table style="width:100%; font-size:0.9em; border-collapse:collapse;">`
+                + `<thead><tr style="color:var(--text-muted);"><th></th>`
+                + `<th style="text-align:left; padding:2px 12px 2px 0;">Severity</th>`
+                + `<th style="text-align:left; padding:2px 0;">Problem</th></tr></thead>`
+                + `<tbody>${rows.join('')}</tbody></table></div></div>`;
+        }
+
         function renderFindingsBadges(counts, status) {
             const { low = 0, medium = 0, high = 0, critical = 0 } = counts;
             if (low + medium + high + critical === 0) {
@@ -3082,9 +3292,12 @@
             
             // 1. Try to parse output for structured findings
             let parsedFindings = false;
+            // Declared out here so the findings table below can read it. Inside
+            // the try it died with the block, and the catch that swallows a
+            // malformed output would have taken the table with it.
+            let outputJson = null;
             try {
                 if (r.output) {
-                    let outputJson = null;
                     if (typeof r.output === 'string') {
                         outputJson = JSON.parse(r.output);
                     } else if (typeof r.output === 'object') {
@@ -3166,6 +3379,11 @@
                 }
             } catch (e) { }
 
+            // The counts above say how many and how bad; this says what they
+            // were, which is the only part a reader can act on without opening
+            // the full inline review.
+            const findingsHtml = renderFindingsTable(outputJson?.findings, uniqueId);
+
             // 2. If no structured findings, fallback to r.result
             if (!parsedFindings) {
                 const rawResult = r.result || 'Finished';
@@ -3235,6 +3453,7 @@
                         `}
                     </div>
                     ${showDetails ? `
+                    ${findingsHtml}
                     ${inlineHtml}
                     <div style="margin-top: 24px; margin-bottom: 0;">
                         ${emailHtml}

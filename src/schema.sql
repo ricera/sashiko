@@ -166,6 +166,7 @@ CREATE TABLE IF NOT EXISTS findings (
     review_id INTEGER NOT NULL,
     severity INTEGER NOT NULL, -- 1: Low, 2: Medium, 3: High, 4: Critical
     severity_explanation TEXT,
+    headline TEXT, -- one sentence, for listing findings without the full problem text
     problem TEXT,
     suggestion TEXT,
     preexisting INTEGER, -- 0 = false, 1 = true

@@ -216,6 +216,14 @@ pub struct Finding {
     pub review_id: i64,
     pub severity: Severity,
     pub severity_explanation: Option<String>,
+    /// One sentence naming the problem, for surfaces that list findings.
+    ///
+    /// `problem` runs to hundreds of characters -- it is an argument, not a
+    /// label -- so anything showing findings in a row or a line needs this
+    /// instead. `None` for every finding recorded before the review prompt began
+    /// asking for it, which callers must render some other way rather than
+    /// leaving blank.
+    pub headline: Option<String>,
     pub problem: String,
     pub preexisting: Option<bool>,
     pub locations: Option<serde_json::Value>,
@@ -859,6 +867,7 @@ impl Database {
             .try_add_column("findings", "preexisting", "INTEGER")
             .await;
         let _ = self.try_add_column("findings", "locations", "TEXT").await;
+        let _ = self.try_add_column("findings", "headline", "TEXT").await;
         // Ignore errors for these as they might fail on new DBs or if already migrated
         let _ = self
             .conn
@@ -1597,12 +1606,13 @@ impl Database {
             .and_then(|v| serde_json::to_string(v).ok());
         self.conn
             .execute(
-                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
-             VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO findings (review_id, severity, severity_explanation, headline, problem, preexisting, locations)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
                 libsql::params![
                     finding.review_id,
                     finding.severity as i32,
                     finding.severity_explanation,
+                    finding.headline,
                     finding.problem,
                     preexisting_val,
                     locations_val,
@@ -4463,7 +4473,7 @@ impl Database {
         for (review_id, patch_id, inline_review, summary, patch_message_id, index) in temp_reviews {
             // Fetch findings for this review
             let mut findings_rows = self.conn.query(
-                "SELECT severity, problem, severity_explanation, preexisting, locations FROM findings WHERE review_id = ?",
+                "SELECT severity, problem, severity_explanation, preexisting, locations, headline FROM findings WHERE review_id = ?",
                 libsql::params![review_id],
             ).await?;
 
@@ -4484,9 +4494,11 @@ impl Database {
                 let locations_str: Option<String> = f_row.get(4).ok();
                 let locations =
                     locations_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+                let headline: Option<String> = f_row.get(5).ok();
 
                 findings.push(json!({
                     "severity": severity,
+                    "headline": headline,
                     "problem": problem,
                     "severity_explanation": severity_explanation,
                     "preexisting": preexisting,
@@ -7220,6 +7232,7 @@ mod tests {
             review_id,
             severity: Severity::Low,
             severity_explanation: None,
+            headline: None,
             problem: "Pre-existing issue".to_string(),
             preexisting: Some(true),
             locations: None,
