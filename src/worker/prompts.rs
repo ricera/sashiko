@@ -31,9 +31,11 @@ pub enum ReviewError {
     /// violated constraint rather than repeating the identical request.
     #[error("Format validation failed: {0}")]
     FormatRejection(String),
-    /// The AI response was truncated by the provider (e.g., hit max tokens).
-    #[error("AI response truncated by provider limit")]
-    OutputTruncated,
+    // Truncation is not here. It was declared as a variant of this enum and
+    // never constructed, because only the session loop can see a response come
+    // back half-written and only it can do anything about it -- and this layer
+    // sits above that one. It lives in `ai` as `OutputTruncated`, where it is
+    // raised and recovered from.
 }
 
 impl ClassifyAiError for ReviewError {
@@ -42,7 +44,6 @@ impl ClassifyAiError for ReviewError {
             ReviewError::LimitExceeded => AiErrorClass::Fatal,
             ReviewError::BudgetExceeded(_) => AiErrorClass::Fatal,
             ReviewError::FormatRejection(_) => AiErrorClass::Fatal,
-            ReviewError::OutputTruncated => AiErrorClass::Fatal,
         }
     }
 }
