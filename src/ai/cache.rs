@@ -174,6 +174,16 @@ impl AiProvider for CachingAiProvider {
 
         let resp = self.inner.generate_content(request.clone()).await?;
 
+        // A truncated answer is not worth keeping. Stored, it would be replayed
+        // for every identical request from here on -- so a stage that hit the
+        // output ceiling once would hit it again on the next review of the same
+        // patch without the model ever being asked, and the retry that recovers
+        // from it would be spent on a cache hit.
+        if resp.truncated {
+            debug!("Not caching truncated response [{}]", hash_prefix);
+            return Ok(resp);
+        }
+
         let response_json = serde_json::to_string(&resp)?;
         let request_json = serde_json::to_string(&request)?;
         let caps = self.inner.get_capabilities();
@@ -225,5 +235,102 @@ impl AiProvider for CachingAiProvider {
             tokens_saved_this_session: self.tokens_saved_this.load(Ordering::Relaxed),
             tokens_saved_prev_session: self.tokens_saved_prev.load(Ordering::Relaxed),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::AiMessage;
+    use std::sync::atomic::AtomicUsize;
+
+    /// Answers once truncated, then properly, counting how often it was asked.
+    struct TruncatesFirst {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiProvider for TruncatesFirst {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(AiResponse {
+                content: Some(if n == 0 {
+                    "half".into()
+                } else {
+                    "whole".into()
+                }),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: n == 0,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "truncates-first".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    fn request() -> AiRequest {
+        AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: crate::ai::AiRole::User,
+                content: Some("same question".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        }
+    }
+
+    /// A half-written answer must not become the permanent answer.
+    ///
+    /// Cached, it would be replayed for every identical request from then on:
+    /// the next review of the same patch would truncate without the model being
+    /// asked, and the retry that recovers from truncation would be spent on a
+    /// cache hit rather than on a real attempt.
+    #[tokio::test]
+    async fn a_truncated_response_is_not_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cache.db");
+        let inner = Arc::new(TruncatesFirst {
+            calls: AtomicUsize::new(0),
+        });
+        let cache = CachingAiProvider::new(inner.clone(), path.to_str().unwrap(), 7)
+            .await
+            .unwrap();
+
+        let first = cache.generate_content(request()).await.unwrap();
+        assert!(first.truncated, "the first answer is the truncated one");
+
+        // The same question again: it must reach the provider, not the cache.
+        let second = cache.generate_content(request()).await.unwrap();
+        assert!(!second.truncated, "the replay would still be truncated");
+        assert_eq!(second.content.as_deref(), Some("whole"));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+
+        // And a whole answer is still cached, or this would have cost the
+        // cache its point.
+        let third = cache.generate_content(request()).await.unwrap();
+        assert_eq!(third.content.as_deref(), Some("whole"));
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            2,
+            "a complete answer must still be served from the cache"
+        );
     }
 }

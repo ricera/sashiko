@@ -128,11 +128,41 @@ pub trait LlmSession: Send {
                  Describe changes in prose, or use highly simplified pseudo-code if you must show code structure."
                     .to_string(),
             )
+        } else if let Some(action) = truncation_action(error) {
+            action
         } else {
             ErrorAction::Fail
         }
     }
 }
+
+/// What to do about a response the provider cut short, if that is what happened.
+///
+/// `None` for any other error, so a caller can fall through to its own handling.
+///
+/// Shared rather than written out at each `handle_provider_error`: the stage
+/// layer overrides that hook to apply its own recitation policy, and a second
+/// copy of this would be the one that stopped being updated.
+pub fn truncation_action(error: &anyhow::Error) -> Option<ErrorAction> {
+    error
+        .downcast_ref::<crate::ai::OutputTruncated>()
+        .map(|_| ErrorAction::RetryWithFeedback(OUTPUT_TRUNCATED_FEEDBACK.to_string()))
+}
+
+/// Asked of a model whose last answer hit the provider's output ceiling.
+///
+/// Retrying without it would be pointless. The ceiling has not moved, and an
+/// identical request is served from the response cache -- so the same truncated
+/// answer would come back, faster. Changing the request is what makes the retry
+/// a retry rather than a replay.
+///
+/// The partial answer is not kept: a response cut mid-token leaves tool-call
+/// arguments unparseable, and half an analysis reads as a whole one.
+pub const OUTPUT_TRUNCATED_FEEDBACK: &str = "IMPORTANT: Your previous response hit the provider's output limit and was discarded \
+     unread. Answer again, shorter. Do not quote long passages of code -- cite file and \
+     line and describe what is there. Keep reasoning to the conclusions you have reached. \
+     If the work does not fit in one response, do the first part only and continue on the \
+     next turn.";
 
 /// Marker in the error text of a session stopped by supervisor cancellation.
 ///
@@ -310,6 +340,30 @@ impl<'a> SessionRunner<'a> {
         }
     }
 
+    /// Appends a retry's feedback to the conversation the model will see next.
+    ///
+    /// The feedback has to reach the model, the live log and the stored history
+    /// alike -- a retry whose reason is missing from the log reads as the model
+    /// answering the same question twice for no reason.
+    fn push_feedback(
+        &self,
+        history: &mut Vec<AiMessage>,
+        log_history: &mut Vec<AiMessage>,
+        feedback: String,
+    ) {
+        let msg = AiMessage {
+            role: AiRole::User,
+            content: Some(feedback),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        history.push(msg.clone());
+        self.emit_message(&msg);
+        log_history.push(msg);
+    }
+
     /// Runs the session to completion. Returns the validated output and conversation history (for logging).
     pub async fn run<S>(&self, session: &mut S) -> Result<SessionResult<S::Output>>
     where
@@ -412,17 +466,7 @@ impl<'a> SessionRunner<'a> {
                                         e
                                     );
                                 }
-                                let msg = AiMessage {
-                                    role: AiRole::User,
-                                    content: Some(feedback.clone()),
-                                    thought: None,
-                                    thought_signature: None,
-                                    tool_calls: None,
-                                    tool_call_id: None,
-                                };
-                                history.push(msg.clone());
-                                self.emit_message(&msg);
-                                log_history.push(msg);
+                                self.push_feedback(&mut history, &mut log_history, feedback);
                                 turns = turns.saturating_sub(1);
                                 continue;
                             }
@@ -432,8 +476,39 @@ impl<'a> SessionRunner<'a> {
                 },
             };
 
+            // A truncated answer is a failure wearing a success's clothes: the
+            // request went through, and what came back stops mid-thought. It is
+            // routed through the same hook and the same budget as a provider
+            // error rather than ending the stage, because the conversation so
+            // far is intact and worth continuing -- three stages of one patch
+            // died here after an hour of work apiece, and the turns they had
+            // already paid for died with them.
+            //
+            // Raised here rather than returned by the provider because only
+            // this layer can do anything about it: the remedy is to ask the
+            // model for less, which means changing the request.
             if resp.truncated {
-                anyhow::bail!("LLM output was truncated by provider (e.g. hit max tokens)");
+                let e = anyhow::Error::new(crate::ai::OutputTruncated);
+                match session.handle_provider_error(&e, provider_error_retries) {
+                    ErrorAction::RetryWithFeedback(feedback) => {
+                        provider_error_retries += 1;
+                        if provider_error_retries > self.max_provider_error_retries {
+                            anyhow::bail!(
+                                "Session failed after {} provider error retries. Last error: {}",
+                                self.max_provider_error_retries,
+                                e
+                            );
+                        }
+                        self.push_feedback(&mut history, &mut log_history, feedback);
+                        // The turn is given back for the same reason a provider
+                        // error's is: nothing usable came of it, and charging
+                        // for it would spend the stage's turn cap on answers
+                        // that were thrown away.
+                        turns = turns.saturating_sub(1);
+                        continue;
+                    }
+                    ErrorAction::Fail => return Err(e),
+                }
             }
 
             if let Some(usage) = &resp.usage {
@@ -581,6 +656,142 @@ mod tests {
         fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
             Ok(response.content.clone().unwrap_or_default())
         }
+    }
+
+    /// Truncates its first `truncate_first` answers, then answers properly.
+    struct TruncatingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        truncate_first: usize,
+        saw_feedback: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TruncatingProvider {
+        fn new(truncate_first: usize) -> Self {
+            Self {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                truncate_first,
+                saw_feedback: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl AiProvider for TruncatingProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // What the model is told on the way back in is the whole point of
+            // the retry, so the test records it rather than assuming it.
+            self.saw_feedback.lock().unwrap().push(
+                request
+                    .messages
+                    .last()
+                    .and_then(|m| m.content.clone())
+                    .unwrap_or_default(),
+            );
+            Ok(AiResponse {
+                content: Some(if n < self.truncate_first {
+                    "half a".into()
+                } else {
+                    "done".into()
+                }),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: n < self.truncate_first,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "truncating".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// A stage used to die outright when the provider cut its answer short.
+    ///
+    /// Three stages of one patch were lost this way in a single review, each
+    /// after an hour of work, because the whole session was abandoned on the
+    /// turn that overran rather than the overrun turn being asked again.
+    #[tokio::test]
+    async fn a_truncated_answer_is_asked_again_rather_than_ending_the_session() {
+        let provider = TruncatingProvider::new(1);
+
+        let result = SessionRunner::new(&provider).run(&mut EchoSession).await;
+
+        let output = match result {
+            Ok(r) => r.output,
+            Err(e) => panic!("a truncated answer must not end the session: {e}"),
+        };
+        assert_eq!(output, "done", "the retry's answer is the one that counts");
+        assert_eq!(provider.calls(), 2, "it has to actually ask again");
+
+        // Asking again unchanged would be pointless: the ceiling has not moved,
+        // and an identical request is served from the response cache.
+        let seen = provider.saw_feedback.lock().unwrap().clone();
+        assert_ne!(
+            seen[0], seen[1],
+            "the second request must differ from the first"
+        );
+        assert!(
+            seen[1].contains("output limit"),
+            "the model has to be told why it is being asked again: {}",
+            seen[1]
+        );
+    }
+
+    /// A model that keeps overrunning still has to stop somewhere.
+    #[tokio::test]
+    async fn truncation_retries_are_bounded_and_say_what_ran_out() {
+        let provider = TruncatingProvider::new(99);
+
+        let err = match SessionRunner::new(&provider)
+            .with_max_provider_error_retries(2)
+            .run(&mut EchoSession)
+            .await
+        {
+            Err(e) => e,
+            Ok(_) => panic!("a provider that always truncates cannot succeed"),
+        };
+
+        assert!(
+            err.to_string().contains("provider error retries"),
+            "the reason must name the budget that ran out: {err}"
+        );
+        // The original cause has to survive, or the stage row says only that
+        // some retries were used up.
+        assert!(
+            err.to_string().contains("truncated by provider"),
+            "the underlying cause must still be reported: {err}"
+        );
+        assert_eq!(provider.calls(), 3, "one attempt plus its two retries");
+    }
+
+    /// The turn cap pays for answers, and a discarded answer is not one.
+    #[tokio::test]
+    async fn a_discarded_turn_is_not_charged_against_the_turn_cap() {
+        let provider = TruncatingProvider::new(2);
+
+        let result = SessionRunner::new(&provider)
+            .with_max_turns(1)
+            .run(&mut EchoSession)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "two truncated answers must not consume a one-turn budget: {:?}",
+            result.err()
+        );
+        assert_eq!(provider.calls(), 3);
     }
 
     /// A wind-down stops the stages that gather concerns.

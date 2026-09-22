@@ -239,6 +239,27 @@ pub struct RemoteAiError {
     pub class: AiErrorClass,
 }
 
+/// The provider stopped the response at its output ceiling.
+///
+/// Not a transport failure: the request succeeded and the answer came back
+/// half-written, which is why this is raised from a successful response rather
+/// than returned by a provider. Fatal as a class, because resending the same
+/// request cannot produce a different answer -- the ceiling has not moved, and a
+/// cached response would be replayed verbatim. Recovering from it means asking
+/// for something shorter, which is a job for the session's error hook.
+///
+/// The message is the text this condition has always reported, so stage failures
+/// recorded before and after this became recoverable read the same.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("LLM output was truncated by provider (e.g. hit max tokens)")]
+pub struct OutputTruncated;
+
+impl ClassifyAiError for OutputTruncated {
+    fn ai_error_class(&self) -> AiErrorClass {
+        AiErrorClass::Fatal
+    }
+}
+
 pub(crate) const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 pub trait ClassifyAiError {
@@ -299,6 +320,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<OutputTruncated>() {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<ollama::OllamaError>() {

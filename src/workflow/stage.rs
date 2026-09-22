@@ -372,6 +372,11 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
                     ErrorAction::RetryWithFeedback(reminder.clone())
                 }
             }
+        // This override is what the review stages actually run, so a truncated
+        // answer left out here is left out everywhere that matters -- the
+        // default hook below would never see it.
+        } else if let Some(action) = crate::ai::session::truncation_action(error) {
+            action
         } else {
             ErrorAction::Fail
         }
@@ -1001,6 +1006,93 @@ mod tests {
                 .contains("error"),
             "the model should see the tool's error: {:?}",
             tool_reply.content
+        );
+    }
+
+    /// Truncates its first answer, then answers properly. Records requests so a
+    /// test can see what the model was told on the way back in.
+    struct TruncatingOnceProvider {
+        turn: Mutex<usize>,
+        seen: Mutex<Vec<AiRequest>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for TruncatingOnceProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.seen.lock().unwrap().push(request);
+            let mut turn = self.turn.lock().unwrap();
+            *turn += 1;
+            Ok(AiResponse {
+                content: Some(if *turn == 1 {
+                    "half an ans".into()
+                } else {
+                    "done".into()
+                }),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: *turn == 1,
+            })
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "truncating-once".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// This override is the hook the review stages actually run.
+    ///
+    /// The session layer's default handles a truncated answer, but every review
+    /// stage replaces that default to apply its own recitation policy -- so a
+    /// stage would have gone on dying on a truncated answer while the tests one
+    /// layer down passed.
+    #[tokio::test]
+    async fn test_a_stage_survives_a_truncated_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(TruncatingOnceProvider {
+            turn: Mutex::new(0),
+            seen: Mutex::new(Vec::new()),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("truncated")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a truncated answer must not end the stage");
+
+        assert!(
+            outcome.history.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("output limit"))),
+            "the retry's reason has to reach the conversation, or the model is \
+             asked the same question twice for no stated reason"
+        );
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the stage has to ask again");
+        assert_ne!(
+            seen[0].messages.len(),
+            seen[1].messages.len(),
+            "the second request must differ, or the cache would replay the truncated answer"
         );
     }
 }
