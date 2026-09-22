@@ -596,6 +596,22 @@ pub fn apply_cache_control(request: &mut ClaudeRequest) {
     }
 }
 
+/// What a truncated response's emitted text says about where the budget went.
+///
+/// Thinking and answer draw on the same `max_tokens`, so a response that stopped
+/// with nothing written spent the whole allowance reasoning. That is the case
+/// where asking the model for a shorter answer is useless -- there was no
+/// answer -- and the only levers are the ones that change the allowance or how
+/// much of it reasoning may take.
+fn truncation_remedy(answer_chars: usize, tool_arg_chars: usize) -> &'static str {
+    if answer_chars == 0 && tool_arg_chars == 0 {
+        " Nothing was written, so the budget went on reasoning: raise max_tokens \
+         or lower effort rather than asking for less."
+    } else {
+        ""
+    }
+}
+
 pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
     let mut thought_signature = String::new();
     let mut content = String::new();
@@ -656,10 +672,31 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         // extended thinking spends the same budget before any answer is
         // emitted. A stop well short of the configured value means the limit
         // that got hit was not the max_tokens one that was configured.
+        //
+        // How far the answer got says where that budget went, which is what
+        // decides the remedy. Thinking and answer draw on the same allowance, so
+        // a stop with nothing written means it all went on reasoning: asking for
+        // a shorter answer cannot help, and the levers are `effort` and
+        // `max_tokens`. A stop part-way through an answer is the opposite case.
+        //
+        // Measured as emitted text rather than as thinking tokens, because the
+        // thinking tokens cannot be counted from here: on models that omit the
+        // reasoning by default -- Opus 5 among them -- thinking blocks arrive
+        // empty while still being billed, so their length reads as zero and
+        // would make every truncation look like a runaway answer.
+        let answered = content.chars().count();
+        let tool_args: usize = tool_calls
+            .iter()
+            .map(|c| c.arguments.to_string().chars().count())
+            .sum();
         tracing::warn!(
-            "{}Claude response truncated at max_tokens after {} output tokens.",
+            "{}Claude response truncated at max_tokens after {} output tokens; \
+             emitted {} chars of answer, {} of tool arguments.{}",
             crate::ai::get_log_prefix(),
-            resp.usage.output_tokens
+            resp.usage.output_tokens,
+            answered,
+            tool_args,
+            truncation_remedy(answered, tool_args)
         );
     }
 
@@ -1034,6 +1071,26 @@ mod tests {
         assert!(
             claude_req.output_config.is_none(),
             "a thinking mode alone must not invent an output config"
+        );
+    }
+
+    /// A truncation that wrote nothing is a different problem from one that
+    /// wrote too much, and the log line has to tell them apart -- it is the only
+    /// place the distinction is visible, because the thinking tokens that
+    /// consumed the budget are billed but never reported.
+    #[test]
+    fn a_truncation_that_wrote_nothing_points_at_the_budget_not_the_answer() {
+        assert!(
+            truncation_remedy(0, 0).contains("went on reasoning"),
+            "an empty response means the allowance was spent before the answer began"
+        );
+        // Either kind of output means the answer had started, so the length of
+        // what it was writing is the thing to act on.
+        assert_eq!(truncation_remedy(1200, 0), "");
+        assert_eq!(
+            truncation_remedy(0, 800),
+            "",
+            "a half-written tool call is still the answer having started"
         );
     }
 
