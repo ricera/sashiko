@@ -2381,20 +2381,119 @@
             }
         }
 
-        // Heading for a finished review's stage table.
+        // Heading for a patch's stage table, running or recorded.
         //
-        // With one stage there is nothing to overlap and nothing to sum, so the
-        // comparison would be noise; say the single duration instead.
-        function stageBreakdownLabel(stages) {
-            const seconds = stages.map(st => st.seconds || 0);
-            if (stages.length === 1) {
-                return `Stage breakdown (1 stage, ${formatDuration(seconds[0])})`;
+        // One name for one table. It read "Stage progress" while the review ran
+        // and "Stage breakdown" once it ended, which is two names for the same
+        // ten rows -- the split "View Live Log" / "View Raw Log" used to have.
+        // What differs is the state, and the state belongs in the parenthetical.
+        //
+        // Live says what is still moving, because that is the question while a
+        // review runs. Recorded compares the longest stage against the sum,
+        // because the rows do not add up to the review time and saying so
+        // without showing it asserts a fact about the system rather than about
+        // this review. With one stage there is nothing to overlap and nothing to
+        // sum, so the comparison would be noise; say the single duration instead.
+        function stageTableLabel(rows, live) {
+            // A persisted row says where the work got to before the daemon
+            // stopped, and carries no numbers to compare or count.
+            if (rows.some(r => r.state === 'persisted')) return 'Stages (stopped)';
+            const stages = rows.filter(r => r.state !== 'patch');
+            if (!live) {
+                if (!stages.length) return 'Stages (stopped)';
+                const seconds = stages.map(r => r.seconds || 0);
+                if (stages.length === 1) {
+                    return `Stages (1 stage, ${formatDuration(seconds[0])})`;
+                }
+                const longest = Math.max(...seconds);
+                const summed = seconds.reduce((a, b) => a + b, 0);
+                return `Stages (${stages.length} stages overlapping:`
+                    + ` longest ${formatDuration(longest)},`
+                    + ` ${formatDuration(summed)} summed)`;
             }
-            const longest = Math.max(...seconds);
-            const summed = seconds.reduce((a, b) => a + b, 0);
-            return `Stage breakdown (${stages.length} stages overlapping:`
-                + ` longest ${formatDuration(longest)},`
-                + ` ${formatDuration(summed)} summed)`;
+            // Counts describe stages only. The patch's own entry is not a stage,
+            // and a stopped stage keeps a row but is not running -- counting
+            // either would overstate what the review is still doing.
+            const done = stages.filter(r => r.state === 'done').length;
+            const stopped = stages.filter(r => r.state === 'stopped').length;
+            const running = stages.length - done - stopped;
+            return `Stages (${[
+                `${running} running`,
+                ...(done ? [`${done} done`] : []),
+                ...(stopped ? [`${stopped} stopped`] : []),
+            ].join(', ')})`;
+        }
+
+        // The recorded stages of a finished review, as table rows.
+        //
+        // Durations and failures are stored apart -- one says how long a stage
+        // took, the other why a stage has no duration at all -- but they are the
+        // same list to a reader, so they are merged here rather than shown as two
+        // things. A stopped stage has no duration to report: the daemon records
+        // only its reason, which already carries the elapsed time in its text.
+        function stageRowsFromRecord(stageDurations, stageFailures) {
+            const rows = [];
+            for (const st of (Array.isArray(stageDurations) ? stageDurations : [])) {
+                rows.push({
+                    stage: st.stage, state: 'done',
+                    seconds: st.seconds || 0, turns: st.turns || 0,
+                });
+            }
+            for (const f of (Array.isArray(stageFailures) ? stageFailures : [])) {
+                rows.push({
+                    stage: f.stage, state: 'stopped',
+                    reason: f.reason || '', cancelled: !!f.cancelled,
+                });
+            }
+            return rows.sort((a, b) => stageRank(a.stage) - stageRank(b.stage));
+        }
+
+        // The same rows, from the activity registry instead of the database.
+        //
+        // The registry deliberately reports a finished stage with the numbers the
+        // recorded breakdown will carry, and a stopped one with the reason the
+        // recorded failure will carry, so those two states translate without
+        // interpretation. Only this producer can emit `running` and `patch`:
+        // a review that has ended has neither. That is the entire difference
+        // between the live table and the finished one, and keeping it in the data
+        // is what lets one renderer serve both.
+        // `live` is false when these entries were read back from the database
+        // after the daemon stopped, rather than observed running. Such an entry
+        // has only a description -- the clocks it carried were wall-clock deltas
+        // that stopped meaning anything when the process did -- so it becomes one
+        // state rather than being sorted into the others on numbers it lacks.
+        function stageRowsFromActivity(entries, live) {
+            const rows = (Array.isArray(entries) ? entries : []).map(entry => {
+                const phase = entry.phase || {};
+                const stage = entry.stage != null ? entry.stage : phase.stage;
+                const age = entry.age_seconds || 0;
+                if (live === false) {
+                    return { stage, state: 'persisted', description: entry.description };
+                }
+                if (stage == null) {
+                    return { stage: null, state: 'patch', age, description: entry.description };
+                }
+                if (phase.kind === 'stage_done') {
+                    return {
+                        stage, state: 'done',
+                        seconds: phase.seconds || 0, turns: phase.turns || 0,
+                    };
+                }
+                if (phase.kind === 'stage_failed') {
+                    return {
+                        stage, state: 'stopped',
+                        reason: phase.reason || '', cancelled: !!phase.cancelled,
+                        age,
+                    };
+                }
+                return {
+                    stage, state: 'running', age,
+                    idle: entry.idle_seconds || 0,
+                    turn: phase.turn || 0, max_turns: phase.max_turns || 0,
+                    waiting: phase.waiting, description: entry.description,
+                };
+            });
+            return rows.sort((a, b) => stageRank(a.stage) - stageRank(b.stage));
         }
 
         // Mirrors activity::summarize_reason on the server. Reasons are
@@ -2425,88 +2524,111 @@
             return i < 0 ? STAGE_ORDER.length : i;
         }
 
-        // One in-progress stage, as a row of the same table the finished review
-        // shows. Live rows carry a fourth column the recorded breakdown has no
-        // use for: what the stage is currently blocked on.
-        function renderLiveStageRow(entry, live) {
-            const phase = entry.phase || {};
-            const stage = entry.stage != null ? entry.stage : phase.stage;
-            const label = `Stage ${escapeHtml(String(stage != null ? stage : '?'))}`;
+        // One stage, as one row, wherever the row came from.
+        //
+        // This is the whole point of the row model: a stage that finished renders
+        // identically whether the numbers arrived from the activity registry a
+        // second ago or from the database an hour later, because by here there is
+        // nothing left to tell them apart. The row's state decides the rendering;
+        // no caller passes a flag saying which table this is.
+        //
+        // Columns: stage, duration, turns, status.
+        function renderStageRow(row) {
+            const label = row.state === 'patch'
+                ? 'This patch'
+                : `Stage ${escapeHtml(String(row.stage != null ? row.stage : '?'))}`;
+            const cell = 'padding:2px 12px 2px 0;';
+            const num = `${cell} text-align:right;`;
 
-            // A persisted entry has no clocks — it records where the work got to,
-            // not how long it has been there — so those columns stay empty
-            // rather than showing a fabricated zero.
-            if (!live) {
-                return `<tr><td style="padding:2px 12px 2px 0;">${label}</td>`
+            // A persisted row is what the daemon was doing when it stopped. It
+            // has no clocks -- it records where the work got to, not how long it
+            // has been there -- so those columns stay empty rather than showing a
+            // fabricated zero, and its one sentence takes the width instead.
+            if (row.state === 'persisted') {
+                return `<tr><td style="${cell}">${label}</td>`
                     + `<td colspan="3" style="padding:2px 0; color:var(--text-muted);">`
-                    + `${escapeHtml(entry.description || '?')}</td></tr>`;
+                    + `${escapeHtml(row.description || '?')}</td></tr>`;
             }
 
-            const age = entry.age_seconds || 0;
-
-            // A finished stage keeps its row, in the columns the recorded
-            // breakdown uses, so it settles in place rather than disappearing
-            // and returning only once the whole review ends.
-            if (phase.kind === 'stage_done') {
-                const turns = !phase.turns
+            // Finished. The same three numbers the recorded breakdown shows,
+            // which is why a stage settles in place as it ends rather than
+            // disappearing and returning only once the whole review is over.
+            if (row.state === 'done') {
+                const turns = !row.turns
                     ? '—'
-                    : phase.turns === 1 ? '1 turn' : `${phase.turns} turns`;
+                    : row.turns === 1 ? '1 turn' : `${row.turns} turns`;
                 return `<tr style="color:var(--text-muted);">`
-                    + `<td style="padding:2px 12px 2px 0;">${label}</td>`
-                    + `<td style="padding:2px 12px 2px 0; text-align:right;">`
-                    + `${formatDuration(phase.seconds || 0)}</td>`
-                    + `<td style="padding:2px 12px 2px 0; text-align:right;">${turns}</td>`
+                    + `<td style="${cell}">${label}</td>`
+                    + `<td style="${num}">${formatDuration(row.seconds || 0)}</td>`
+                    + `<td style="${num}">${turns}</td>`
                     + `<td style="padding:2px 0; color:var(--status-reviewed, var(--text-muted));">`
                     + `done</td></tr>`;
             }
 
-            // A stage that stopped keeps its row rather than disappearing:
-            // vanishing would be indistinguishable from never having run, and
-            // the review carries on without it.
-            if (phase.kind === 'stage_failed') {
-                const what = phase.cancelled ? 'cancelled' : 'failed';
-                const colour = phase.cancelled ? 'var(--text-muted)' : 'var(--status-failed)';
-                return `<tr title="${escapeHtml(phase.reason || '')}">`
-                    + `<td style="padding:2px 12px 2px 0;">${label}</td>`
-                    + `<td style="padding:2px 12px 2px 0; text-align:right; color:var(--text-muted);">`
-                    + `${formatDuration(age)} ago</td>`
-                    + `<td style="padding:2px 12px 2px 0; text-align:right;">—</td>`
+            // Stopped. Kept rather than dropped: a stage that vanished would be
+            // indistinguishable from one that never ran, and the review carries
+            // on without it. A recorded stopped stage has no duration -- only its
+            // reason was written down, and the elapsed time is inside that text.
+            if (row.state === 'stopped') {
+                const what = row.cancelled ? 'stopped' : 'failed';
+                const colour = row.cancelled ? 'var(--text-muted)' : 'var(--status-failed)';
+                const when = row.age ? `${formatDuration(row.age)} ago` : '—';
+                return `<tr title="${escapeHtml(row.reason || '')}">`
+                    + `<td style="${cell}">${label}</td>`
+                    + `<td style="${num} color:var(--text-muted);">${when}</td>`
+                    + `<td style="${num}">—</td>`
                     + `<td style="padding:2px 0; color:${colour};">`
-                    + `${what}: ${escapeHtml(summarizeReason(phase.reason))}</td></tr>`;
+                    + `${what}: ${escapeHtml(summarizeReason(row.reason))}</td></tr>`;
             }
 
-            const idle = entry.idle_seconds || 0;
-            // Age says how long this stage has been running; idle says how long
-            // since it last moved. Only the second one can reveal a wedge.
-            const stalled = idle > 300;
-
+            const age = row.age || 0;
             // The patch's own entry, above its stages: planning has no stage
             // number yet, and once stages start it says the patch is running
             // them. Reusing the stage columns for it would print "Stage ?".
-            if (stage == null) {
+            if (row.state === 'patch') {
                 return `<tr>`
-                    + `<td style="padding:2px 12px 2px 0;">This patch</td>`
-                    + `<td style="padding:2px 12px 2px 0; text-align:right;">${formatDuration(age)}</td>`
-                    + `<td style="padding:2px 12px 2px 0; text-align:right;">—</td>`
+                    + `<td style="${cell}">${label}</td>`
+                    + `<td style="${num}">${formatDuration(age)}</td>`
+                    + `<td style="${num}">—</td>`
                     + `<td style="padding:2px 0; color:var(--text-muted);">`
-                    + `${escapeHtml(entry.description || '?')}</td></tr>`;
+                    + `${escapeHtml(row.description || '?')}</td></tr>`;
             }
 
-            const turns = phase.max_turns
-                ? `turn ${phase.turn || 0}/${phase.max_turns}`
-                : 'starting';
+            // Age says how long this stage has been running; idle says how long
+            // since it last moved. Only the second one can reveal a wedge.
+            const idle = row.idle || 0;
+            const stalled = idle > 300;
+            const turns = row.max_turns ? `turn ${row.turn || 0}/${row.max_turns}` : 'starting';
 
             return `<tr>`
-                + `<td style="padding:2px 12px 2px 0;">${label}</td>`
-                + `<td style="padding:2px 12px 2px 0; text-align:right;">${formatDuration(age)}</td>`
-                + `<td style="padding:2px 12px 2px 0; text-align:right;">${escapeHtml(turns)}</td>`
+                + `<td style="${cell}">${label}</td>`
+                + `<td style="${num}">${formatDuration(age)}</td>`
+                + `<td style="${num}">${escapeHtml(turns)}</td>`
                 + `<td style="padding:2px 0; color:var(--text-muted);">`
-                + `${escapeHtml(describeStageWait(phase.waiting, entry.description))}`
+                + `${escapeHtml(describeStageWait(row.waiting, row.description))}`
                 + (stalled
                     ? ` <span style="color:var(--status-failed);">`
                       + `— no progress for ${formatDuration(idle)}</span>`
                     : '')
                 + `</td></tr>`;
+        }
+
+        // The two halves of the table, for the two ways it gets mounted.
+        //
+        // renderReviewCard builds a string; paintStageProgress assigns into an
+        // element that already exists and must keep existing. That difference is
+        // in the DOM, not in the table, so it is the only thing the two callers
+        // do differently.
+        function stageTableParts(rows, live, patchId) {
+            const summaryHtml = escapeHtml(stageTableLabel(rows, live))
+                // Filled by applyToolCallCounts, which runs after this so the
+                // slot exists. Keeping the count out of here leaves this
+                // function dependent on its arguments alone.
+                + (patchId != null ? `<span id="stage-tool-calls-${patchId}"></span>` : '');
+            const bodyHtml = `<table style="margin:6px 0 0 12px; border-collapse:collapse;">`
+                + rows.map(renderStageRow).join('')
+                + `</table>`;
+            return { summaryHtml, bodyHtml };
         }
 
         // The element that holds one patch's live progress.
@@ -2550,42 +2672,26 @@
             return host;
         }
 
-        // Fills one patch's stage-progress element, reusing the slot the finished
-        // review's "Stage breakdown" occupies.
+        // Fills one patch's stage table from the activity registry.
+        //
+        // Renders through the same functions the finished review's table uses, so
+        // a stage does not change shape as it stops being live. The only thing
+        // this adds is the mounting: the element already exists and has to keep
+        // existing, because refreshActivity finds it again on the next poll.
         function paintStageProgress(host, entries, live) {
             const summary = host.querySelector('summary');
             const body = host.querySelector('.stage-progress-body');
             if (!summary || !body) return;
 
-            // The patch's own entry has no stage, so it sorts to the top,
-            // above the stages it covers.
-            const sorted = [...entries].sort((a, b) => stageRank(a.stage) - stageRank(b.stage));
-            // Counts describe stages only. The patch's own entry is not a stage,
-            // and failed stages keep a row but are not running -- counting either
-            // would overstate what the review is still doing.
-            const stages = sorted.filter(e => e.stage != null);
-            const kindOf = e => (e.phase || {}).kind;
-            const done = stages.filter(e => kindOf(e) === 'stage_done').length;
-            const stopped = stages.filter(e => kindOf(e) === 'stage_failed').length;
-            const running = stages.length - done - stopped;
-            const counts = [
-                `${running} running`,
-                ...(done ? [`${done} done`] : []),
-                ...(stopped ? [`${stopped} stopped`] : []),
-            ].join(', ');
+            const rows = stageRowsFromActivity(entries, live);
             // Tool calls belong here rather than only on the finished review
-            // card: before a review completes, this element is the only thing
-            // on screen for the patch, so a count carried solely by the card
-            // would be invisible for the whole run -- which is when a count
-            // that keeps climbing is the useful signal.
+            // card: before a review completes, this table is the only thing on
+            // screen for the patch, so a count carried solely by the card would
+            // be invisible for the whole run -- which is when a count that keeps
+            // climbing is the useful signal.
             const patchId = host.id.replace('stage-progress-', '');
-            summary.innerHTML = (live
-                ? `Stage progress (${counts})`
-                : 'Stage progress (stopped)')
-                // Filled by applyToolCallCounts, which runs after this so the
-                // slot exists. Keeping the count out of here leaves this
-                // function dependent on its arguments alone.
-                + `<span id="stage-tool-calls-${patchId}"></span>`;
+            const parts = stageTableParts(rows, live, patchId);
+            summary.innerHTML = parts.summaryHtml;
             // Persisted entries describe what the work *was* doing when the
             // daemon stopped. Worth keeping — it says where a failed patch got to
             // — but phrased as an observation, not a cause: the work stopped
@@ -2596,9 +2702,7 @@
                 : 'Last activity recorded before the daemon stopped. This is where'
                   + ' the work got to, not necessarily why it failed.';
 
-            body.innerHTML = `<table style="margin:6px 0 0 12px; border-collapse:collapse;">`
-                + sorted.map(e => renderLiveStageRow(e, live)).join('')
-                + `</table>`;
+            body.innerHTML = parts.bodyHtml;
             host.style.display = '';
         }
 
@@ -2673,6 +2777,17 @@
             const byPatch = new Map();
             const general = [];
             entries.forEach(entry => {
+                // A patch whose review has been recorded already shows these
+                // stages, from the database, with the same numbers. The registry
+                // holds its entries until the whole patchset ends, so without
+                // this they would either repaint the recorded table or -- as they
+                // did -- build a second card beside it showing the same ten rows.
+                // Dropped rather than sent to the patchset-wide row: it is on
+                // screen, just not from here.
+                if (entry.patch_id != null
+                    && document.querySelector(`[data-stage-recorded="${entry.patch_id}"]`)) {
+                    return;
+                }
                 const host = entry.patch_id != null
                     ? hostForPatch(entry.patch_id)
                     : null;
@@ -3230,28 +3345,23 @@
             // shows the stages of the attempt that produced it rather than a
             // meaningless mix across attempts.
             let stageTimingHtml = '';
-            if (Array.isArray(r.stage_durations) && r.stage_durations.length > 0) {
-                const stages = [...r.stage_durations].sort((a, b) => stageRank(a.stage) - stageRank(b.stage));
-                const rows = stages.map(st => {
-                    const turns = typeof st.turns !== 'number' || st.turns === 0
-                        ? '—'
-                        : st.turns === 1 ? '1 turn' : `${st.turns} turns`;
-                    return `<tr>`
-                        + `<td style="padding:2px 12px 2px 0;">Stage ${escapeHtml(String(st.stage))}</td>`
-                        + `<td style="padding:2px 12px 2px 0; text-align:right;">${formatDuration(st.seconds || 0)}</td>`
-                        + `<td style="padding:2px 0; text-align:right;">${turns}</td>`
-                        + `</tr>`;
-                }).join('');
-                // The rows will not add up to the patch's review time, because
-                // the stages overlap. Saying only "run concurrently" asserted
-                // that without showing it, and was the same words on every card;
-                // the longest stage beside the sum makes the gap visible, and
-                // both numbers are about this review rather than about the
-                // system in general.
-                stageTimingHtml = `<details style="margin:6px 0; font-size:0.9em;">`
+            const recordedRows = stageRowsFromRecord(r.stage_durations, r.stage_failures);
+            if (recordedRows.length > 0) {
+                // Marked recorded, so refreshActivity leaves it alone. The
+                // registry keeps a patch's stage entries until the whole patchset
+                // ends, and those entries carry the same numbers this table
+                // already shows -- routed here they would repaint it, and routed
+                // nowhere they used to build a second card beside it.
+                // Keyed by attribute rather than by id: a retried patch has a
+                // finished card per attempt, each with its own recorded table,
+                // and one id across all of them would be a duplicate.
+                const parts = stageTableParts(recordedRows, false, null);
+                stageTimingHtml = `<details`
+                    + (r.patch_id != null ? ` data-stage-recorded="${r.patch_id}"` : '')
+                    + ` style="margin:6px 0; font-size:0.9em;">`
                     + `<summary style="cursor:pointer; color:var(--text-muted);">`
-                    + `${escapeHtml(stageBreakdownLabel(stages))}</summary>`
-                    + `<table style="margin:6px 0 0 12px; border-collapse:collapse;">${rows}</table>`
+                    + `${parts.summaryHtml}</summary>`
+                    + `<div class="stage-progress-body">${parts.bodyHtml}</div>`
                     + `</details>`;
             } else if (!showDetails && r.patch_id != null) {
                 // Rendered empty and hidden: this view is built once, while the
@@ -3272,11 +3382,11 @@
 
             let coverageHtml = '';
             if (Array.isArray(r.stage_failures) && r.stage_failures.length > 0) {
-                const parts = r.stage_failures.map(f => {
-                    const what = f.cancelled ? 'stopped' : 'failed';
-                    const why = f.reason ? `: ${escapeHtml(String(f.reason))}` : '';
-                    return `<div>Stage ${escapeHtml(String(f.stage))} ${what}${why}</div>`;
-                }).join('');
+                // Only what the table above cannot say. It used to repeat every
+                // stage name and reason here, which was the one place they
+                // appeared -- now they are rows, and printing them twice makes a
+                // reader check whether the two lists agree.
+                //
                 // "did not complete" rather than "did not run": a stage killed
                 // by the deadline did run, and saying otherwise hides the work
                 // it got through.
@@ -3284,7 +3394,6 @@
                     + ` border:1px solid var(--status-failed); color:var(--status-failed);">`
                     + `<strong>Incomplete coverage — ${r.stage_failures.length} stage(s) did not complete</strong>`
                     + (failed ? `<div>Any findings below come only from the stages that finished.</div>` : '')
-                    + parts
                     + `</div>`;
             }
 
