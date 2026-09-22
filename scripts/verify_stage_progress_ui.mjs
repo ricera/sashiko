@@ -54,7 +54,10 @@ const CONSTS = ['STAGE_ORDER'];
 const NAMES = ['escapeHtml', 'formatDuration', 'describeStageWait', 'summarizeReason',
                'stageRank', 'renderLiveStageRow', 'paintStageProgress', 'refreshActivity',
                'stopActivityPolling', 'renderReviewCard', 'hostForPatch',
-               'stageBreakdownLabel', 'formatToolCalls', 'applyToolCallCounts'];
+               'stageBreakdownLabel', 'formatToolCalls', 'applyToolCallCounts',
+               'parseSeverityCalibration', 'renderSeverityCalibration',
+               'isSpeculativeFinding', 'findingHeadline', 'renderFindingLocations',
+               'renderFindingsTable', 'toggleFindingReasoning'];
 const ctx = {};
 new Function('ctx', CONSTS.map(grabConst).join('\n\n') + '\n\n' +
     NAMES.map(grab).join('\n\n') +
@@ -529,6 +532,110 @@ check('a first-attempt review still reads plainly',
 check('a retried success still says it succeeded',
     ctx.renderReviewCard({ id: 11, status: 'Reviewed', patch_id: 11, attempt: 2, duration_seconds: 90 })
         .includes('succeeded on attempt 2'));
+
+// ---- findings table ------------------------------------------------------
+// The severity rationale the review already writes, which the page discarded
+// until now. Its shape comes from third_party/prompts/kernel/severity.md, so
+// these cases are written against what that rubric actually produces.
+
+const card = (findings, extra = {}) => ctx.renderReviewCard({
+    id: 7, status: 'Reviewed', patch_id: 3,
+    output: JSON.stringify({ findings }), ...extra,
+});
+
+const threeLabels = ctx.parseSeverityCalibration(
+    'Consequence: a leaked page per call. Triggering path: any caller taking the '
+    + 'error branch. Reachability: reachable by unprivileged ioctl.');
+check('all three calibration labels are found',
+    threeLabels.sections.length === 3, JSON.stringify(threeLabels));
+check('calibration sections keep the rubric order',
+    threeLabels.sections.map(s => s.label).join('|')
+        === 'consequence|triggering path|reachability',
+    JSON.stringify(threeLabels.sections.map(s => s.label)));
+check('a section body stops at the next label',
+    threeLabels.sections[0].body === 'a leaked page per call.',
+    threeLabels.sections[0].body);
+
+// The reason the label regex needs a leading boundary at all: the rubric's own
+// vocabulary appears inside the prose it writes.
+const inProse = ctx.parseSeverityCalibration(
+    'Consequence: nothing, because reachability is speculative here.');
+check('a label mentioned in prose does not open a section',
+    inProse.sections.length === 1, JSON.stringify(inProse.sections));
+
+// Every review recorded before the rubric asked for labels.
+const unlabelled = ctx.parseSeverityCalibration('1. Condition Y is met.\n2. The buffer leaks.');
+check('an unlabelled explanation survives as one block',
+    unlabelled.sections.length === 0 && unlabelled.preamble.includes('The buffer leaks'),
+    JSON.stringify(unlabelled));
+check('an empty explanation is not a section',
+    ctx.parseSeverityCalibration('   ') === null);
+
+// A /g regex held at module scope would carry lastIndex into the next finding.
+const repeated = [0, 1, 2].map(() =>
+    ctx.parseSeverityCalibration('Consequence: x. Reachability: y.').sections.length);
+check('parsing is not stateful across findings',
+    repeated.every(n => n === 2), JSON.stringify(repeated));
+
+check('a capped finding is marked speculative',
+    ctx.isSpeculativeFinding('Consequence: unclear, so capped at Medium.', 'Medium'));
+check('a High finding is never marked speculative',
+    !ctx.isSpeculativeFinding('Not capped as speculative; the path is proven.', 'High'));
+check('an explicit "not speculative" is not marked',
+    !ctx.isSpeculativeFinding('Reachability is proven, so not speculative.', 'Low'));
+
+check('a headline is used verbatim',
+    ctx.findingHeadline({ headline: 'Admin queue logs at the wrong level.', problem: 'x'.repeat(400) })
+        === 'Admin queue logs at the wrong level.');
+const clipped = ctx.findingHeadline({ problem: 'y'.repeat(400) });
+check('a finding with no headline falls back to a clipped problem',
+    clipped.length < 200 && clipped.endsWith('…'), clipped);
+
+const full = 'z'.repeat(400);
+const fallbackCard = card([{ severity: 'Low', problem: full }]);
+check('the untruncated problem is still reachable in the expansion',
+    fallbackCard.includes(full), 'full problem text missing from detail row');
+
+const table = card([
+    { severity: 'Low', headline: 'Low one', problem: 'Low one', severity_explanation: 'Consequence: minor.' },
+    { severity: 'Critical', headline: 'Critical one', problem: 'Critical one', severity_explanation: 'Consequence: heap corruption.' },
+    { severity: 'Medium', headline: 'Preexisting one', problem: 'Preexisting one', preexisting: true },
+]);
+check('the findings table is rendered and counted',
+    table.includes('Findings (3)'), table.slice(0, 200));
+check('findings are listed severest first',
+    table.indexOf('Critical one') < table.indexOf('Preexisting one')
+        && table.indexOf('Preexisting one') < table.indexOf('Low one'));
+check('a preexisting finding says so',
+    table.includes('(preexisting)'));
+check('the table starts collapsed',
+    table.includes('class="collapsible"') && !table.includes('collapsible open'));
+
+// A control that opens an empty box is worse than no control.
+const bare = card([{ severity: 'Low', headline: 'Nothing behind this' }]);
+check('a finding with no detail gets no toggle',
+    !bare.includes('toggleFindingReasoning'), bare.slice(0, 400));
+
+check('a review with no findings renders no table',
+    !card([]).includes('Findings ('));
+check('a review with unparseable output renders no table',
+    !ctx.renderReviewCard({ id: 7, status: 'Reviewed', patch_id: 3, output: '{ not json' })
+        .includes('Findings ('));
+
+const nasty = card([{
+    severity: 'High',
+    headline: '<script>alert(1)</script>',
+    problem: '<img src=x onerror=alert(2)>',
+    severity_explanation: 'Consequence: <b>bold</b> trouble.',
+    locations: [{ file: '<svg onload=alert(3)>', function_or_symbol: 'f', line: 12 }],
+}]);
+check('finding text is escaped',
+    !nasty.includes('<script>alert(1)</script>')
+        && !nasty.includes('<img src=x')
+        && !nasty.includes('<svg onload')
+        && nasty.includes('&lt;script&gt;'), nasty.slice(0, 400));
+check('a location is shown as file:function:line',
+    nasty.includes('f:12'), nasty.slice(0, 600));
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);

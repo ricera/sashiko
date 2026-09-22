@@ -53,8 +53,19 @@ async fn test_get_completed_reviews_for_release() {
         .unwrap();
     db.conn
         .execute(
+            "INSERT INTO findings (review_id, severity, problem, severity_explanation, headline)
+         VALUES (1, 3, 'Problem 1', 'Explanation 1', 'A one-line headline')",
+            (),
+        )
+        .await
+        .unwrap();
+    // Written before the review prompt asked for a headline. Every consumer has
+    // to cope with its absence for as long as these rows exist, so one is kept
+    // here beside the row that has one.
+    db.conn
+        .execute(
             "INSERT INTO findings (review_id, severity, problem, severity_explanation)
-         VALUES (1, 3, 'Problem 1', 'Explanation 1')",
+         VALUES (1, 2, 'Problem 2', 'Explanation 2')",
             (),
         )
         .await
@@ -63,5 +74,13 @@ async fn test_get_completed_reviews_for_release() {
     let reviews = db.get_completed_reviews_for_release(1).await.unwrap();
     assert_eq!(reviews.len(), 1);
     assert_eq!(reviews[0].summary, "Summary");
-    assert_eq!(reviews[0].findings.len(), 1);
+    assert_eq!(reviews[0].findings.len(), 2);
+    assert_eq!(
+        reviews[0].findings[0]["headline"], "A one-line headline",
+        "a stored headline must reach the release notes"
+    );
+    assert!(
+        reviews[0].findings[1]["headline"].is_null(),
+        "a pre-headline finding must read as absent, not as an empty string"
+    );
 }

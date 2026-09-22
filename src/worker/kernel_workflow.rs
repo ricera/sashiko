@@ -1076,13 +1076,14 @@ CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must fi
 Consolidated Concerns:
 {{{{conflict_resolved_concerns}}}}
 
-Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a string containing the vulnerability description), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "headline" (one sentence of at most 120 characters stating what is wrong, written to be read on its own in a list: no severity label, no file paths, no restating of the reasoning), "problem" (a string containing the vulnerability description), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
 
 Example Output:
 ```json
 {{
   "findings": [
     {{
+      "headline": "Buffer allocated in function X leaks on the condition-Y error path.",
       "problem": "Memory leak in function X when condition Y is met.",
       "severity": "High",
       "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
@@ -1398,6 +1399,40 @@ mod tests {
         assert!(is_known_stage("Locking"));
         assert!(is_known_stage("execution_flow"));
         assert!(is_known_stage("stage_report"));
+    }
+
+    /// The key list and the worked example must ask for the same thing.
+    ///
+    /// A model follows the example at least as closely as the prose, so a key
+    /// named in one and missing from the other is emitted unreliably or not at
+    /// all -- and nothing downstream fails when that happens, because the stage
+    /// has no validator and every reader treats the field as optional. The page
+    /// simply goes back to showing clipped `problem` text with no way to tell
+    /// why.
+    #[test]
+    fn verification_asks_for_a_headline_in_both_the_key_list_and_the_example() {
+        let stage = verification_stage(10, 1.0);
+        let prompt = stage
+            .user_prompt
+            .render_for_log(&KernelReviewState::default());
+
+        let (keys, example) = prompt
+            .split_once("Example Output:")
+            .expect("the verification prompt must carry a worked example");
+
+        for field in ["headline", "problem", "severity", "severity_explanation"] {
+            let quoted = format!("\"{}\"", field);
+            assert!(
+                keys.contains(&quoted),
+                "{} must be named in the required-keys sentence",
+                field
+            );
+            assert!(
+                example.contains(&quoted),
+                "{} must also appear in the example the model copies",
+                field
+            );
+        }
     }
 
     #[test]
