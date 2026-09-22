@@ -52,9 +52,10 @@ function grabConst(name) {
 
 const CONSTS = ['STAGE_ORDER'];
 const NAMES = ['escapeHtml', 'formatDuration', 'describeStageWait', 'summarizeReason',
-               'stageRank', 'renderLiveStageRow', 'paintStageProgress', 'refreshActivity',
+               'stageRank', 'renderStageRow', 'paintStageProgress', 'refreshActivity',
                'stopActivityPolling', 'renderReviewCard', 'hostForPatch',
-               'stageBreakdownLabel', 'formatToolCalls', 'applyToolCallCounts',
+               'stageTableLabel', 'stageTableParts', 'stageRowsFromRecord',
+               'stageRowsFromActivity', 'formatToolCalls', 'applyToolCallCounts',
                'parseSeverityCalibration', 'renderSeverityCalibration',
                'isSpeculativeFinding', 'findingHeadline', 'renderFindingLocations',
                'renderFindingsTable', 'toggleFindingReasoning'];
@@ -112,9 +113,22 @@ class El {
 }
 const byId = new Map();
 const all = [];
+// A finished review's recorded table, which renderReviewCard emits as a string.
+// The page finds these with an attribute selector to decide that a patch's
+// stages are already on screen; the harness has to be able to answer the same
+// question, so a test mounts one here.
+const recorded = new Map();
 function register(node) {
     if (node.id) byId.set(node.id, node);
     if (node.attrs.has('data-stage-progress') && !all.includes(node)) all.push(node);
+}
+// Mounts the recorded table a review card would have rendered, keyed the way
+// the page keys it.
+function mkRecorded(patchId) {
+    const el = new El(null, 'details');
+    el.setAttribute('data-stage-recorded', String(patchId));
+    recorded.set(String(patchId), el);
+    return el;
 }
 function mkHost(patchId) {
     const host = new El(`stage-progress-${patchId}`);
@@ -145,16 +159,23 @@ byId.set('activity-row', row); byId.set('activity-value', value);
 globalThis.document = {
     getElementById: id => byId.get(id) || null,
     querySelectorAll: sel => sel === '[data-stage-progress]' ? all : [],
+    querySelector: sel => {
+        const m = /^\[data-stage-recorded="(.+)"\]$/.exec(sel);
+        return m ? (recorded.get(m[1]) || null) : null;
+    },
     createElement: tag => new El(null, tag),
 };
 globalThis.escapeHtml = ctx.escapeHtml;
 globalThis.formatDuration = ctx.formatDuration;
 globalThis.describeStageWait = ctx.describeStageWait;
 globalThis.summarizeReason = ctx.summarizeReason;
-globalThis.renderLiveStageRow = ctx.renderLiveStageRow;
+globalThis.renderStageRow = ctx.renderStageRow;
+globalThis.stageRowsFromActivity = ctx.stageRowsFromActivity;
+globalThis.stageRowsFromRecord = ctx.stageRowsFromRecord;
+globalThis.stageTableLabel = ctx.stageTableLabel;
+globalThis.stageTableParts = ctx.stageTableParts;
 globalThis.paintStageProgress = ctx.paintStageProgress;
 globalThis.hostForPatch = ctx.hostForPatch;
-globalThis.stageBreakdownLabel = ctx.stageBreakdownLabel;
 globalThis.stopActivityPolling = () => {};
 
 let payload;
@@ -200,7 +221,7 @@ check('stalled stage is flagged',
     h10.querySelector('.stage-progress-body').innerHTML.includes('no progress for 6m 40s'));
 check('turn counter shown', h10.querySelector('.stage-progress-body').innerHTML.includes('turn 7/50'));
 check('summary counts running stages',
-    h10.querySelector('summary').textContent === 'Stage progress (2 running)',
+    h10.querySelector('summary').textContent === 'Stages (2 running)',
     h10.querySelector('summary').textContent);
 check('patch 11 has no activity, stays hidden', h11.style.display === 'none');
 check('patchset-wide entry stays in the top row', value.innerHTML.includes('running review stages'));
@@ -272,9 +293,9 @@ check('failed stage stops claiming a turn',
 check('a still-running sibling keeps its turn counter',
     /turn 7\/50/.test(visibleText(rowFor(body5, 'Stage execution-flow'))));
 check('cancelled is not called a failure',
-    visibleText(rowFor(body5, 'Stage security')).includes('cancelled: Session cancelled by supervisor'));
+    visibleText(rowFor(body5, 'Stage security')).includes('stopped: Session cancelled by supervisor'));
 check('summary separates running from stopped',
-    h10.querySelector('summary').textContent === 'Stage progress (1 running, 2 stopped)',
+    h10.querySelector('summary').textContent === 'Stages (1 running, 2 stopped)',
     h10.querySelector('summary').textContent);
 
 // ---- case 4: persisted (daemon stopped) ---------------------------------
@@ -293,7 +314,7 @@ check('persisted stage lands on its patch', h10.style.display === '' &&
 check('persisted stage does not invent a duration',
     !h10.querySelector('.stage-progress-body').innerHTML.includes('0s'));
 check('summary says stopped, not running',
-    h10.querySelector('summary').textContent === 'Stage progress (stopped)',
+    h10.querySelector('summary').textContent === 'Stages (stopped)',
     h10.querySelector('summary').textContent);
 check('commit-keyed fetch stays in the top row',
     value.innerHTML.includes('Stopped while:') &&
@@ -369,7 +390,7 @@ check('planning does not print a stage number', !body7.includes('Stage ?'));
 check('planning shows its own elapsed time', body7.includes('20s'));
 const summary7 = built ? built.querySelector('summary').textContent : 'no host';
 check('the patch entry is not counted as a running stage',
-    summary7 === 'Stage progress (1 running)', summary7);
+    summary7 === 'Stages (1 running)', summary7);
 check('the patch entry sorts above its stages',
     body7.indexOf('This patch') < body7.indexOf('Stage goal'));
 
@@ -411,7 +432,7 @@ check('a finished stage does not claim to be mid-turn',
 check('the running stage is still shown as running',
     visibleText(rowFor(body9, 'Stage execution-flow')).includes('turn 4/50'));
 check('done, running and stopped are counted apart',
-    h10.querySelector('summary').textContent === 'Stage progress (1 running, 2 done, 1 stopped)',
+    h10.querySelector('summary').textContent === 'Stages (1 running, 2 done, 1 stopped)',
     h10.querySelector('summary').textContent);
 check('rows stay in stage order',
     body9.indexOf('>Stage goal<') < body9.indexOf('>Stage execution-flow<')
@@ -444,7 +465,7 @@ const one = ctx.renderReviewCard({
 // One stage has nothing to overlap and nothing to sum; the comparison would be
 // noise, and "longest 90s, 90s summed" reads as a bug.
 check('a single stage just states its duration',
-    one.includes('Stage breakdown (1 stage, 90s)'), one.slice(0, 400));
+    one.includes('Stages (1 stage, 90s)'), one.slice(0, 400));
 
 // ---- case 11: tool call counts reach the live element --------------------
 // Before a review finishes there is no review card, so the stage-progress
@@ -514,8 +535,16 @@ check('the stages that did finish are still listed',
 check('the stage that did not finish is named',
     failedCard.includes('Stage locking') && failedCard.includes('2h 58m'),
     failedCard.slice(0, 600));
+// It is now a row of the stage table rather than a line in the banner, so the
+// wording lives in the status cell. Same claim, one place to read it.
 check('an unfinished stage is not called a failure',
-    failedCard.includes('Stage locking stopped'), failedCard.slice(0, 600));
+    visibleText(rowFor(failedCard, 'Stage locking')).includes('stopped:')
+        && !visibleText(rowFor(failedCard, 'Stage locking')).includes('failed:'),
+    failedCard.slice(0, 900));
+// The stage names and reasons belong to the table now; repeating them in the
+// banner made a reader check whether the two lists agreed.
+check('the banner does not repeat what the table lists',
+    failedCard.split('Stage locking').length === 2, failedCard.slice(0, 900));
 check('the coverage gap is stated',
     failedCard.includes('did not complete'), failedCard.slice(0, 600));
 check('partial findings are not presented as a full review',
@@ -532,6 +561,76 @@ check('a first-attempt review still reads plainly',
 check('a retried success still says it succeeded',
     ctx.renderReviewCard({ id: 11, status: 'Reviewed', patch_id: 11, attempt: 2, duration_seconds: 90 })
         .includes('succeeded on attempt 2'));
+
+// ---- case 13: one table, live and recorded -------------------------------
+// The same ten stages used to render twice: "Stage breakdown" inside the review
+// card, from the database, and "Stage progress" in a card of its own, from the
+// activity registry, in a different format. The registry holds a patch's entries
+// until the whole patchset ends, so every reviewed patch in a running patchset
+// got both.
+console.log('case 13: one stage table');
+
+// The anti-drift check, and the reason the row model is shared rather than
+// merely similar: a finished stage must render identically whether its numbers
+// arrived from the registry a second ago or from the database an hour later.
+const fromRecord = ctx.stageRowsFromRecord([{ stage: 'goal', seconds: 574, turns: 8 }], []);
+const fromActivity = ctx.stageRowsFromActivity([{
+    key: 'patchset:5/patch:19/stage:goal', patch_id: 19, stage: 'goal',
+    phase: { kind: 'stage_done', stage: 'goal', seconds: 574, turns: 8 },
+    description: 'stage goal done in 9m 34s, 8 turns', age_seconds: 1212,
+}], true);
+check('a finished stage renders the same from either source',
+    ctx.renderStageRow(fromRecord[0]) === ctx.renderStageRow(fromActivity[0]),
+    `${ctx.renderStageRow(fromRecord[0])}\n!==\n${ctx.renderStageRow(fromActivity[0])}`);
+check('and it is the row the reader wants',
+    visibleText(ctx.renderStageRow(fromRecord[0])).includes('9m 34s')
+        && visibleText(ctx.renderStageRow(fromRecord[0])).includes('8 turns'),
+    ctx.renderStageRow(fromRecord[0]));
+
+// A stopped stage: recorded failures carry no duration, only a reason whose text
+// already holds the elapsed time.
+const stoppedRow = ctx.stageRowsFromRecord([], [
+    { stage: 'locking', reason: 'still running when the review stopped, after 2h 58m', cancelled: true },
+])[0];
+check('a recorded stopped stage does not invent a duration',
+    visibleText(ctx.renderStageRow(stoppedRow)).includes('—'), ctx.renderStageRow(stoppedRow));
+check('durations and failures are one list, in stage order',
+    ctx.stageRowsFromRecord(
+        [{ stage: 'security', seconds: 10, turns: 1 }],
+        [{ stage: 'goal', reason: 'x', cancelled: true }],
+    ).map(r => r.stage).join(',') === 'goal,security');
+
+// The finished review's table now lives in the review card and says so, which is
+// what stops a second card being built beside it.
+const recordedCard = ctx.renderReviewCard({
+    id: 8, status: 'Reviewed', patch_id: 19,
+    stage_durations: [{ stage: 'goal', seconds: 574, turns: 8 }],
+});
+check('a recorded card marks itself as holding the stages',
+    recordedCard.includes('data-stage-recorded="19"'), recordedCard.slice(0, 400));
+check('the recorded table carries a status column like the live one',
+    visibleText(rowFor(recordedCard, 'Stage goal')).includes('done'),
+    rowFor(recordedCard, 'Stage goal'));
+
+// And the live entries for that patch are dropped rather than repainting it or
+// building a second host.
+mkRecorded(19);
+mkPatchBlock(19);
+payload = { live: true, entries: [
+    { key: 'patchset:5/patch:19/stage:goal', patch_id: 19, stage: 'goal',
+      phase: { kind: 'stage_done', stage: 'goal', seconds: 574, turns: 8 },
+      description: 'stage goal done in 9m 34s, 8 turns', age_seconds: 1212 },
+    { key: 'patchset:5', patch_id: null, stage: null,
+      phase: { kind: 'reviewing_patches', patches: 3 },
+      description: 'reviewing 3 patches', age_seconds: 3563, idle_seconds: 20 },
+]};
+await ctx.refreshActivity(5);
+check('a patch with a recorded table gets no second host',
+    document.getElementById('stage-progress-19') === null);
+check('and its stages do not leak into the patchset-wide row',
+    !value.innerHTML.includes('stage goal'), value.innerHTML);
+check('the patchset-wide entry is still reported',
+    value.innerHTML.includes('reviewing 3 patches'));
 
 // ---- findings table ------------------------------------------------------
 // The severity rationale the review already writes, which the page discarded
