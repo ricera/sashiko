@@ -1925,6 +1925,16 @@ impl StageSlotObserver {
         else {
             return;
         };
+        // Only stages the worker also reports on. Planning and the pre-screen
+        // tag their model calls like any other stage, but the worker reports
+        // them as the patch's own phase rather than as stage rows, so neither
+        // ever sends a turn or a finish for them. A row created from this side
+        // alone therefore had nothing to advance or remove it, and sat reading
+        // "stage planning, starting (awaiting model)" for the rest of the
+        // patchset's run -- long after the patch it belonged to was reviewed.
+        if crate::worker::kernel_workflow::stage_short_label(&stage).is_none() {
+            return;
+        }
         self.activity.update_stage_wait(
             crate::activity::ActivityKey::PatchsetStage {
                 patchset_id: self.patchset_id,
@@ -1944,6 +1954,46 @@ impl crate::ai::concurrency_limited_provider::SlotObserver for StageSlotObserver
 
     fn running(&self, request: &crate::ai::AiRequest) {
         self.mark(request, crate::activity::StageWait::Model);
+    }
+}
+
+/// Stops the live rows of stages that never reported finishing.
+///
+/// A stage row is only ever moved by the worker, so one that was still mid-turn
+/// when the worker died stayed that way: "turn 23/100 (awaiting model)" beside a
+/// patch whose review had ended, until the patchset cleared everything at the
+/// end. The durable record already says these stages were cut short; this says
+/// the same thing, in the same words, on the page someone is actually watching.
+///
+/// `stopped` pairs each stage with that account. Only rows still claiming to be
+/// running are replaced: a stage that reported its own failure already carries
+/// the true reason, and this one would bury it.
+fn settle_unfinished_stages(
+    activity: &crate::activity::ActivityRegistry,
+    patchset_id: i64,
+    patch_id: i64,
+    stopped: &[(String, String)],
+) {
+    for (stage, reason) in stopped {
+        let key = crate::activity::ActivityKey::PatchsetStage {
+            patchset_id,
+            patch_id,
+            stage: stage.clone(),
+        };
+        if activity
+            .get(&key)
+            .is_some_and(|entry| matches!(entry.phase, crate::activity::Phase::Stage { .. }))
+        {
+            activity.update(
+                key,
+                crate::activity::Phase::StageFailed {
+                    stage: stage.clone(),
+                    reason: reason.clone(),
+                    // Not a fault in the stage: it was cut short, not broken.
+                    cancelled: true,
+                },
+            );
+        }
     }
 }
 
@@ -2889,31 +2939,52 @@ async fn run_review_tool_with_cmd(
 
     // Stages that started and never reported finishing. On a timeout this is
     // the answer to "which stage was it stuck in?", which nothing else records:
-    // the activity registry is cleared when the review ends, and the worker
-    // cannot report a stage it never got to the end of.
-    if interaction_result.is_err() && !stage_starts.is_empty() {
+    // the worker cannot report a stage it never got to the end of.
+    if !stage_starts.is_empty() {
         let mut unfinished: Vec<(&String, &TokioInstant)> = stage_starts.iter().collect();
         unfinished
             .sort_by_key(|(stage, _)| crate::worker::kernel_workflow::stage_order(stage.as_str()));
-        let failures: Vec<serde_json::Value> = unfinished
+        // One account, used by both the durable record and the live rows. They
+        // described the same stages in different words before, so a reader
+        // moving between them could not tell they were the same event.
+        let stopped: Vec<(String, String)> = unfinished
             .iter()
             .map(|(stage, started)| {
                 let turns = stage_turns.get(*stage).copied().unwrap_or(0);
-                serde_json::json!({
-                    "stage": stage,
-                    "reason": format!(
+                (
+                    stage.to_string(),
+                    format!(
                         "still running when the review stopped, after {} and {} turn(s)",
                         format_elapsed(started.elapsed()),
                         turns
                     ),
-                    // Not a fault in the stage: it was cut short, not broken.
-                    "cancelled": true,
-                })
+                )
             })
             .collect();
-        let _ = db
-            .set_review_stage_failures(review_id, &serde_json::Value::Array(failures).to_string())
-            .await;
+
+        // Unconditional, unlike the durable record below: a row still claiming
+        // to be mid-turn is just as wrong on the path where the review
+        // succeeded without it.
+        settle_unfinished_stages(&activity, patchset_id, patch_id, &stopped);
+
+        if interaction_result.is_err() {
+            let failures: Vec<serde_json::Value> = stopped
+                .iter()
+                .map(|(stage, reason)| {
+                    serde_json::json!({
+                        "stage": stage,
+                        "reason": reason,
+                        "cancelled": true,
+                    })
+                })
+                .collect();
+            let _ = db
+                .set_review_stage_failures(
+                    review_id,
+                    &serde_json::Value::Array(failures).to_string(),
+                )
+                .await;
+        }
     }
 
     // A failed review never reaches the worker's own history, so the streamed
@@ -2975,6 +3046,16 @@ async fn run_review_tool_with_cmd(
     } else {
         let _ = child.wait().await; // Reap zombie
     }
+
+    // The patch's own entry describes work in flight, and this patch has none
+    // left however it ended. Leaving it behind meant a reviewed patch's card
+    // still read "running review stages" until the last of its siblings
+    // finished -- an hour, on a three-patch set. Its stage rows stay: those are
+    // the record of what ran, and the patchset guard clears them at the end.
+    activity.clear(&crate::activity::ActivityKey::PatchsetPatch {
+        patchset_id,
+        patch_id,
+    });
 
     match interaction_result {
         Ok(json) => {
@@ -4494,6 +4575,126 @@ sleep 30
         assert_eq!(stage_from_context_tag(""), None);
         assert_eq!(stage_from_context_tag("[s:]"), None);
         assert_eq!(stage_from_context_tag("[s:locking"), None);
+    }
+
+    /// The proxy may only open rows for stages the worker will close.
+    ///
+    /// Planning tags its model calls like any other stage, so the queue
+    /// observer used to create a `stage:planning` row for it -- which nothing
+    /// ever advanced or removed, because the worker reports planning as the
+    /// patch's phase instead. The row stayed at "starting (awaiting model)"
+    /// beside a patch that had long since been reviewed.
+    #[test]
+    fn a_queue_wait_opens_no_row_for_a_stage_the_worker_never_reports() {
+        use crate::activity::{ActivityRegistry, StageWait};
+
+        let activity = ActivityRegistry::new();
+        let observer = StageSlotObserver {
+            activity: activity.clone(),
+            patchset_id: 5,
+            patch_id: 19,
+        };
+        let request = |stage: &str| crate::ai::AiRequest {
+            system: None,
+            messages: vec![],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: Some(format!("[ps:5 p:19] [s:{}] ", stage)),
+        };
+
+        for uncounted in ["planning", "pre-screen"] {
+            observer.mark(&request(uncounted), StageWait::Queued);
+        }
+        assert!(
+            activity.patchset_snapshot(5).is_empty(),
+            "a stage the worker never reports on must get no row at all"
+        );
+
+        // A real stage still does: this is the only side that can tell a queue
+        // wait from a slow model, so filtering must not cost that.
+        observer.mark(&request("locking"), StageWait::Queued);
+        let entries = activity.patchset_snapshot(5);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].stage.as_deref(), Some("locking"));
+    }
+
+    /// Nothing on a finished patch's card may still claim to be running.
+    ///
+    /// A killed worker leaves its stages mid-turn, and only the worker ever
+    /// moves those rows -- so "turn 23/100 (awaiting model)" outlived the
+    /// review that was running it. What it must not do is overwrite a stage
+    /// that reported its own failure, whose reason is the real one.
+    #[test]
+    fn stages_left_mid_turn_stop_claiming_to_be_running() {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase, StageWait};
+
+        let activity = ActivityRegistry::new();
+        let key = |stage: &str| ActivityKey::PatchsetStage {
+            patchset_id: 5,
+            patch_id: 19,
+            stage: stage.to_string(),
+        };
+
+        activity.update(
+            key("hardware"),
+            Phase::Stage {
+                stage: "hardware".to_string(),
+                turn: 23,
+                max_turns: 100,
+                waiting: StageWait::Model,
+            },
+        );
+        activity.update(
+            key("locking"),
+            Phase::StageFailed {
+                stage: "locking".to_string(),
+                reason: "Session exceeded max turns limit (100)".to_string(),
+                cancelled: false,
+            },
+        );
+        activity.update(
+            key("goal"),
+            Phase::StageDone {
+                stage: "goal".to_string(),
+                seconds: 41,
+                turns: 5,
+            },
+        );
+
+        let stopped: Vec<(String, String)> = ["hardware", "locking", "goal"]
+            .iter()
+            .map(|s| {
+                (
+                    s.to_string(),
+                    "still running when the review stopped".into(),
+                )
+            })
+            .collect();
+        settle_unfinished_stages(&activity, 5, 19, &stopped);
+
+        let phase = |stage: &str| activity.get(&key(stage)).expect("row must survive").phase;
+
+        match phase("hardware") {
+            Phase::StageFailed {
+                reason, cancelled, ..
+            } => {
+                assert!(cancelled, "cut short is not the same as broken");
+                assert_eq!(reason, "still running when the review stopped");
+            }
+            other => panic!("a stage left mid-turn must stop claiming to run: {other:?}"),
+        }
+
+        // The stage that failed on its own keeps its own account.
+        match phase("locking") {
+            Phase::StageFailed { reason, .. } => {
+                assert_eq!(reason, "Session exceeded max turns limit (100)")
+            }
+            other => panic!("a reported failure must survive untouched: {other:?}"),
+        }
+
+        // And a finished stage is not retroactively stopped.
+        assert!(matches!(phase("goal"), Phase::StageDone { .. }));
     }
 
     #[test]
