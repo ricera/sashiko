@@ -96,6 +96,8 @@ pub struct ClaudeRequest {
     pub tools: Option<Vec<ClaudeTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<OutputConfig>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -103,6 +105,17 @@ pub struct ThinkingConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "type")]
     pub thinking: Option<String>,
+}
+
+/// Request-level output controls. Today only `effort`.
+///
+/// `effort` is a sibling of `thinking`, not a field inside it. It was nested,
+/// which meant the setting was accepted by this crate and then sent somewhere
+/// the API does not read -- so the one knob for how much of the output budget
+/// goes on reasoning did nothing, silently, and the only visible symptom was
+/// responses truncated at `max_tokens`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct OutputConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
 }
@@ -539,11 +552,8 @@ pub fn translate_ai_request(
             Some(system_blocks)
         },
         tools,
-        thinking: if thinking.is_some() || effort.is_some() {
-            Some(ThinkingConfig { thinking, effort })
-        } else {
-            None
-        },
+        thinking: thinking.map(|t| ThinkingConfig { thinking: Some(t) }),
+        output_config: effort.map(|e| OutputConfig { effort: Some(e) }),
     };
 
     // Apply cache control if enabled
@@ -645,7 +655,7 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         // asked for, but a gateway in front of the API can lower it, and
         // extended thinking spends the same budget before any answer is
         // emitted. A stop well short of the configured value means the limit
-        // that bit was not the one that was configured.
+        // that got hit was not the max_tokens one that was configured.
         tracing::warn!(
             "{}Claude response truncated at max_tokens after {} output tokens.",
             crate::ai::get_log_prefix(),
@@ -1017,15 +1027,25 @@ mod tests {
         }]);
 
         let claude_req =
-            translate_ai_request(&req, false, 4096, Some("enabled".to_string()), None).unwrap();
+            translate_ai_request(&req, false, 4096, Some("adaptive".to_string()), None).unwrap();
         assert!(claude_req.thinking.is_some());
         let tc = claude_req.thinking.unwrap();
-        assert_eq!(tc.thinking.as_deref(), Some("enabled"));
-        assert!(tc.effort.is_none());
+        assert_eq!(tc.thinking.as_deref(), Some("adaptive"));
+        assert!(
+            claude_req.output_config.is_none(),
+            "a thinking mode alone must not invent an output config"
+        );
     }
 
+    /// Effort is a sibling of `thinking`, not a field inside it.
+    ///
+    /// This test asserted the nesting until now, which is how the setting came
+    /// to be accepted by this crate and sent where the API does not read it.
+    /// The knob did nothing, silently, and the only symptom was answers
+    /// truncated at `max_tokens` with no way to spend less of the budget on
+    /// reasoning.
     #[test]
-    fn test_thinking_config_present_when_effort_set() {
+    fn effort_is_sent_as_output_config_not_inside_thinking() {
         let req = make_request(vec![AiMessage {
             role: AiRole::User,
             content: Some("hi".to_string()),
@@ -1037,10 +1057,14 @@ mod tests {
 
         let claude_req =
             translate_ai_request(&req, false, 4096, None, Some("high".to_string())).unwrap();
-        assert!(claude_req.thinking.is_some());
-        let tc = claude_req.thinking.unwrap();
-        assert!(tc.thinking.is_none());
-        assert_eq!(tc.effort.as_deref(), Some("high"));
+        assert_eq!(
+            claude_req.output_config.and_then(|o| o.effort).as_deref(),
+            Some("high")
+        );
+        assert!(
+            claude_req.thinking.is_none(),
+            "effort alone must not imply a thinking mode: the two are set apart"
+        );
     }
 
     #[test]
@@ -1058,14 +1082,20 @@ mod tests {
             &req,
             false,
             4096,
-            Some("enabled".to_string()),
+            Some("adaptive".to_string()),
             Some("high".to_string()),
         )
         .unwrap();
         let json = serde_json::to_value(&claude_req).unwrap();
-        let thinking = &json["thinking"];
-        assert_eq!(thinking["type"], "enabled");
-        assert_eq!(thinking["effort"], "high");
+        assert_eq!(json["thinking"]["type"], "adaptive");
+        assert_eq!(json["output_config"]["effort"], "high");
+        // The shape on the wire is the thing under test: an effort nested here
+        // is accepted by serde and ignored by the API.
+        assert!(
+            json["thinking"].get("effort").is_none(),
+            "effort must not be nested inside thinking: {}",
+            json
+        );
     }
 
     // --- Request translation tests ---
