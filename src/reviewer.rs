@@ -1413,10 +1413,9 @@ impl Reviewer {
             match result {
                 Ok(ReviewToolOutcome {
                     output: json_output,
-                    // Set when the worker produced this result only because it
-                    // was asked to wind down early. Its coverage is short of
-                    // what was planned however complete the output looks.
-                    timed_out: salvaged,
+                    // The deadline passed before the worker returned. On its own
+                    // that says nothing about coverage -- see below.
+                    wound_down,
                 }) => {
                     let patches_status = json_output["patches"].as_array();
                     let target_applied = patches_status
@@ -1427,13 +1426,8 @@ impl Reviewer {
                     // Record incomplete coverage before anything else touches the
                     // review row, so a partial review can never be presented as
                     // a complete one.
-                    if let Some(failures) = json_output
-                        .get("review")
-                        .and_then(|r| r.get("stage_failures"))
-                        .or_else(|| json_output.get("stage_failures"))
-                        .and_then(|f| f.as_array())
-                        .filter(|f| !f.is_empty())
-                    {
+                    let incomplete = incomplete_stages(&json_output);
+                    if let Some(failures) = incomplete {
                         let stages: Vec<&str> = failures
                             .iter()
                             .filter_map(|f| f["stage"].as_str())
@@ -1451,6 +1445,29 @@ impl Reviewer {
                                 &serde_json::Value::Array(failures.clone()).to_string(),
                             )
                             .await;
+                    }
+
+                    // A salvage is a wind-down that cost coverage, not a
+                    // wind-down that happened. The analysis stages stop when
+                    // asked; the consolidation stages do not, because they are
+                    // what turn gathered concerns into findings. So a review
+                    // whose analysis finished inside the deadline and whose tail
+                    // overran it is asked to wind down, has nothing left that
+                    // will listen, and completes every stage it planned.
+                    //
+                    // Recorded as a salvage, that review was marked Failed, its
+                    // patch Partial and its patchset Failed -- hiding a full set
+                    // of findings behind a status that reads "not reviewed". The
+                    // stages the worker reports as incomplete are the difference,
+                    // and it reports none when nothing was cut short.
+                    let salvaged = is_salvage(wound_down, incomplete);
+                    if wound_down && !salvaged {
+                        info!(
+                            "Review {} ran past its deadline but finished every stage it \
+                             planned; recording a complete review that ran late rather than \
+                             a salvage",
+                            review_id
+                        );
                     }
 
                     let history = json_output.get("history");
@@ -1840,14 +1857,50 @@ enum WindDown {
 #[error("Review tool timed out (active time exceeded)")]
 struct ReviewTimedOut;
 
-/// What a run of the review tool produced, and whether it had to be salvaged.
+/// What a run of the review tool produced, and whether it was asked to stop early.
 ///
-/// `timed_out` cannot be read off the output: the worker reports a normal
+/// `wound_down` cannot be read off the output: the worker reports a normal
 /// result either way, and only the daemon knows it asked for that result early.
+///
+/// It says the deadline passed, which is not the same as the deadline having
+/// cost anything -- the consolidation stages ignore the wind-down by design,
+/// because stopping the stages that turn concerns into findings is what would
+/// make a salvage pointless. A review whose analysis finished in time and whose
+/// tail ran a few minutes long is asked to wind down, complies by having nothing
+/// left to stop, and finishes everything. Whether coverage was actually lost is
+/// the caller's to judge, from the stages the worker reports as incomplete.
 #[derive(Debug)]
 struct ReviewToolOutcome {
     output: serde_json::Value,
-    timed_out: bool,
+    wound_down: bool,
+}
+
+/// The stages the worker reports it did not finish, if there are any.
+///
+/// `None` covers both "the key is absent" and "the array is empty", because a
+/// review that cut nothing short says so by listing nothing. That distinction
+/// is what separates a salvage from a review that merely ran late, so it is
+/// worth one named place rather than an inline chain at each caller.
+///
+/// Two shapes are accepted because two producers write it: the worker nests its
+/// own under `review`, and the cancellation path reports it at the top level.
+fn incomplete_stages(output: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    output
+        .get("review")
+        .and_then(|r| r.get("stage_failures"))
+        .or_else(|| output.get("stage_failures"))
+        .and_then(|f| f.as_array())
+        .filter(|f| !f.is_empty())
+}
+
+/// Whether a wind-down actually cost this review coverage.
+///
+/// Both halves are required. The deadline passing is not enough on its own:
+/// that was the rule, and it marked complete reviews as failures. Incomplete
+/// stages are not enough either -- a stage can fail on its own errors well
+/// inside the deadline, which is a coverage gap but not a salvage.
+fn is_salvage(wound_down: bool, incomplete: Option<&Vec<serde_json::Value>>) -> bool {
+    wound_down && incomplete.is_some()
 }
 
 /// Renders an elapsed duration the way the rest of the review reports time.
@@ -3116,7 +3169,7 @@ async fn run_review_tool_with_cmd(
             }
             Ok(ReviewToolOutcome {
                 output: json,
-                timed_out: wind_down == Some(WindDown::TimedOut),
+                wound_down: wind_down == Some(WindDown::TimedOut),
             })
         }
         Err(e) => Err(e),
@@ -3955,7 +4008,7 @@ done
         let result = outcome.output;
 
         assert!(
-            !outcome.timed_out,
+            !outcome.wound_down,
             "a cancellation is not a timeout, and must not be reported as one"
         );
         assert_eq!(
@@ -4005,7 +4058,7 @@ done
             .await?;
 
         assert!(
-            outcome.timed_out,
+            outcome.wound_down,
             "the caller has to know this result was produced under a wind-down, \
              because nothing in the output itself says so"
         );
@@ -4587,6 +4640,70 @@ sleep 30
         assert_eq!(stage_from_context_tag(""), None);
         assert_eq!(stage_from_context_tag("[s:]"), None);
         assert_eq!(stage_from_context_tag("[s:locking"), None);
+    }
+
+    /// A wind-down that cost nothing is not a salvage.
+    ///
+    /// Crossing the deadline used to mark the review Failed, its patch Partial
+    /// and its patchset Failed on its own. But the consolidation stages ignore
+    /// the wind-down by design -- they are what turn gathered concerns into
+    /// findings -- so a review whose analysis finished in time and whose tail
+    /// ran a few minutes long completes every stage it planned and reports no
+    /// incomplete ones. One such review had 11 of 11 stages finished and 9
+    /// findings, presented as a failure.
+    #[test]
+    fn a_review_that_only_ran_late_reports_no_incomplete_stages() {
+        // What a review that lost nothing says: the key is there and empty.
+        let complete = serde_json::json!({
+            "review": { "findings": [{"severity": "High"}], "stage_failures": [] }
+        });
+        assert!(
+            incomplete_stages(&complete).is_none(),
+            "an empty list is a review that cut nothing short, not a missing answer"
+        );
+        // And when the key was never written at all.
+        assert!(incomplete_stages(&serde_json::json!({"review": {}})).is_none());
+
+        // A genuine salvage names what it dropped.
+        let salvaged = serde_json::json!({
+            "review": { "stage_failures": [
+                {"stage": "locking", "reason": "Stage stopped: the review ran out of time",
+                 "cancelled": true}
+            ]}
+        });
+        let failures = incomplete_stages(&salvaged).expect("a dropped stage must be reported");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["stage"], "locking");
+
+        // The cancellation path reports at the top level instead, and both
+        // producers have to be understood by the one rule.
+        let cancelled = serde_json::json!({
+            "stage_failures": [{"stage": "security", "cancelled": true}]
+        });
+        assert_eq!(
+            incomplete_stages(&cancelled).map(|f| f.len()),
+            Some(1),
+            "a top-level list must count too, or a cancelled review reads as complete"
+        );
+
+        // The rule itself, over both halves. The first row is the bug: it used
+        // to be the whole condition, and it is the one that hid a finished
+        // review behind a Failed status.
+        let dropped = incomplete_stages(&salvaged);
+        assert!(
+            !is_salvage(true, None),
+            "a deadline crossed while everything still finished is a late review"
+        );
+        assert!(
+            is_salvage(true, dropped),
+            "a dropped stage under a wind-down is a salvage"
+        );
+        assert!(
+            !is_salvage(false, dropped),
+            "a stage that failed on its own well inside the deadline is a coverage gap, \
+             not a salvage, and must not be reported as a timeout"
+        );
+        assert!(!is_salvage(false, None), "the ordinary case is neither");
     }
 
     /// The proxy may only open rows for stages the worker will close.
