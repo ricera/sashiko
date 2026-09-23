@@ -75,6 +75,13 @@ pub const REPO_ARG_REFERENCE: &str = "kernel";
 /// Value of [`REPO_ARG`] selecting the repository under review.
 pub const REPO_ARG_REVIEW: &str = "review";
 
+/// Key naming the revision a reference-repository read was served from.
+///
+/// Distinct from the `revision` argument, which records what the caller asked
+/// for. The two differ whenever the caller left the revision unpinned, which is
+/// most of the time, and only this one says what the answer describes.
+pub const REVISION_READ_KEY: &str = "revision_read";
+
 impl SashikoToolContext {
     /// Replaces occurrences of `HEAD` in a reference string with the virtualized head commit SHA.
     pub fn virtualize_ref(&self, r: &str) -> String {
@@ -292,6 +299,36 @@ impl ToolBox {
                 {
                     props.remove(REPO_ARG);
                 }
+                // Name the pin in the one place the model is deciding what to
+                // pass. It was being told the revision elsewhere in the prompt
+                // and still sent "HEAD" on about half of its kernel reads --
+                // harmless, because an unpinned read is served the pin anyway,
+                // but it made the log read as though the kernel tree were
+                // floating. A description on the argument itself is free and
+                // arrives at the moment of the choice.
+                if let Some(pin) = self.reference_revision()
+                    && let Some(rev) = parameters
+                        .get_mut("properties")
+                        .and_then(Value::as_object_mut)
+                        .and_then(|props| props.get_mut("revision"))
+                        .and_then(Value::as_object_mut)
+                {
+                    let base = rev
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    rev.insert(
+                        "description".to_string(),
+                        Value::from(format!(
+                            "{base} When {REPO_ARG} is \"{REPO_ARG_REFERENCE}\", that tree is \
+                             pinned to {pin}: pass \"{pin}\" so the log records what was read. \
+                             \"HEAD\" there is served {pin} anyway and never means the tip of \
+                             the clone. Name a different revision only to ask whether something \
+                             changed in another release."
+                        )),
+                    );
+                }
                 AiTool {
                     name: decl["name"].as_str().unwrap().to_string(),
                     description: decl["description"].as_str().unwrap().to_string(),
@@ -339,10 +376,36 @@ impl ToolBox {
             None
         };
 
-        let res = self
+        let mut res = self
             .registry
             .call(&name_normalized, args, &self.context)
             .await?;
+
+        // Say which revision of the reference repository was actually read.
+        //
+        // An unpinned caller is served the configured revision rather than the
+        // one it named, so the arguments recorded in the log are what was asked
+        // for and not what was done. Reading a tracking clone at whatever was
+        // last fetched, instead of the tag the module is built against, is
+        // exactly the failure pinning exists to prevent -- and it would leave
+        // the log looking identical to a correct run.
+        //
+        // Annotated here rather than in each of the nine tools, and before the
+        // cache write so a hit carries it too.
+        // Resolved for this call rather than taken from the configuration: an
+        // explicitly named revision is honoured, so the pin is not always what
+        // was read.
+        if self.context.repo_target(&normalized_args)? == RepoTarget::Reference {
+            let raw = normalized_args
+                .get("revision")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let resolved = self.context.resolve_ref(&normalized_args, raw)?;
+            if let Some(obj) = res.as_object_mut() {
+                obj.entry(REVISION_READ_KEY)
+                    .or_insert_with(|| Value::from(resolved));
+            }
+        }
 
         if let Some(k) = key {
             let mut cache = self.cache.write().unwrap();
