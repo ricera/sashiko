@@ -751,4 +751,121 @@ mod tests {
                 .any(|v| v == "kernel")
         );
     }
+
+    /// The model is deciding what to pass for `revision` while reading this
+    /// schema, so the pin belongs here.
+    ///
+    /// Told the revision only elsewhere in the prompt, it sent "HEAD" on about
+    /// half its kernel reads. Those were served the pin regardless, but the log
+    /// then recorded "HEAD" against a tracking clone whose tip was several
+    /// hundred commits off the pinned tag -- indistinguishable from a review
+    /// that really had read the wrong tree.
+    #[test]
+    fn the_revision_schema_names_the_pin_when_one_is_configured() {
+        let (_review_dir, review_path) = setup_test_repo();
+
+        let pinned = ToolBox::new(review_path.clone(), None)
+            .with_reference(PathBuf::from("/nonexistent"), Some("v6.12".to_string()));
+        for tool in pinned.get_declarations_generic() {
+            let Some(rev) = tool.parameters["properties"].get("revision") else {
+                continue;
+            };
+            let desc = rev["description"].as_str().unwrap_or_default();
+            assert!(
+                desc.contains("v6.12"),
+                "{} must name the pinned revision where the model chooses one: {desc}",
+                tool.name
+            );
+        }
+
+        // Without a reference repository there is no pin to name, and a
+        // description inventing one would be worse than silence.
+        let bare = ToolBox::new(review_path, None);
+        let grep = bare
+            .get_declarations_generic()
+            .into_iter()
+            .find(|t| t.name == "git_grep")
+            .expect("git_grep is registered");
+        assert!(
+            !grep.parameters["properties"]["revision"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pinned"),
+            "a single-repository review has nothing to pin"
+        );
+    }
+
+    /// A reference read reports the revision it was served, not the one asked
+    /// for.
+    ///
+    /// The two differ whenever the caller leaves the revision unpinned, which
+    /// is most of the time. Recording only the request makes a correct review
+    /// and one reading a stale tracking clone produce identical logs.
+    #[test]
+    fn a_reference_read_reports_the_revision_it_was_served() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let (_ref_dir, ref_path) = setup_reference_repo();
+        let ref_path_for_sha = ref_path.clone();
+        let toolbox =
+            ToolBox::new(review_path, None).with_reference(ref_path, Some("v6.12".to_string()));
+        let rt = Runtime::new().unwrap();
+
+        // Asked for HEAD, served the pin: the case the log could not show.
+        let res = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({
+                    "repo": "kernel", "revision": "HEAD",
+                    "pattern": "net_device_ops", "is_literal": true
+                }),
+            ))
+            .expect("the reference read must succeed");
+        assert_eq!(
+            res[crate::toolbox::REVISION_READ_KEY],
+            "v6.12",
+            "an unpinned reference read must say it was served the pin: {res}"
+        );
+
+        // An explicitly named revision is honoured, so the annotation has to
+        // follow the call rather than repeat the configuration. Named as a SHA
+        // so it cannot coincide with the pin and pass by accident.
+        let sha = String::from_utf8(
+            std::process::Command::new("git")
+                .current_dir(&ref_path_for_sha)
+                .args(["rev-parse", "v6.12^{commit}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        assert_ne!(sha, "v6.12");
+        let res = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({
+                    "repo": "kernel", "revision": sha,
+                    "pattern": "net_device_ops", "is_literal": true
+                }),
+            ))
+            .expect("the reference read must succeed");
+        assert_eq!(
+            res[crate::toolbox::REVISION_READ_KEY],
+            sha,
+            "a named revision must be reported as read, not replaced by the pin: {res}"
+        );
+
+        // A review-repo read is unaffected: its revision means what it says.
+        let res = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({"revision": "HEAD", "pattern": "fn", "is_literal": true}),
+            ))
+            .expect("the review read must succeed");
+        assert!(
+            res.get(crate::toolbox::REVISION_READ_KEY).is_none(),
+            "only reference reads are substituted, so only they need the note: {res}"
+        );
+    }
 }
