@@ -135,6 +135,7 @@ async fn test_findings_sum_across_patches() {
         problem: "low1".into(),
         preexisting: None,
         locations: None,
+        prior: None,
     })
     .await
     .unwrap();
@@ -146,6 +147,7 @@ async fn test_findings_sum_across_patches() {
         problem: "low2".into(),
         preexisting: None,
         locations: None,
+        prior: None,
     })
     .await
     .unwrap();
@@ -157,6 +159,7 @@ async fn test_findings_sum_across_patches() {
         problem: "high1".into(),
         preexisting: None,
         locations: None,
+        prior: None,
     })
     .await
     .unwrap();
@@ -170,6 +173,7 @@ async fn test_findings_sum_across_patches() {
         problem: "low3".into(),
         preexisting: None,
         locations: None,
+        prior: None,
     })
     .await
     .unwrap();
@@ -181,6 +185,7 @@ async fn test_findings_sum_across_patches() {
         problem: "crit1".into(),
         preexisting: None,
         locations: None,
+        prior: None,
     })
     .await
     .unwrap();
@@ -192,6 +197,7 @@ async fn test_findings_sum_across_patches() {
         problem: "crit2".into(),
         preexisting: None,
         locations: None,
+        prior: None,
     })
     .await
     .unwrap();

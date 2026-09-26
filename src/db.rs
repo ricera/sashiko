@@ -197,6 +197,18 @@ pub enum Severity {
 }
 
 impl Severity {
+    /// The label for a severity as stored, which is the integer the enum
+    /// discriminant writes. Anything unrecognised reads as Low, matching
+    /// [`Severity::from_str`].
+    pub fn label_for_level(level: i64) -> &'static str {
+        match level {
+            4 => "Critical",
+            3 => "High",
+            2 => "Medium",
+            _ => "Low",
+        }
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         let s = s.trim();
@@ -227,6 +239,10 @@ pub struct Finding {
     pub problem: String,
     pub preexisting: Option<bool>,
     pub locations: Option<serde_json::Value>,
+    /// How this finding relates to one reported on an earlier revision of the
+    /// same pull request: `{relation, revision, headline}`, where `relation` is
+    /// `repeat` or `fix_regression`. `None` for a finding with no history.
+    pub prior: Option<serde_json::Value>,
 }
 
 pub struct EmailOutboxRow {
@@ -733,6 +749,10 @@ impl Database {
         let _ = self
             .try_add_column("patchsets", "mr_number", "INTEGER")
             .await;
+        let _ = self.try_add_column("patchsets", "mr_body", "TEXT").await;
+        let _ = self
+            .try_create_index("idx_patchsets_mr_url", "patchsets", "mr_url")
+            .await;
 
         let _ = self
             .conn
@@ -868,6 +888,7 @@ impl Database {
             .await;
         let _ = self.try_add_column("findings", "locations", "TEXT").await;
         let _ = self.try_add_column("findings", "headline", "TEXT").await;
+        let _ = self.try_add_column("findings", "prior", "TEXT").await;
         // Ignore errors for these as they might fail on new DBs or if already migrated
         let _ = self
             .conn
@@ -1604,10 +1625,15 @@ impl Database {
             .locations
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
+        let prior_val = finding
+            .prior
+            .as_ref()
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::to_string(v).ok());
         self.conn
             .execute(
-                "INSERT INTO findings (review_id, severity, severity_explanation, headline, problem, preexisting, locations)
-             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO findings (review_id, severity, severity_explanation, headline, problem, preexisting, locations, prior)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 libsql::params![
                     finding.review_id,
                     finding.severity as i32,
@@ -1616,6 +1642,7 @@ impl Database {
                     finding.problem,
                     preexisting_val,
                     locations_val,
+                    prior_val,
                 ],
             )
             .await?;
@@ -2868,7 +2895,7 @@ impl Database {
                 let mut identity = self
                     .conn
                     .query(
-                        "SELECT slug, mr_url, mr_title, mr_number FROM patchsets WHERE id = ?",
+                        "SELECT slug, mr_url, mr_title, mr_number, mr_body FROM patchsets WHERE id = ?",
                         libsql::params![merge_from_id],
                     )
                     .await?;
@@ -2878,8 +2905,10 @@ impl Database {
                         row.get::<Option<String>>(1).ok().flatten(),
                         row.get::<Option<String>>(2).ok().flatten(),
                         row.get::<Option<i64>>(3).ok().flatten(),
+                        // Moved as stored, compressed or not.
+                        row.get::<libsql::Value>(4).unwrap_or(libsql::Value::Null),
                     ),
-                    None => (None, None, None, None),
+                    None => (None, None, None, None, libsql::Value::Null),
                 };
 
                 // Delete the merged patchset
@@ -2892,17 +2921,24 @@ impl Database {
 
                 // COALESCE so a target that already knows who it is keeps its
                 // own answer rather than adopting the merged row's.
-                let (slug, mr_url, mr_title, mr_number) = identity;
-                if slug.is_some() || mr_url.is_some() || mr_title.is_some() || mr_number.is_some() {
+                let (slug, mr_url, mr_title, mr_number, mr_body) = identity;
+                let has_body = !matches!(mr_body, libsql::Value::Null);
+                if slug.is_some()
+                    || mr_url.is_some()
+                    || mr_title.is_some()
+                    || mr_number.is_some()
+                    || has_body
+                {
                     self.conn
                         .execute(
                             "UPDATE patchsets SET
                                 slug = COALESCE(slug, ?),
                                 mr_url = COALESCE(mr_url, ?),
                                 mr_title = COALESCE(mr_title, ?),
-                                mr_number = COALESCE(mr_number, ?)
+                                mr_number = COALESCE(mr_number, ?),
+                                mr_body = COALESCE(mr_body, ?)
                              WHERE id = ?",
-                            libsql::params![slug, mr_url, mr_title, mr_number, target_id],
+                            libsql::params![slug, mr_url, mr_title, mr_number, mr_body, target_id],
                         )
                         .await?;
                 }
@@ -4473,20 +4509,14 @@ impl Database {
         for (review_id, patch_id, inline_review, summary, patch_message_id, index) in temp_reviews {
             // Fetch findings for this review
             let mut findings_rows = self.conn.query(
-                "SELECT severity, problem, severity_explanation, preexisting, locations, headline FROM findings WHERE review_id = ?",
+                "SELECT severity, problem, severity_explanation, preexisting, locations, headline, prior FROM findings WHERE review_id = ?",
                 libsql::params![review_id],
             ).await?;
 
             let mut findings = Vec::new();
             while let Ok(Some(f_row)) = findings_rows.next().await {
                 let severity_int: i64 = f_row.get(0).unwrap_or(1);
-                let severity = match severity_int {
-                    4 => "Critical",
-                    3 => "High",
-                    2 => "Medium",
-                    _ => "Low",
-                }
-                .to_string();
+                let severity = Severity::label_for_level(severity_int).to_string();
                 let problem: String = f_row.get(1).unwrap_or_default();
                 let severity_explanation: Option<String> = f_row.get(2).ok();
                 let preexisting_int: Option<i64> = f_row.get(3).ok();
@@ -4495,6 +4525,11 @@ impl Database {
                 let locations =
                     locations_str.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
                 let headline: Option<String> = f_row.get(5).ok();
+                let prior = f_row
+                    .get::<Option<String>>(6)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
 
                 findings.push(json!({
                     "severity": severity,
@@ -4503,6 +4538,7 @@ impl Database {
                     "severity_explanation": severity_explanation,
                     "preexisting": preexisting,
                     "locations": locations,
+                    "prior": prior,
                 }));
             }
 
@@ -4516,6 +4552,202 @@ impl Database {
             });
         }
         Ok(reviews)
+    }
+
+    /// Findings reported on earlier revisions of the same pull request, newest
+    /// revision first.
+    ///
+    /// Every force-push is its own patchset, and they share nothing but the
+    /// request's URL, so that is the lineage. Earlier means a lower id -- the
+    /// order revisions arrived in, and what `mark_superseded_pr_revisions`
+    /// already takes as newest. A patchset with no `mr_url` (a mailing-list
+    /// series) has no lineage here and gets an empty list.
+    ///
+    /// Findings are taken from every review of a patch, not only the latest
+    /// `Reviewed` one: a rerun can leave a clean pass on top of one that found
+    /// something, and a review salvaged after a timeout is recorded `Failed`
+    /// while its findings are real. Duplicates across those passes are
+    /// dropped. Revisions and patches that contributed no findings are left
+    /// out, so `max_revisions` counts revisions that have something to say.
+    ///
+    /// Only the newest returned revision carries patch diffs: that is the one a
+    /// fix for its findings was made against, and every per-patch worker gets a
+    /// copy of this list, so older diffs would be weight with no reader.
+    /// Findings are cut down the same way, to what the review is shown of them:
+    /// see the comment where each is built.
+    pub async fn get_prior_revision_findings(
+        &self,
+        patchset_id: i64,
+        max_revisions: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, slug FROM patchsets
+                 WHERE mr_url = (SELECT mr_url FROM patchsets WHERE id = ?) AND id < ?
+                 ORDER BY id DESC",
+                libsql::params![patchset_id, patchset_id],
+            )
+            .await?;
+        let mut earlier = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let slug: Option<String> = row.get::<Option<String>>(1).ok().flatten();
+            earlier.push((id, slug));
+        }
+
+        let mut revisions = Vec::new();
+        for (revision_id, slug) in earlier {
+            if revisions.len() >= max_revisions {
+                break;
+            }
+            let include_diff = revisions.is_empty();
+
+            let mut patch_rows = self
+                .conn
+                .query(
+                    "SELECT p.id, p.part_index, p.diff, m.subject, p.message_id
+                     FROM patches p
+                     LEFT JOIN messages m ON p.message_id = m.message_id
+                     WHERE p.patchset_id = ?
+                     ORDER BY p.part_index ASC",
+                    libsql::params![revision_id],
+                )
+                .await?;
+            let mut patch_meta = Vec::new();
+            while let Some(row) = patch_rows.next().await? {
+                let patch_id: i64 = row.get(0)?;
+                let index: i64 = row.get(1).unwrap_or(0);
+                let diff = if include_diff {
+                    crate::compression::get_compressed_string(&row, 2).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let subject: String = row
+                    .get::<Option<String>>(3)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let commit: String = row.get(4).unwrap_or_default();
+                patch_meta.push((patch_id, index, diff, subject, commit));
+            }
+
+            let mut patches = Vec::new();
+            for (patch_id, index, diff, subject, commit) in patch_meta {
+                let mut finding_rows = self
+                    .conn
+                    .query(
+                        "SELECT f.severity, f.headline, f.problem, f.locations, f.prior,
+                                f.severity_explanation
+                         FROM findings f
+                         JOIN reviews r ON f.review_id = r.id
+                         WHERE r.patch_id = ?
+                         ORDER BY r.id DESC, f.id ASC",
+                        libsql::params![patch_id],
+                    )
+                    .await?;
+                let mut seen = std::collections::HashSet::new();
+                let mut findings = Vec::new();
+                while let Some(row) = finding_rows.next().await? {
+                    let severity: i64 = row.get(0).unwrap_or(1);
+                    let headline: Option<String> = row.get::<Option<String>>(1).ok().flatten();
+                    let problem: String = row
+                        .get::<Option<String>>(2)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let key = headline
+                        .as_deref()
+                        .filter(|h| !h.trim().is_empty())
+                        .unwrap_or(&problem)
+                        .trim()
+                        .to_lowercase();
+                    if key.is_empty() || !seen.insert(key) {
+                        continue;
+                    }
+                    let parse = |i: i32| {
+                        row.get::<Option<String>>(i)
+                            .ok()
+                            .flatten()
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                    };
+                    // A review is shown a summary of each finding, not its
+                    // argument, and every patch's worker gets a copy of this
+                    // list. So the argument travels only where it has to stand
+                    // in for a missing headline, and the severity explanation
+                    // only as far as its opening line, where the consequence is.
+                    let has_headline = headline.as_deref().is_some_and(|h| !h.trim().is_empty());
+                    let explanation_opening = row
+                        .get::<Option<String>>(5)
+                        .ok()
+                        .flatten()
+                        .and_then(|e| e.trim().lines().next().map(str::to_string));
+                    findings.push(json!({
+                        "severity": Severity::label_for_level(severity),
+                        "headline": headline,
+                        "problem": if has_headline { None } else { Some(problem) },
+                        "locations": parse(3),
+                        "prior": parse(4),
+                        "severity_explanation": explanation_opening,
+                    }));
+                }
+                if findings.is_empty() {
+                    continue;
+                }
+                let mut patch = json!({
+                    "index": index,
+                    "subject": subject,
+                    "commit": commit,
+                    "findings": findings,
+                });
+                if include_diff && !diff.is_empty() {
+                    patch["diff"] = json!(diff);
+                }
+                patches.push(patch);
+            }
+
+            if !patches.is_empty() {
+                revisions.push(json!({
+                    "revision": slug.unwrap_or_else(|| format!("patchset {}", revision_id)),
+                    "patches": patches,
+                }));
+            }
+        }
+        Ok(revisions)
+    }
+
+    /// Records the pull request's description as the cover letter for this
+    /// revision. Blank descriptions are stored as NULL, so an empty template
+    /// never occupies a prompt section.
+    pub async fn set_patchset_mr_body(&self, patchset_id: i64, body: Option<&str>) -> Result<()> {
+        let value = body
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(crate::compression::compress_string_if_needed)
+            .unwrap_or(libsql::Value::Null);
+        self.conn
+            .execute(
+                "UPDATE patchsets SET mr_body = ? WHERE id = ?",
+                libsql::params![value, patchset_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_patchset_mr_body(&self, patchset_id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT mr_body FROM patchsets WHERE id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(crate::compression::get_compressed_string_opt(&row, 0)
+                .unwrap_or(None)
+                .filter(|b| !b.trim().is_empty())),
+            None => Ok(None),
+        }
     }
 
     pub async fn update_patchset_status(&self, id: i64, status: &str) -> Result<()> {
@@ -7236,6 +7468,7 @@ mod tests {
             problem: "Pre-existing issue".to_string(),
             preexisting: Some(true),
             locations: None,
+            prior: None,
         })
         .await
         .unwrap();
@@ -9893,9 +10126,19 @@ mod tests {
             )
             .await
             .unwrap();
+        // Long enough to be stored compressed, which the merge must move as is.
+        let description = format!("Changes since v1: {}", "reworded. ".repeat(200));
+        db.set_patchset_mr_body(ps_lo, Some(&description))
+            .await
+            .unwrap();
 
         let ps_id = add_unthreaded_part(&db, thread_mid, 3, 175_000, None).await;
         assert_eq!(ps_id, ps_hi, "the merge keeps the patchset created first");
+        assert_eq!(
+            db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
+            Some(description.trim()),
+            "the description is the review's cover letter and must survive the merge"
+        );
 
         let details = db
             .get_patchset_details_by_slug("linux-pds-25", None, None)
@@ -9910,6 +10153,283 @@ mod tests {
 
         let id = db.get_patchset_id_by_mr_number(25).await.unwrap();
         assert_eq!(id, Some(ps_id), "a re-review must find the surviving row");
+    }
+
+    #[tokio::test]
+    async fn blank_pull_request_description_is_no_cover_letter() {
+        let db = setup_db().await;
+        let (ps_id, _) = add_pr_revision(&db, "https://github.com/org/repo/pull/7", "aaaa").await;
+        for blank in [None, Some(""), Some("  \n\t ")] {
+            db.set_patchset_mr_body(ps_id, blank).await.unwrap();
+            assert_eq!(db.get_patchset_mr_body(ps_id).await.unwrap(), None);
+        }
+        db.set_patchset_mr_body(ps_id, Some("  Fixes the race.  "))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
+            Some("Fixes the race.")
+        );
+    }
+
+    /// One revision of a pull request as the forge path leaves it: its own
+    /// patchset carrying the request's URL, with one patch.
+    async fn add_pr_revision(db: &Database, mr_url: &str, head: &str) -> (i64, i64) {
+        let author = "Pr Author <pr@example.com>";
+        let subject = format!("pds_core: add CPER support ({head})");
+        let thread_id = db
+            .create_thread(&format!("root-{head}"), &subject, 1000)
+            .await
+            .unwrap();
+        db.create_message(
+            head, thread_id, None, author, &subject, 1000, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, head, &subject, author, 1000, 1, 1, "", "", None, 1, None, true,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET mr_url = ?, slug = ? WHERE id = ?",
+                libsql::params![mr_url, format!("repo-7-{head}"), ps_id],
+            )
+            .await
+            .unwrap();
+        let patch_id = db
+            .create_patch(
+                ps_id,
+                head,
+                1,
+                "diff --git a/drivers/pds/cper.c b/drivers/pds/cper.c\n+registered = true;\n",
+            )
+            .await
+            .unwrap();
+        (ps_id, patch_id)
+    }
+
+    async fn add_review_with_findings(
+        db: &Database,
+        ps_id: i64,
+        patch_id: i64,
+        status: &str,
+        findings: &[(&str, Option<serde_json::Value>)],
+    ) {
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+        db.complete_review(review_id, status, "done", None, None, None, None)
+            .await
+            .unwrap();
+        for (headline, prior) in findings {
+            db.create_finding(Finding {
+                review_id,
+                severity: Severity::High,
+                severity_explanation: Some(format!(
+                    "Consequence: {headline} loses records.\nTriggering path: the reader races."
+                )),
+                headline: Some(headline.to_string()),
+                problem: format!("{headline}: the reasoning."),
+                preexisting: Some(false),
+                locations: Some(json!([{
+                    "file": "drivers/pds/cper.c",
+                    "function_or_symbol": "pdsc_cper_register",
+                    "line": 42
+                }])),
+                prior: prior.clone(),
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    fn prior_headlines(revisions: &[serde_json::Value]) -> Vec<Vec<String>> {
+        revisions
+            .iter()
+            .map(|r| {
+                r["patches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|p| p["findings"].as_array().unwrap())
+                    .map(|f| f["headline"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The lineage is the request's URL and nothing else: a different pull
+    /// request, or a revision that came later, is not history of this one.
+    #[tokio::test]
+    async fn prior_revision_findings_follow_the_pull_request() {
+        let db = setup_db().await;
+        let url = "https://github.com/org/linux-pds/pull/27";
+
+        let (r1, p1) = add_pr_revision(&db, url, "r1").await;
+        add_review_with_findings(
+            &db,
+            r1,
+            p1,
+            "Reviewed",
+            &[("read() == 0 is overloaded", None)],
+        )
+        .await;
+        let (other, po) =
+            add_pr_revision(&db, "https://github.com/org/linux-pds/pull/28", "o1").await;
+        add_review_with_findings(&db, other, po, "Reviewed", &[("unrelated", None)]).await;
+        let (r2, p2) = add_pr_revision(&db, url, "r2").await;
+        add_review_with_findings(
+            &db,
+            r2,
+            p2,
+            "Reviewed",
+            &[("DEINIT can overtake INIT", None)],
+        )
+        .await;
+        let (current, _) = add_pr_revision(&db, url, "r3").await;
+        let (r4, p4) = add_pr_revision(&db, url, "r4").await;
+        add_review_with_findings(&db, r4, p4, "Reviewed", &[("from the future", None)]).await;
+
+        let revisions = db.get_prior_revision_findings(current, 5).await.unwrap();
+        assert_eq!(
+            prior_headlines(&revisions),
+            [
+                vec!["DEINIT can overtake INIT".to_string()],
+                vec!["read() == 0 is overloaded".to_string()]
+            ],
+            "earlier revisions of this request only, newest first"
+        );
+        assert_eq!(revisions[0]["revision"], "repo-7-r2");
+        assert_eq!(revisions[0]["patches"][0]["commit"], "r2");
+        assert_eq!(revisions[0]["patches"][0]["index"], 1);
+        assert_eq!(
+            revisions[0]["patches"][0]["findings"][0]["severity"],
+            "High"
+        );
+        assert!(
+            revisions[0]["patches"][0]["diff"]
+                .as_str()
+                .unwrap()
+                .contains("registered = true"),
+            "the newest earlier revision carries its diff"
+        );
+        assert!(
+            revisions[1]["patches"][0].get("diff").is_none(),
+            "older revisions do not: nothing reads them"
+        );
+
+        let newest_only = db.get_prior_revision_findings(current, 1).await.unwrap();
+        assert_eq!(newest_only.len(), 1);
+        assert_eq!(newest_only[0]["revision"], "repo-7-r2");
+
+        let (mail, _) = add_unthreaded_pr_less_patchset(&db).await;
+        assert!(
+            db.get_prior_revision_findings(mail, 5)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a mailing-list series has no pull request lineage"
+        );
+    }
+
+    async fn add_unthreaded_pr_less_patchset(db: &Database) -> (i64, i64) {
+        let (ps_id, patch_id) = add_pr_revision(db, "unused", "mail").await;
+        db.conn
+            .execute(
+                "UPDATE patchsets SET mr_url = NULL WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        (ps_id, patch_id)
+    }
+
+    /// A revision whose review found nothing, or failed without salvaging
+    /// anything, has nothing to say -- and must not use up a slot that the
+    /// revision before it, which did, would otherwise fill.
+    #[tokio::test]
+    async fn prior_revision_findings_skip_revisions_with_nothing_to_say() {
+        let db = setup_db().await;
+        let url = "https://github.com/org/linux-pds/pull/27";
+        let (r1, p1) = add_pr_revision(&db, url, "r1").await;
+        add_review_with_findings(&db, r1, p1, "Reviewed", &[("constants duplicated", None)]).await;
+        let (r2, p2) = add_pr_revision(&db, url, "r2").await;
+        add_review_with_findings(&db, r2, p2, "Failed", &[]).await;
+        let (r3, p3) = add_pr_revision(&db, url, "r3").await;
+        add_review_with_findings(&db, r3, p3, "Reviewed", &[]).await;
+        let (current, _) = add_pr_revision(&db, url, "r4").await;
+
+        let revisions = db.get_prior_revision_findings(current, 1).await.unwrap();
+        assert_eq!(
+            prior_headlines(&revisions),
+            [vec!["constants duplicated".to_string()]]
+        );
+        assert!(
+            revisions[0]["patches"][0]["diff"].is_string(),
+            "the newest revision with findings is the one that carries its diff"
+        );
+    }
+
+    /// A rerun can leave a clean pass on top of one that found something, and a
+    /// salvaged review is recorded Failed with real findings. Every pass counts,
+    /// once.
+    #[tokio::test]
+    async fn prior_revision_findings_union_every_pass_of_a_patch() {
+        let db = setup_db().await;
+        let url = "https://github.com/org/linux-pds/pull/27";
+        let (r1, p1) = add_pr_revision(&db, url, "r1").await;
+        let prior = json!({
+            "relation": "fix_regression",
+            "revision": "repo-7-r0",
+            "headline": "flag published outside the devcmd"
+        });
+        add_review_with_findings(
+            &db,
+            r1,
+            p1,
+            "Failed",
+            &[("salvaged race", None), ("leak", None)],
+        )
+        .await;
+        add_review_with_findings(&db, r1, p1, "Reviewed", &[("Leak ", Some(prior.clone()))]).await;
+        add_review_with_findings(&db, r1, p1, "Reviewed", &[]).await;
+        let (current, _) = add_pr_revision(&db, url, "r2").await;
+
+        let revisions = db.get_prior_revision_findings(current, 5).await.unwrap();
+        let mut headlines = prior_headlines(&revisions).concat();
+        headlines.sort();
+        assert_eq!(headlines, ["Leak ", "salvaged race"]);
+
+        let findings = revisions[0]["patches"][0]["findings"].as_array().unwrap();
+        let rerun = findings.iter().find(|f| f["headline"] == "Leak ").unwrap();
+        assert_eq!(
+            rerun["prior"], prior,
+            "the newest pass's wording wins, carrying its own history"
+        );
+        assert_eq!(rerun["locations"][0]["file"], "drivers/pds/cper.c");
+        assert!(
+            rerun["problem"].is_null(),
+            "the argument stays behind when a headline names the finding"
+        );
+        assert_eq!(
+            rerun["severity_explanation"], "Consequence: Leak  loses records.",
+            "only the opening line, where the consequence is"
+        );
+
+        let released = db.get_completed_reviews_for_release(r1).await.unwrap();
+        assert!(
+            released
+                .iter()
+                .flat_map(|r| &r.findings)
+                .any(|f| f["prior"] == prior),
+            "the stored relation is readable wherever findings are released"
+        );
     }
 
     /// Verify that a commit SHA submitted as a singleton does NOT steal

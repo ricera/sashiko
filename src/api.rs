@@ -1569,6 +1569,20 @@ async fn enqueue_pull_request(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    // Written on every enqueue, so the stored text is the description as it
+    // stood for this revision. Not fatal: without it the review simply has no
+    // cover letter, which is what every pull request got before.
+    if let Err(e) = state
+        .db
+        .set_patchset_mr_body(placeholder_patchset_id, metadata.pr_body.as_deref())
+        .await
+    {
+        warn!(
+            "Could not record the description of PR #{} on patchset {}: {}",
+            metadata.pr_number, placeholder_patchset_id, e
+        );
+    }
+
     let req = FetchRequest {
         repo_url: metadata.repo_url,
         commit_hash: commit_range,

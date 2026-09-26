@@ -41,6 +41,11 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 
+/// How many earlier revisions of a pull request a review hears about. Enough to
+/// show a finding coming back round after round; the worker's token budget
+/// bounds what actually reaches the prompt.
+const MAX_PRIOR_REVISIONS: usize = 5;
+
 #[derive(Clone)]
 struct ReviewContext {
     semaphore: Arc<Semaphore>,
@@ -537,6 +542,17 @@ impl Reviewer {
         } else {
             None
         };
+        // A pull request's cover letter id names a placeholder with no message
+        // behind it, so the lookup above finds nothing. What the author wrote
+        // about the series is the request's description instead.
+        let body = match body {
+            Some(b) => Some(b),
+            None => ctx
+                .db
+                .get_patchset_mr_body(patchset_id)
+                .await
+                .unwrap_or(None),
+        };
 
         let subject = patchset.subject.clone().unwrap_or("Unknown".to_string());
         let candidates = if let Some(bid) = patchset.baseline_id {
@@ -618,12 +634,30 @@ impl Reviewer {
             // `body` is the patchset's cover letter where one exists. It has
             // fed baseline resolution above; passing it on is what gets the
             // author's series intent in front of the model.
+            // What earlier revisions of this pull request were told, so the
+            // review can see which of its findings are repeats and which were
+            // caused by the fix for an earlier one. Fetched once for the whole
+            // patchset; each patch's worker picks out what concerns it. Missing
+            // history costs the review that context and nothing else.
+            let prior_revisions = ctx
+                .db
+                .get_prior_revision_findings(patchset_id, MAX_PRIOR_REVISIONS)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!(
+                        "Could not read earlier revisions' findings for patchset {}: {}",
+                        patchset_id, e
+                    );
+                    Vec::new()
+                });
+
             let input_payload = json!({
                 "id": patchset_id,
                 "message_id": patchset_msg_id,
                 "subject": patchset.subject.clone().unwrap_or("Unknown".to_string()),
                 "cover_letter": body,
-                "patches": patches_json
+                "patches": patches_json,
+                "prior_revisions": prior_revisions
             });
 
             let skip_filters: Vec<String> = patchset
@@ -1565,6 +1599,10 @@ impl Reviewer {
                                             .map(|s| s.to_string());
                                         let preexisting = f["preexisting"].as_bool();
                                         let locations = f.get("locations").cloned();
+                                        // Set only when the review was given the
+                                        // findings of an earlier revision and this
+                                        // one repeats or follows from one of them.
+                                        let prior = f.get("prior").cloned();
 
                                         ctx.db
                                             .create_finding(Finding {
@@ -1575,6 +1613,7 @@ impl Reviewer {
                                                 problem,
                                                 preexisting,
                                                 locations,
+                                                prior,
                                             })
                                             .await?;
                                     }

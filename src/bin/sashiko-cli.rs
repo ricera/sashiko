@@ -2178,6 +2178,7 @@ async fn handle_local(
             // choice made against the daemon.
             cover_letter: None,
             patches,
+            prior_revisions: None,
         };
 
         let review_json =

@@ -271,6 +271,8 @@ pub async fn build_review_input_from_git(
             // choice made against the daemon.
             cover_letter: None,
             patches,
+            // Nor any review history: that lives in the daemon's database.
+            prior_revisions: None,
         },
         shas,
     ))
@@ -378,6 +380,7 @@ pub async fn run_worker(
     let patchset_id = input.id;
     let subject = input.subject;
     let cover_letter = input.cover_letter;
+    let prior_revisions = input.prior_revisions;
     let patches = input.patches;
     let baseline_arg = if options.current_tree {
         options.baseline.clone().unwrap_or_default()
@@ -466,6 +469,7 @@ pub async fn run_worker(
         patchset_id,
         subject,
         cover_letter,
+        prior_revisions,
         patches,
         &baseline_arg,
         &baseline_sha,
@@ -529,6 +533,31 @@ fn decorate_provider(
     ))
 }
 
+/// The patchset as one patch's review sees it.
+///
+/// Rebuilt here rather than passed through, so everything the reviewer sends
+/// that a stage needs has to be named in this one place: `ReviewInput` ignores
+/// fields it does not know, so one left out is dropped without a sound.
+fn worker_patchset_value(
+    patchset_id: i64,
+    subject: &str,
+    cover_letter: Option<&str>,
+    prior_revisions: Option<&Value>,
+    rich_patches: &[Value],
+    patch_index: i64,
+    baseline_sha: &str,
+) -> Value {
+    json!({
+        "id": patchset_id,
+        "subject": subject,
+        "cover_letter": cover_letter,
+        "patches": rich_patches,
+        "patch_index": Some(patch_index),
+        "baseline": baseline_sha,
+        "prior_revisions": prior_revisions
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn review_single_patch(
     worktree: &GitWorktree,
@@ -536,6 +565,7 @@ async fn review_single_patch(
     patchset_id: i64,
     subject: &str,
     cover_letter: Option<&str>,
+    prior_revisions: Option<&Value>,
     p: &PatchInput,
     all_patches: &[PatchInput],
     rich_patches: &[Value],
@@ -731,14 +761,15 @@ async fn review_single_patch(
             }
         });
 
-        let patchset_val = json!({
-            "id": patchset_id,
-            "subject": subject,
-            "cover_letter": cover_letter,
-            "patches": rich_patches,
-            "patch_index": Some(p.index),
-            "baseline": baseline_sha
-        });
+        let patchset_val = worker_patchset_value(
+            patchset_id,
+            subject,
+            cover_letter,
+            prior_revisions,
+            rich_patches,
+            p.index,
+            baseline_sha,
+        );
 
         match worker
             .run(
@@ -817,6 +848,7 @@ async fn run_worker_in_worktree(
     patchset_id: i64,
     subject: String,
     cover_letter: Option<String>,
+    prior_revisions: Option<Value>,
     patches: Vec<PatchInput>,
     baseline_arg: &str,
     baseline_sha: &str,
@@ -988,6 +1020,9 @@ async fn run_worker_in_worktree(
                 "author": p.author,
                 "date_string": date_str,
                 "diff": p.diff,
+                // The id the patch arrived under; for a pull request, the
+                // forge's commit, which `commit_id` re-applies under a new sha.
+                "message_id": p.message_id,
                 "commit_id": patch_shas.get(&p.index).cloned(),
                 "git_show": patch_shows.get(&p.index).cloned(),
                 "commit_message_full": patch_messages.get(&p.index).cloned()
@@ -1012,6 +1047,7 @@ async fn run_worker_in_worktree(
         let reference = reference.as_ref();
         let subject_clone = subject.clone();
         let cover_letter_ref = cover_letter.as_deref();
+        let prior_revisions_ref = prior_revisions.as_ref();
         let all_patches = &patches;
         let llm_semaphore = &llm_semaphore;
         let quota = &quota;
@@ -1022,6 +1058,7 @@ async fn run_worker_in_worktree(
                 patchset_id,
                 &subject_clone,
                 cover_letter_ref,
+                prior_revisions_ref,
                 p,
                 all_patches,
                 &rich_patches,
@@ -1449,6 +1486,63 @@ pub fn print_worker_json(result: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The review history crosses a process boundary as JSON and is rebuilt on
+    /// the other side. Nothing fails if it is dropped along the way -- the
+    /// review just runs without it -- so this follows it the whole way, from
+    /// the payload the reviewer sends to the context a stage renders.
+    #[test]
+    fn prior_revisions_survive_the_trip_to_the_worker() {
+        let payload = json!({
+            "id": 42,
+            "subject": "pds_core: add CPER",
+            "cover_letter": "Changes since v2: moved registration after setup.",
+            "patches": [{
+                "index": 1,
+                "diff": "diff --git a/drivers/pds/cper.c b/drivers/pds/cper.c\n+x\n",
+                "subject": "pds_core: add CPER",
+                "message_id": "cafe0003"
+            }],
+            "prior_revisions": [{
+                "revision": "linux-pds-27-e916f06a",
+                "patches": [{
+                    "index": 1,
+                    "subject": "pds_core: add CPER",
+                    "commit": "e916f06a",
+                    "findings": [{
+                        "severity": "High",
+                        "headline": "DEINIT can overtake INIT",
+                        "problem": "The flag is published outside the devcmd.",
+                        "locations": [{"file": "drivers/pds/cper.c"}]
+                    }]
+                }]
+            }]
+        });
+        let input: ReviewInput = serde_json::from_str(&payload.to_string()).unwrap();
+        let rich_patches: Vec<Value> = input
+            .patches
+            .iter()
+            .map(|p| json!({"index": p.index, "subject": p.subject, "diff": p.diff, "message_id": p.message_id}))
+            .collect();
+
+        let patchset = worker_patchset_value(
+            input.id,
+            &input.subject,
+            input.cover_letter.as_deref(),
+            input.prior_revisions.as_ref(),
+            &rich_patches,
+            1,
+            "base",
+        );
+
+        let context = crate::worker::prompts::build_prior_review_context(&patchset)
+            .expect("the history must reach the stage that renders it");
+        assert!(context.contains("DEINIT can overtake INIT"));
+        assert_eq!(
+            patchset["cover_letter"],
+            "Changes since v2: moved registration after setup."
+        );
+    }
     use std::fs::File;
     use std::io::Write;
     use std::process::Command;

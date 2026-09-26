@@ -168,6 +168,11 @@ matches a patchset already ingested, the existing one is re-run; if the PR has
 new commits, or was never seen, it is queued as a new review through the same
 path the webhook uses.
 
+A review of a later revision is given the findings reported on the earlier
+ones (up to five revisions back), and the pull request's description as its
+cover letter. A finding that repeats an earlier one, or that was caused by the
+change made for one, says so in the review.
+
 Resolving a PR needs the GitHub CLI (`gh`) installed and authenticated on the
 **daemon** host — it runs inside the configured repository, so it infers the
 owner and name from the git remote. If `gh` is unavailable but the PR has been

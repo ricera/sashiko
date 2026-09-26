@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS patchsets (
     mr_url TEXT,
     mr_title TEXT,
     mr_number INTEGER,
+    mr_body TEXT, -- pull request description as of this revision; the review's cover letter
     prompts_git_hash TEXT,
     baseline_logs TEXT,
     failed_reason TEXT,
@@ -93,6 +94,9 @@ CREATE TABLE IF NOT EXISTS patchsets (
 );
 
 CREATE INDEX IF NOT EXISTS idx_patchsets_status ON patchsets(status);
+-- Every revision of a pull request shares its URL; a review reads the findings
+-- of the earlier ones through it.
+CREATE INDEX IF NOT EXISTS idx_patchsets_mr_url ON patchsets(mr_url);
 
 -- Last known activity per unit of work, so a patchset stranded by a daemon
 -- restart can still explain what it was doing. Live state lives in memory;
@@ -171,6 +175,7 @@ CREATE TABLE IF NOT EXISTS findings (
     suggestion TEXT,
     preexisting INTEGER, -- 0 = false, 1 = true
     locations TEXT,
+    prior TEXT, -- JSON {relation, revision, headline}: how this relates to a finding on an earlier revision
     FOREIGN KEY(review_id) REFERENCES reviews(id)
 );
 CREATE INDEX IF NOT EXISTS idx_findings_review_id ON findings(review_id);
