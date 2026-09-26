@@ -167,6 +167,20 @@ pub struct ForgeMetadata {
     pub pr_number: i64,
     pub pr_title: Option<String>,
     pub pr_url: Option<String>,
+    /// The request's description. What the author says about the series,
+    /// including what changed since the last revision; reviewed as the cover
+    /// letter. `None` when blank.
+    pub pr_body: Option<String>,
+}
+
+/// A request description as the forge sent it, or `None` when there is
+/// nothing in it. Forges send an empty string or null for "no description".
+fn request_description(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Trait for forge provider implementations
@@ -263,6 +277,7 @@ impl ForgeProvider for GitHubForge {
 
         let pr_title = pr["title"].as_str().map(|s| s.to_string());
         let pr_url = pr["html_url"].as_str().map(|s| s.to_string());
+        let pr_body = request_description(&pr["body"]);
 
         let repo_url = payload["repository"]["clone_url"]
             .as_str()
@@ -281,6 +296,7 @@ impl ForgeProvider for GitHubForge {
             pr_number,
             pr_title,
             pr_url,
+            pr_body,
         };
 
         Ok((action, metadata))
@@ -378,6 +394,7 @@ impl ForgeProvider for GitLabForge {
 
         let pr_title = attrs["title"].as_str().map(|s| s.to_string());
         let pr_url = attrs["url"].as_str().map(|s| s.to_string());
+        let pr_body = request_description(&attrs["description"]);
 
         let repo_url = payload["project"]["git_http_url"]
             .as_str()
@@ -396,6 +413,7 @@ impl ForgeProvider for GitLabForge {
             pr_number,
             pr_title,
             pr_url,
+            pr_body,
         };
 
         Ok((action, metadata))
@@ -473,7 +491,7 @@ pub async fn resolve_pull_request(
         .args(["pr", "view", &number.to_string()])
         .args([
             "--json",
-            "number,title,url,baseRefOid,headRefOid,headRepository,headRepositoryOwner",
+            "number,title,url,body,baseRefOid,headRefOid,headRepository,headRepositoryOwner",
         ])
         .kill_on_drop(true)
         .output()
@@ -537,6 +555,7 @@ pub async fn resolve_pull_request(
         pr_number: number,
         pr_title: pr["title"].as_str().map(str::to_string),
         pr_url: pr["url"].as_str().map(str::to_string),
+        pr_body: request_description(&pr["body"]),
     })
 }
 
@@ -826,6 +845,43 @@ mod tests {
         assert_eq!(metadata.head_sha, valid_sha);
     }
 
+    /// The description is what the author says changed since the last
+    /// revision, so it is carried as the review's cover letter. GitHub sends
+    /// null for an empty one; a blank string is the same thing.
+    #[test]
+    fn test_github_parse_payload_carries_the_description() {
+        let forge = GitHubForge;
+        let payload = |body: serde_json::Value| {
+            let payload = serde_json::json!({
+                "action": "synchronize",
+                "pull_request": {
+                    "head": {"sha": "a".repeat(40)},
+                    "base": {"sha": "b".repeat(40)},
+                    "number": 42,
+                    "title": "Fix something",
+                    "body": body,
+                },
+                "repository": {"clone_url": "https://github.com/org/repo.git"}
+            });
+            Bytes::from(serde_json::to_vec(&payload).unwrap())
+        };
+
+        let (_, metadata) = forge
+            .parse_payload(&payload(serde_json::json!(
+                "Changes since v2:\n- register after setup\n"
+            )))
+            .unwrap();
+        assert_eq!(
+            metadata.pr_body.as_deref(),
+            Some("Changes since v2:\n- register after setup")
+        );
+
+        for blank in [serde_json::Value::Null, serde_json::json!("  \r\n ")] {
+            let (_, metadata) = forge.parse_payload(&payload(blank)).unwrap();
+            assert_eq!(metadata.pr_body, None);
+        }
+    }
+
     #[test]
     fn test_gitlab_parse_payload_rejects_invalid_sha() {
         let forge = GitLabForge;
@@ -886,6 +942,30 @@ mod tests {
         let (action, metadata) = forge.parse_payload(&body).unwrap();
         assert_eq!(action, "merge_request");
         assert_eq!(metadata.pr_number, 10);
+        assert_eq!(metadata.pr_body, None, "no description sent, none recorded");
+    }
+
+    #[test]
+    fn test_gitlab_parse_payload_carries_the_description() {
+        let forge = GitLabForge;
+        let valid_sha = "c".repeat(40);
+        let payload = serde_json::json!({
+            "object_kind": "merge_request",
+            "object_attributes": {
+                "last_commit": {"id": &valid_sha},
+                "diff_refs": {"base_sha": &valid_sha},
+                "iid": 10,
+                "title": "Fix bug",
+                "description": "v3: drop the debugfs node."
+            },
+            "project": {"git_http_url": "https://gitlab.com/org/repo.git"}
+        });
+        let body = Bytes::from(serde_json::to_vec(&payload).unwrap());
+        let (_, metadata) = forge.parse_payload(&body).unwrap();
+        assert_eq!(
+            metadata.pr_body.as_deref(),
+            Some("v3: drop the debugfs node.")
+        );
     }
 
     // --- HMAC verification tests ---

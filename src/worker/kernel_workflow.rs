@@ -45,6 +45,10 @@ pub struct KernelReviewState {
     pub cover_letter: Option<String>,
     pub series_range: Option<String>,
     pub follow_up_series_context: Option<String>,
+    /// Findings reported on earlier revisions of the same pull request that
+    /// concern this patch, rendered by `build_prior_review_context`. `None` for
+    /// a first revision and for anything that is not a pull request.
+    pub prior_review_context: Option<String>,
     /// Revision of the reference kernel tree, when one is configured. Its
     /// presence is what marks this review as out-of-tree: the repository has no
     /// mainline history and no kernel headers of its own.
@@ -321,6 +325,21 @@ CRITICAL RULE: If a finding is flagged as pre-existing (`"preexisting": true`), 
 Follow the formatting rules strictly. Do not use markdown headers or ALL CAPS shouting. Ensure the tone is constructive and professional. Do not use backticks to quote any names or expressions.
 
 SPECIFICITY REQUIREMENT: Each inline comment MUST reference the exact function name, file, line number when known, and specific triggering condition. Prefer the finding's `locations` field when present. Do not produce vague summaries like 'potential issue in error handling'. State precisely what goes wrong, where, and under what circumstances. Do not invent line numbers; if the exact line is unavailable, anchor the comment to the nearest verified function or symbol and explain the triggering condition."#;
+
+const PRIOR_REVIEWS_GENERIC_RULES: &str = r#"The findings above were reported on earlier revisions of this pull request. They show where to look again -- in particular at code that was changed in response to them -- but they are not concerns of this review until you confirm them in the current code."#;
+
+const PRIOR_REVIEWS_VERIFICATION_RULES: &str = r#"PRIOR REVISION RULES: The findings above were reported on earlier revisions of this pull request. Use them as follows.
+1. Judge every concern on the current code, by the rules above. That a concern was reported before makes it neither more nor less likely to be valid, and an earlier finding proves nothing about the code in front of you.
+2. REPEAT: If a concern is the same defect as an earlier finding and the current code still has it, report it and add "prior": {"relation": "repeat", "revision": "<the revision it was reported on>", "headline": "<the earlier finding's headline>"}. Say in "problem" that it was reported on an earlier revision and is still present.
+3. FIX REGRESSION: If the code a concern is about was added or changed in response to an earlier finding -- that finding no longer applies, and the change that resolved it is what creates this defect -- report it with "prior": {"relation": "fix_regression", "revision": "<the revision it was reported on>", "headline": "<the earlier finding's headline>"}. In "problem", name the earlier finding and explain how the change made for it causes this one, so the author can see the whole chain. Establish this by comparing the earlier revision's code (its diff above, or its commit if the git tools can still read it) with the current code; similar wording between two findings is not enough.
+4. The series cover letter may say what the author changed since the last revision. Treat that as a claim to check against the code, not as evidence.
+5. Omit "prior" for a finding with no counterpart above. Do not report an earlier finding that no concern in this review raises: this stage validates concerns, it does not revive them.
+"prior" is the only addition to the findings format above; every other key is unchanged."#;
+
+const PRIOR_REVIEWS_REPORT_RULES: &str = r#"PRIOR REVISION RULES: Some findings may carry a "prior" field linking them to a finding reported on an earlier revision of this pull request, listed above.
+- "relation": "repeat" -- begin that inline comment by saying the issue was raised on an earlier revision and is still present, naming the earlier finding by its headline.
+- "relation": "fix_regression" -- begin that inline comment by saying the issue appears to have been introduced by the change made for the earlier finding, naming it by its headline. Any fix you suggest must resolve both this issue and the original one; do not suggest going back to the code the earlier finding was about.
+Findings without a "prior" field are new; do not mention earlier revisions for them."#;
 
 const STAGE_JSON_SCHEMA_EXAMPLE: &str = r#"
 TodoWrite compatibility: vendored prompts may ask you to add tasks or suspected bugs to TodoWrite. Do not call or mention TodoWrite. Treat those instructions as an internal checklist only. If that checklist identifies a concrete suspected bug, carry it forward as a JSON concern with file, function_or_symbol, line when known, triggering condition, and evidence. Do not output generic checklist progress as a concern.
@@ -612,6 +631,9 @@ pub struct AnalysisStage {
     /// Whether the prompt carries the list of patches that follow this one in
     /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
     pub wants_series_context: bool,
+    /// Whether the prompt carries the findings of earlier revisions of the
+    /// same pull request. See [`PRIOR_REVIEWS_PLACEHOLDER`].
+    pub wants_prior_reviews: bool,
 }
 
 pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
@@ -623,6 +645,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "implementation",
@@ -632,6 +655,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "execution-flow",
@@ -641,6 +665,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "resources",
@@ -650,6 +675,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "locking",
@@ -659,6 +685,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "security",
@@ -668,6 +695,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "hardware",
@@ -677,6 +705,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
 ];
 
@@ -690,30 +719,37 @@ pub struct ConsolidationStage {
     /// Whether the prompt carries the list of patches that follow this one in
     /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
     pub wants_series_context: bool,
+    /// Whether the prompt carries the findings of earlier revisions of the
+    /// same pull request. See [`PRIOR_REVIEWS_PLACEHOLDER`].
+    pub wants_prior_reviews: bool,
 }
 
 pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
     name: "deduplication",
     short: "Deduplication",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 pub static CONFLICT_RESOLUTION: ConsolidationStage = ConsolidationStage {
     name: "conflict-resolution",
     short: "Conflict Resolution",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Severity Estimation",
     wants_series_context: true,
+    wants_prior_reviews: true,
 };
 
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
     wants_series_context: false,
+    wants_prior_reviews: true,
 };
 
 /// In the order the workflow runs them. Each builder refers to its own
@@ -751,6 +787,42 @@ fn with_series_context(
         s.follow_up_series_context
             .as_ref()
             .map(|ctx| format!("\n\n{}", ctx))
+            .unwrap_or_default()
+    })
+}
+
+/// Marks where a stage's prompt carries the findings of earlier revisions of
+/// the same pull request.
+///
+/// Verification needs them to tell a repeat, or a problem caused by the fix
+/// for an earlier one, from a new finding; the report needs them to say so to
+/// the author. The analysis stages go without, so what they raise is not
+/// anchored on what was raised last time. Declared in the stage tables for the
+/// same reason as [`SERIES_CONTEXT_PLACEHOLDER`].
+pub const PRIOR_REVIEWS_PLACEHOLDER: &str = "{{prior_review_section}}";
+
+fn prior_reviews_placeholder(wants: bool) -> &'static str {
+    if wants { PRIOR_REVIEWS_PLACEHOLDER } else { "" }
+}
+
+/// Fills [`PRIOR_REVIEWS_PLACEHOLDER`] with the earlier findings followed by
+/// how this stage is to use them. Both are left out when there is no history,
+/// so a first revision's prompt is exactly what it would otherwise be.
+///
+/// Registered after every other variable: the findings are model-written text,
+/// and no variable substituted later may scan them for placeholders.
+fn with_prior_reviews(
+    template: PromptTemplate<KernelReviewState>,
+    wants: bool,
+    rules: &'static str,
+) -> PromptTemplate<KernelReviewState> {
+    if !wants {
+        return template;
+    }
+    template.with_var("prior_review_section", move |s: &KernelReviewState| {
+        s.prior_review_context
+            .as_ref()
+            .map(|ctx| format!("{ctx}\n\n{rules}"))
             .unwrap_or_default()
     })
 }
@@ -835,15 +907,21 @@ fn analysis_stage(
     temperature: f32,
 ) -> Box<dyn ExecutableStage<KernelReviewState>> {
     let mut user_template = PromptTemplate::<KernelReviewState>::new(format!(
-        "{}\n\n{}{}",
+        "{}\n\n{}{}{}",
         def.instruction,
         STAGE_JSON_SCHEMA_EXAMPLE,
-        series_context_placeholder(def.wants_series_context)
+        series_context_placeholder(def.wants_series_context),
+        prior_reviews_placeholder(def.wants_prior_reviews)
     ));
     for guide in def.guides {
         user_template = user_template.include_file(*guide);
     }
     let user_template = with_series_context(user_template, def.wants_series_context);
+    let user_template = with_prior_reviews(
+        user_template,
+        def.wants_prior_reviews,
+        PRIOR_REVIEWS_GENERIC_RULES,
+    );
 
     Box::new(
         Stage::builder(def.name)
@@ -909,9 +987,10 @@ pub fn deduplication_stage(
     max_turns: usize,
     temperature: f32,
 ) -> Stage<KernelReviewState, StageConcernsOutput> {
+    let prior_reviews = prior_reviews_placeholder(DEDUPLICATION.wants_prior_reviews);
     Stage::builder(DEDUPLICATION.name)
         .system_prompt(kernel_system_prompt(true))
-        .user_prompt(
+        .user_prompt(with_prior_reviews(
             PromptTemplate::<KernelReviewState>::new(format!(
                 r#"{STAGE_DEDUPLICATION_INSTRUCTION}
 
@@ -963,7 +1042,7 @@ Example Output:
     }}
   ]
 }}
-```"#
+```{prior_reviews}"#
             ))
             .with_var("aggregated_concerns", |s: &KernelReviewState| {
                 serde_json::to_string_pretty(&s.all_concerns).unwrap_or_default()
@@ -971,7 +1050,9 @@ Example Output:
             .with_var("aggregated_dismissed_concerns", |s: &KernelReviewState| {
                 serde_json::to_string_pretty(&s.all_dismissed_concerns).unwrap_or_default()
             }),
-        )
+            DEDUPLICATION.wants_prior_reviews,
+            PRIOR_REVIEWS_GENERIC_RULES,
+        ))
         .output_format(
             OutputFormat::json()
                 .with_validator(validate_concerns_output)
@@ -998,9 +1079,10 @@ pub fn conflict_resolution_stage(
     max_turns: usize,
     temperature: f32,
 ) -> Stage<KernelReviewState, ConflictResolutionOutput> {
+    let prior_reviews = prior_reviews_placeholder(CONFLICT_RESOLUTION.wants_prior_reviews);
     Stage::builder(CONFLICT_RESOLUTION.name)
         .system_prompt(kernel_system_prompt(true))
-        .user_prompt(
+        .user_prompt(with_prior_reviews(
             PromptTemplate::<KernelReviewState>::new(format!(
                 r#"{STAGE_CONFLICT_RESOLUTION_INSTRUCTION}
 
@@ -1034,7 +1116,7 @@ Example Output:
     }}
   ]
 }}
-```"#
+```{prior_reviews}"#
             ))
             .with_var("deduplicated_concerns", |s: &KernelReviewState| {
                 serde_json::to_string_pretty(&s.deduplicated_concerns).unwrap_or_default()
@@ -1042,7 +1124,9 @@ Example Output:
             .with_var("deduplicated_dismissed_concerns", |s: &KernelReviewState| {
                 serde_json::to_string_pretty(&s.deduplicated_dismissed_concerns).unwrap_or_default()
             }),
-        )
+            CONFLICT_RESOLUTION.wants_prior_reviews,
+            PRIOR_REVIEWS_GENERIC_RULES,
+        ))
         .output_format(OutputFormat::json())
         .policy(StagePolicy {
             tools: ToolScope::All,
@@ -1065,9 +1149,12 @@ pub fn verification_stage(
     temperature: f32,
 ) -> Stage<KernelReviewState, VerificationOutput> {
     let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
+    // After the findings format rather than beside the series context: the
+    // rules add a key to that format, so they have to be read after it.
+    let prior_reviews = prior_reviews_placeholder(VERIFICATION.wants_prior_reviews);
     Stage::builder(VERIFICATION.name)
         .system_prompt(kernel_system_prompt(true))
-        .user_prompt(with_series_context(
+        .user_prompt(with_prior_reviews(with_series_context(
             PromptTemplate::<KernelReviewState>::new(format!(
                 r#"{STAGE_VERIFICATION_INSTRUCTION}
 
@@ -1100,7 +1187,7 @@ Example Output:
     }}
   ]
 }}
-```"#
+```{prior_reviews}"#
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
@@ -1108,6 +1195,9 @@ Example Output:
                 serde_json::to_string_pretty(&s.conflict_resolved_concerns).unwrap_or_default()
             }),
             VERIFICATION.wants_series_context,
+        ),
+            VERIFICATION.wants_prior_reviews,
+            PRIOR_REVIEWS_VERIFICATION_RULES,
         ))
         .output_format(OutputFormat::json())
         .policy(StagePolicy {
@@ -1127,11 +1217,12 @@ Example Output:
 }
 
 pub fn report_stage(max_turns: usize, temperature: f32) -> Stage<KernelReviewState, String> {
+    let prior_reviews = prior_reviews_placeholder(REPORT.wants_prior_reviews);
     Stage::builder(REPORT.name)
         .system_prompt(kernel_system_prompt(true))
-        .user_prompt(
+        .user_prompt(with_prior_reviews(
             PromptTemplate::<KernelReviewState>::new(format!(
-                r#"{STAGE_REPORT_INSTRUCTION}
+                r#"{STAGE_REPORT_INSTRUCTION}{prior_reviews}
 
 Findings:
 {{{{findings}}}}
@@ -1142,7 +1233,9 @@ Return raw text output, not JSON."#
             .with_var("findings", |s: &KernelReviewState| {
                 serde_json::to_string_pretty(&s.findings).unwrap_or_default()
             }),
-        )
+            REPORT.wants_prior_reviews,
+            PRIOR_REVIEWS_REPORT_RULES,
+        ))
         .output_format(OutputFormat::text_with_validator(
             validate_inline_format,
             format_inline_feedback,
@@ -1277,6 +1370,94 @@ mod tests {
         // and the variable together, never one without the other.
         for def in ANALYSIS_STAGES {
             assert!(!def.wants_series_context, "{} does not use it", def.name);
+        }
+    }
+
+    #[test]
+    fn test_prior_reviews_reach_verification_and_report_only() {
+        // Verification tells repeats and fix regressions from new findings; the
+        // report tells the author. The analysts go without, so what they raise
+        // is not anchored on what was raised last time.
+        for def in CONSOLIDATION_STAGES {
+            assert_eq!(
+                def.wants_prior_reviews,
+                matches!(def.name, "verification" | "report"),
+                "{}",
+                def.name
+            );
+        }
+        for def in ANALYSIS_STAGES {
+            assert!(!def.wants_prior_reviews, "{} does not use it", def.name);
+        }
+        assert_eq!(prior_reviews_placeholder(true), PRIOR_REVIEWS_PLACEHOLDER);
+        assert_eq!(prior_reviews_placeholder(false), "");
+    }
+
+    /// A first revision's prompts carry no trace of the feature: no section,
+    /// no rules, and no placeholder left unfilled.
+    #[test]
+    fn test_prior_reviews_render_nothing_without_history() {
+        let state = KernelReviewState::default();
+        for prompt in [
+            verification_stage(10, 0.0)
+                .user_prompt
+                .render_for_log(&state),
+            report_stage(10, 0.0).user_prompt.render_for_log(&state),
+            deduplication_stage(10, 0.0)
+                .user_prompt
+                .render_for_log(&state),
+            conflict_resolution_stage(10, 0.0)
+                .user_prompt
+                .render_for_log(&state),
+        ] {
+            assert!(!prompt.contains("prior_review_section"));
+            assert!(!prompt.contains("PRIOR REVISION RULES"));
+            assert!(!prompt.contains("\"prior\""));
+        }
+    }
+
+    #[test]
+    fn test_prior_reviews_render_with_each_stages_own_rules() {
+        let state = KernelReviewState {
+            prior_review_context: Some(
+                "\n\n=== Findings From Earlier Revisions of This Pull Request ===\n1. [High] X"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        let verification = verification_stage(10, 0.0)
+            .user_prompt
+            .render_for_log(&state);
+        let section = verification
+            .find("=== Findings From Earlier Revisions")
+            .expect("verification sees the history");
+        assert!(
+            section > verification.find("Example Output:").unwrap(),
+            "the rules add a key to the findings format, so they follow it"
+        );
+        assert!(verification.contains(PRIOR_REVIEWS_VERIFICATION_RULES));
+        for relation in [
+            "\"relation\": \"repeat\"",
+            "\"relation\": \"fix_regression\"",
+        ] {
+            assert!(verification.contains(relation), "{relation}");
+        }
+
+        let report = report_stage(10, 0.0).user_prompt.render_for_log(&state);
+        assert!(report.contains("=== Findings From Earlier Revisions"));
+        assert!(report.contains(PRIOR_REVIEWS_REPORT_RULES));
+        assert!(!report.contains(PRIOR_REVIEWS_VERIFICATION_RULES));
+
+        for prompt in [
+            deduplication_stage(10, 0.0)
+                .user_prompt
+                .render_for_log(&state),
+            conflict_resolution_stage(10, 0.0)
+                .user_prompt
+                .render_for_log(&state),
+        ] {
+            assert!(!prompt.contains("=== Findings From Earlier Revisions"));
         }
     }
 

@@ -320,6 +320,7 @@ Sashiko processes the following fields from GitHub's `pull_request` webhook:
   "pull_request": {
     "number": 123,
     "title": "Fix memory leak in driver",
+    "body": "Changes since the last push: ...",
     "html_url": "https://github.com/owner/repo/pull/123",
     "head": {
       "sha": "abc123..."
@@ -332,6 +333,16 @@ Sashiko processes the following fields from GitHub's `pull_request` webhook:
 ```
 
 Supported actions: `opened`, `reopened`, `synchronize` (new commits pushed)
+
+`body`, the pull request's description, is reviewed as the series cover letter:
+context for what the change intends, not code to review. It is recorded per
+revision, so each review sees the description as it stood when that push was
+made.
+
+`html_url` is also what links the revisions of one pull request. When a PR is
+force-pushed, the new revision's review is given the findings reported on
+earlier revisions, so it can say which problems are still present and which
+were introduced by the fix for an earlier finding.
 
 ## See Also
 
