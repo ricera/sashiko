@@ -77,6 +77,12 @@ pub enum WorkflowEvent {
         /// work has already been handed out.
         output: serde_json::Value,
     },
+    /// A stage was not run: its output from an earlier run was folded into the
+    /// state instead. Carries that output, so it is kept again with this run's.
+    StageReplayed {
+        stage_name: &'static str,
+        output: serde_json::Value,
+    },
     /// A dynamic fan-out resolved the stages it will run. Emitted whether or
     /// not the planning stage ran, so a skipped planner still reports a plan.
     ParallelResolved { stage_names: Vec<&'static str> },

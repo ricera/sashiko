@@ -176,6 +176,14 @@ enum Commands {
         /// beside it that timed out.
         #[arg(long)]
         skip_reviewed: bool,
+
+        /// Like --skip-reviewed, but each patch picks up where its last
+        /// unfinished review stopped: the stages that review completed are
+        /// reused, and only the rest run, with a fresh timeout. A patch with no
+        /// saved stages, or whose baseline, model or provider has changed since,
+        /// starts over.
+        #[arg(long)]
+        resume: bool,
     },
     /// Cancel a pending review
     Cancel {
@@ -353,11 +361,14 @@ async fn run_command(
             id,
             pr,
             skip_reviewed,
+            resume,
         } => match (id, pr) {
             (_, Some(number)) => {
-                handle_pr_review(client, base_url, number, skip_reviewed, format).await
+                handle_pr_review(client, base_url, number, skip_reviewed, resume, format).await
             }
-            (Some(id), None) => handle_rerun(client, base_url, id, skip_reviewed, format).await,
+            (Some(id), None) => {
+                handle_rerun(client, base_url, id, skip_reviewed, resume, format).await
+            }
             (None, None) => Err(anyhow::anyhow!(
                 "Give a patchset id or --pr <number>: `sashiko-cli rerun 42` or `sashiko-cli rerun --pr 20`"
             )),
@@ -410,7 +421,7 @@ async fn handle_submit(
     {
         // A submit asks for the pull request to be reviewed, so it reviews all
         // of it. Skipping what is already done is a rerun's business.
-        return handle_pr_review(client, base_url, number, false, format).await;
+        return handle_pr_review(client, base_url, number, false, false, format).await;
     }
 
     let url = format!("{}/api/submit", base_url);
@@ -996,21 +1007,29 @@ fn stage_row(entry: &Value, live: bool) -> String {
 ///
 /// With one stage there is nothing to overlap and nothing to sum.
 fn stage_breakdown_note(stages: &[&Value]) -> String {
+    // A reused stage ran in an earlier review, so its zero seconds say nothing
+    // about this one and would drag the summary toward it.
+    let reused = stages.iter().filter(|s| s["reused"] == true).count();
     let seconds: Vec<u64> = stages
         .iter()
+        .filter(|s| s["reused"] != true)
         .map(|s| s["seconds"].as_u64().unwrap_or(0))
         .collect();
 
-    if seconds.len() == 1 {
-        return format!("1 stage, {}", format_duration(seconds[0]));
+    let ran = match seconds.len() {
+        0 => "no stage ran".to_string(),
+        1 => format!("1 stage, {}", format_duration(seconds[0])),
+        n => format!(
+            "{} stages overlapping: longest {}, {} summed",
+            n,
+            format_duration(seconds.iter().copied().max().unwrap_or(0)),
+            format_duration(seconds.iter().sum())
+        ),
+    };
+    match reused {
+        0 => ran,
+        n => format!("{}; {} reused", ran, n),
     }
-
-    format!(
-        "{} stages overlapping: longest {}, {} summed",
-        seconds.len(),
-        format_duration(seconds.iter().copied().max().unwrap_or(0)),
-        format_duration(seconds.iter().sum())
-    )
 }
 
 /// Per-patch stage tables, mirroring the web card.
@@ -1037,7 +1056,11 @@ fn print_patch_timings(patches: &[Value], reviews: &[&Value], activity: Option<&
         let live_entries = activity
             .and_then(|a| a.by_patch.get(&p_id))
             .filter(|e| !e.is_empty());
-        let recorded = find_best_review_for_patch_refs(p_id, reviews)
+        let best = find_best_review_for_patch_refs(p_id, reviews);
+        if let Some(from) = best.and_then(|r| r["resumed_from"].as_i64()) {
+            println!("    resumed from review {}", from);
+        }
+        let recorded = best
             .and_then(|r| r.get("stage_durations"))
             .and_then(|d| d.as_array())
             .filter(|d| !d.is_empty());
@@ -1066,6 +1089,7 @@ fn print_patch_timings(patches: &[Value], reviews: &[&Value], activity: Option<&
                 println!("    {:<20} {:>10}  {:>12}", "STAGE", "ELAPSED", "TURNS");
                 for st in &stages {
                     let turns = match st["turns"].as_u64().unwrap_or(0) {
+                        _ if st["reused"] == true => "reused".to_string(),
                         0 => "—".to_string(),
                         1 => "1 turn".to_string(),
                         n => format!("{} turns", n),
@@ -1867,11 +1891,12 @@ async fn handle_rerun(
     base_url: &str,
     id: i64,
     skip_reviewed: bool,
+    resume: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let url = format!(
-        "{}/api/patchset/rerun?id={}&skip_reviewed={}",
-        base_url, id, skip_reviewed
+        "{}/api/patchset/rerun?id={}&skip_reviewed={}&resume={}",
+        base_url, id, skip_reviewed, resume
     );
     let resp = client.post(&url).send().await?;
 
@@ -1885,7 +1910,13 @@ async fn handle_rerun(
                 // would hide a refused rerun.
                 if result["status"] == "accepted" {
                     print_colored(Color::Green, "Rerun queued: ");
-                    if skip_reviewed {
+                    if resume {
+                        println!(
+                            "Patchset {} requeued; patches already reviewed will be skipped.",
+                            id
+                        );
+                        print_resume_count(&result);
+                    } else if skip_reviewed {
                         println!(
                             "Patchset {} requeued; patches already reviewed will be skipped.",
                             id
@@ -1961,11 +1992,12 @@ async fn handle_pr_review(
     base_url: &str,
     number: i64,
     skip_reviewed: bool,
+    resume: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let url = format!(
-        "{}/api/pr/review?number={}&skip_reviewed={}",
-        base_url, number, skip_reviewed
+        "{}/api/pr/review?number={}&skip_reviewed={}&resume={}",
+        base_url, number, skip_reviewed, resume
     );
     let resp = client.post(&url).send().await?;
 
@@ -1989,6 +2021,9 @@ async fn handle_pr_review(
                 Some("accepted") => {
                     print_colored(Color::Green, "Queued: ");
                     println!("{}", message.unwrap_or("Pull request queued for review."));
+                    if resume {
+                        print_resume_count(&result);
+                    }
                 }
                 _ => {
                     print_colored(Color::Yellow, "Not queued: ");
@@ -2010,6 +2045,25 @@ async fn handle_pr_review(
     }
 
     Ok(())
+}
+
+/// Says how many patches a queued resume will pick up rather than restart,
+/// since a patch with nothing saved starts over without any other sign.
+fn print_resume_count(result: &serde_json::Value) {
+    let Some(n) = result["resuming"].as_i64() else {
+        return;
+    };
+    if n == 0 {
+        print_colored(Color::Yellow, "Nothing saved: ");
+        println!("no unreviewed patch has completed stages to resume from; they start over.");
+    } else {
+        println!(
+            "  {} patch{} resume{} from saved stages; any other unreviewed patch starts over.",
+            n,
+            if n == 1 { "" } else { "es" },
+            if n == 1 { "s" } else { "" }
+        );
+    }
 }
 
 async fn handle_cancel(
@@ -2179,6 +2233,7 @@ async fn handle_local(
             cover_letter: None,
             patches,
             prior_revisions: None,
+            resume_stage_outputs: None,
         };
 
         let review_json =

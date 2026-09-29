@@ -39,6 +39,22 @@ pub enum RerunScope {
     /// or produced findings without completing. A patch that was reviewed is
     /// left alone, along with the hours it cost.
     Unreviewed,
+    /// The same patches as `Unreviewed`, but each picks up from the stages its
+    /// last unfinished review completed instead of starting over. A patch with
+    /// nothing saved starts over.
+    Resume,
+}
+
+/// Stage outputs a pending review was queued to resume from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumeSeed {
+    /// The review the outputs were saved by.
+    pub from: i64,
+    /// Stage name to that stage's output.
+    pub outputs: serde_json::Value,
+    /// The outputs were produced by another build of Sashiko. Allowed, since
+    /// resuming is asked for, but worth saying: its prompts may have differed.
+    pub other_build: bool,
 }
 
 /// What a rerun request did.
@@ -696,6 +712,9 @@ impl Database {
             .await;
         let _ = self
             .try_add_column("reviews", "stage_outputs", "TEXT")
+            .await;
+        let _ = self
+            .try_add_column("reviews", "resumed_from", "INTEGER")
             .await;
         let _ = self
             .try_add_column("patchsets", "review_duration_seconds", "INTEGER")
@@ -1426,6 +1445,188 @@ impl Database {
                 libsql::params![stage, output.to_string(), review_id],
             )
             .await?;
+        Ok(())
+    }
+
+    /// The stage outputs a pending review was queued to resume from, if they
+    /// still fit the review about to run.
+    ///
+    /// They fit when the patch is applied to the same baseline and reviewed by
+    /// the same model through the same provider: saved stages are that model's
+    /// reading of that code, and replayed under anything else they would be
+    /// presented as a review nobody ran. A different build is allowed and
+    /// flagged. When they do not fit, the row forgets where it came from, so it
+    /// is not later presented as a resume.
+    pub async fn take_resume_seed(
+        &self,
+        review_id: i64,
+        baseline_id: Option<i64>,
+        model: &str,
+        provider: &str,
+        prompts_hash: Option<&str>,
+    ) -> Result<Option<ResumeSeed>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT resumed_from, stage_outputs, baseline_id, model, provider, prompts_hash
+                 FROM reviews WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let (Some(from), Some(outputs)) = (
+            row.get::<Option<i64>>(0)?,
+            row.get::<Option<String>>(1)?
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+        ) else {
+            return Ok(None);
+        };
+        let saved_baseline = row.get::<Option<i64>>(2)?;
+        let saved_model = row.get::<Option<String>>(3)?;
+        let saved_provider = row.get::<Option<String>>(4)?;
+        let saved_hash = row.get::<Option<String>>(5)?;
+
+        let mut mismatches = Vec::new();
+        if saved_baseline != baseline_id {
+            mismatches.push(format!(
+                "baseline {:?} is now {:?}",
+                saved_baseline, baseline_id
+            ));
+        }
+        if saved_model.as_deref() != Some(model) {
+            mismatches.push(format!("model {:?} is now {:?}", saved_model, model));
+        }
+        if saved_provider.as_deref() != Some(provider) {
+            mismatches.push(format!(
+                "provider {:?} is now {:?}",
+                saved_provider, provider
+            ));
+        }
+        if !mismatches.is_empty() {
+            tracing::warn!(
+                "Review {} will not resume from review {}: {}; starting over",
+                review_id,
+                from,
+                mismatches.join(", ")
+            );
+            self.conn
+                .execute(
+                    "UPDATE reviews SET resumed_from = NULL WHERE id = ?",
+                    libsql::params![review_id],
+                )
+                .await?;
+            return Ok(None);
+        }
+
+        Ok(Some(ResumeSeed {
+            from,
+            outputs,
+            other_build: saved_hash.as_deref() != prompts_hash,
+        }))
+    }
+
+    /// Records which review a review resumed from. Set on every attempt of a
+    /// resumed review, since each stands on the same saved stages.
+    pub async fn set_review_resumed_from(&self, review_id: i64, from: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET resumed_from = ? WHERE id = ?",
+                libsql::params![from, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Pending reviews of this patchset that were queued to resume, which is
+    /// how many patches a resume request will pick up rather than restart.
+    pub async fn count_resuming_reviews(&self, patchset_id: i64) -> Result<i64> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM reviews
+                 WHERE patchset_id = ? AND status = 'Pending' AND resumed_from IS NOT NULL",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get(0)?),
+            None => Ok(0),
+        }
+    }
+
+    /// Queues each unreviewed patch of a patchset to resume from its newest
+    /// saved stages.
+    ///
+    /// The saved outputs are copied onto the pending review the reviewer will
+    /// pick up, together with what they were produced under, rather than read
+    /// from their source later: a timed-out source is exactly the kind of row a
+    /// rerun deletes, and one left in place would stop the patch being reviewed
+    /// at all (see [`Self::has_failed_review`]).
+    async fn queue_resumes(&self, patchset_id: i64) -> Result<()> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT r.patch_id, r.id FROM reviews r
+                 WHERE r.patchset_id = ? AND r.patch_id IS NOT NULL
+                   AND r.id = (
+                       SELECT MAX(s.id) FROM reviews s
+                       WHERE s.patch_id = r.patch_id AND s.stage_outputs IS NOT NULL
+                         AND s.status IN ('Failed', 'Cancelled')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reviews ok
+                       WHERE ok.patch_id = r.patch_id AND ok.status = 'Reviewed'
+                   )",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut sources = Vec::new();
+        while let Some(row) = rows.next().await? {
+            sources.push((row.get::<i64>(0)?, row.get::<i64>(1)?));
+        }
+
+        for (patch_id, source) in sources {
+            // A row an interrupted run left pending is the one the reviewer
+            // will pick up, so the checkpoint goes there instead of beside it.
+            match self
+                .get_pending_review_id(patchset_id, Some(patch_id))
+                .await?
+            {
+                Some(pending) => {
+                    self.conn
+                        .execute(
+                            "UPDATE reviews SET
+                                 stage_outputs = src.stage_outputs, resumed_from = src.id,
+                                 baseline_id = src.baseline_id, prompts_hash = src.prompts_hash,
+                                 model = src.model, provider = src.provider
+                             FROM (SELECT * FROM reviews WHERE id = ?) AS src
+                             WHERE reviews.id = ?",
+                            libsql::params![source, pending],
+                        )
+                        .await?;
+                }
+                None => {
+                    self.conn
+                        .execute(
+                            "INSERT INTO reviews (patchset_id, patch_id, status, created_at, provider,
+                                                  model, baseline_id, prompts_hash, stage_outputs,
+                                                  resumed_from)
+                             SELECT patchset_id, patch_id, 'Pending', ?, provider, model,
+                                    baseline_id, prompts_hash, stage_outputs, id
+                             FROM reviews WHERE id = ?",
+                            libsql::params![
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)?
+                                    .as_secs() as i64,
+                                source
+                            ],
+                        )
+                        .await?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3671,7 +3872,8 @@ impl Database {
                 "SELECT r.summary, r.created_at, ai.input_context, ai.output_raw, 
                         r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.stage_failures, r.attempt, r.duration_seconds, r.stage_durations,
                         (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id) AS tool_calls,
-                        (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id AND tu.repo = 'kernel') AS reference_tool_calls
+                        (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id AND tu.repo = 'kernel') AS reference_tool_calls,
+                        r.resumed_from
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -3712,6 +3914,8 @@ impl Database {
                     // The two answer different questions.
                     "tool_calls": r.get::<i64>(17).ok(),
                     "reference_tool_calls": r.get::<i64>(18).ok(),
+                    // The review whose saved stages this one picked up from.
+                    "resumed_from": r.get::<Option<i64>>(19).ok().flatten(),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -3932,7 +4136,8 @@ impl Database {
                 "SELECT r.summary, r.created_at, ai.output_raw, 
                         r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.stage_failures, r.attempt, r.duration_seconds, r.stage_durations,
                         (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id) AS tool_calls,
-                        (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id AND tu.repo = 'kernel') AS reference_tool_calls
+                        (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id AND tu.repo = 'kernel') AS reference_tool_calls,
+                        r.resumed_from
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -3972,6 +4177,8 @@ impl Database {
                     // the reference kernel rather than at the code under review.
                     "tool_calls": r.get::<i64>(15).ok(),
                     "reference_tool_calls": r.get::<i64>(16).ok(),
+                    // The review whose saved stages this one picked up from.
+                    "resumed_from": r.get::<Option<i64>>(17).ok().flatten(),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -4203,7 +4410,7 @@ impl Database {
                         b.repo_url, b.branch, b.last_known_commit,
                         r.provider, r.prompts_hash, r.result_description,
                         r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached,
-                        r.stage_outputs
+                        r.stage_outputs, r.resumed_from
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -4240,6 +4447,7 @@ impl Database {
                 // to see and far more than a list of reviews needs.
                 "stage_outputs": r.get::<Option<String>>(19).ok().flatten()
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                "resumed_from": r.get::<Option<i64>>(20).ok().flatten(),
             })))
         } else {
             Ok(None)
@@ -4884,7 +5092,7 @@ impl Database {
         // patchset would go Pending, skip every patch, and return to a terminal
         // state having reviewed nothing -- which looks identical to a rerun that
         // worked.
-        if scope == RerunScope::Unreviewed && self.count_unreviewed_patches(id).await? == 0 {
+        if scope != RerunScope::All && self.count_unreviewed_patches(id).await? == 0 {
             return Ok(RerunOutcome::NothingToDo);
         }
 
@@ -4909,7 +5117,7 @@ impl Database {
                     )
                     .await?;
             }
-            RerunScope::Unreviewed => {
+            RerunScope::Unreviewed | RerunScope::Resume => {
                 self.conn
                     .execute(
                         "UPDATE patchsets SET status = 'Pending' WHERE id = ?",
@@ -4960,6 +5168,12 @@ impl Database {
                     libsql::params![max_successful + 1, id],
                 )
                 .await?;
+        }
+
+        // 3. Carry each resuming patch's saved stages forward before step 4
+        // deletes the failed review they were saved on.
+        if scope == RerunScope::Resume {
+            self.queue_resumes(id).await?;
         }
 
         // 4. Delete associated tool usages and findings for failed reviews that block retrying
@@ -6123,6 +6337,280 @@ mod tests {
                 "rerun must always ask for one more pass than already achieved"
             );
         }
+    }
+
+    /// A patchset with one patch that timed out after saving stages, one that
+    /// failed with nothing saved, and one that was reviewed.
+    async fn resumable_patchset(db: &Arc<Database>) -> (i64, i64, i64, i64, i64, i64) {
+        let base = db
+            .create_baseline(None, Some("main"), Some("aaaa"))
+            .await
+            .unwrap();
+        let thread_id = db.create_thread("rs", "Subject", 1000).await.unwrap();
+        for m in ["rs1", "rs2", "rs3"] {
+            db.create_message(
+                m, thread_id, None, "A", "Subject", 1000, "Body", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "rs", "Subject", "A", 1000, 3, 3, "", "", None, 3, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let timed_out = db.create_patch(ps_id, "rs1", 1, "diff").await.unwrap();
+        let bare_failure = db.create_patch(ps_id, "rs2", 2, "diff").await.unwrap();
+        let reviewed = db.create_patch(ps_id, "rs3", 3, "diff").await.unwrap();
+
+        let source = db
+            .create_review(
+                ps_id,
+                Some(timed_out),
+                "claude",
+                "opus",
+                Some(base),
+                Some("build-a"),
+            )
+            .await
+            .unwrap();
+        db.record_review_stage_output(source, "hardware", &json!({"concerns": [1]}))
+            .await
+            .unwrap();
+        db.record_review_stage_output(source, "deduplication", &json!({"concerns": [1]}))
+            .await
+            .unwrap();
+        // What a worker killed at its deadline leaves: Failed, no interaction.
+        db.complete_review(
+            source,
+            "Failed",
+            "Tool error: timed out",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let bare = db
+            .create_review(
+                ps_id,
+                Some(bare_failure),
+                "claude",
+                "opus",
+                Some(base),
+                Some("build-a"),
+            )
+            .await
+            .unwrap();
+        db.complete_review(bare, "Failed", "Tool error: spawn", None, None, None, None)
+            .await
+            .unwrap();
+
+        let ok = db
+            .create_review(
+                ps_id,
+                Some(reviewed),
+                "claude",
+                "opus",
+                Some(base),
+                Some("build-a"),
+            )
+            .await
+            .unwrap();
+        db.complete_review(ok, "Reviewed", "done", None, None, None, None)
+            .await
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Failed' WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+
+        (ps_id, timed_out, bare_failure, reviewed, source, base)
+    }
+
+    /// A resume carries the saved stages onto the review that will run, and
+    /// clears the way for it: the timed-out review they came from would
+    /// otherwise stop the patch being reviewed at all.
+    #[tokio::test]
+    async fn test_resume_rerun_moves_saved_stages_onto_a_pending_review() {
+        let db = setup_db().await;
+        let (ps_id, timed_out, bare_failure, reviewed, source, _) = resumable_patchset(&db).await;
+
+        assert_eq!(
+            db.rerun_patchset(ps_id, RerunScope::Resume).await.unwrap(),
+            RerunOutcome::Queued
+        );
+
+        let pending = db
+            .get_pending_review_id(ps_id, Some(timed_out))
+            .await
+            .unwrap()
+            .expect("the resuming patch has a review waiting");
+        let details = db.get_review_details(pending).await.unwrap().unwrap();
+        assert_eq!(details["resumed_from"], source);
+        assert_eq!(
+            details["stage_outputs"],
+            json!({"hardware": {"concerns": [1]}, "deduplication": {"concerns": [1]}})
+        );
+        assert!(
+            !db.has_failed_review(ps_id, timed_out, None).await.unwrap(),
+            "the timed-out review must not block the resume"
+        );
+
+        // Nothing saved: redone from scratch, as --skip-reviewed would.
+        assert!(
+            db.get_pending_review_id(ps_id, Some(bare_failure))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !db.has_failed_review(ps_id, bare_failure, None)
+                .await
+                .unwrap()
+        );
+        // Reviewed: left alone.
+        assert!(
+            db.get_pending_review_id(ps_id, Some(reviewed))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.count_resuming_reviews(ps_id).await.unwrap(), 1);
+    }
+
+    /// A patch can already have a review waiting -- one an interrupted run left
+    /// pending. That is the row the reviewer will pick up, so the saved stages
+    /// go onto it rather than onto a second one it would never reach.
+    #[tokio::test]
+    async fn test_resume_reuses_a_review_already_waiting() {
+        let db = setup_db().await;
+        let (ps_id, timed_out, _, _, source, _) = resumable_patchset(&db).await;
+        let waiting = db
+            .create_review(ps_id, Some(timed_out), "claude", "stale-model", None, None)
+            .await
+            .unwrap();
+
+        db.rerun_patchset(ps_id, RerunScope::Resume).await.unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT id FROM reviews WHERE patch_id = ? AND status = 'Pending'",
+                libsql::params![timed_out],
+            )
+            .await
+            .unwrap();
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            pending.push(row.get::<i64>(0).unwrap());
+        }
+        assert_eq!(pending, vec![waiting]);
+
+        let details = db.get_review_details(waiting).await.unwrap().unwrap();
+        assert_eq!(details["resumed_from"], source);
+        assert!(details["stage_outputs"]["hardware"].is_object());
+        // What the stages were produced under travels with them, so the check
+        // before running compares against the source, not the stale row.
+        assert_eq!(details["model"], "opus");
+    }
+
+    /// Saved stages are one model's reading of one tree. Replayed on another
+    /// baseline, model or provider they would be passed off as a review that
+    /// never ran, so the patch starts over; another build is allowed, and said.
+    #[tokio::test]
+    async fn test_resume_seed_is_only_taken_by_the_review_it_fits() {
+        let db = setup_db().await;
+        let (ps_id, timed_out, _, _, source, base) = resumable_patchset(&db).await;
+        let other_base = db
+            .create_baseline(None, Some("main"), Some("bbbb"))
+            .await
+            .unwrap();
+        db.rerun_patchset(ps_id, RerunScope::Resume).await.unwrap();
+        let pending = db
+            .get_pending_review_id(ps_id, Some(timed_out))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let seed = db
+            .take_resume_seed(pending, Some(base), "opus", "claude", Some("build-a"))
+            .await
+            .unwrap()
+            .expect("same baseline, model and provider");
+        assert_eq!(seed.from, source);
+        assert!(seed.outputs["hardware"].is_object());
+        assert!(!seed.other_build);
+
+        let seed = db
+            .take_resume_seed(pending, Some(base), "opus", "claude", Some("build-b"))
+            .await
+            .unwrap()
+            .expect("another build still resumes");
+        assert!(seed.other_build);
+
+        for (baseline, model, provider) in [
+            (Some(other_base), "opus", "claude"),
+            (Some(base), "sonnet", "claude"),
+            (Some(base), "opus", "gemini"),
+        ] {
+            // Each miss forgets the source, so set it back for the next case.
+            db.set_review_resumed_from(pending, source).await.unwrap();
+            assert!(
+                db.take_resume_seed(pending, baseline, model, provider, Some("build-a"))
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{baseline:?}/{model}/{provider} must not resume"
+            );
+            let details = db.get_review_details(pending).await.unwrap().unwrap();
+            assert!(
+                details["resumed_from"].is_null(),
+                "a review that starts over must not claim to be a resume"
+            );
+        }
+    }
+
+    /// Resuming, like skipping the reviewed patches, has nothing to do once
+    /// every patch is reviewed -- and says so instead of queueing nothing.
+    #[tokio::test]
+    async fn test_resume_with_every_patch_reviewed_is_nothing_to_do() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("rn", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "rn1", thread_id, None, "A", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "rn", "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let p_id = db.create_patch(ps_id, "rn1", 1, "diff").await.unwrap();
+        let r = db
+            .create_review(ps_id, Some(p_id), "claude", "opus", None, None)
+            .await
+            .unwrap();
+        db.complete_review(r, "Reviewed", "done", None, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.rerun_patchset(ps_id, RerunScope::Resume).await.unwrap(),
+            RerunOutcome::NothingToDo
+        );
     }
 
     #[tokio::test]

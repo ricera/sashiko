@@ -1389,6 +1389,46 @@ impl Reviewer {
             .get_pending_review_id(patchset_id, Some(patch_id))
             .await?;
 
+        // A rerun that asked to resume left this patch's saved stages on the
+        // pending row. Read once, before the first attempt clears the row's
+        // outputs, and kept for every attempt: the resume was asked for, and a
+        // retry that started over would quietly undo it.
+        let resume = match existing_pending_review_id {
+            Some(pending) => ctx
+                .db
+                .take_resume_seed(
+                    pending,
+                    baseline_id,
+                    &ctx.settings.ai.model,
+                    &ctx.settings.ai.provider,
+                    prompts_hash,
+                )
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Could not read saved stages for review {}: {}", pending, e);
+                    None
+                }),
+            None => None,
+        };
+        if let Some(seed) = &resume {
+            info!(
+                "Resuming patch {}/{} from review {} ({} saved stage(s))",
+                patchset_id,
+                index,
+                seed.from,
+                seed.outputs.as_object().map_or(0, |o| o.len())
+            );
+            if seed.other_build {
+                warn!(
+                    "Review {} was saved by another build of Sashiko; resuming anyway, \
+                     but its stages may have run on different prompts",
+                    seed.from
+                );
+            }
+        }
+        let input_payload = payload_for_patch(input_payload, index, resume.as_ref());
+        let input_payload = input_payload.as_ref();
+
         loop {
             let review_id = if let Some(id) = existing_pending_review_id.take() {
                 id
@@ -1413,7 +1453,12 @@ impl Reviewer {
             // Stamped before the work runs, not after, so a row that never
             // reaches a terminal state still records which attempt it was.
             let _ = ctx.db.set_review_attempt(review_id, retries + 1).await;
+            // Replayed stages are reported again as they are folded in, so the
+            // row ends up holding every stage this attempt stands on.
             let _ = ctx.db.clear_review_stage_outputs(review_id).await;
+            if let Some(seed) = &resume {
+                let _ = ctx.db.set_review_resumed_from(review_id, seed.from).await;
+            }
 
             let result = run_review_tool(
                 patchset_id,
@@ -2326,6 +2371,26 @@ async fn run_review_tool(
     .await
 }
 
+/// The worker payload for one patch: the patchset's shared payload, plus the
+/// patch's saved stages when it is resuming. Copied only then -- each worker
+/// reviews one patch, and the shared payload carries every patch's diff.
+fn payload_for_patch<'a>(
+    input_payload: &'a serde_json::Value,
+    index: i64,
+    resume: Option<&crate::db::ResumeSeed>,
+) -> std::borrow::Cow<'a, serde_json::Value> {
+    match resume {
+        Some(seed) => {
+            let mut payload = input_payload.clone();
+            // Keyed by patch index, as the worker expects: it hands each patch
+            // only its own part.
+            payload["resume_stage_outputs"] = json!({ index.to_string(): seed.outputs });
+            std::borrow::Cow::Owned(payload)
+        }
+        None => std::borrow::Cow::Borrowed(input_payload),
+    }
+}
+
 fn default_worker_command() -> Result<Command> {
     let exe_path = std::env::current_exe()?;
     let bin_dir = exe_path
@@ -2529,7 +2594,10 @@ async fn run_review_tool_with_cmd(
     // Highest turn number seen per stage, which is how many LLM round trips
     // that stage needed before it finished.
     let mut stage_turns: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let mut stage_stats: Vec<(String, u64, u64)> = Vec::new();
+    // (stage, seconds, turns, reused): `reused` marks a stage replayed from a
+    // resumed review's saved output, which took no time here because it ran
+    // in an earlier review.
+    let mut stage_stats: Vec<(String, u64, u64, bool)> = Vec::new();
     // Set when the daemon asks the worker to stop, for the same reason.
     let mut wind_down: Option<WindDown> = None;
 
@@ -2884,6 +2952,12 @@ async fn run_review_tool_with_cmd(
                                         // has one, and this is then all that
                                         // is left of its finished stages.
                                         // Best-effort, like the log above.
+                                        if p["kind"] == "stage_replayed"
+                                            && let Some(stage) = p["stage"].as_str()
+                                        {
+                                            stage_stats.push((stage.to_string(), 0, 0, true));
+                                        }
+
                                         if p["kind"] == "stage_output"
                                             && let Some(stage) = p["stage"].as_str()
                                             && let Err(e) = db
@@ -2993,8 +3067,12 @@ async fn run_review_tool_with_cmd(
                                                     let turns = stage_turns
                                                         .remove(&stage)
                                                         .unwrap_or(0);
-                                                    stage_stats
-                                                        .push((stage.clone(), seconds, turns));
+                                                    stage_stats.push((
+                                                        stage.clone(),
+                                                        seconds,
+                                                        turns,
+                                                        false,
+                                                    ));
                                                     done = Some(
                                                         crate::activity::Phase::StageDone {
                                                             stage,
@@ -3055,8 +3133,13 @@ async fn run_review_tool_with_cmd(
     if !stage_stats.is_empty() {
         let payload: Vec<serde_json::Value> = stage_stats
             .iter()
-            .map(|(stage, secs, turns)| {
-                serde_json::json!({"stage": stage, "seconds": secs, "turns": turns})
+            .map(|(stage, secs, turns, reused)| {
+                let mut entry =
+                    serde_json::json!({"stage": stage, "seconds": secs, "turns": turns});
+                if *reused {
+                    entry["reused"] = serde_json::json!(true);
+                }
+                entry
             })
             .collect();
         let _ = db
@@ -4237,6 +4320,72 @@ sleep 30
             "every finished stage is kept, not only the latest: {outputs}"
         );
 
+        Ok(())
+    }
+
+    /// A resuming patch's saved stages are added to its own copy of the
+    /// payload, in the shape the worker reads; a patch that is not resuming
+    /// is sent the shared payload untouched.
+    #[test]
+    fn resume_payload_is_built_per_patch_in_the_shape_the_worker_reads() {
+        let shared = json!({"id": 15, "subject": "s", "patches": []});
+        let seed = crate::db::ResumeSeed {
+            from: 193,
+            outputs: json!({"deduplication": {"concerns": [], "dismissed_concerns": []}}),
+            other_build: false,
+        };
+
+        let resumed = payload_for_patch(&shared, 8, Some(&seed));
+        let input: crate::worker::prompts::ReviewInput =
+            serde_json::from_value(resumed.into_owned()).expect("the worker must accept it");
+        assert!(
+            input.resume_stage_outputs.as_ref().unwrap()["8"]["deduplication"].is_object(),
+            "keyed by the patch index the worker looks up"
+        );
+
+        let fresh = payload_for_patch(&shared, 8, None);
+        assert!(matches!(fresh, std::borrow::Cow::Borrowed(_)));
+        assert!(fresh.get("resume_stage_outputs").is_none());
+    }
+
+    /// Replayed stages cost nothing in this review, and are recorded as reused
+    /// rather than as stages that finished in no time -- which would read as a
+    /// stage that did nothing.
+    #[tokio::test]
+    async fn test_replayed_stages_are_recorded_as_reused() -> Result<()> {
+        let mock = r#"#!/bin/sh
+read -r _payload
+echo '{"type":"progress","payload":{"kind":"stage_replayed","stage":"hardware"}}'
+echo '{"type":"progress","payload":{"kind":"stage_output","stage":"hardware","output":{"concerns":[],"dismissed_concerns":[]}}}'
+echo '{"patchset_id":1,"patches":[{"index":1,"status":"applied"}]}'
+"#;
+        let run = run_mock_review(mock, Arc::new(MockProvider), None, |_| {}).await?;
+        run.outcome?;
+
+        let summary = run
+            .db
+            .get_review_details(run.review_id)
+            .await?
+            .expect("review row");
+        assert!(
+            summary["stage_outputs"]["hardware"].is_object(),
+            "a replayed stage is kept on this review too, so it can be resumed again"
+        );
+
+        let mut rows = run
+            .db
+            .conn
+            .query(
+                "SELECT stage_durations FROM reviews WHERE id = ?",
+                libsql::params![run.review_id],
+            )
+            .await?;
+        let durations: String = rows.next().await?.expect("row").get(0)?;
+        let durations: Value = serde_json::from_str(&durations)?;
+        assert_eq!(
+            durations,
+            json!([{"stage": "hardware", "seconds": 0, "turns": 0, "reused": true}])
+        );
         Ok(())
     }
 

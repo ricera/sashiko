@@ -88,6 +88,12 @@ pub struct ReviewInput {
     /// the whole list; `build_prior_review_context` picks out its own part.
     #[serde(default)]
     pub prior_revisions: Option<Value>,
+    /// Stage outputs saved by an earlier, unfinished review, keyed by patch
+    /// index and then by stage name. Present only when a rerun asked to resume
+    /// rather than start over; each patch is handed its own part by
+    /// `worker_patchset_value`.
+    #[serde(default)]
+    pub resume_stage_outputs: Option<Value>,
 }
 
 pub struct WorkerConfig {
@@ -264,6 +270,12 @@ pub enum WorkerProgressEvent {
         stage: String,
     },
     StageFinished {
+        stage: String,
+    },
+    /// A stage that was not run because its output from an earlier review was
+    /// replayed instead. Its output follows as a `StageOutput`, like a stage
+    /// that ran.
+    StageReplayed {
         stage: String,
     },
     /// What a stage produced, sent as soon as it finishes.
@@ -597,6 +609,17 @@ impl Worker {
                             planned_stages: planned_stages_from(&stage_names),
                         });
                     }
+                    WorkflowEvent::StageReplayed { stage_name, output } => {
+                        progress_cb(WorkerProgressEvent::StageReplayed {
+                            stage: stage_name.to_string(),
+                        });
+                        // Kept again, so this review's record holds every stage
+                        // it stands on and can itself be resumed.
+                        progress_cb(WorkerProgressEvent::StageOutput {
+                            stage: stage_name.to_string(),
+                            output,
+                        });
+                    }
                     WorkflowEvent::StageFinished {
                         stage_name, output, ..
                     } => {
@@ -679,7 +702,30 @@ impl Worker {
             }
         };
 
-        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, Some(&event_cb)).await?;
+        let saved_outputs: std::collections::HashMap<String, Value> =
+            patchset["resume_stage_outputs"]
+                .as_object()
+                .map(|outputs| {
+                    outputs
+                        .iter()
+                        .map(|(stage, output)| (stage.clone(), output.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+        if !saved_outputs.is_empty() {
+            tracing::info!(
+                "Resuming from {} saved stage output(s)",
+                saved_outputs.len()
+            );
+        }
+        let outcome = WorkflowEngine::execute_with_replay(
+            &workflow,
+            &env,
+            &mut state,
+            Some(&event_cb),
+            saved_outputs,
+        )
+        .await?;
         self.global_history.extend(outcome.history.clone());
 
         let concerns_count = state.all_concerns.len();
