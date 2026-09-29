@@ -180,6 +180,12 @@ pub enum ProgressEvent {
         patch_index: i64,
         stage: String,
     },
+    /// A stage replayed from a saved output instead of run. See
+    /// [`crate::worker::WorkerProgressEvent::StageReplayed`].
+    AiReviewStageReplayed {
+        patch_index: i64,
+        stage: String,
+    },
     /// What a stage produced. See [`crate::worker::WorkerProgressEvent::StageOutput`].
     AiReviewStageOutput {
         patch_index: i64,
@@ -279,6 +285,7 @@ pub async fn build_review_input_from_git(
             patches,
             // Nor any review history: that lives in the daemon's database.
             prior_revisions: None,
+            resume_stage_outputs: None,
         },
         shas,
     ))
@@ -387,6 +394,7 @@ pub async fn run_worker(
     let subject = input.subject;
     let cover_letter = input.cover_letter;
     let prior_revisions = input.prior_revisions;
+    let resume_stage_outputs = input.resume_stage_outputs;
     let patches = input.patches;
     let baseline_arg = if options.current_tree {
         options.baseline.clone().unwrap_or_default()
@@ -476,6 +484,7 @@ pub async fn run_worker(
         subject,
         cover_letter,
         prior_revisions,
+        resume_stage_outputs,
         patches,
         &baseline_arg,
         &baseline_sha,
@@ -544,11 +553,13 @@ fn decorate_provider(
 /// Rebuilt here rather than passed through, so everything the reviewer sends
 /// that a stage needs has to be named in this one place: `ReviewInput` ignores
 /// fields it does not know, so one left out is dropped without a sound.
+#[allow(clippy::too_many_arguments)]
 fn worker_patchset_value(
     patchset_id: i64,
     subject: &str,
     cover_letter: Option<&str>,
     prior_revisions: Option<&Value>,
+    resume_stage_outputs: Option<&Value>,
     rich_patches: &[Value],
     patch_index: i64,
     baseline_sha: &str,
@@ -560,7 +571,11 @@ fn worker_patchset_value(
         "patches": rich_patches,
         "patch_index": Some(patch_index),
         "baseline": baseline_sha,
-        "prior_revisions": prior_revisions
+        "prior_revisions": prior_revisions,
+        // Only this patch's part. Another patch's saved stages replayed here
+        // would be that patch's review presented as this one's.
+        "resume_stage_outputs": resume_stage_outputs
+            .and_then(|all| all.get(patch_index.to_string())),
     })
 }
 
@@ -572,6 +587,7 @@ async fn review_single_patch(
     subject: &str,
     cover_letter: Option<&str>,
     prior_revisions: Option<&Value>,
+    resume_stage_outputs: Option<&Value>,
     p: &PatchInput,
     all_patches: &[PatchInput],
     rich_patches: &[Value],
@@ -752,6 +768,12 @@ async fn review_single_patch(
                         stage,
                     });
                 }
+                crate::worker::WorkerProgressEvent::StageReplayed { stage } => {
+                    cb(ProgressEvent::AiReviewStageReplayed {
+                        patch_index: p_index,
+                        stage,
+                    });
+                }
                 crate::worker::WorkerProgressEvent::StageOutput { stage, output } => {
                     cb(ProgressEvent::AiReviewStageOutput {
                         patch_index: p_index,
@@ -779,6 +801,7 @@ async fn review_single_patch(
             subject,
             cover_letter,
             prior_revisions,
+            resume_stage_outputs,
             rich_patches,
             p.index,
             baseline_sha,
@@ -862,6 +885,7 @@ async fn run_worker_in_worktree(
     subject: String,
     cover_letter: Option<String>,
     prior_revisions: Option<Value>,
+    resume_stage_outputs: Option<Value>,
     patches: Vec<PatchInput>,
     baseline_arg: &str,
     baseline_sha: &str,
@@ -1061,6 +1085,7 @@ async fn run_worker_in_worktree(
         let subject_clone = subject.clone();
         let cover_letter_ref = cover_letter.as_deref();
         let prior_revisions_ref = prior_revisions.as_ref();
+        let resume_stage_outputs_ref = resume_stage_outputs.as_ref();
         let all_patches = &patches;
         let llm_semaphore = &llm_semaphore;
         let quota = &quota;
@@ -1072,6 +1097,7 @@ async fn run_worker_in_worktree(
                 &subject_clone,
                 cover_letter_ref,
                 prior_revisions_ref,
+                resume_stage_outputs_ref,
                 p,
                 all_patches,
                 &rich_patches,
@@ -1247,6 +1273,9 @@ pub fn encode_progress(event: &ProgressEvent) -> Option<String> {
         }),
         ProgressEvent::AiReviewStageFinished { stage, .. } => {
             json!({ "kind": "stage_finished", "stage": stage })
+        }
+        ProgressEvent::AiReviewStageReplayed { stage, .. } => {
+            json!({ "kind": "stage_replayed", "stage": stage })
         }
         ProgressEvent::AiReviewStageOutput { stage, output, .. } => json!({
             "kind": "stage_output",
@@ -1548,6 +1577,7 @@ mod tests {
             &input.subject,
             input.cover_letter.as_deref(),
             input.prior_revisions.as_ref(),
+            None,
             &rich_patches,
             1,
             "base",
@@ -1559,6 +1589,53 @@ mod tests {
         assert_eq!(
             patchset["cover_letter"],
             "Changes since v2: moved registration after setup."
+        );
+    }
+
+    /// Saved stage outputs cross the same boundary as the review history, and
+    /// are dropped just as quietly if a hop forgets them -- the review then
+    /// starts over, which looks like a resume that merely took its time. Each
+    /// patch must also get its own stages and nobody else's.
+    #[test]
+    fn resume_stage_outputs_reach_their_own_patch_only() {
+        let payload = json!({
+            "id": 42,
+            "subject": "ionic: AF_XDP pool rework",
+            "patches": [
+                {"index": 7, "diff": "diff --git a/a.c b/a.c\n+x\n"},
+                {"index": 8, "diff": "diff --git a/b.c b/b.c\n+y\n"}
+            ],
+            "resume_stage_outputs": {
+                "8": {
+                    "hardware": {"concerns": [], "dismissed_concerns": []},
+                    "deduplication": {"concerns": [{"description": "leak"}], "dismissed_concerns": []}
+                }
+            }
+        });
+        let input: ReviewInput = serde_json::from_str(&payload.to_string()).unwrap();
+
+        let for_patch = |index: i64| {
+            worker_patchset_value(
+                input.id,
+                &input.subject,
+                None,
+                None,
+                input.resume_stage_outputs.as_ref(),
+                &[],
+                index,
+                "base",
+            )
+        };
+
+        let eighth = for_patch(8);
+        assert_eq!(
+            eighth["resume_stage_outputs"]["deduplication"]["concerns"][0]["description"],
+            "leak"
+        );
+        assert!(eighth["resume_stage_outputs"]["hardware"].is_object());
+        assert!(
+            for_patch(7)["resume_stage_outputs"].is_null(),
+            "patch 7 has nothing saved and must start from scratch"
         );
     }
     use std::fs::File;

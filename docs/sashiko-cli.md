@@ -154,6 +154,7 @@ sashiko-cli rerun --pr <NUMBER>
 |------|-------------|
 | `--pr <NUMBER>` | Review or re-review a pull request by number, against the repository the daemon watches. Mutually exclusive with `ID`. |
 | `--skip-reviewed` | Review only the patches that have no successful review yet. |
+| `--resume` | As `--skip-reviewed`, but each patch picks up from the stages its last unfinished review completed. |
 
 `--skip-reviewed` is for a patchset that partly succeeded: the patches already
 reviewed keep their reviews, and only the ones that failed, were cancelled, or
@@ -161,6 +162,18 @@ never completed go round again. Without it a rerun redoes everything, which on
 a large series means hours of work to get at the one patch that timed out. If
 every patch has already been reviewed the command says so rather than queueing
 a run that would review nothing.
+
+`--resume` goes one step further for a patch whose review ran out of time or
+was cancelled partway. Each stage's output is saved as the stage finishes, so
+the stages that review completed are reused and only the rest run, with a
+fresh timeout. Reuse stops at the first stage that has to run again: if an
+analysis stage never finished, it runs, and so does everything after it
+(deduplication, conflict resolution, verification, report), since their saved
+answers were built without it. A patch starts over instead when nothing was
+saved for it, or when its baseline, model or provider has changed since; a
+different Sashiko build is allowed and logged. The command reports how many
+patches will resume, and `show` marks their reused stages and the review they
+resumed from.
 
 `--pr` resolves the pull request's current head before doing anything, so a
 force-pushed PR is reviewed as it is now rather than as it was. If that head

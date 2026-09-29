@@ -39,6 +39,11 @@ pub struct StageOutcome {
     pub tokens_out: u32,
     pub tokens_cached: u32,
     pub history: Vec<AiMessage>,
+    /// Whether the stage actually ran, as opposed to being skipped by its
+    /// condition. A resume has to know: a stage that ran may have produced
+    /// something other than what was saved, and nothing after it can then be
+    /// replayed.
+    pub ran: bool,
 }
 
 /// Execution environment provided to stages during workflow runs.
@@ -66,6 +71,11 @@ pub trait ExecutableStage<S: Send + Sync>: Send + Sync {
         state: &S,
         event_cb: Option<&(dyn Fn(WorkflowEvent) + Send + Sync)>,
     ) -> Result<(StageOutcome, StateMutation<S>)>;
+
+    /// Rebuilds the stage's effect on the state from an output it produced on
+    /// an earlier run, without calling the model. Fails when the saved output
+    /// no longer has the shape the stage produces.
+    fn replay(&self, output: &Value) -> Result<StateMutation<S>>;
 
     /// Executes the stage and immediately applies its mutation to `&mut S`.
     async fn execute(
@@ -407,6 +417,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Serialize + Send + 'static>
                     tokens_in: 0,
                     tokens_out: 0,
                     tokens_cached: 0,
+                    ran: false,
                 },
                 Box::new(|_| {}),
             ));
@@ -540,9 +551,18 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Serialize + Send + 'static>
             tokens_out,
             tokens_cached,
             history: result.history,
+            ran: true,
         };
 
         Ok((outcome, mutation))
+    }
+
+    fn replay(&self, output: &Value) -> Result<StateMutation<S>> {
+        // The saved output is the parsed `T` the stage handed its reducer, so
+        // folding it in again rebuilds exactly the state the stage produced.
+        let parsed: T = serde_json::from_value(output.clone())?;
+        let reducer = self.reducer.clone();
+        Ok(Box::new(move |s: &mut S| reducer(s, parsed)))
     }
 }
 

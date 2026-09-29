@@ -141,6 +141,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     duration_seconds INTEGER,  -- wall time from the first attempt to this result, retries included
     stage_durations TEXT,      -- JSON array of {stage, seconds} for this attempt
     stage_outputs TEXT,        -- JSON object: stage name -> what it produced, written as each finishes
+    resumed_from INTEGER,      -- review whose saved stage outputs this one was resumed from
     baseline_id INTEGER,
     model TEXT,
     prompts_hash TEXT,

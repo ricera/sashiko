@@ -175,6 +175,10 @@ pub struct PatchQuery {
     /// Redo only the patches with no successful review.
     #[serde(default)]
     pub skip_reviewed: bool,
+    /// Redo the same patches as `skip_reviewed`, each from the stages its last
+    /// unfinished review completed. Implies `skip_reviewed`.
+    #[serde(default)]
+    pub resume: bool,
 }
 
 #[derive(Deserialize)]
@@ -1215,24 +1219,47 @@ async fn rerun_patchset(
         .parse::<i64>()
         .map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let outcome = state
-        .db
-        .rerun_patchset(id, scope_for(query.skip_reviewed))
-        .await
-        .map_err(|e| {
-            error!("Failed to rerun patchset {}: {}", id, e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let scope = scope_for(query.skip_reviewed, query.resume);
+    let outcome = state.db.rerun_patchset(id, scope).await.map_err(|e| {
+        error!("Failed to rerun patchset {}: {}", id, e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
-    Ok(Json(rerun_response(outcome, None)))
+    let mut body = rerun_response(outcome, None);
+    add_resume_count(&state, id, scope, outcome, &mut body).await;
+    Ok(Json(body))
 }
 
-/// Maps the request flag onto what the rerun should cover.
-fn scope_for(skip_reviewed: bool) -> crate::db::RerunScope {
-    if skip_reviewed {
+/// Maps the request flags onto what the rerun should cover. Resuming only
+/// makes sense for patches that were not reviewed, so it implies that scope.
+fn scope_for(skip_reviewed: bool, resume: bool) -> crate::db::RerunScope {
+    if resume {
+        crate::db::RerunScope::Resume
+    } else if skip_reviewed {
         crate::db::RerunScope::Unreviewed
     } else {
         crate::db::RerunScope::All
+    }
+}
+
+/// Says how many patches a queued resume will pick up rather than restart.
+///
+/// A patch with nothing saved starts over, and from the outside that looks
+/// just like a resume that is taking its time. Reported so the difference is
+/// known when the request is made, not hours later.
+async fn add_resume_count(
+    state: &AppState,
+    id: i64,
+    scope: crate::db::RerunScope,
+    outcome: crate::db::RerunOutcome,
+    body: &mut serde_json::Value,
+) {
+    if scope != crate::db::RerunScope::Resume || outcome != crate::db::RerunOutcome::Queued {
+        return;
+    }
+    match state.db.count_resuming_reviews(id).await {
+        Ok(n) => body["resuming"] = serde_json::json!(n),
+        Err(e) => warn!("Could not count resuming reviews of patchset {}: {}", id, e),
     }
 }
 
@@ -1362,6 +1389,9 @@ struct PrQuery {
     /// Redo only the patches with no successful review.
     #[serde(default)]
     skip_reviewed: bool,
+    /// Resume those patches from their saved stages; see `PatchQuery::resume`.
+    #[serde(default)]
+    resume: bool,
 }
 
 /// Reviews or re-reviews a pull request by number, without the caller knowing
@@ -1399,15 +1429,13 @@ async fn review_pull_request(
                 error!("PR #{} is unknown and unresolvable", query.number);
                 return Err(StatusCode::BAD_REQUEST);
             };
-            let outcome = state
-                .db
-                .rerun_patchset(id, scope_for(query.skip_reviewed))
-                .await
-                .map_err(|e| {
-                    error!("Failed to rerun patchset {}: {}", id, e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
+            let scope = scope_for(query.skip_reviewed, query.resume);
+            let outcome = state.db.rerun_patchset(id, scope).await.map_err(|e| {
+                error!("Failed to rerun patchset {}: {}", id, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
             let mut body = rerun_response(outcome, Some(id));
+            add_resume_count(&state, id, scope, outcome, &mut body).await;
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("stale".to_string(), serde_json::json!(true));
                 obj.insert(
@@ -1432,22 +1460,25 @@ async fn review_pull_request(
         .get_patchset_id_by_pr_range(query.number, &commit_range)
         .await
     {
-        let outcome = state
-            .db
-            .rerun_patchset(id, scope_for(query.skip_reviewed))
-            .await
-            .map_err(|e| {
-                error!("Failed to rerun patchset {}: {}", id, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+        let scope = scope_for(query.skip_reviewed, query.resume);
+        let outcome = state.db.rerun_patchset(id, scope).await.map_err(|e| {
+            error!("Failed to rerun patchset {}: {}", id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
         let mut body = rerun_response(outcome, Some(id));
+        add_resume_count(&state, id, scope, outcome, &mut body).await;
         if outcome == crate::db::RerunOutcome::Queued
             && let Some(obj) = body.as_object_mut()
         {
             obj.insert(
                 "message".to_string(),
-                serde_json::json!(if query.skip_reviewed {
+                serde_json::json!(if query.resume {
+                    format!(
+                        "PR #{} queued; unreviewed patches resume from their saved stages",
+                        query.number
+                    )
+                } else if query.skip_reviewed {
                     format!(
                         "PR #{} queued; patches already reviewed will be skipped",
                         query.number
@@ -1646,5 +1677,23 @@ mod tests {
         let id = generate_synthetic_id("test");
         assert!(id.starts_with("sashiko-test-"));
         assert!(id.ends_with("@sashiko.local"));
+    }
+
+    /// Resuming only ever covers the patches without a successful review, so
+    /// it wins over, rather than conflicts with, `skip_reviewed`.
+    #[test]
+    fn rerun_flags_map_onto_scopes() {
+        use crate::db::RerunScope;
+        assert_eq!(scope_for(false, false), RerunScope::All);
+        assert_eq!(scope_for(true, false), RerunScope::Unreviewed);
+        assert_eq!(scope_for(false, true), RerunScope::Resume);
+        assert_eq!(scope_for(true, true), RerunScope::Resume);
+    }
+
+    /// Absent from older clients' requests, so it must default to off.
+    #[test]
+    fn resume_defaults_to_off() {
+        let query: PatchQuery = serde_json::from_value(serde_json::json!({"id": "15"})).unwrap();
+        assert!(!query.resume);
     }
 }

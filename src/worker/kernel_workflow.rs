@@ -1743,4 +1743,140 @@ mod tests {
              would stop nothing"
         );
     }
+
+    /// Counts calls and refuses them, so a test sees exactly which stages
+    /// reached the model and stops at the first one that does.
+    struct RefusingProvider {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for RefusingProvider {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("no model in this test")
+        }
+
+        fn estimate_tokens(&self, _request: &crate::ai::AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "refusing".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// Runs the real review workflow over saved outputs, recording which stages
+    /// were replayed and which started for real.
+    async fn resume_kernel_review(
+        saved: serde_json::Value,
+    ) -> (KernelReviewState, Vec<String>, Vec<String>, usize) {
+        use crate::workflow::engine::WorkflowEngine;
+        use crate::workflow::events::WorkflowEvent;
+        use crate::workflow::stage::WorkflowEnv;
+
+        let provider = std::sync::Arc::new(RefusingProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: std::sync::Arc::new(crate::toolbox::ToolBox::new(
+                tmp.path().to_path_buf(),
+                None,
+            )),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+        let replayed = std::sync::Mutex::new(Vec::new());
+        let started = std::sync::Mutex::new(Vec::new());
+        let record = |event: WorkflowEvent| match event {
+            WorkflowEvent::StageReplayed { stage_name, .. } => {
+                replayed.lock().unwrap().push(stage_name.to_string())
+            }
+            WorkflowEvent::StageStarted { stage_name } => {
+                started.lock().unwrap().push(stage_name.to_string())
+            }
+            _ => {}
+        };
+        let mut state = KernelReviewState::default();
+        let _ = WorkflowEngine::execute_with_replay(
+            &build_kernel_review_workflow(),
+            &env,
+            &mut state,
+            Some(&record),
+            saved
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
+        .await;
+        let calls = provider.calls.load(std::sync::atomic::Ordering::SeqCst);
+        (
+            state,
+            replayed.into_inner().unwrap(),
+            started.into_inner().unwrap(),
+            calls,
+        )
+    }
+
+    fn concerns(description: &str) -> serde_json::Value {
+        json!({"concerns": [{"description": description}], "dismissed_concerns": []})
+    }
+
+    /// linux-ionic PR 968 patch 8: every analysis stage and deduplication
+    /// finished, then the review was killed in conflict resolution. Resuming it
+    /// must start at conflict resolution, with dedup's answer as its input, and
+    /// ask the model nothing before that.
+    #[tokio::test]
+    async fn test_a_review_killed_in_conflict_resolution_resumes_there() {
+        let mut saved = json!({
+            "pre-screen": {"selected_prompts": ["networking.md"]},
+            "planning": {"relevant_stages": ["resources", "locking", "security", "hardware"]},
+            "deduplication": concerns("xsk pool leaks on unbind"),
+        });
+        for stage in ANALYSIS_STAGES {
+            saved[stage.name] = concerns(&format!("{} concern", stage.name));
+        }
+
+        let (state, replayed, started, calls) = resume_kernel_review(saved).await;
+
+        assert_eq!(started, vec!["conflict-resolution"]);
+        assert_eq!(calls, 1, "only conflict resolution reached the model");
+        assert_eq!(replayed.len(), 2 + ANALYSIS_STAGES.len() + 1);
+        assert_eq!(state.selected_guides, vec!["networking.md"]);
+        assert_eq!(state.all_concerns.len(), ANALYSIS_STAGES.len());
+        assert_eq!(
+            state.deduplicated_concerns[0]["description"],
+            "xsk pool leaks on unbind"
+        );
+    }
+
+    /// One analysis stage never finished (the salvage case). It runs, and the
+    /// saved deduplication -- built without its concerns -- is not used.
+    #[tokio::test]
+    async fn test_a_missing_analysis_stage_reruns_before_anything_downstream() {
+        let mut saved = json!({
+            "pre-screen": {"selected_prompts": []},
+            "planning": {"relevant_stages": ["resources", "locking", "security", "hardware"]},
+            "deduplication": concerns("built without hardware"),
+        });
+        for stage in ANALYSIS_STAGES.iter().filter(|s| s.name != "hardware") {
+            saved[stage.name] = concerns(&format!("{} concern", stage.name));
+        }
+
+        let (state, replayed, started, _) = resume_kernel_review(saved).await;
+
+        assert!(started.contains(&"hardware".to_string()));
+        assert!(!replayed.contains(&"deduplication".to_string()));
+        assert!(state.deduplicated_concerns.is_empty());
+    }
 }
