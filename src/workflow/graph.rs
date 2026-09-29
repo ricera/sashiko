@@ -14,6 +14,7 @@
 
 //! Workflow graph definitions, step types, and builder combinators.
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::policy::ParallelPolicy;
@@ -82,7 +83,10 @@ impl<S: Send + Sync + 'static> WorkflowBuilder<S> {
     }
 
     /// Appends a stage to the workflow.
-    pub fn stage<T: DeserializeOwned + Send + 'static>(mut self, stage: Stage<S, T>) -> Self
+    pub fn stage<T: DeserializeOwned + Serialize + Send + 'static>(
+        mut self,
+        stage: Stage<S, T>,
+    ) -> Self
     where
         S: Send + Sync,
     {
@@ -115,7 +119,7 @@ impl<S: Send + Sync + 'static> WorkflowBuilder<S> {
     ) -> Self
     where
         S: Send + Sync,
-        P: DeserializeOwned + Send + 'static,
+        P: DeserializeOwned + Serialize + Send + 'static,
         R: Fn(&S) -> Vec<Box<dyn ExecutableStage<S>>> + Send + Sync + 'static,
     {
         self.steps.push(WorkflowStep::DynamicParallel {

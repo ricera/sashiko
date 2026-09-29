@@ -70,6 +70,12 @@ pub enum WorkflowEvent {
         tokens_in: u32,
         tokens_out: u32,
         tokens_cached: u32,
+        /// What the stage answered, validated and parsed: exactly what its
+        /// reducer is about to fold into the state. Carried here because the
+        /// state lives only in the worker, so a worker killed before the
+        /// review ends takes every finished stage's work with it unless that
+        /// work has already been handed out.
+        output: serde_json::Value,
     },
     /// A dynamic fan-out resolved the stages it will run. Emitted whether or
     /// not the planning stage ran, so a skipped planner still reports a plan.

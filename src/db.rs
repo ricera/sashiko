@@ -695,6 +695,9 @@ impl Database {
             .try_add_column("reviews", "stage_durations", "TEXT")
             .await;
         let _ = self
+            .try_add_column("reviews", "stage_outputs", "TEXT")
+            .await;
+        let _ = self
             .try_add_column("patchsets", "review_duration_seconds", "INTEGER")
             .await;
         let _ = self
@@ -1396,6 +1399,46 @@ impl Database {
             .execute(
                 "UPDATE reviews SET stage_durations = ? WHERE id = ?",
                 libsql::params![durations_json, review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Records what one review stage produced, as soon as it finishes.
+    ///
+    /// Merged into the stored object under the stage's name rather than
+    /// replacing it, so each write costs one stage's output instead of the whole
+    /// review's. Written as the review runs, not at the end, because the end is
+    /// exactly what a timed-out review never reaches: the worker is killed with
+    /// the review's state in memory, and without this every stage it finished --
+    /// hours of analysis -- goes with it.
+    pub async fn record_review_stage_output(
+        &self,
+        review_id: i64,
+        stage: &str,
+        output: &serde_json::Value,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews
+                 SET stage_outputs = json_set(COALESCE(stage_outputs, '{}'), '$.' || json_quote(?), json(?))
+                 WHERE id = ?",
+                libsql::params![stage, output.to_string(), review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Forgets the stage outputs recorded on a review row.
+    ///
+    /// For a row about to be run again. The first attempt can reuse a row an
+    /// interrupted run left behind, and stage outputs from that run would
+    /// otherwise sit beside this run's as though one review had produced both.
+    pub async fn clear_review_stage_outputs(&self, review_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET stage_outputs = NULL WHERE id = ?",
+                libsql::params![review_id],
             )
             .await?;
         Ok(())
@@ -4159,7 +4202,8 @@ impl Database {
                 "SELECT r.id, r.model, r.summary, r.created_at, ai.input_context, ai.output_raw, 
                         b.repo_url, b.branch, b.last_known_commit,
                         r.provider, r.prompts_hash, r.result_description,
-                        r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached
+                        r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached,
+                        r.stage_outputs
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -4191,6 +4235,11 @@ impl Database {
                 "tokens_out": r.get::<Option<u32>>(16).ok(),
                 "patch_id": r.get::<Option<i64>>(17).ok(),
                 "tokens_cached": r.get::<Option<u32>>(18).ok(),
+                // Only here, not in the patchset listings: it holds every
+                // stage's full answer, which is what a single review is opened
+                // to see and far more than a list of reviews needs.
+                "stage_outputs": r.get::<Option<String>>(19).ok().flatten()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
             })))
         } else {
             Ok(None)
@@ -6074,6 +6123,88 @@ mod tests {
                 "rerun must always ask for one more pass than already achieved"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_stage_outputs_accumulate_per_stage_and_clear() {
+        let db = setup_db().await;
+
+        let thread_id = db.create_thread("so", "Subject", 1000).await.unwrap();
+        db.create_message(
+            "so1", thread_id, None, "A", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "so", "Subject", "A", 1000, 1, 1, "", "", None, 1, None, false,
+                None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let p_id = db.create_patch(ps_id, "so1", 1, "diff").await.unwrap();
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+
+        let outputs = |db: Arc<Database>| async move {
+            db.get_review_details(review_id)
+                .await
+                .unwrap()
+                .expect("review")["stage_outputs"]
+                .clone()
+        };
+        assert!(outputs(db.clone()).await.is_null(), "nothing recorded yet");
+
+        // Stage names carry hyphens, which a JSON path would read as syntax
+        // unless quoted.
+        db.record_review_stage_output(review_id, "execution-flow", &json!({"concerns": [1]}))
+            .await
+            .unwrap();
+        db.record_review_stage_output(
+            review_id,
+            "planning",
+            &json!({"relevant_stages": ["locking"]}),
+        )
+        .await
+        .unwrap();
+        // Text output (the report stage) is a JSON string, not an object.
+        db.record_review_stage_output(review_id, "report", &json!("inline review"))
+            .await
+            .unwrap();
+        // A later report for the same stage replaces the earlier one.
+        db.record_review_stage_output(review_id, "execution-flow", &json!({"concerns": [2]}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outputs(db.clone()).await,
+            json!({
+                "execution-flow": {"concerns": [2]},
+                "planning": {"relevant_stages": ["locking"]},
+                "report": "inline review",
+            })
+        );
+
+        // Kept out of the listings, which would otherwise carry every stage's
+        // full answer for every review on the page.
+        let summary = db
+            .get_patchset_summary(ps_id, None, None)
+            .await
+            .unwrap()
+            .expect("summary");
+        let listed = summary["reviews"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == review_id)
+            .expect("review listed");
+        assert!(listed.get("stage_outputs").is_none());
+
+        db.clear_review_stage_outputs(review_id).await.unwrap();
+        assert!(outputs(db.clone()).await.is_null(), "a rerun starts empty");
     }
 
     #[tokio::test]

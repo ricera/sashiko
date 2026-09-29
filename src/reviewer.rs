@@ -1413,6 +1413,7 @@ impl Reviewer {
             // Stamped before the work runs, not after, so a row that never
             // reaches a terminal state still records which attempt it was.
             let _ = ctx.db.set_review_attempt(review_id, retries + 1).await;
+            let _ = ctx.db.clear_review_stage_outputs(review_id).await;
 
             let result = run_review_tool(
                 patchset_id,
@@ -2877,6 +2878,28 @@ async fn run_review_tool_with_cmd(
                                             log_seq += 1;
                                         }
 
+                                        // Kept the moment the stage finishes,
+                                        // not with the result: a review that
+                                        // runs out of time is killed before it
+                                        // has one, and this is then all that
+                                        // is left of its finished stages.
+                                        // Best-effort, like the log above.
+                                        if p["kind"] == "stage_output"
+                                            && let Some(stage) = p["stage"].as_str()
+                                            && let Err(e) = db
+                                                .record_review_stage_output(
+                                                    review_id,
+                                                    stage,
+                                                    &p["output"],
+                                                )
+                                                .await
+                                        {
+                                            warn!(
+                                                "Failed to record output of stage {} for review {}: {}",
+                                                stage, review_id, e
+                                            );
+                                        }
+
                                         // Advisory only: never let a malformed
                                         // progress line disturb the review.
                                         match progress_update(
@@ -3949,6 +3972,25 @@ mod tests {
         cancel_token: Option<tokio_util::sync::CancellationToken>,
         configure: impl FnOnce(&mut Settings),
     ) -> Result<ReviewToolOutcome> {
+        run_mock_review(mock_script, provider, cancel_token, configure)
+            .await?
+            .outcome
+    }
+
+    /// A mock run together with the database it wrote to, for tests that check
+    /// what the review row holds afterwards rather than what the run returned.
+    struct MockReview {
+        outcome: Result<ReviewToolOutcome>,
+        db: Arc<Database>,
+        review_id: i64,
+    }
+
+    async fn run_mock_review(
+        mock_script: &str,
+        provider: Arc<dyn AiProvider>,
+        cancel_token: Option<tokio_util::sync::CancellationToken>,
+        configure: impl FnOnce(&mut Settings),
+    ) -> Result<MockReview> {
         let temp_dir = tempdir()?;
         let bin_path = temp_dir.path().join("mock_review");
 
@@ -3993,13 +4035,13 @@ mod tests {
             .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
             .await?;
 
-        run_review_tool_with_cmd(
+        let outcome = run_review_tool_with_cmd(
             Command::new(&bin_path),
             ps_id,
             p_id,
             &json!({}),
             &settings,
-            db,
+            db.clone(),
             "HEAD",
             Some(1),
             None,
@@ -4013,7 +4055,13 @@ mod tests {
             1,
             1,
         )
-        .await
+        .await;
+
+        Ok(MockReview {
+            outcome,
+            db,
+            review_id,
+        })
     }
 
     /// Cancelling must interrupt the worker, not merely discard its result.
@@ -4139,6 +4187,54 @@ sleep 30
         assert!(
             err.downcast_ref::<ReviewTimedOut>().is_some(),
             "a timeout must be recognisable without matching on its message: {err}"
+        );
+
+        Ok(())
+    }
+
+    /// A worker killed at the deadline still leaves behind the stages it finished.
+    ///
+    /// The case this exists for: a review whose analysis took nearly all of its
+    /// time, then ran out partway through consolidation and was killed. The
+    /// worker never reported a result, so the finished stages' outputs are the
+    /// only part of hours of work that can survive -- and only if the daemon
+    /// kept each one as it arrived.
+    #[tokio::test]
+    async fn test_stage_outputs_survive_a_worker_killed_at_the_deadline() -> Result<()> {
+        // Reports two finished stages, then ignores everything, including the
+        // wind-down request, until it is killed.
+        let mock = r#"#!/bin/sh
+read -r _payload
+echo '{"type":"progress","payload":{"kind":"stage_output","stage":"execution-flow","output":{"concerns":[{"description":"leak"}],"dismissed_concerns":[]}}}'
+echo '{"type":"progress","payload":{"kind":"stage_output","stage":"deduplication","output":{"concerns":[{"description":"leak, merged"}],"dismissed_concerns":[]}}}'
+sleep 30
+"#;
+
+        let run = run_mock_review(mock, Arc::new(MockProvider), None, |settings| {
+            settings.review.timeout_seconds = 1;
+            settings.review.salvage_seconds = 1;
+        })
+        .await?;
+        assert!(
+            run.outcome
+                .as_ref()
+                .is_err_and(|e| e.downcast_ref::<ReviewTimedOut>().is_some()),
+            "the worker was meant to be killed at the deadline"
+        );
+
+        let review = run
+            .db
+            .get_review_details(run.review_id)
+            .await?
+            .expect("review row");
+        let outputs = &review["stage_outputs"];
+        assert_eq!(
+            outputs["execution-flow"]["concerns"][0]["description"], "leak",
+            "an analysis stage's output must outlive the worker: {outputs}"
+        );
+        assert_eq!(
+            outputs["deduplication"]["concerns"][0]["description"], "leak, merged",
+            "every finished stage is kept, not only the latest: {outputs}"
         );
 
         Ok(())
@@ -4414,6 +4510,35 @@ sleep 30
 
         // Log entries are not activity updates; decoding one as a phase must
         // yield nothing rather than corrupting the stage display.
+        assert!(progress_update(1, 2, &parsed["payload"], 1, 4).is_none());
+    }
+
+    /// A stage's output is encoded by the worker and read by the daemon, which
+    /// keys what it stores on the payload's `kind`. A mismatch would drop every
+    /// output without a sound, and nobody would find out until a review was
+    /// killed and nothing of it had been kept.
+    #[test]
+    fn stage_outputs_round_trip_and_leave_activity_alone() {
+        use crate::local_review::{ProgressEvent, encode_progress};
+
+        let line = encode_progress(&ProgressEvent::AiReviewStageOutput {
+            patch_index: 0,
+            stage: "deduplication".to_string(),
+            output: json!({"concerns": [{"description": "leak"}], "dismissed_concerns": []}),
+        })
+        .expect("stage outputs must be forwarded");
+
+        let parsed: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed["type"], "progress");
+        assert_eq!(parsed["payload"]["kind"], "stage_output");
+        assert_eq!(parsed["payload"]["stage"], "deduplication");
+        assert_eq!(
+            parsed["payload"]["output"]["concerns"][0]["description"],
+            "leak"
+        );
+
+        // `stage_finished` is what closes a stage on the activity display; the
+        // output arriving must not do it a second time.
         assert!(progress_update(1, 2, &parsed["payload"], 1, 4).is_none());
     }
 

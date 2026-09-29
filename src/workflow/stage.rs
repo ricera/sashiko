@@ -16,6 +16,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -384,7 +385,7 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
 }
 
 #[async_trait]
-impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableStage<S>
+impl<S: Send + Sync + 'static, T: DeserializeOwned + Serialize + Send + 'static> ExecutableStage<S>
     for Stage<S, T>
 {
     fn name(&self) -> &'static str {
@@ -525,6 +526,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 tokens_in,
                 tokens_out,
                 tokens_cached,
+                output: serde_json::to_value(&result.output).unwrap_or(Value::Null),
             });
         }
 

@@ -180,6 +180,12 @@ pub enum ProgressEvent {
         patch_index: i64,
         stage: String,
     },
+    /// What a stage produced. See [`crate::worker::WorkerProgressEvent::StageOutput`].
+    AiReviewStageOutput {
+        patch_index: i64,
+        stage: String,
+        output: Value,
+    },
     /// A stage stopped without finishing. Distinct from
     /// [`ProgressEvent::AiReviewStageFinished`] because the two mean opposite
     /// things to anyone watching: one stage is done, the other never will be.
@@ -746,6 +752,13 @@ async fn review_single_patch(
                         stage,
                     });
                 }
+                crate::worker::WorkerProgressEvent::StageOutput { stage, output } => {
+                    cb(ProgressEvent::AiReviewStageOutput {
+                        patch_index: p_index,
+                        stage,
+                        output,
+                    });
+                }
                 crate::worker::WorkerProgressEvent::StageFailed {
                     stage,
                     reason,
@@ -1235,6 +1248,11 @@ pub fn encode_progress(event: &ProgressEvent) -> Option<String> {
         ProgressEvent::AiReviewStageFinished { stage, .. } => {
             json!({ "kind": "stage_finished", "stage": stage })
         }
+        ProgressEvent::AiReviewStageOutput { stage, output, .. } => json!({
+            "kind": "stage_output",
+            "stage": stage,
+            "output": output,
+        }),
         ProgressEvent::AiReviewStageFailed {
             stage,
             reason,
