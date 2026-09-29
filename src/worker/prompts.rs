@@ -266,6 +266,16 @@ pub enum WorkerProgressEvent {
     StageFinished {
         stage: String,
     },
+    /// What a stage produced, sent as soon as it finishes.
+    ///
+    /// Reported for every stage, including the pre-screen and planning that
+    /// the progress events leave out: their answers -- the guides selected and
+    /// the stages planned -- are part of what the later stages were given, so
+    /// a record of the review's progress without them is incomplete.
+    StageOutput {
+        stage: String,
+        output: Value,
+    },
     StageTurn {
         stage: String,
         turn: usize,
@@ -587,7 +597,13 @@ impl Worker {
                             planned_stages: planned_stages_from(&stage_names),
                         });
                     }
-                    WorkflowEvent::StageFinished { stage_name, .. } => {
+                    WorkflowEvent::StageFinished {
+                        stage_name, output, ..
+                    } => {
+                        progress_cb(WorkerProgressEvent::StageOutput {
+                            stage: stage_name.to_string(),
+                            output,
+                        });
                         if is_counted_stage(stage_name) {
                             progress_cb(WorkerProgressEvent::StageFinished {
                                 stage: stage_name.to_string(),

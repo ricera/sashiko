@@ -1511,9 +1511,12 @@ async fn handle_review_command(
             // view, where work runs unattended.
             // The local CLI prints the conversation itself; the streamed copy
             // exists for the daemon, where nobody is watching the terminal.
+            // Stage outputs are for the daemon to keep; the CLI has the whole
+            // result in hand when the review ends.
             ProgressEvent::AiReviewStageTools { .. }
             | ProgressEvent::AiReviewStageBackoff { .. }
-            | ProgressEvent::AiReviewLogEntry { .. } => {}
+            | ProgressEvent::AiReviewLogEntry { .. }
+            | ProgressEvent::AiReviewStageOutput { .. } => {}
             ProgressEvent::AiReviewStageFinished { patch_index, stage } => {
                 if let Some(p) = s.patches.get_mut(&patch_index) {
                     p.active_stages.remove(&stage);

@@ -249,7 +249,7 @@ mod tests {
     use crate::workflow::output::OutputFormat;
     use crate::workflow::prompt::PromptTemplate;
     use crate::workflow::stage::Stage;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -261,12 +261,12 @@ mod tests {
         selected_stages: Vec<u8>,
     }
 
-    #[derive(Deserialize, Debug)]
+    #[derive(Deserialize, Serialize, Debug)]
     struct DummyConcernsOutput {
         items: Vec<String>,
     }
 
-    #[derive(Deserialize, Debug)]
+    #[derive(Deserialize, Serialize, Debug)]
     struct DummyPlanningOutput {
         stages: Vec<u8>,
     }
@@ -370,6 +370,54 @@ mod tests {
         assert!(!outcome.early_exit);
         assert_eq!(state.concerns, vec!["leak in foo".to_string()]);
         assert_eq!(state.findings, vec!["leak in foo".to_string()]);
+    }
+
+    /// A finished stage hands out what it produced, parsed -- the same value
+    /// its reducer receives, not the model's raw text around it.
+    #[tokio::test]
+    async fn test_stage_finished_carries_the_parsed_output() {
+        let provider = Arc::new(MockProvider::single(
+            "Here you go:\n```json\n{\"items\": [\"leak in foo\"]}\n```",
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = Arc::new(ToolBox::new(tmp.path().to_path_buf(), None));
+        let env = WorkflowEnv {
+            provider,
+            tools,
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let workflow = Workflow::builder("output_flow")
+            .stage(
+                Stage::builder("stage_1")
+                    .user_prompt(PromptTemplate::new("Analyze"))
+                    .output_format(OutputFormat::json())
+                    .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                        s.concerns.extend(out.items);
+                    })
+                    .build(),
+            )
+            .build();
+
+        let outputs = std::sync::Mutex::new(Vec::new());
+        let record = |event: WorkflowEvent| {
+            if let WorkflowEvent::StageFinished {
+                stage_name, output, ..
+            } = event
+            {
+                outputs.lock().unwrap().push((stage_name, output));
+            }
+        };
+        let mut state = DummyState::default();
+        WorkflowEngine::execute(&workflow, &env, &mut state, Some(&record))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *outputs.lock().unwrap(),
+            vec![("stage_1", serde_json::json!({"items": ["leak in foo"]}))]
+        );
     }
 
     #[tokio::test]
