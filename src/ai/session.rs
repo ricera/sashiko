@@ -427,6 +427,12 @@ impl<'a> SessionRunner<'a> {
 
             let resp = match self.provider.generate_content(request).await {
                 Ok(r) => r,
+                // A cancel aborts the request in flight, so whatever error it
+                // came back with is the cancel, not something to retry or
+                // report as a failure of the stage.
+                Err(_) if crate::ai::worker_cancel_token().is_cancelled() => {
+                    anyhow::bail!("{}", SESSION_CANCELLED);
+                }
                 Err(e) => match classify_ai_error(&e) {
                     AiErrorClass::RateLimit { retry_after }
                     | AiErrorClass::Transient { retry_after } => {

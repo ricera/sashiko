@@ -2810,6 +2810,7 @@ async fn run_review_tool_with_cmd(
                                         let total_tokens_used_clone = total_tokens_used.clone();
                                         let total_output_tokens_used_clone = total_output_tokens_used.clone();
                                         let abort_tx_clone = abort_tx.clone();
+                                        let cancel_clone = cancel_token.clone();
 
                                         let handle = tokio::spawn(async move {
                                             let req: AiRequest = match serde_json::from_value(payload) {
@@ -2850,9 +2851,25 @@ async fn run_review_tool_with_cmd(
                                             }
 
                                             let ctx_tag = req.context_tag.clone().unwrap_or_default();
-                                            let resp_payload = crate::ai::LOG_CONTEXT
-                                                .scope(ctx_tag, provider_clone.generate_content(req.clone()))
-                                                .await;
+                                            // Raced against the cancel. The worker
+                                            // only notices a cancel between turns,
+                                            // and a stage deep into its conversation
+                                            // can wait minutes on one answer -- longer
+                                            // than the grace period, so the worker was
+                                            // killed and lost every stage it had not
+                                            // yet reported. Dropping the request frees
+                                            // its slot and its connection; the worker
+                                            // hears at once and stops the stage.
+                                            // A wind-down is not a cancel: the stages
+                                            // it lets run still need their answers.
+                                            let resp_payload = tokio::select! {
+                                                biased;
+                                                _ = wait_for_cancel(&cancel_clone) => {
+                                                    Err(anyhow::anyhow!("{}", crate::ai::session::SESSION_CANCELLED))
+                                                }
+                                                resp = crate::ai::LOG_CONTEXT
+                                                    .scope(ctx_tag, provider_clone.generate_content(req.clone())) => resp,
+                                            };
 
                                             let reply = match resp_payload {
                                                 Ok(p) => {
@@ -4515,6 +4532,79 @@ done
         assert!(matches!(result, PatchResult::ReviewFailed));
         assert!(review_statuses(&ctx.db, p_id).await?.is_empty());
         assert_eq!(patch_status(&ctx.db, p_id).await?, "Cancelled");
+        Ok(())
+    }
+
+    /// Answers nothing, ever, and says when it has been asked: a model call
+    /// still in flight when the review is cancelled.
+    struct HangingProvider {
+        asked: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl AiProvider for HangingProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            self.asked.notify_one();
+            std::future::pending().await
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "hanging".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// linux-ionic PR 974: the cancel reached the worker, but every stage was
+    /// waiting on a model answer and only looks for a cancel between turns, so
+    /// the grace period ran out and the worker was killed -- taking every stage
+    /// it had not yet reported with it. The request in flight is now abandoned
+    /// the moment the cancel lands, and the worker is told why.
+    #[tokio::test]
+    async fn test_a_cancel_abandons_the_model_call_in_flight() -> Result<()> {
+        // Asks once, then reports a clean stop as soon as its request comes
+        // back cancelled. Without the fix nothing comes back, and the worker
+        // is killed once the grace period runs out.
+        let mock = r#"#!/bin/sh
+read -r _payload
+echo '{"type":"ai_request","tx_id":7,"payload":{"messages":[{"role":"user","content":"hello"}]}}'
+while read -r msg; do
+  case "$msg" in
+    *'Session cancelled by supervisor'*)
+      echo '{"patchset_id":1,"cancelled":true,"patches":[],"stage_failures":[{"stage":"locking","reason":"Session cancelled by supervisor","cancelled":true}]}'
+      exit 0
+      ;;
+  esac
+done
+"#;
+        let asked = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(HangingProvider {
+            asked: asked.clone(),
+        });
+        let token = tokio_util::sync::CancellationToken::new();
+        let canceller = {
+            let token = token.clone();
+            tokio::spawn(async move {
+                asked.notified().await;
+                token.cancel();
+            })
+        };
+
+        let started = std::time::Instant::now();
+        let outcome = run_single_ai_request_mock_with_cancel(mock, provider, Some(token)).await?;
+        canceller.await?;
+
+        assert!(
+            started.elapsed() < GRACEFUL_CANCEL_WAIT / 2,
+            "the worker should have stopped at once, not been waited out: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(outcome.output["cancelled"], true);
         Ok(())
     }
 
