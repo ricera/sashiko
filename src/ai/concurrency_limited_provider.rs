@@ -57,6 +57,9 @@ pub trait SlotObserver: Send + Sync {
     fn queued(&self, request: &AiRequest);
     /// The permit is held, so the time from here really is the model's.
     fn running(&self, request: &AiRequest);
+    /// How long the request waited for its permit, reported with `running`.
+    /// A separate hook so an observer that only shows state need not care.
+    fn waited(&self, _request: &AiRequest, _waited: std::time::Duration) {}
 }
 
 /// Limits concurrent model calls to the permits of a shared semaphore. All
@@ -99,6 +102,7 @@ impl AiProvider for ConcurrencyLimitedProvider {
                 if let Some(observer) = &self.observer {
                     observer.queued(&request);
                 }
+                let queued_at = std::time::Instant::now();
                 let permit = self
                     .semaphore
                     .acquire()
@@ -106,6 +110,7 @@ impl AiProvider for ConcurrencyLimitedProvider {
                     .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
                 if let Some(observer) = &self.observer {
                     observer.running(&request);
+                    observer.waited(&request, queued_at.elapsed());
                 }
                 permit
             }
@@ -176,6 +181,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingObserver {
         events: std::sync::Mutex<Vec<&'static str>>,
+        waits: std::sync::Mutex<Vec<std::time::Duration>>,
     }
 
     impl SlotObserver for RecordingObserver {
@@ -184,6 +190,9 @@ mod tests {
         }
         fn running(&self, _request: &AiRequest) {
             self.events.lock().unwrap().push("running");
+        }
+        fn waited(&self, _request: &AiRequest, waited: std::time::Duration) {
+            self.waits.lock().unwrap().push(waited);
         }
     }
 
@@ -246,6 +255,16 @@ mod tests {
             observer.events.lock().unwrap().as_slice(),
             ["queued", "running"],
             "the wait has to be cleared, or the stage reads as queued forever"
+        );
+
+        // And how long it lasted: the second call sat behind the first for at
+        // least the 50ms before the gate opened.
+        let waits = observer.waits.lock().unwrap();
+        assert_eq!(waits.len(), 1, "one call waited, once");
+        assert!(
+            waits[0] >= std::time::Duration::from_millis(40),
+            "the wait is measured, not guessed: {:?}",
+            waits[0]
         );
     }
 
