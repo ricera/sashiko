@@ -214,56 +214,111 @@ SASHIKO__SERVER__ACL__ADMINS="first@example.org,second@example.org"
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `repository_path` | string | -- | Path to the kernel git repository used for patch application and context. |
-| `reference_repository_path` | string | unset | Optional read-only second repository consulted for grounding. Linux project only. See [Reviewing out-of-tree modules](#reviewing-out-of-tree-modules). |
-| `reference_revision` | string | `HEAD` | Revision to read the reference repository at. |
+| `references` | array of tables | empty | Optional read-only repositories consulted for grounding. Linux project only. See [`[[git.references]]`](#gitreferences). |
+
+#### `[[git.references]]`
+
+Optional ordered list of read-only repositories the review can read alongside
+the code under review. Each entry is one table:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `name` | string | -- | Required. What the model passes as `repo` to read this tree, and what errors and logs call it. Must match `^[a-z0-9][a-z0-9._-]{0,31}$` and be unique. `review` is reserved for the repository under review, and `kernel` may only name a `kind = "kernel"` entry. |
+| `kind` | string | `"source"` | `"kernel"` for the Linux tree the reviewed code builds against, or `"source"` for any other tree. At most one entry may be `"kernel"`. |
+| `path` | string | -- | Required. The top of a git work tree, or the git directory of a bare clone. Use an absolute path: a relative one is resolved against the working directory of whichever process reads it. |
+| `revision` | string | `HEAD` | Revision to read the tree at: a tag, SHA or branch. Must not start with `-`. |
+| `description` | string | -- | What the tree is and what to use it for, shown to the model. Required for `kind = "source"`; optional for `kind = "kernel"`, which has built-in text. |
+
+At most 8 entries are allowed. Each adds a `repo` value to every git tool and an
+entry to every review's prompt, so configure only trees the reviews need.
 
 #### Reviewing out-of-tree modules
 
 When `repository_path` is an out-of-tree kernel module rather than a kernel tree,
 the review has no `include/linux/` to read. The model then answers questions
 about kernel APIs from training recall -- unversioned, possibly wrong for the
-kernel you build against, and with no signal that it is doing so.
+kernel you build against, and with no signal that it is doing so. The same holds
+for any other tree the module talks to: the RDMA half of driver-a has an ABI
+with the userspace provider in rdma-core, and that code is in neither the module
+nor the kernel.
 
-Point `reference_repository_path` at a separate kernel checkout to fix that:
+Add a reference for each such tree. For driver-a, the kernel it builds
+against and the example-org/rdma-core release branch it ships with:
 
 ```toml
 [git]
 repository_path = "/srv/sashiko/driver-a"
-reference_repository_path = "/srv/sashiko/linux"
-reference_revision = "v6.12"
+
+[[git.references]]
+name = "kernel"
+kind = "kernel"
+path = "/srv/sashiko/linux"
+revision = "v6.18"
+
+[[git.references]]
+name = "rdma-core"
+path = "/srv/sashiko/rdma-core"      # a clone of example-org/rdma-core
+revision = "origin/ionic-rdma"       # a release branch; see the notes on pins
+description = """Userspace RDMA stack (example-org/rdma-core). \
+kernel-headers/rdma/ionic-abi.h mirrors the kernel uapi; providers/ionic is \
+libionic, whose ionic_fw.h hand-mirrors the driver's WQE/CQE/doorbell formats. \
+Use it to check the kernel<->provider ABI, ctx_resp capability/version fields \
+and mmap offsets; old and new rdma-core must both keep working."""
 ```
 
-or, through the environment:
+`[[git.references]]` tables must come after every plain `[git]` key. In TOML, a
+key written below a table header belongs to that table, so a `repository_path`
+placed after the first `[[git.references]]` becomes an unknown key of that entry
+and the settings fail to load. References are configured in `Settings.toml`
+only: an array of tables cannot be expressed through `SASHIKO__` environment
+variables.
 
-```bash
-SASHIKO__GIT__REFERENCE_REPOSITORY_PATH=/srv/sashiko/linux
-SASHIKO__GIT__REFERENCE_REVISION=v6.12
-```
+This does several things:
 
-This does three things. The git tools gain a `repo` argument, so the model can
-read the kernel tree with `repo: "kernel"` while the code under review stays the
-default. The system prompt gains a block stating the repository is out-of-tree,
-naming the pinned kernel, and withdrawing the in-tree conventions that do not
-apply here -- `Fixes:` tags, lore threads, and treating compat `#ifdef`s as
-needless complexity. And the path and revision are validated before any review
-runs, at daemon startup and again each time a review worker starts, because a
-reference that does not resolve otherwise surfaces as tool errors the model
-works around, leaving a review that looks normal and is ungrounded.
+- The git tools gain a `repo` argument whose values are `"review"` (the
+  default, the code under review) followed by each reference's name, in
+  configured order. Its description names each reference's kind and pin.
+- The system prompt gains a "Read-only Reference Repositories" block listing
+  each reference with its pin, the commit it resolved to and its description,
+  and asking the model to cite `repo:file:line` for any contract it claims.
+- When a `kind = "kernel"` reference is attached, the prompt also states that
+  the repository under review is an out-of-tree module and withdraws the
+  in-tree conventions that do not apply -- `Fixes:` tags, lore threads, and
+  treating compat `#ifdef`s as needless complexity. A configuration with only
+  `"source"` references, such as rdma-core alone, does not get this block.
+- Every tool result read from a reference carries `repo_read`, the reference's
+  name, and `revision_read`, the revision actually served, with `HEAD` reported
+  as the commit SHA it was served.
+- The list is validated before any review runs, at daemon startup and again
+  each time a review worker starts, because a reference that does not resolve
+  otherwise surfaces as tool errors the model works around, leaving a review
+  that looks normal and is ungrounded. Errors name the entry, e.g.
+  `git.references[rdma-core].revision 'v59' does not resolve in ...`.
+- Each worker logs one line per reference when it starts, at INFO: its name,
+  kind, path, and configured revision with the commit it resolved to, e.g.
+  `Reference repository rdma-core: kind source, path /srv/sashiko/rdma-core,
+  revision origin/ionic-rdma -> 9f8e7d6c...`.
 
 Notes:
 
-- **The daemon never writes to or fetches the reference repository.** Clone and
-  update it yourself.
-- **Pin `reference_revision`.** Left at `HEAD` on a tracking clone, the answers
-  change from one review to the next as the tree moves. Each worker resolves
-  the revision to a commit when it starts and serves that commit for the whole
-  review, so a fetch mid-review does not move it. `HEAD` in a kernel-tree read
-  -- including forms such as `HEAD:include/linux/netdevice.h` or
-  `HEAD~5..HEAD`, and git's `@` shorthand for it -- means that commit, never
-  the tip of the clone. A revision named explicitly, including the pin's own
-  name, is passed to git as written. Each kernel-tree tool result carries a
-  `revision_read` field naming what was actually read, with `HEAD` reported as
-  the commit SHA it was served.
+- **Sashiko never fetches, writes to or checks out a reference repository.**
+  Clone each one and keep it updated yourself, for example with a `git fetch`
+  from cron.
+- **Pins.** Each worker resolves every reference's revision to a commit when it
+  starts and serves that commit for the whole review, so a fetch mid-review does
+  not move it. A tag or SHA gives a fixed pin. A branch pin -- such as a
+  example-org/rdma-core release branch -- moves as you update the clone: the next
+  worker reads the new tip, and its INFO line records which commit that was. A
+  revision left at `HEAD` behaves the same way for whatever the clone has
+  checked out.
+- **HEAD means the pin.** In a reference read, `HEAD`, git's `@` shorthand, an
+  omitted revision, and forms such as `HEAD:include/linux/netdevice.h` or
+  `HEAD~5..HEAD` all mean that reference's pinned commit, never the tip of the
+  clone. A revision named explicitly, including the pin's own name, is passed to
+  git as written.
+- **One clone may back several entries** at different revisions, for example
+  `net` and `net-next` pins from one kernel clone. Two entries that resolve to
+  the same commit of the same clone are refused.
 - **Point at the top of the repository.** The path must be the root of the
   work tree, or the git directory of a bare clone. A directory inside some other
   repository is refused, since git would otherwise serve every read from the
@@ -271,22 +326,32 @@ Notes:
 - **A nested clone or submodule inside the module repo does not work.** `git grep`
   and `git show <rev>:<path>` read the repository's own index, so only this
   setting makes a second tree reachable.
-- **Linux project only.** Only the Linux review prompt explains the second tree
+- **Linux project only.** Only the Linux review prompt explains reference trees
   to the model. With `[project].kind = "sashiko"` (or `--project sashiko`) the
-  daemon refuses to start when `reference_repository_path` is set, and a
-  standalone worker ignores it with a warning.
-- Leaving `reference_repository_path` unset reproduces the previous behaviour
-  exactly: no `repo` argument is advertised to the model, and no out-of-tree
-  block is added to the prompt.
-- The setting is read only where the full `Settings.toml` is loaded: the daemon
+  daemon refuses to start when `git.references` is non-empty, and a standalone
+  worker ignores the list with a warning; both name the entries.
+- An empty list reproduces single-repository behaviour exactly: no `repo`
+  argument is advertised to the model, and neither block is added to the
+  prompt.
+- The list is read only where the full `Settings.toml` is loaded: the daemon
   and the review workers it spawns. `sashiko review` and `sashiko-cli local`
   load the local review settings, which have no `[git]` section, and have no
   flag for it, so reviews started that way are never grounded. The hidden
-  `sashiko worker` subcommand accepts `--reference-repo` and
-  `--reference-revision`, which override the setting and are the only way to
-  set a reference alongside `--repo` or `--settings`: both of those load the
-  local review settings, so `[git]` in the named file is ignored.
-  `--reference-revision` on its own re-pins the configured repository.
+  `sashiko worker` subcommand takes two repeatable flags, merged by name over
+  the configured list. They are the only way to set references alongside
+  `--repo` or `--settings`, both of which load the local review settings, so
+  `[git]` in the named file is ignored.
+  - `--reference NAME=PATH[@REV]` replaces the path of entry `NAME` and drops
+    its configured revision, which was chosen for a different clone; `@REV`
+    pins the new one. A `NAME` that is not configured is added only as
+    `kernel`, because any other reference needs a description, which only
+    `Settings.toml` can give. `PATH@REV` splits at the last `@`, so a
+    revision containing `@` must be given with `--reference-revision`, and a
+    path containing `@` must be followed by `@REV` (`@HEAD` pins the clone's
+    current commit); otherwise the part after the path's own `@` is taken as
+    the revision.
+  - `--reference-revision NAME=REV` re-pins entry `NAME`, and wins over an
+    `@REV` for the same name. An unknown `NAME` is an error.
 
 #### `[[git.custom_remotes]]`
 

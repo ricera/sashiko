@@ -42,18 +42,27 @@ pub struct SashikoToolContext {
     pub prompts_path: Option<PathBuf>,
     pub active_patch_files: RwLock<Vec<String>>,
     pub virtual_head: RwLock<Option<String>>,
-    /// A read-only second repository for grounding, and the revision to read it
-    /// at. See [`RepoTarget`] and `git.reference_repository_path`.
-    pub reference: Option<ReferenceRepo>,
+    /// Read-only repositories for grounding, in configured order. See
+    /// [`RepoTarget`] and `git.references`.
+    ///
+    /// Fixed for the ToolBox's lifetime, so an index into it is a stable
+    /// identity for a cache key.
+    pub references: Vec<ReferenceRepo>,
     pub(crate) cache: Arc<RwLock<std::collections::HashMap<String, Value>>>,
 }
 
 /// A read-only repository consulted for context but never reviewed or written.
 #[derive(Debug, Clone)]
 pub struct ReferenceRepo {
+    /// The value of [`REPO_ARG`] that selects this repository. A lookup key
+    /// only: it never reaches a git command line.
+    pub name: String,
+    /// What the tree is, which decides how the prompt frames it. A kernel entry
+    /// is what marks the review as out-of-tree.
+    pub kind: crate::settings::ReferenceKind,
     pub path: PathBuf,
-    /// The revision as configured, e.g. a tag. Shown to the model so it knows
-    /// which kernel it is reading; never handed to git.
+    /// The revision as configured, e.g. a tag or a release branch. Shown to the
+    /// model so it knows which release it is reading; never handed to git.
     pub revision: String,
     /// The commit `revision` resolved to when it was validated. This, not the
     /// name, is what an unpinned read is served: a branch name, or the default
@@ -61,6 +70,9 @@ pub struct ReferenceRepo {
     /// fetch or checkout in the clone mid-review would change what the rest of
     /// the review reads.
     pub commit: String,
+    /// What the tree is for, as configured. Shown to the model in the prompt;
+    /// a kernel entry without one gets built-in text.
+    pub description: Option<String>,
 }
 
 /// Which repository a tool call reads from.
@@ -69,15 +81,14 @@ pub enum RepoTarget {
     /// The worktree holding the patch under review. The default, and the only
     /// option unless a reference repository is configured.
     Review,
-    /// The kernel tree the reviewed code builds against.
-    Reference,
+    /// A read-only reference repository: an index into
+    /// [`SashikoToolContext::references`], stable because the list never
+    /// changes after the ToolBox is built.
+    Reference(usize),
 }
 
 /// Argument name the model uses to pick a repository.
 pub const REPO_ARG: &str = "repo";
-
-/// Value of [`REPO_ARG`] selecting the reference repository.
-pub const REPO_ARG_REFERENCE: &str = "kernel";
 
 /// Value of [`REPO_ARG`] selecting the repository under review.
 pub const REPO_ARG_REVIEW: &str = "review";
@@ -88,6 +99,13 @@ pub const REPO_ARG_REVIEW: &str = "review";
 /// for. The two differ whenever the caller left the revision unpinned, which is
 /// most of the time, and only this one says what the answer describes.
 pub const REVISION_READ_KEY: &str = "revision_read";
+
+/// Key naming the reference repository a read was served from.
+///
+/// With several references attached, the commit in [`REVISION_READ_KEY`] alone
+/// does not say which tree was read, and a tag like `v6.12` can exist in more
+/// than one of them.
+pub const REPO_READ_KEY: &str = "repo_read";
 
 /// Arguments that name a revision, per tool, in the order they appear on the
 /// command line. Most tools take one `revision`; git_show and git_log embed the
@@ -147,29 +165,37 @@ impl SashikoToolContext {
     /// An unknown value is an error rather than a silent fall back to the review
     /// repository: answering a question about kernel headers with a search of
     /// the driver returns "no matches", which the model reads as a fact about
-    /// the kernel.
+    /// the kernel. The error lists every valid name, so the retry can be right.
     pub fn repo_target(&self, args: &Value) -> Result<RepoTarget> {
-        match args[REPO_ARG].as_str() {
-            None | Some(REPO_ARG_REVIEW) => Ok(RepoTarget::Review),
-            Some(REPO_ARG_REFERENCE) if self.reference.is_some() => Ok(RepoTarget::Reference),
-            Some(REPO_ARG_REFERENCE) => Err(anyhow::anyhow!(
-                "No reference repository is configured, so '{}: \"{}\"' cannot be served. \
-                 Either this review has no separate kernel tree to consult, or \
-                 git.reference_repository_path is unset in the daemon's settings. \
-                 Retry without '{}' to search the repository under review.",
-                REPO_ARG,
-                REPO_ARG_REFERENCE,
-                REPO_ARG
-            )),
-            Some(other) => Err(anyhow::anyhow!(
-                "Unknown {} '{}'. Valid values are \"{}\" (the code under review) and \"{}\" \
-                 (the kernel tree it builds against).",
-                REPO_ARG,
-                other,
-                REPO_ARG_REVIEW,
-                REPO_ARG_REFERENCE
-            )),
+        let name = match args[REPO_ARG].as_str() {
+            None | Some(REPO_ARG_REVIEW) => return Ok(RepoTarget::Review),
+            Some(name) => name,
+        };
+        if let Some(index) = self.references.iter().position(|r| r.name == name) {
+            return Ok(RepoTarget::Reference(index));
         }
+        if self.references.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No reference repositories are attached to this review (git.references \
+                 or --reference), so '{}: \"{}\"' cannot be served. Retry without '{}' \
+                 to search the repository under review.",
+                REPO_ARG,
+                name,
+                REPO_ARG
+            ));
+        }
+        let valid: Vec<String> = self
+            .references
+            .iter()
+            .map(|r| format!("\"{}\"", r.name))
+            .collect();
+        Err(anyhow::anyhow!(
+            "Unknown {} '{}'. Valid values: \"{}\" (the code under review), {}.",
+            REPO_ARG,
+            name,
+            REPO_ARG_REVIEW,
+            valid.join(", ")
+        ))
     }
 
     /// The reference repository a call is aimed at, or `None` when the call is
@@ -177,9 +203,9 @@ impl SashikoToolContext {
     fn reference_for(&self, args: &Value) -> Result<Option<&ReferenceRepo>> {
         Ok(match self.repo_target(args)? {
             RepoTarget::Review => None,
-            // repo_target only returns Reference when a reference is attached,
-            // so the `None` here is unreachable rather than a silent fallback.
-            RepoTarget::Reference => self.reference.as_ref(),
+            // repo_target only returns indices it found in the list, so the
+            // `None` here is unreachable rather than a silent fallback.
+            RepoTarget::Reference(index) => self.references.get(index),
         })
     }
 
@@ -195,14 +221,14 @@ impl SashikoToolContext {
     ///
     /// Virtualization applies to the review repository alone. The virtual head
     /// is a commit that exists only in the review worktree, so rewriting `HEAD`
-    /// into it before querying the kernel tree would ask for an object that is
-    /// not there -- or, worse, one that is there and unrelated.
+    /// into it before querying a reference repository would ask for an object
+    /// that is not there -- or, worse, one that is there and unrelated.
     ///
-    /// In the reference repository, `HEAD` means the pinned commit instead.
-    /// That covers `HEAD` inside a larger expression too:
+    /// In a reference repository, `HEAD` means that repository's own pinned
+    /// commit instead. That covers `HEAD` inside a larger expression too:
     /// `HEAD:include/linux/foo.h` or `HEAD~5..HEAD` would otherwise read the
     /// tip of the clone, which on a tracking clone can be hundreds of commits
-    /// away from the kernel the module is built against.
+    /// away from the release the review is pinned to.
     pub fn resolve_ref(&self, args: &Value, raw: &str) -> Result<String> {
         Ok(match self.reference_for(args)? {
             None => self.virtualize_ref(raw),
@@ -212,11 +238,6 @@ impl SashikoToolContext {
             Some(reference) if raw.is_empty() => reference.commit.clone(),
             Some(reference) => substitute_head(raw, &reference.commit),
         })
-    }
-
-    /// Whether a reference repository is available to be named at all.
-    pub fn has_reference(&self) -> bool {
-        self.reference.is_some()
     }
 
     /// The revision expression a reference read was served, resolved from
@@ -249,21 +270,88 @@ impl SashikoToolContext {
     }
 }
 
-/// JSON-schema fragment for the `repo` argument, shared by every tool that reads
-/// a repository so the model is told the same thing eight times.
+/// Placeholder JSON-schema fragment for the `repo` argument, embedded in the
+/// static parameters of every tool that reads a repository.
 ///
-/// Stripped from the declarations when no reference repository is configured, so
-/// the model is never offered an option that can only fail.
+/// It has to stay in each tool's own schema: [`ToolBox::call`] decides whether
+/// a tool takes `repo` from its declared parameters, and only such tools are
+/// validated and tagged. The values the model actually sees depend on the
+/// configured references, so [`ToolBox::get_declarations_generic`] replaces
+/// this with [`repo_arg_schema_for`], or strips it when there are none.
 pub fn repo_arg_schema() -> Value {
     serde_json::json!({
         "type": "string",
-        "enum": [REPO_ARG_REVIEW, REPO_ARG_REFERENCE],
-        "description":
-            "Which repository to read. \"review\" (default) is the code under review. \"kernel\" \
-             is the read-only Linux tree that code builds against -- use it to check API \
-             contracts, struct layouts, and header definitions rather than recalling them. \
-             Never use \"kernel\" to look for the change under review; it is not there."
+        "enum": [REPO_ARG_REVIEW],
+        "description": "Which repository to read. \"review\" (default) is the code under review."
     })
+}
+
+/// The `repo` argument as offered to the model: "review" plus every reference
+/// in configured order, each named with its kind and pin.
+///
+/// Kept short because it is repeated in eight tools. What HEAD means in a
+/// reference is already said on every revision argument, and what each tree
+/// is for, and that the change is never in one, is said once in the prompt.
+fn repo_arg_schema_for(refs: &[ReferenceRepo]) -> Value {
+    let mut values = vec![Value::from(REPO_ARG_REVIEW)];
+    values.extend(refs.iter().map(|r| Value::from(r.name.as_str())));
+    let listed = refs
+        .iter()
+        .map(|r| {
+            let kind = match r.kind {
+                crate::settings::ReferenceKind::Kernel => "kernel tree",
+                crate::settings::ReferenceKind::Source => "source",
+            };
+            format!("{} ({kind}, {})", r.name, r.revision)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    serde_json::json!({
+        "type": "string",
+        "enum": values,
+        "description": format!(
+            "Which repository to read. \"review\" (default) is the code under review. \
+             Read-only references: {listed}."
+        )
+    })
+}
+
+/// Appends the note on what HEAD means in a reference repository to every
+/// argument of a tool schema that names a revision.
+fn add_pin_note(props: &mut serde_json::Map<String, Value>) {
+    // Say what HEAD means in the one place the model is deciding what to
+    // pass. Told only elsewhere in the prompt, it was unsure whether HEAD in
+    // the kernel tree meant the pin or the tip of the clone. A description on
+    // the argument itself arrives at the moment of the choice. Every argument
+    // that carries a revision gets it, not only those named `revision`.
+    //
+    // The pins themselves are named once, in the repo argument, rather than
+    // once per reference in each of the five revision arguments of eight
+    // tools.
+    //
+    // HEAD is steered towards rather than the pin's name, because HEAD is
+    // served the commit validated at startup, whereas a name -- a branch in
+    // particular -- is resolved again on every read and can move under a
+    // running review.
+    for key in REVISION_ARGS {
+        if let Some(arg) = props.get_mut(key).and_then(Value::as_object_mut) {
+            let base = arg
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            arg.insert(
+                "description".to_string(),
+                Value::from(format!(
+                    "{base} In a read-only reference repo, \"HEAD\" (or \"@\"), \
+                     or leaving the revision out, reads that repo's pin (listed \
+                     under {REPO_ARG}), never the tip of the clone. Name a \
+                     different revision only to ask whether something changed \
+                     in another release."
+                )),
+            );
+        }
+    }
 }
 
 /// A backward-compatible adapter that coordinates Sashiko's LLM tools.
@@ -287,7 +375,7 @@ impl ToolBox {
             prompts_path,
             active_patch_files: RwLock::new(Vec::new()),
             virtual_head: RwLock::new(None),
-            reference: None,
+            references: Vec::new(),
             cache: cache.clone(),
         };
 
@@ -322,14 +410,30 @@ impl ToolBox {
         self.registry.register(tool);
     }
 
-    /// Attaches a read-only repository the model can consult for grounding.
+    /// Appends a read-only repository the model can consult for grounding.
     ///
-    /// Without one, the `repo` argument is not advertised to the model at all --
+    /// Without any, the `repo` argument is not advertised to the model at all --
     /// see `get_declarations_generic` -- so an unconfigured deployment behaves
-    /// exactly as it did before.
+    /// exactly as it did before. Must be called before the first tool call:
+    /// cache keys identify a reference by its name and position.
     pub fn with_reference(mut self, reference: ReferenceRepo) -> Self {
-        self.context.reference = Some(reference);
+        debug_assert!(
+            !self
+                .context
+                .references
+                .iter()
+                .any(|r| r.name == reference.name),
+            "reference {} attached twice",
+            reference.name
+        );
+        self.context.references.push(reference);
         self
+    }
+
+    /// Appends several read-only repositories, in order. See
+    /// [`ToolBox::with_reference`].
+    pub fn with_references(self, references: impl IntoIterator<Item = ReferenceRepo>) -> Self {
+        references.into_iter().fold(self, Self::with_reference)
     }
 
     /// Sets the virtual head commit SHA for the current review session.
@@ -354,12 +458,12 @@ impl ToolBox {
         &self.context.worktree_path
     }
 
-    /// Revision of the reference repository, if one is attached.
+    /// The attached reference repositories, in configured order.
     ///
-    /// The prompt layer uses this both to tell the model which kernel it is
-    /// reading and to decide whether this is an out-of-tree review at all.
-    pub fn reference_revision(&self) -> Option<&str> {
-        self.context.reference.as_ref().map(|r| r.revision.as_str())
+    /// The prompt layer uses these both to list the trees the model can read
+    /// and to decide whether this is an out-of-tree review at all.
+    pub fn references(&self) -> &[ReferenceRepo] {
+        &self.context.references
     }
 
     /// Generates LLM-facing declarations for all registered tools.
@@ -367,10 +471,10 @@ impl ToolBox {
     /// With no reference repository configured, the `repo` argument is removed
     /// from every schema. Advertising a value that always errors would spend a
     /// turn per attempt to teach the model something the declaration could have
-    /// said for free.
+    /// said for free. With references, it lists exactly the attached names.
     pub fn get_declarations_generic(&self) -> Vec<AiTool> {
-        let has_reference = self.context.has_reference();
-        let pin = self.reference_revision();
+        let references = &self.context.references;
+        let repo_schema = (!references.is_empty()).then(|| repo_arg_schema_for(references));
         self.registry
             .declarations()
             .into_iter()
@@ -380,40 +484,15 @@ impl ToolBox {
                     .get_mut("properties")
                     .and_then(Value::as_object_mut)
                 {
-                    if !has_reference {
-                        props.remove(REPO_ARG);
-                    }
-                    // Name the pin in the one place the model is deciding what
-                    // to pass. Told the revision only elsewhere in the prompt,
-                    // it was unsure whether HEAD in the kernel tree meant the
-                    // pin or the tip of the clone. A description on the
-                    // argument itself is free and arrives at the moment of the
-                    // choice. Every argument that carries a revision gets it,
-                    // not only those named `revision`.
-                    //
-                    // HEAD is steered towards rather than the pin's name,
-                    // because HEAD is served the commit validated at startup,
-                    // whereas a name -- a branch in particular -- is resolved
-                    // again on every read and can move under a running review.
-                    if let Some(pin) = pin {
-                        for key in REVISION_ARGS {
-                            if let Some(arg) = props.get_mut(key).and_then(Value::as_object_mut) {
-                                let base = arg
-                                    .get("description")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                arg.insert(
-                                    "description".to_string(),
-                                    Value::from(format!(
-                                        "{base} When {REPO_ARG} is \"{REPO_ARG_REFERENCE}\", that \
-                                         tree is pinned to {pin}: \"HEAD\" (or \"@\"), or leaving \
-                                         the revision out, reads {pin} and never the tip of the \
-                                         clone. Name a different revision only to ask whether \
-                                         something changed in another release."
-                                    )),
-                                );
+                    match &repo_schema {
+                        None => {
+                            props.remove(REPO_ARG);
+                        }
+                        Some(repo_schema) => {
+                            if props.contains_key(REPO_ARG) {
+                                props.insert(REPO_ARG.to_string(), repo_schema.clone());
                             }
+                            add_pin_note(props);
                         }
                     }
                 }
@@ -448,9 +527,11 @@ impl ToolBox {
 
         // Pin the repository into the cache key centrally rather than in eight
         // `normalize_args` bodies: a tool that forgot would serve the review
-        // repo's answer to a question about the kernel tree, which is a wrong
+        // repo's answer to a question about a reference tree, which is a wrong
         // answer that looks like a right one. Defaulting the absent case here
-        // also keeps `{}` and `{"repo":"review"}` on the same cache entry.
+        // also keeps `{}` and `{"repo":"review"}` on the same cache entry. The
+        // key carries the reference's name as the model gave it, so two
+        // references asked the same question never share an entry.
         if takes_repo
             && let Some(obj) = normalized_args.as_object_mut()
             && !obj.contains_key(REPO_ARG)
@@ -478,37 +559,45 @@ impl ToolBox {
         // Resolved before the call, so a bad `repo` fails without running the
         // tool, and a call that did run is never turned into an error after
         // the fact.
-        let served =
-            if takes_repo && self.context.repo_target(&normalized_args)? == RepoTarget::Reference {
-                Some(self.context.served_revision(&normalized_args)?)
-            } else {
-                None
-            };
+        let served = if takes_repo
+            && let RepoTarget::Reference(index) = self.context.repo_target(&normalized_args)?
+        {
+            Some((
+                self.context.served_revision(&normalized_args)?,
+                self.context.references[index].name.clone(),
+            ))
+        } else {
+            None
+        };
 
         let mut res = self
             .registry
             .call(&name_normalized, args, &self.context)
             .await?;
 
-        // Say which revision of the reference repository was actually read.
+        // Say which reference repository was read, and at which revision.
         //
-        // HEAD in the kernel tree is served the pinned commit rather than the
-        // tip of the clone, so the arguments recorded in the log are what was
-        // asked for and not what was done. Reading a tracking clone at
-        // whatever was last fetched, instead of the tag the module is built
-        // against, is exactly the failure pinning exists to prevent -- and it
-        // would leave the log looking identical to a correct run.
+        // HEAD in a reference repository is served its pinned commit rather
+        // than the tip of the clone, so the arguments recorded in the log are
+        // what was asked for and not what was done. Reading a tracking clone at
+        // whatever was last fetched, instead of the release the review is
+        // pinned to, is exactly the failure pinning exists to prevent -- and it
+        // would leave the log looking identical to a correct run. The name goes
+        // beside the commit because, with several references, the commit alone
+        // does not say which tree it came from.
         //
         // Annotated here rather than in each of the eight tools, and before the
         // cache write so a hit carries it too. Resolved for this call rather
         // than taken from the configuration: an explicitly named revision is
         // honoured, so the pin is not always what was read. HEAD and an
         // omitted revision are reported as the commit SHA they were served.
-        if let Some(served) = served
+        if let Some((served, name)) = served
             && let Some(obj) = res.as_object_mut()
         {
             obj.entry(REVISION_READ_KEY)
                 .or_insert_with(|| Value::from(served));
+            obj.entry(REPO_READ_KEY)
+                .or_insert_with(|| Value::from(name));
         }
 
         if let Some(k) = key {

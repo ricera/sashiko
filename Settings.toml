@@ -218,6 +218,20 @@ repository_path = "third_party/linux"
 # check_all_branches = true
 # only_branches = []
 
+# Read-only reference repositories for grounding (Linux project only). Put
+# these tables after every plain [git] key. Sashiko never fetches them.
+# [[git.references]]
+# name = "kernel"               # the value the model passes as repo=
+# kind = "kernel"               # "kernel" | "source" (default "source")
+# path = "/srv/sashiko/linux"
+# revision = "v6.18"            # resolved to a commit when each worker starts
+#
+# [[git.references]]
+# name = "rdma-core"
+# path = "/srv/sashiko/rdma-core"
+# revision = "origin/ionic-rdma"
+# description = "Userspace RDMA stack; required for kind \"source\"."
+
 [review]
 concurrency = 16
 worktree_dir = "review_trees"

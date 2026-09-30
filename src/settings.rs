@@ -763,20 +763,65 @@ pub struct CustomRemoteSettings {
 pub struct GitSettings {
     pub repository_path: String,
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
-    /// A second, read-only repository the review can consult for grounding.
+    /// Read-only repositories the review can consult for grounding, in the
+    /// order they are offered to the model.
     ///
-    /// Set when `repository_path` is an out-of-tree kernel module: the module's
-    /// own tree has no `include/linux/`, so without this the model answers
-    /// questions about kernel API contracts from recall rather than from source,
-    /// and does so silently. Absent means single-repository review, exactly as
-    /// before. Linux project only.
+    /// Set when `repository_path` is code that talks to another tree it does
+    /// not contain: an out-of-tree kernel module needs the kernel it builds
+    /// against, and its userspace counterpart (rdma-core for an RDMA driver)
+    /// needs the other side of its ABI. Without them the model answers
+    /// questions about those contracts from recall rather than from source, and
+    /// does so silently. The order is the order of the `repo` tool argument and
+    /// of the list in the prompt. Empty means single-repository review, exactly
+    /// as before. Linux project only.
     #[serde(default)]
-    pub reference_repository_path: Option<String>,
-    /// Revision to read the reference repository at, e.g. the tag the module is
-    /// built against. Defaults to `HEAD`, which on a tracking clone means
-    /// whatever was last fetched -- pin it to keep reviews reproducible.
+    pub references: Vec<ReferenceSettings>,
+}
+
+/// What a reference repository is, which decides how the prompt frames it.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ReferenceKind {
+    /// The Linux kernel tree the code under review builds against. Attaching
+    /// one marks the review as out-of-tree, so the prompt withdraws the
+    /// in-tree conventions that do not apply.
+    Kernel,
+    /// Any other source tree, described to the model by `description`.
+    #[default]
+    Source,
+}
+
+impl std::fmt::Display for ReferenceKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ReferenceKind::Kernel => "kernel",
+            ReferenceKind::Source => "source",
+        })
+    }
+}
+
+/// One `[[git.references]]` entry.
+///
+/// Unknown keys are refused, so a key this build does not implement fails the
+/// load instead of being silently ignored.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ReferenceSettings {
+    /// The value the model passes as `repo`, and the name every error and log
+    /// line uses for this entry.
+    pub name: String,
     #[serde(default)]
-    pub reference_revision: Option<String>,
+    pub kind: ReferenceKind,
+    pub path: String,
+    /// Revision to read the repository at, e.g. the tag the module is built
+    /// against or a release branch. Defaults to `HEAD`. Resolved to a commit
+    /// once per worker run, so a fetch mid-review does not move it.
+    #[serde(default)]
+    pub revision: Option<String>,
+    /// What the tree is and what to use it for, shown to the model. Required
+    /// for kind "source"; a kind "kernel" entry has built-in text.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1105,26 +1150,141 @@ mod tests {
         }
     }
 
-    /// `GitSettings` denies unknown fields, so a Settings.toml naming a
-    /// reference repository fails to load unless both keys are declared.
+    /// `[[git.references]]` entries deserialize in order, with the kind
+    /// defaulting to "source" and the revision optional.
     #[test]
-    fn git_settings_accept_a_reference_repository() {
+    fn git_settings_accept_named_references() {
         let git: GitSettings = toml::from_str(
             "repository_path = \"/srv/sashiko/driver-a\"\n\
-             reference_repository_path = \"/srv/sashiko/linux\"\n\
-             reference_revision = \"v6.12\"\n",
+             \n\
+             [[references]]\n\
+             name = \"kernel\"\n\
+             kind = \"kernel\"\n\
+             path = \"/srv/sashiko/linux\"\n\
+             revision = \"v6.18\"\n\
+             \n\
+             [[references]]\n\
+             name = \"rdma-core\"\n\
+             path = \"/srv/sashiko/rdma-core\"\n\
+             description = \"\"\"Userspace RDMA stack.\n\
+             providers/ionic is libionic.\"\"\"\n",
         )
-        .expect("reference keys must deserialize");
-        assert_eq!(
-            git.reference_repository_path.as_deref(),
-            Some("/srv/sashiko/linux")
+        .expect("reference entries must deserialize");
+        assert_eq!(git.references.len(), 2);
+        let kernel = &git.references[0];
+        assert_eq!(kernel.name, "kernel");
+        assert_eq!(kernel.kind, ReferenceKind::Kernel);
+        assert_eq!(kernel.path, "/srv/sashiko/linux");
+        assert_eq!(kernel.revision.as_deref(), Some("v6.18"));
+        assert!(kernel.description.is_none());
+        let rdma = &git.references[1];
+        assert_eq!(rdma.name, "rdma-core");
+        assert_eq!(rdma.kind, ReferenceKind::Source, "kind defaults to source");
+        assert!(rdma.revision.is_none());
+        assert!(
+            rdma.description
+                .as_deref()
+                .is_some_and(|d| d.contains("libionic")),
+            "{rdma:?}"
         );
-        assert_eq!(git.reference_revision.as_deref(), Some("v6.12"));
 
         // Absent means single-repository review, exactly as before.
         let git: GitSettings = toml::from_str("repository_path = \"linux\"\n").unwrap();
-        assert!(git.reference_repository_path.is_none());
-        assert!(git.reference_revision.is_none());
+        assert!(git.references.is_empty());
+    }
+
+    /// The single-reference keys were removed without an alias. A Settings.toml
+    /// that was not migrated must stop the load and name the key, not be
+    /// silently read as a review with no reference at all.
+    #[test]
+    fn git_settings_reject_the_removed_scalar_keys() {
+        for key in ["reference_repository_path", "reference_revision"] {
+            let err = toml::from_str::<GitSettings>(&format!(
+                "repository_path = \"linux\"\n{key} = \"/srv/linux\"\n"
+            ))
+            .expect_err("a removed key must not load");
+            assert!(err.to_string().contains(key), "{err}");
+        }
+    }
+
+    /// The same holds through the config loader the daemon and worker use, not
+    /// only through `toml` directly: an array of tables with a multi-line
+    /// description survives it, and a removed key still stops the load.
+    #[test]
+    fn settings_file_carries_references_through_the_config_loader() {
+        let shipped =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Settings.toml"))
+                .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+
+        let path = dir.path().join("Settings.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "{shipped}\n\
+                 [[git.references]]\n\
+                 name = \"kernel\"\n\
+                 kind = \"kernel\"\n\
+                 path = \"/srv/linux\"\n\
+                 revision = \"v6.18\"\n\
+                 \n\
+                 [[git.references]]\n\
+                 name = \"rdma-core\"\n\
+                 path = \"/srv/rdma-core\"\n\
+                 description = \"\"\"Userspace RDMA stack.\n\
+                 providers/ionic is libionic.\"\"\"\n"
+            ),
+        )
+        .unwrap();
+        let settings = Settings::from_file(&path).expect("references must load");
+        let names: Vec<_> = settings
+            .git
+            .references
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(names, ["kernel", "rdma-core"]);
+        assert_eq!(settings.git.references[0].kind, ReferenceKind::Kernel);
+        assert_eq!(
+            settings.git.references[1].description.as_deref(),
+            Some("Userspace RDMA stack.\nproviders/ionic is libionic.")
+        );
+
+        let stale = dir.path().join("Stale.toml");
+        std::fs::write(
+            &stale,
+            shipped.replacen(
+                "[git]\n",
+                "[git]\nreference_repository_path = \"/srv/linux\"\n",
+                1,
+            ),
+        )
+        .unwrap();
+        let err = Settings::from_file(&stale).expect_err("a removed key must stop the load");
+        assert!(
+            err.to_string().contains("reference_repository_path"),
+            "{err}"
+        );
+    }
+
+    /// Path scoping is not implemented yet, so a config that asks for it must
+    /// fail rather than attach the reference to every patch unannounced. Any
+    /// other unknown key on an entry is refused the same way.
+    #[test]
+    fn git_settings_reject_applies_to_until_supported() {
+        for extra in ["applies_to = [\"rdma/**\"]", "mirrors = \"x\""] {
+            let err = toml::from_str::<GitSettings>(&format!(
+                "repository_path = \"linux\"\n\
+                 [[references]]\n\
+                 name = \"rdma-core\"\n\
+                 path = \"/srv/rdma-core\"\n\
+                 description = \"d\"\n\
+                 {extra}\n"
+            ))
+            .expect_err("an unknown entry key must not load");
+            let key = extra.split(' ').next().unwrap();
+            assert!(err.to_string().contains(key), "{err}");
+        }
     }
 
     #[test]

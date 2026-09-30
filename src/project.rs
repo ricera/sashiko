@@ -84,14 +84,15 @@ impl ProjectId {
         }
     }
 
-    /// Whether a review of this project may be grounded against a separate,
-    /// read-only kernel tree (`git.reference_repository_path`).
+    /// Whether a review of this project may be grounded against separate,
+    /// read-only reference repositories (`git.references`).
     ///
-    /// Only the Linux prompt explains that tree to the model, and the tool
-    /// schema and errors describe it as a kernel. Offering it to a review of
-    /// any other project would hand the model a Linux checkout with no framing
-    /// for why it is there.
-    pub fn supports_reference_repository(self) -> bool {
+    /// The gate covers the whole list, not only a kernel entry. Only the Linux
+    /// prompt explains reference trees to the model -- the list of what each
+    /// one is for, and the out-of-tree caveats a kernel entry brings. Offering
+    /// them to a review of any other project would hand the model checkouts
+    /// with no framing for why they are there.
+    pub fn supports_reference_repositories(self) -> bool {
         match self {
             ProjectId::Linux => true,
             ProjectId::Sashiko => false,
