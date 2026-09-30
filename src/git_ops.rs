@@ -21,7 +21,7 @@ use std::sync::{Mutex, OnceLock};
 use tempfile::TempDir;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod apply_error;
 use apply_error::GitAmError;
@@ -781,8 +781,13 @@ pub async fn repack_repository(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Checks that a reference repository exists and that its revision resolves,
-/// returning the commit the revision names.
+/// Checks that the reference repository `git.references[name]` exists and that
+/// its revision resolves, returning the commit the revision names.
+///
+/// This is the only per-entry git check; the rules that span the whole list
+/// live in `crate::references`. Every error names the entry, because with
+/// several references configured a bare path or revision does not say which
+/// `[[git.references]]` table to fix.
 ///
 /// Called before any review runs rather than lazily, because the failure is
 /// silent where it would otherwise land: a bad path or a tag that was never
@@ -793,10 +798,14 @@ pub async fn repack_repository(repo_path: &Path) -> Result<()> {
 /// extra configuration, so a repository this accepts is one they can read. A
 /// check that relaxed, say, `safe.bareRepository` would pass a clone that every
 /// later tool call then fails on.
-pub async fn validate_reference_repository(path: &Path, revision: Option<&str>) -> Result<String> {
+pub async fn validate_reference_repository(
+    name: &str,
+    path: &Path,
+    revision: Option<&str>,
+) -> Result<String> {
     if !path.exists() {
         return Err(anyhow!(
-            "git.reference_repository_path {} does not exist",
+            "git.references[{name}].path {} does not exist",
             path.display()
         ));
     }
@@ -809,14 +818,14 @@ pub async fn validate_reference_repository(path: &Path, revision: Option<&str>) 
     // would then be served from that enclosing repository instead.
     let root = repository_root(path).await.map_err(|e| {
         anyhow!(
-            "git.reference_repository_path {} is not a git repository: {}",
+            "git.references[{name}].path {} is not a git repository: {}",
             path.display(),
             e
         )
     })?;
     if std::fs::canonicalize(&root)? != std::fs::canonicalize(path)? {
         return Err(anyhow!(
-            "git.reference_repository_path {} is not the top of a git repository; \
+            "git.references[{name}].path {} is not the top of a git repository; \
              it lies inside {}",
             path.display(),
             root.display()
@@ -829,7 +838,7 @@ pub async fn validate_reference_repository(path: &Path, revision: Option<&str>) 
     // then fail every single read.
     if revision.starts_with('-') {
         return Err(anyhow!(
-            "git.reference_revision '{}' is not a valid revision name",
+            "git.references[{name}].revision '{}' is not a valid revision name",
             revision
         ));
     }
@@ -838,15 +847,17 @@ pub async fn validate_reference_repository(path: &Path, revision: Option<&str>) 
     // repository, and a revision that names a tree or a missing tag, both fail.
     let sha = get_commit_hash(path, revision).await.map_err(|e| {
         anyhow!(
-            "git.reference_revision '{}' does not resolve in {}: {}",
+            "git.references[{name}].revision '{}' does not resolve in {}: {}",
             revision,
             path.display(),
             e
         )
     })?;
 
-    info!(
-        "Reference repository {} validated at {} ({})",
+    // The worker logs one line per reference once the whole list has
+    // resolved; this is only the trace of the individual check.
+    debug!(
+        "git.references[{name}] {} validated at {} ({})",
         path.display(),
         revision,
         sha
@@ -2208,19 +2219,24 @@ mod tests {
 
         // A path that is not there at all.
         let missing = temp.path().join("nope");
-        let err = validate_reference_repository(&missing, None)
+        let err = validate_reference_repository("rdma-core", &missing, None)
             .await
             .expect_err("a missing path must not pass");
         assert!(err.to_string().contains("does not exist"), "{err}");
+        assert!(
+            err.to_string().contains("git.references[rdma-core].path"),
+            "the error must name the entry and field: {err}"
+        );
 
         // A directory that exists but is not a git repository.
         let not_a_repo = temp.path().join("plain");
         std::fs::create_dir(&not_a_repo)?;
+        let err = validate_reference_repository("rdma-core", &not_a_repo, None)
+            .await
+            .expect_err("a plain directory must not pass as a repository");
         assert!(
-            validate_reference_repository(&not_a_repo, None)
-                .await
-                .is_err(),
-            "a plain directory must not pass as a repository"
+            err.to_string().contains("git.references[rdma-core].path"),
+            "{err}"
         );
 
         // A real repository, but a revision that was never fetched -- the
@@ -2241,30 +2257,44 @@ mod tests {
             assert!(status.success());
         }
 
-        let err = validate_reference_repository(&repo, Some("v6.12"))
+        let err = validate_reference_repository("rdma-core", &repo, Some("v6.12"))
             .await
             .expect_err("an unresolvable revision must not pass");
         assert!(err.to_string().contains("v6.12"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("git.references[rdma-core].revision"),
+            "{err}"
+        );
 
         // A leading dash would resolve under --end-of-options and then be
         // refused by every tool, so it is refused here instead.
-        let err = validate_reference_repository(&repo, Some("-HEAD"))
+        let err = validate_reference_repository("rdma-core", &repo, Some("-HEAD"))
             .await
             .expect_err("a revision the tools would refuse must not pass");
         assert!(err.to_string().contains("-HEAD"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("git.references[rdma-core].revision"),
+            "{err}"
+        );
 
         // A directory inside a repository is not that repository. git would
         // search upward and serve every read from the enclosing checkout.
         let nested = repo.join("include");
         std::fs::create_dir(&nested)?;
-        let err = validate_reference_repository(&nested, None)
+        let err = validate_reference_repository("rdma-core", &nested, None)
             .await
             .expect_err("a directory inside another repository must not pass");
         assert!(err.to_string().contains("not the top"), "{err}");
+        assert!(
+            err.to_string().contains("git.references[rdma-core].path"),
+            "{err}"
+        );
 
-        let sha = validate_reference_repository(&repo, None).await?;
+        let sha = validate_reference_repository("rdma-core", &repo, None).await?;
         assert_eq!(sha.len(), 40, "the resolved commit is returned: {sha}");
-        validate_reference_repository(&repo, Some("HEAD")).await?;
+        validate_reference_repository("rdma-core", &repo, Some("HEAD")).await?;
 
         // A bare clone is its own root, and is accepted.
         let bare = temp.path().join("bare.git");
@@ -2275,7 +2305,10 @@ mod tests {
             .status()
             .await?;
         assert!(status.success());
-        assert_eq!(validate_reference_repository(&bare, None).await?, sha);
+        assert_eq!(
+            validate_reference_repository("rdma-core", &bare, None).await?,
+            sha
+        );
         Ok(())
     }
 

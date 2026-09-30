@@ -113,9 +113,10 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
         }
 
         // The repository belongs in this key as much as the object does. A tag
-        // like `v6.12` names a different commit in the reference tree than in
-        // the repository under review, and serving one for the other is a wrong
-        // answer with no symptom.
+        // like `v6.12` names a different commit in each repository -- the one
+        // under review and every reference -- and serving one for another is a
+        // wrong answer with no symptom. The target carries the reference's
+        // index, which is stable because the list is fixed for the ToolBox.
         let raw_key = format!(
             "git_show_raw:{:?}:{}:{}:{:?}",
             context.repo_target(&args)?,

@@ -22,12 +22,90 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::toolbox::{REPO_ARG, REPO_ARG_REFERENCE};
+use crate::settings::ReferenceKind;
+use crate::toolbox::{REPO_ARG, REPO_ARG_REVIEW, ReferenceRepo};
 use crate::workflow::graph::Workflow;
 use crate::workflow::output::OutputFormat;
 use crate::workflow::policy::{ParallelPolicy, RecitationPolicy, StagePolicy, ToolScope};
 use crate::workflow::prompt::PromptTemplate;
 use crate::workflow::stage::{ExecutableStage, Stage};
+
+/// What the prompt says about a kernel reference configured without a
+/// description.
+const KERNEL_REFERENCE_DESCRIPTION: &str = "The Linux kernel tree the code under review builds \
+     against. Verify API contracts, struct layouts and helper semantics by reading it rather than \
+     recalling them -- your recollection is not pinned to this version.";
+
+/// The prompt block describing the attached reference repositories, or
+/// nothing when there are none.
+///
+/// Two blocks, because they say different things. The list applies to any
+/// reference: the model has somewhere else to look, which it will not use
+/// unless told, and each tree needs saying what it is for. The out-of-tree
+/// caveats are about the repository under review being an out-of-tree kernel
+/// module, and several in-tree conventions the model would otherwise enforce do
+/// not exist there. Only a kernel reference implies that, so a configuration
+/// with only a userspace tree such as rdma-core must not claim it: telling an
+/// in-tree review that Fixes: tags do not apply would suppress real findings.
+fn reference_context_block(references: &[ReferenceRepo]) -> String {
+    if references.is_empty() {
+        return String::new();
+    }
+    let mut block = format!(
+        "\n\n=== Read-only Reference Repositories ===\n\
+         The change under review exists only in {REPO_ARG}=\"{REPO_ARG_REVIEW}\". The repositories \
+         below are read-only context pinned for this review; pass {REPO_ARG}=\"<name>\" to any \
+         git tool to read one. In them, \"HEAD\", \"@\" or an omitted revision means that \
+         repository's pin. Never search them for the change itself.\n"
+    );
+    for r in references {
+        let description = match (r.description.as_deref().map(str::trim), r.kind) {
+            (Some(d), _) if !d.is_empty() => d.to_string(),
+            (_, ReferenceKind::Kernel) => KERNEL_REFERENCE_DESCRIPTION.to_string(),
+            // Validation requires a description for every other kind.
+            _ => String::new(),
+        };
+        let short = r.commit.get(..12).unwrap_or(&r.commit);
+        block.push_str(&format!(
+            "- {REPO_ARG}=\"{}\" (pinned at {}, commit {short}): {}\n",
+            r.name,
+            r.revision,
+            description.replace('\n', "\n  ")
+        ));
+    }
+    block.push_str(
+        "When you claim a contract with one of these repositories, cite repo:file:line. A \
+         mismatch is a finding only if this patch introduces it, or changes one side of an \
+         interface without accounting for existing users of the other side.\n\
+         ===========================",
+    );
+
+    if let Some(kernel) = references.iter().find(|r| r.kind == ReferenceKind::Kernel) {
+        block.push_str(&format!(
+            "\n\n=== Out-of-Tree Module ===\n\
+             The repository under review is an out-of-tree Linux kernel module, not a \
+             mainline kernel tree. It contains the module's own sources and nothing else: \
+             there is no include/linux/, no kernel core code, and no mainline history.\n\n\
+             The kernel this module builds against is available as the read-only repository \
+             {REPO_ARG}=\"{}\", pinned at {}. Verify API contracts, struct layouts, and helper \
+             semantics by reading that tree rather than recalling them -- your recollection is \
+             not pinned to this kernel version and may describe a different one.\n\n\
+             Consequences of being out-of-tree, all of which change what counts as a \
+             finding:\n\
+             - Fixes: tags, lore threads, and 'look forward in git history for the fix' do \
+             not apply. There is no mainline history in this repository to search, and a \
+             missing Fixes: tag is not a defect here.\n\
+             - Compatibility shims and kernel-version #ifdefs are expected in this \
+             codebase; they exist because the module supports several kernel releases. Do \
+             not report them as unnecessary complexity unless the specific logic is wrong.\n\
+             - File paths will not match mainline paths. Do not conclude that code is \
+             missing or misplaced from its path alone.\n\
+             ===========================",
+            kernel.name, kernel.revision
+        ));
+    }
+    block
+}
 
 /// Complete execution state of a Linux kernel patch review.
 #[derive(Clone, Debug, Default)]
@@ -43,10 +121,11 @@ pub struct LinuxPatchReviewState {
     pub prefetch_failed: bool,
     pub series_range: Option<String>,
     pub follow_up_series_context: Option<String>,
-    /// Revision of the reference kernel tree, when one is configured. Its
-    /// presence is what marks this review as out-of-tree: the repository has no
-    /// mainline history and no kernel headers of its own.
-    pub reference_revision: Option<String>,
+    /// The read-only reference repositories attached to this review, in
+    /// configured order. A kind "kernel" entry among them is what marks the
+    /// review as out-of-tree: the repository has no mainline history and no
+    /// kernel headers of its own.
+    pub references: Vec<ReferenceRepo>,
 
     /// Subsystem guide markdown files selected during the pre-screen and
     /// shared with every stage.
@@ -167,7 +246,7 @@ The following documents contain the official technical patterns, architectural r
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
 Baseline SHA: {{{{baseline_sha}}}}
-==========================={{{{oot_context_block}}}}
+==========================={{{{reference_context_block}}}}
 
 Target Commit:
 {diff_var}
@@ -177,36 +256,8 @@ Target Commit:
     .with_var("baseline_sha", |s: &LinuxPatchReviewState| s.baseline_sha.clone())
     .with_var("target_commit_diff", |s: &LinuxPatchReviewState| s.target_commit_diff.clone())
     .with_var("target_commit_diff_only", |s: &LinuxPatchReviewState| s.target_commit_diff_only.clone())
-    // Out-of-tree review differs from in-tree in two directions, and both need
-    // saying. The model has somewhere else to look for kernel APIs, which it
-    // will not use unless told; and several in-tree conventions it would
-    // otherwise enforce do not exist here, which produces confident findings
-    // about a tree that was never claiming to follow them.
-    .with_var("oot_context_block", |s: &LinuxPatchReviewState| {
-        s.reference_revision.as_deref().map_or_else(String::new, |revision| {
-            format!(
-                "\n\n=== Out-of-Tree Module ===\n\
-                 The repository under review is an out-of-tree Linux kernel module, not a \
-                 mainline kernel tree. It contains the module's own sources and nothing else: \
-                 there is no include/linux/, no kernel core code, and no mainline history.\n\n\
-                 The kernel this module builds against is available as a separate, read-only \
-                 repository, pinned at {revision}. Reach it by passing {REPO_ARG}=\"{REPO_ARG_REFERENCE}\" to any \
-                 git tool. Verify API contracts, struct layouts, and helper semantics by \
-                 reading that tree rather than recalling them -- your recollection is not \
-                 pinned to this kernel version and may describe a different one.\n\n\
-                 Consequences of being out-of-tree, all of which change what counts as a \
-                 finding:\n\
-                 - Fixes: tags, lore threads, and 'look forward in git history for the fix' do \
-                 not apply. There is no mainline history in this repository to search, and a \
-                 missing Fixes: tag is not a defect here.\n\
-                 - Compatibility shims and kernel-version #ifdefs are expected in this \
-                 codebase; they exist because the module supports several kernel releases. Do \
-                 not report them as unnecessary complexity unless the specific logic is wrong.\n\
-                 - File paths will not match mainline paths. Do not conclude that code is \
-                 missing or misplaced from its path alone.\n\
-                 ==========================="
-            )
-        })
+    .with_var("reference_context_block", |s: &LinuxPatchReviewState| {
+        reference_context_block(&s.references)
     })
     .with_var("prefetched_block", |s: &LinuxPatchReviewState| {
         if s.prefetch_failed {
@@ -3570,40 +3621,113 @@ mod tests {
         );
     }
 
-    /// The out-of-tree framing must reach the model when a reference kernel is
-    /// attached, and must leave an in-tree review untouched -- telling an
-    /// in-tree review that Fixes: tags do not apply would suppress real
-    /// findings.
+    fn reference(name: &str, kind: ReferenceKind, revision: &str) -> ReferenceRepo {
+        ReferenceRepo {
+            name: name.to_string(),
+            kind,
+            path: PathBuf::from(format!("/srv/{name}")),
+            revision: revision.to_string(),
+            commit: "1a2b3c4d5e6f7a8b9c0d1a2b3c4d5e6f7a8b9c0d".to_string(),
+            description: (kind == ReferenceKind::Source)
+                .then(|| "Userspace RDMA stack.\nproviders/ionic is libionic.".to_string()),
+        }
+    }
+
+    fn render_with(references: Vec<ReferenceRepo>) -> String {
+        linux_system_prompt(true).render_for_log(&LinuxPatchReviewState {
+            references,
+            ..Default::default()
+        })
+    }
+
+    /// The reference framing must reach the model when a reference is attached,
+    /// and must leave an in-tree review untouched -- telling an in-tree review
+    /// that Fixes: tags do not apply would suppress real findings.
     #[test]
-    fn oot_context_renders_only_when_a_reference_is_attached() {
-        let render = |reference_revision| {
-            linux_system_prompt(true).render_for_log(&LinuxPatchReviewState {
-                reference_revision,
-                ..Default::default()
-            })
-        };
-        let in_tree = render(None);
+    fn reference_blocks_render_only_when_attached() {
+        let in_tree = render_with(vec![]);
+        assert!(
+            !in_tree.contains("Read-only Reference Repositories"),
+            "a single-repository review lists no references"
+        );
         assert!(
             !in_tree.contains("Out-of-Tree Module"),
             "an in-tree review must not be told to relax in-tree conventions"
         );
 
-        let grounded = render(Some("v6.12".to_string()));
-        for needle in ["Out-of-Tree Module", "v6.12", r#"repo="kernel""#, "Fixes:"] {
+        let grounded = render_with(vec![reference("kernel", ReferenceKind::Kernel, "v6.12")]);
+        for needle in [
+            "Read-only Reference Repositories",
+            "Out-of-Tree Module",
+            "v6.12",
+            "1a2b3c4d5e6f",
+            r#"repo="kernel""#,
+            "Fixes:",
+            // A kernel entry without a description gets the built-in text.
+            "builds against",
+        ] {
             assert!(grounded.contains(needle), "missing {needle}: {grounded}");
         }
-        // Nothing else about the prompt moves: the block is inserted after the
-        // git metadata and the rest renders exactly as it did in-tree.
-        let block_start = grounded.find("\n\n=== Out-of-Tree Module ===").unwrap();
-        let block_end = block_start
-            + grounded[block_start..]
-                .find("\n===========================")
-                .unwrap()
-            + "\n===========================".len();
+        // Nothing else about the prompt moves: the blocks are inserted after
+        // the git metadata and the rest renders exactly as it did in-tree.
+        let terminator = "\n===========================";
+        let block_start = grounded
+            .find("\n\n=== Read-only Reference Repositories ===")
+            .unwrap();
+        let oot_start = grounded.find("\n\n=== Out-of-Tree Module ===").unwrap();
+        let block_end =
+            oot_start + grounded[oot_start..].find(terminator).unwrap() + terminator.len();
         assert_eq!(
             format!("{}{}", &grounded[..block_start], &grounded[block_end..]),
             in_tree
         );
+    }
+
+    /// A userspace tree alone says nothing about the repository under review
+    /// being out-of-tree, so the caveats that withdraw in-tree conventions must
+    /// not appear.
+    #[test]
+    fn rdma_only_config_renders_no_out_of_tree_caveats() {
+        let prompt = render_with(vec![reference(
+            "rdma-core",
+            ReferenceKind::Source,
+            "ionic-rdma-v59",
+        )]);
+        for needle in [
+            "Read-only Reference Repositories",
+            r#"repo="rdma-core""#,
+            "ionic-rdma-v59",
+            "Userspace RDMA stack.",
+            // Continuation lines of a description stay inside its list entry.
+            "\n  providers/ionic is libionic.",
+        ] {
+            assert!(prompt.contains(needle), "missing {needle}: {prompt}");
+        }
+        assert!(!prompt.contains("Out-of-Tree Module"), "{prompt}");
+        assert!(!prompt.contains("Fixes:"), "{prompt}");
+    }
+
+    /// References are listed in configured order, and the out-of-tree caveats
+    /// name the kernel entry, not whichever reference happens to come first.
+    #[test]
+    fn kernel_caveats_use_the_kernel_entrys_name_and_pin() {
+        let prompt = render_with(vec![
+            reference("rdma-core", ReferenceKind::Source, "ionic-rdma-v59"),
+            reference("kernel", ReferenceKind::Kernel, "v6.18"),
+        ]);
+        let rdma = prompt
+            .find(r#"- repo="rdma-core""#)
+            .expect("rdma-core listed");
+        let kernel = prompt.find(r#"- repo="kernel""#).expect("kernel listed");
+        assert!(rdma < kernel, "listed in configured order: {prompt}");
+
+        let caveats = &prompt[prompt.find("=== Out-of-Tree Module ===").unwrap()..];
+        assert!(
+            caveats.contains(r#"repo="kernel", pinned at v6.18"#),
+            "{caveats}"
+        );
+        assert!(!caveats.contains("rdma-core"), "{caveats}");
+        assert!(!caveats.contains("ionic-rdma-v59"), "{caveats}");
     }
 
     #[test]

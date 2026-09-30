@@ -13,9 +13,12 @@ and ARM64 Hyp (EL2) rows — all four guides apply.
 The triggers column below includes both path names, function calls,
 and symbols regexes.
 
-Path triggers describe mainline layout. When reviewing an out-of-tree module the
-paths will not match, so rely on the symbol triggers -- they fire on the same
-code wherever it lives. Prefer over-inclusion here: a guide loaded for code it
+Path triggers describe mainline layout. When the review is of an out-of-tree
+module (the prompt lists a kernel reference repository), the paths will not
+match, so rely on the symbol triggers -- they fire on the same code wherever it
+lives. Code read from a read-only reference repository listed in the prompt,
+such as a userspace library, is context rather than the change, and does not by
+itself select guides. Prefer over-inclusion here: a guide loaded for code it
 does not describe costs tokens, while a guide missed because the path was
 unfamiliar costs the finding it would have made.
 

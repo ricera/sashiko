@@ -236,15 +236,27 @@ enum Commands {
         #[arg(long, hide = true)]
         report_preexisting: bool,
 
-        /// Read-only kernel tree to consult for API contracts and headers.
-        /// Overrides git.reference_repository_path. Linux project only.
-        #[arg(long)]
-        reference_repo: Option<PathBuf>,
+        /// Read-only reference repository, repeatable. Replaces the path of
+        /// the git.references entry NAME and drops its configured pin; REV
+        /// re-pins it. A NAME not in settings is accepted only as "kernel",
+        /// since any other reference needs a description from Settings.toml.
+        /// Linux project only.
+        #[arg(
+            long = "reference",
+            value_name = "NAME=PATH[@REV]",
+            value_parser = sashiko::references::parse_reference_flag
+        )]
+        reference: Vec<sashiko::references::ReferenceOverride>,
 
-        /// Revision to read the reference repository at. Default: HEAD. On its
-        /// own, re-pins the configured git.reference_repository_path.
-        #[arg(long)]
-        reference_revision: Option<String>,
+        /// Revision to read reference NAME at, repeatable. Re-pins a configured
+        /// or --reference entry, and wins over its @REV. An unknown NAME is an
+        /// error.
+        #[arg(
+            long = "reference-revision",
+            value_name = "NAME=REV",
+            value_parser = sashiko::references::parse_reference_revision_flag
+        )]
+        reference_revision: Vec<sashiko::references::RevisionOverride>,
     },
 }
 
@@ -292,13 +304,9 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             ai_provider,
             effort,
             stages,
-            reference_repo,
-            reference_revision,
             ..
         }) => Overrides {
             repository_path: repo.as_deref().map(path_string),
-            reference_repository_path: reference_repo.as_deref().map(path_string),
-            reference_revision: reference_revision.clone(),
             worktree_dir: worktree_dir.as_deref().map(path_string),
             no_ai: *no_ai,
             ai_provider: ai_provider.clone(),
@@ -468,18 +476,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 custom_prompt,
                 agent,
                 report_preexisting,
+                reference,
+                reference_revision,
                 ..
             } => {
                 std::panic::set_hook(Box::new(|info| {
                     eprintln!("CRITICAL ERROR: Panic detected: {}", info);
                 }));
 
-                let settings = match settings_result {
+                let mut settings = match settings_result {
                     Ok(settings) => settings,
                     Err(e) => exit_worker_with_error(format!(
                         "Failed to load settings from {}: {e}",
                         settings_path.display()
                     )),
+                };
+                // The reference flags merge onto [[git.references]] by name, as
+                // the other worker flags merge onto their settings. Unlike
+                // those, the merge can fail -- a flag given twice, or a re-pin
+                // of a name that exists nowhere -- so it runs here rather than
+                // in apply_overrides.
+                settings.git.references = match sashiko::references::merge_references(
+                    std::mem::take(&mut settings.git.references),
+                    reference,
+                    reference_revision,
+                ) {
+                    Ok(references) => references,
+                    Err(e) => exit_worker_with_error(format!("{e:#}")),
                 };
 
                 let result = run_worker_from_stdin(
@@ -583,23 +606,17 @@ async fn run_daemon(
     // A reference repository that does not resolve is worth refusing to start
     // over. Left to the review, it surfaces as tool errors the model absorbs and
     // works around, and the run reads as a normal review that quietly did its
-    // grounding from memory. One configured for a project whose prompt cannot
-    // explain it is refused too, as a mismatched [project].kind is: the worker
-    // would ignore it, and a setting that silently does nothing is worse than
-    // one that stops the daemon.
-    if let Some(reason) =
-        reference_repository_refusal(project, settings.git.reference_repository_path.as_deref())
+    // grounding from memory. References configured for a project whose prompt
+    // cannot explain them are refused too, as a mismatched [project].kind is:
+    // the worker would ignore them, and a setting that silently does nothing is
+    // worse than one that stops the daemon. The resolved list is discarded;
+    // each worker resolves its own, so a branch pin follows the clone.
+    if let Some(reason) = sashiko::references::reference_refusal(project, &settings.git.references)
     {
         error!("Refusing to start: {}", reason);
         return Err(reason.into());
     }
-    if let Some(path) = &settings.git.reference_repository_path {
-        sashiko::git_ops::validate_reference_repository(
-            std::path::Path::new(path),
-            settings.git.reference_revision.as_deref(),
-        )
-        .await?;
-    }
+    sashiko::references::resolve_references(&settings.git.references).await?;
 
     // Initialize Database
     let db = Arc::new(Database::new(&settings.database).await?);
@@ -1549,24 +1566,6 @@ fn handle_init_command(
     let prompts_root = prompt_bundle::install_prompt_bundle(reinstall_prompts)?;
     println!("Installed prompts in {}", prompts_root.display());
     Ok(())
-}
-
-/// Why the daemon must not start with this reference repository setting, if
-/// it must not.
-///
-/// Only a Linux review's prompt explains the second tree, so a reference set
-/// for any other project would be silently ignored by every worker.
-#[cfg(feature = "server")]
-fn reference_repository_refusal(
-    project: ProjectId,
-    reference_repository_path: Option<&str>,
-) -> Option<String> {
-    (reference_repository_path.is_some() && !project.supports_reference_repository()).then(|| {
-        format!(
-            "git.reference_repository_path is set, but project '{project}' does not \
-             support a reference repository; it is only used for Linux reviews"
-        )
-    })
 }
 
 /// The project this invocation is for.
@@ -4864,23 +4863,46 @@ mod tests {
 
     #[test]
     fn test_cli_worker_reference_flags() {
+        use sashiko::references::{ReferenceOverride, RevisionOverride};
         let cli = Cli::try_parse_from([
             "sashiko",
             "worker",
-            "--reference-repo",
-            "/srv/linux",
+            "--reference",
+            "kernel=/srv/linux@v6.18",
+            "--reference",
+            "rdma-core=/srv/rdma-core",
             "--reference-revision",
-            "v6.12",
+            "rdma-core=ionic-rdma-v59",
         ])
         .unwrap();
         match cli.command {
             Some(Commands::Worker {
-                reference_repo,
+                reference,
                 reference_revision,
                 ..
             }) => {
-                assert_eq!(reference_repo, Some(PathBuf::from("/srv/linux")));
-                assert_eq!(reference_revision.as_deref(), Some("v6.12"));
+                assert_eq!(
+                    reference,
+                    vec![
+                        ReferenceOverride {
+                            name: "kernel".to_string(),
+                            path: "/srv/linux".to_string(),
+                            revision: Some("v6.18".to_string()),
+                        },
+                        ReferenceOverride {
+                            name: "rdma-core".to_string(),
+                            path: "/srv/rdma-core".to_string(),
+                            revision: None,
+                        },
+                    ]
+                );
+                assert_eq!(
+                    reference_revision,
+                    vec![RevisionOverride {
+                        name: "rdma-core".to_string(),
+                        revision: "ionic-rdma-v59".to_string(),
+                    }]
+                );
             }
             _ => panic!("expected worker command"),
         }
@@ -4888,28 +4910,29 @@ mod tests {
         let cli = Cli::try_parse_from(["sashiko", "worker"]).unwrap();
         match cli.command {
             Some(Commands::Worker {
-                reference_repo,
+                reference,
                 reference_revision,
                 ..
             }) => {
-                assert!(reference_repo.is_none());
-                assert!(reference_revision.is_none());
+                assert!(reference.is_empty());
+                assert!(reference_revision.is_empty());
             }
             _ => panic!("expected worker command"),
         }
-    }
 
-    /// The daemon refuses a reference repository only for a project whose
-    /// prompt cannot explain it, and never when none is configured.
-    #[cfg(feature = "server")]
-    #[test]
-    fn test_reference_repository_refusal() {
-        assert!(reference_repository_refusal(ProjectId::Linux, Some("/srv/linux")).is_none());
-        assert!(reference_repository_refusal(ProjectId::Linux, None).is_none());
-        assert!(reference_repository_refusal(ProjectId::Sashiko, None).is_none());
-        let reason = reference_repository_refusal(ProjectId::Sashiko, Some("/srv/linux"))
-            .expect("a non-Linux project with a reference must be refused");
-        assert!(reason.contains("reference_repository_path"), "{reason}");
+        // A value without NAME= is refused at parse time rather than guessed
+        // at: the removed single-reference flags took values exactly like this.
+        for args in [
+            ["sashiko", "worker", "--reference", "kernel"],
+            ["sashiko", "worker", "--reference-revision", "v6.12"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+
+        // The single-reference flag was removed, not aliased.
+        let err = Cli::try_parse_from(["sashiko", "worker", "--reference-repo", "/x"])
+            .expect_err("--reference-repo is gone");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 
     #[cfg(feature = "server")]

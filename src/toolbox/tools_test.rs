@@ -832,24 +832,111 @@ mod tests {
         (temp_dir, repo_path)
     }
 
-    /// The reference repository pinned at `v6.12`, with the commit it resolves
-    /// to filled in as startup validation would.
-    fn pinned_reference(path: PathBuf) -> crate::toolbox::ReferenceRepo {
-        let commit = rev_parse(&path, "v6.12^{commit}");
+    /// Builds a second reference repo, a stand-in for rdma-core, whose content
+    /// cannot be confused with either the review repo or the kernel fixture.
+    ///
+    /// Its pin, `v59`, is not the tip either: a commit past it adds
+    /// `rdma_tip_only`. It also carries a `v6.12` tag, deliberately on a
+    /// different commit than the kernel fixture's, so a cache keyed on the tag
+    /// name alone would serve one tree's answer for the other.
+    fn setup_rdma_reference_repo() -> (tempfile::TempDir, PathBuf) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let repo_path = temp_dir.path().to_path_buf();
+
+        let run_git = |args: &[&str]| {
+            let status = crate::git_cmd::in_dir(&repo_path)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+
+        run_git(&["init"]);
+        run_git(&["config", "user.name", "Test User"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        std::fs::create_dir_all(repo_path.join("providers/ionic")).unwrap();
+        let abi = repo_path.join("providers/ionic/ionic-abi.h");
+        std::fs::write(&abi, "struct ionic_ctx_resp {\n\t__u32 version;\n};\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "Reference rdma-core tree"]);
+        run_git(&["tag", "v6.12"]);
+        std::fs::write(
+            &abi,
+            "struct ionic_ctx_resp {\n\t__u32 version;\n\t__u32 udma_count;\n};\n",
+        )
+        .unwrap();
+        run_git(&["commit", "-am", "rdma-core release"]);
+        run_git(&["tag", "v59"]);
+        std::fs::write(
+            &abi,
+            "struct ionic_ctx_resp {\n\t__u32 version;\n\t__u32 udma_count;\n\
+             \t__u32 rdma_tip_only;\n};\n",
+        )
+        .unwrap();
+        run_git(&["commit", "-am", "rdma past the pin"]);
+
+        (temp_dir, repo_path)
+    }
+
+    /// A reference named `name` pinned at `tag`, with the commit it resolves to
+    /// filled in as startup validation would.
+    fn pinned_named(
+        name: &str,
+        kind: crate::settings::ReferenceKind,
+        path: PathBuf,
+        tag: &str,
+    ) -> crate::toolbox::ReferenceRepo {
+        let commit = rev_parse(&path, &format!("{tag}^{{commit}}"));
         crate::toolbox::ReferenceRepo {
+            name: name.to_string(),
+            kind,
             path,
-            revision: "v6.12".to_string(),
+            revision: tag.to_string(),
             commit,
+            description: (kind == crate::settings::ReferenceKind::Source)
+                .then(|| "A userspace tree.".to_string()),
         }
     }
 
+    /// The kernel fixture as the "kernel" reference, pinned at `v6.12`.
+    fn pinned_reference(path: PathBuf) -> crate::toolbox::ReferenceRepo {
+        pinned_named(
+            "kernel",
+            crate::settings::ReferenceKind::Kernel,
+            path,
+            "v6.12",
+        )
+    }
+
+    /// The rdma-core fixture as the "rdma-core" reference, pinned at `v59`.
+    fn pinned_rdma(path: PathBuf) -> crate::toolbox::ReferenceRepo {
+        pinned_named(
+            "rdma-core",
+            crate::settings::ReferenceKind::Source,
+            path,
+            "v59",
+        )
+    }
+
     /// A reference that is never read, for tests that only inspect schemas.
-    fn unread_reference(revision: &str) -> crate::toolbox::ReferenceRepo {
+    fn unread_named(
+        name: &str,
+        kind: crate::settings::ReferenceKind,
+        revision: &str,
+    ) -> crate::toolbox::ReferenceRepo {
         crate::toolbox::ReferenceRepo {
+            name: name.to_string(),
+            kind,
             path: PathBuf::from("/nonexistent"),
             revision: revision.to_string(),
             commit: "0".repeat(40),
+            description: None,
         }
+    }
+
+    /// A kernel reference that is never read.
+    fn unread_reference(revision: &str) -> crate::toolbox::ReferenceRepo {
+        unread_named("kernel", crate::settings::ReferenceKind::Kernel, revision)
     }
 
     fn rev_parse(repo: &std::path::Path, rev: &str) -> String {
@@ -912,7 +999,7 @@ mod tests {
             .expect_err("must not silently search the review repo");
         let msg = err.to_string();
         assert!(
-            msg.contains("reference_repository_path"),
+            msg.contains("git.references"),
             "the error must name the missing setting: {msg}"
         );
     }
@@ -1064,7 +1151,8 @@ mod tests {
     }
 
     /// The model is deciding what revision to pass while reading this schema,
-    /// so the pin belongs here.
+    /// so what HEAD means belongs here, and the pins belong in the repo
+    /// argument beside it.
     ///
     /// Told the revision only elsewhere in the prompt, it sent "HEAD" on about
     /// half its kernel reads. Those were served the pin regardless, but the log
@@ -1072,7 +1160,9 @@ mod tests {
     /// hundred commits off the pinned tag -- indistinguishable from a review
     /// that really had read the wrong tree. git_show, git_log and git_diff name
     /// their revision in `object`, `range` and a base/target pair, so those
-    /// arguments carry the note as well.
+    /// arguments carry the note as well. With several references, each pin is
+    /// named once, in the repo argument, rather than in every revision
+    /// argument of every tool.
     #[test]
     fn the_revision_schema_names_the_pin_when_one_is_configured() {
         let (_review_dir, review_path) = setup_test_repo();
@@ -1093,8 +1183,16 @@ mod tests {
                 };
                 let desc = arg["description"].as_str().unwrap_or_default();
                 assert!(
-                    desc.contains("v6.12"),
-                    "{}.{key} must name the pinned revision where the model chooses one: {desc}",
+                    desc.contains("reads that repo's pin"),
+                    "{}.{key} must say what HEAD means where the model chooses one: {desc}",
+                    tool.name
+                );
+            }
+            if let Some(repo) = tool.parameters["properties"].get("repo") {
+                let desc = repo["description"].as_str().unwrap_or_default();
+                assert!(
+                    desc.contains("kernel (kernel tree, v6.12)"),
+                    "{}.repo must name the pin: {desc}",
                     tool.name
                 );
             }
@@ -1113,7 +1211,7 @@ mod tests {
                 decl.parameters["properties"][key]["description"]
                     .as_str()
                     .unwrap_or_default()
-                    .contains("pinned to v6.12"),
+                    .contains("reads that repo's pin"),
                 "{tool}.{key} must carry the pin note"
             );
         }
@@ -1130,7 +1228,7 @@ mod tests {
             !grep.parameters["properties"]["revision"]["description"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("pinned"),
+                .contains("pin"),
             "a single-repository review has nothing to pin"
         );
     }
@@ -1164,6 +1262,11 @@ mod tests {
             res[crate::toolbox::REVISION_READ_KEY],
             pin_sha.as_str(),
             "an unpinned reference read must say which commit it was served: {res}"
+        );
+        assert_eq!(
+            res[crate::toolbox::REPO_READ_KEY],
+            "kernel",
+            "a reference read must say which reference it read: {res}"
         );
 
         // An explicitly named revision is honoured, so the annotation has to
@@ -1244,6 +1347,10 @@ mod tests {
             res.get(crate::toolbox::REVISION_READ_KEY).is_none(),
             "only reference reads are substituted, so only they need the note: {res}"
         );
+        assert!(
+            res.get(crate::toolbox::REPO_READ_KEY).is_none(),
+            "a review read is not a reference read: {res}"
+        );
     }
 
     /// The pin is inserted literally. A `$` in a revision would otherwise be
@@ -1253,9 +1360,8 @@ mod tests {
         let (_review_dir, review_path) = setup_test_repo();
         let toolbox =
             ToolBox::new(review_path, None).with_reference(crate::toolbox::ReferenceRepo {
-                path: PathBuf::from("/nonexistent"),
-                revision: "odd".to_string(),
                 commit: "a$1b${2}c".to_string(),
+                ..unread_reference("odd")
             });
         let args = json!({ "repo": "kernel" });
         assert_eq!(
@@ -1286,6 +1392,10 @@ mod tests {
         assert!(
             res.get(crate::toolbox::REVISION_READ_KEY).is_none(),
             "read_prompt did not read the kernel tree: {res}"
+        );
+        assert!(
+            res.get(crate::toolbox::REPO_READ_KEY).is_none(),
+            "read_prompt did not read a reference repository: {res}"
         );
 
         // Nothing configured, and an unknown value: still ignored.
@@ -1329,31 +1439,282 @@ mod tests {
         }
     }
 
-    /// The same refusal holds in the reference repository: pointing the tool
-    /// at the kernel tree must not reopen the host-file hole.
+    /// The same refusal holds in every reference repository: pointing the tool
+    /// at a reference tree must not reopen the host-file hole.
     #[test]
     fn git_diff_reference_revisions_cannot_name_host_files() {
         let (_review_dir, review_path) = setup_test_repo();
         let (_ref_dir, ref_path) = setup_reference_repo();
+        let (_rdma_dir, rdma_path) = setup_rdma_reference_repo();
         let outside = tempfile::tempdir().unwrap();
         let a = outside.path().join("a.txt");
         let b = outside.path().join("b.txt");
         std::fs::write(&a, "host secret\n").unwrap();
         std::fs::write(&b, "host secret\n").unwrap();
 
-        let toolbox = ToolBox::new(review_path, None).with_reference(pinned_reference(ref_path));
+        let toolbox = ToolBox::new(review_path, None)
+            .with_reference(pinned_reference(ref_path))
+            .with_reference(pinned_rdma(rdma_path));
         let rt = Runtime::new().unwrap();
-        let args = json!({
-            "repo": "kernel",
-            "base_revision": a.to_str().unwrap(),
-            "target_revision": b.to_str().unwrap(),
-        });
-        match rt.block_on(toolbox.call("git_diff", args)) {
-            Err(e) => assert!(
-                !e.to_string().contains("host secret"),
-                "the refusal must not echo the file: {e}"
-            ),
-            Ok(res) => panic!("a host path must not be diffed: {res}"),
+        for repo in ["kernel", "rdma-core"] {
+            let args = json!({
+                "repo": repo,
+                "base_revision": a.to_str().unwrap(),
+                "target_revision": b.to_str().unwrap(),
+            });
+            match rt.block_on(toolbox.call("git_diff", args)) {
+                Err(e) => assert!(
+                    !e.to_string().contains("host secret"),
+                    "the refusal must not echo the file: {e}"
+                ),
+                Ok(res) => panic!("a host path must not be diffed in {repo}: {res}"),
+            }
         }
+    }
+
+    /// Each reference is read in its own root: a search in one never sees the
+    /// other's files, and the review repo sees neither.
+    #[test]
+    fn two_references_route_to_their_own_roots() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let (_ref_dir, ref_path) = setup_reference_repo();
+        let (_rdma_dir, rdma_path) = setup_rdma_reference_repo();
+        let toolbox = ToolBox::new(review_path.clone(), None)
+            .with_reference(pinned_reference(ref_path.clone()))
+            .with_reference(pinned_rdma(rdma_path.clone()));
+        let rt = Runtime::new().unwrap();
+
+        let find = |repo: Option<&str>| {
+            let mut args = json!({ "revision": "HEAD", "pattern": "struct", "is_literal": true });
+            if let Some(repo) = repo {
+                args["repo"] = json!(repo);
+            }
+            rt.block_on(toolbox.call("git_grep", args.clone()))
+                .unwrap_or_else(|e| panic!("{args}: {e}"))["content"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let kernel = find(Some("kernel"));
+        assert!(kernel.contains("netdevice.h"), "{kernel}");
+        assert!(!kernel.contains("ionic-abi.h"), "{kernel}");
+        let rdma = find(Some("rdma-core"));
+        assert!(rdma.contains("ionic-abi.h"), "{rdma}");
+        assert!(!rdma.contains("netdevice.h"), "{rdma}");
+        let review = find(None);
+        assert!(!review.contains("netdevice.h"), "{review}");
+        assert!(!review.contains("ionic-abi.h"), "{review}");
+
+        let ctx = &toolbox.context;
+        assert_eq!(
+            ctx.repo_root(&json!({ "repo": "kernel" })).unwrap(),
+            ref_path
+        );
+        assert_eq!(
+            ctx.repo_root(&json!({ "repo": "rdma-core" })).unwrap(),
+            rdma_path
+        );
+        assert_eq!(ctx.repo_root(&json!({})).unwrap(), review_path);
+    }
+
+    /// HEAD, `@` and an omitted revision mean each reference's own pin, never
+    /// another reference's and never the review's virtual head.
+    #[test]
+    fn head_maps_to_each_references_own_pin() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let (_ref_dir, ref_path) = setup_reference_repo();
+        let (_rdma_dir, rdma_path) = setup_rdma_reference_repo();
+        let kernel_pin = rev_parse(&ref_path, "v6.12^{commit}");
+        let rdma_pin = rev_parse(&rdma_path, "v59^{commit}");
+        let review_head = rev_parse(&review_path, "HEAD~1");
+
+        let mut toolbox = ToolBox::new(review_path, None)
+            .with_reference(pinned_reference(ref_path))
+            .with_reference(pinned_rdma(rdma_path));
+        toolbox.set_virtual_head(review_head.clone());
+
+        for (repo, pin) in [("kernel", &kernel_pin), ("rdma-core", &rdma_pin)] {
+            let args = json!({ "repo": repo });
+            let resolve = |raw: &str| toolbox.context.resolve_ref(&args, raw).unwrap();
+            assert_eq!(&resolve("HEAD"), pin, "{repo}");
+            assert_eq!(&resolve(""), pin, "{repo}");
+            assert_eq!(resolve("@:x"), format!("{pin}:x"), "{repo}");
+            assert_eq!(resolve("HEAD~1..HEAD"), format!("{pin}~1..{pin}"), "{repo}");
+            assert!(!resolve("HEAD").contains(&review_head), "{repo}");
+        }
+
+        let rt = Runtime::new().unwrap();
+        let res = rt
+            .block_on(toolbox.call(
+                "git_show",
+                json!({ "repo": "rdma-core", "object": "HEAD:providers/ionic/ionic-abi.h" }),
+            ))
+            .expect("the reference read must succeed");
+        let content = res["content"].as_str().unwrap();
+        assert!(content.contains("udma_count"), "{content}");
+        assert!(
+            !content.contains("rdma_tip_only"),
+            "HEAD in rdma-core must read its pin, not the tip: {content}"
+        );
+        assert_eq!(res[crate::toolbox::REVISION_READ_KEY], rdma_pin.as_str());
+        assert_eq!(res[crate::toolbox::REPO_READ_KEY], "rdma-core");
+    }
+
+    /// The repo enum is "review" and then the references in configured order,
+    /// identical in every tool that takes it, and its description names each
+    /// reference with its kind and pin.
+    #[test]
+    fn repo_enum_lists_names_in_config_order() {
+        use crate::settings::ReferenceKind;
+        let (_review_dir, review_path) = setup_test_repo();
+        let toolbox = ToolBox::new(review_path, None).with_references([
+            unread_named("rdma-core", ReferenceKind::Source, "ionic-rdma-v59"),
+            unread_reference("v6.18"),
+        ]);
+
+        let mut seen = 0;
+        for tool in toolbox.get_declarations_generic() {
+            let Some(repo) = tool.parameters["properties"].get("repo") else {
+                continue;
+            };
+            seen += 1;
+            assert_eq!(
+                repo["enum"],
+                json!(["review", "rdma-core", "kernel"]),
+                "{}",
+                tool.name
+            );
+            let desc = repo["description"].as_str().unwrap();
+            for needle in [
+                "rdma-core (source, ionic-rdma-v59)",
+                "kernel (kernel tree, v6.18)",
+            ] {
+                assert!(
+                    desc.contains(needle),
+                    "{}: missing {needle}: {desc}",
+                    tool.name
+                );
+            }
+        }
+        assert_eq!(seen, 8, "every git tool takes repo");
+    }
+
+    /// An unknown name is refused with every valid one, so the retry can be
+    /// right.
+    #[test]
+    fn unknown_repo_lists_valid_names() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let toolbox = ToolBox::new(review_path, None).with_references([
+            unread_reference("v6.18"),
+            unread_named(
+                "rdma-core",
+                crate::settings::ReferenceKind::Source,
+                "ionic-rdma-v59",
+            ),
+        ]);
+        let rt = Runtime::new().unwrap();
+        let err = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({ "repo": "iproute2", "revision": "HEAD", "pattern": "x" }),
+            ))
+            .expect_err("an unknown repo must not be served")
+            .to_string();
+        for needle in ["iproute2", "\"review\"", "\"kernel\"", "\"rdma-core\""] {
+            assert!(err.contains(needle), "missing {needle}: {err}");
+        }
+    }
+
+    /// The same tag in two references, and in the review repo, names three
+    /// different commits. Neither the central cache nor git_show's raw cache
+    /// may serve one for another, on the first call or on a repeat.
+    #[test]
+    fn same_tag_in_two_references_does_not_collide() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let (_ref_dir, ref_path) = setup_reference_repo();
+        let (_rdma_dir, rdma_path) = setup_rdma_reference_repo();
+        let status = crate::git_cmd::in_dir(&review_path)
+            .args(["tag", "v6.12"])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let toolbox = ToolBox::new(review_path, None)
+            .with_reference(pinned_reference(ref_path))
+            .with_reference(pinned_rdma(rdma_path));
+        let rt = Runtime::new().unwrap();
+
+        // The second round repeats the first call exactly, which is a central
+        // cache hit, and then asks for a line range, which misses the central
+        // cache but reads git_show's raw cache under the same object.
+        for extra in [
+            json!({}),
+            json!({}),
+            json!({ "start_line": 1, "end_line": 200 }),
+        ] {
+            let show = |repo: Option<&str>| {
+                let mut args = json!({ "object": "v6.12" });
+                if let Some(repo) = repo {
+                    args["repo"] = json!(repo);
+                }
+                for (k, v) in extra.as_object().unwrap() {
+                    args[k] = v.clone();
+                }
+                rt.block_on(toolbox.call("git_show", args)).unwrap()
+            };
+            let kernel = show(Some("kernel"));
+            let rdma = show(Some("rdma-core"));
+            let review = show(None);
+
+            let text = |v: &serde_json::Value| v["content"].as_str().unwrap().to_string();
+            assert!(text(&kernel).contains("Reference kernel tree"), "{kernel}");
+            assert!(!text(&kernel).contains("rdma-core"), "{kernel}");
+            assert!(text(&rdma).contains("Reference rdma-core tree"), "{rdma}");
+            assert!(!text(&rdma).contains("kernel tree"), "{rdma}");
+            assert!(text(&review).contains("Second commit"), "{review}");
+
+            assert_eq!(kernel[crate::toolbox::REPO_READ_KEY], "kernel");
+            assert_eq!(rdma[crate::toolbox::REPO_READ_KEY], "rdma-core");
+            assert!(review.get(crate::toolbox::REPO_READ_KEY).is_none());
+        }
+    }
+
+    /// One clone may back two references at different pins. Each is served its
+    /// own pin, so two releases of one tree can be compared.
+    #[test]
+    fn same_path_two_pins_is_served_per_pin() {
+        use crate::settings::ReferenceKind;
+        let (_review_dir, review_path) = setup_test_repo();
+        let (_ref_dir, ref_path) = setup_reference_repo();
+        let tip = rev_parse(&ref_path, "HEAD");
+        let toolbox = ToolBox::new(review_path, None)
+            .with_reference(pinned_reference(ref_path.clone()))
+            .with_reference(pinned_named(
+                "net-next",
+                ReferenceKind::Source,
+                ref_path,
+                &tip,
+            ));
+        let rt = Runtime::new().unwrap();
+
+        let read = |repo: &str| {
+            rt.block_on(toolbox.call(
+                "git_show",
+                json!({ "repo": repo, "object": "HEAD:include/linux/netdevice.h" }),
+            ))
+            .unwrap()
+        };
+        let pinned = read("kernel");
+        let next = read("net-next");
+        assert!(
+            !pinned["content"].as_str().unwrap().contains("ndo_tip_only"),
+            "{pinned}"
+        );
+        assert!(
+            next["content"].as_str().unwrap().contains("ndo_tip_only"),
+            "{next}"
+        );
+        assert_eq!(next[crate::toolbox::REVISION_READ_KEY], tip.as_str());
+        assert_eq!(next[crate::toolbox::REPO_READ_KEY], "net-next");
     }
 }
