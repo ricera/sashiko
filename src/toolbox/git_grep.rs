@@ -37,6 +37,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "revision": { "type": "string", "description": "Git commit SHA or reference to search at." },
                 "pattern": { "type": "string", "description": "Regex or literal pattern to search." },
                 "path": { "type": "string", "description": "Relative paths or pathspecs to restrict search (optional). Highly recommended to scope to the modified subsystem directory (e.g. 'net/mptcp/') to avoid extremely expensive tree-wide searches." },
@@ -71,7 +72,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
         let revision_raw = args["revision"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing revision"))?;
-        let revision_virt = context.virtualize_ref(revision_raw);
+        let revision_virt = context.resolve_ref(&args, revision_raw)?;
         let revision = revision_virt.as_str();
         let pattern = args["pattern"]
             .as_str()
@@ -85,7 +86,7 @@ impl LlmTool<SashikoToolContext> for GitGrepTool {
             return Err(anyhow!("Invalid revision: {}", revision));
         }
 
-        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        let mut cmd = crate::git_cmd::in_dir_async(context.repo_root(&args)?);
         cmd.arg("grep");
 
         if count_only {

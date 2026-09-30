@@ -344,6 +344,7 @@ impl Worker {
             prefetch_failed,
             series_range: self.series_range.clone(),
             follow_up_series_context,
+            reference_revision: self.tools.reference_revision().map(str::to_string),
             selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
@@ -1303,6 +1304,96 @@ mod tests {
         if let Err(e) = &res {
             panic!("Expected run to succeed, got error: {:?}", e);
         }
+    }
+
+    /// The out-of-tree framing must reach the model, and must stay away when the
+    /// review is a normal in-tree one -- telling an in-tree review that Fixes:
+    /// tags do not apply would suppress real findings.
+    #[tokio::test]
+    async fn oot_context_reaches_the_stage_context_only_when_grounded() {
+        async fn system_prompt_for(project: ProjectId, reference: Option<(&str, &str)>) -> String {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let prompts_dir = temp_dir.path().join("prompts");
+            std::fs::create_dir_all(&prompts_dir).unwrap();
+
+            let mut tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+            if let Some((path, revision)) = reference {
+                tools = tools.with_reference(crate::toolbox::ReferenceRepo {
+                    path: std::path::PathBuf::from(path),
+                    revision: revision.to_string(),
+                    commit: "0".repeat(40),
+                });
+            }
+
+            let mut worker = Worker::new(
+                std::sync::Arc::new(MockBlockedProvider {
+                    attempts: AtomicUsize::new(0),
+                }),
+                std::sync::Arc::new(tools),
+                PromptRegistry::new(prompts_dir),
+                WorkerConfig {
+                    project,
+                    max_input_tokens: 10000,
+                    max_interactions: 3,
+                    temperature: 0.0,
+                    series_range: None,
+                    baseline_sha: None,
+                    custom_prompt: None,
+                    stages: Some(vec!["goal".to_string()]),
+                    skip_report: false,
+                },
+            );
+
+            let res = worker
+                .run(
+                    serde_json::json!({
+                        "id": 1,
+                        "patch_index": 1,
+                        "patches": [{"diff": "diff --git a/x.c b/x.c\n+int x;"}]
+                    }),
+                    None,
+                )
+                .await
+                .expect("review runs");
+            res.history[0].content.clone().unwrap_or_default()
+        }
+
+        let grounded = system_prompt_for(ProjectId::Linux, Some(("/srv/linux", "v6.12"))).await;
+        assert!(
+            grounded.contains("Out-of-Tree Module"),
+            "the model must be told the tree it is reviewing is not mainline"
+        );
+        assert!(
+            grounded.contains("v6.12"),
+            "the pinned kernel version must be named: {grounded}"
+        );
+        assert!(
+            grounded.contains(r#"repo="kernel""#),
+            "the model must be told how to reach the kernel tree"
+        );
+        assert!(
+            grounded.contains("Fixes:"),
+            "the in-tree conventions that no longer apply must be named"
+        );
+
+        let in_tree = system_prompt_for(ProjectId::Linux, None).await;
+        assert!(
+            !in_tree.contains("Out-of-Tree Module"),
+            "an in-tree review must not be told to relax in-tree conventions"
+        );
+
+        // The Sashiko prompt has no out-of-tree framing. run_worker drops the
+        // reference for that project before it gets here; even if one slipped
+        // through, the Linux-only block must not appear. Rendered directly
+        // because the Sashiko stages do not survive the blocked mock provider.
+        let sashiko = sashiko_system_prompt(true).render_for_log(&LinuxPatchReviewState {
+            reference_revision: Some("v6.12".to_string()),
+            ..Default::default()
+        });
+        assert!(
+            !sashiko.contains("Out-of-Tree Module"),
+            "only the Linux prompt carries the out-of-tree block"
+        );
     }
 
     #[tokio::test]

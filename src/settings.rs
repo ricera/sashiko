@@ -763,6 +763,20 @@ pub struct CustomRemoteSettings {
 pub struct GitSettings {
     pub repository_path: String,
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
+    /// A second, read-only repository the review can consult for grounding.
+    ///
+    /// Set when `repository_path` is an out-of-tree kernel module: the module's
+    /// own tree has no `include/linux/`, so without this the model answers
+    /// questions about kernel API contracts from recall rather than from source,
+    /// and does so silently. Absent means single-repository review, exactly as
+    /// before. Linux project only.
+    #[serde(default)]
+    pub reference_repository_path: Option<String>,
+    /// Revision to read the reference repository at, e.g. the tag the module is
+    /// built against. Defaults to `HEAD`, which on a tracking clone means
+    /// whatever was last fetched -- pin it to keep reviews reproducible.
+    #[serde(default)]
+    pub reference_revision: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1089,6 +1103,28 @@ mod tests {
             let _ = Settings::from_file("Settings")
                 .expect("Production 'Settings.toml' failed to parse");
         }
+    }
+
+    /// `GitSettings` denies unknown fields, so a Settings.toml naming a
+    /// reference repository fails to load unless both keys are declared.
+    #[test]
+    fn git_settings_accept_a_reference_repository() {
+        let git: GitSettings = toml::from_str(
+            "repository_path = \"/srv/sashiko/driver-a\"\n\
+             reference_repository_path = \"/srv/sashiko/linux\"\n\
+             reference_revision = \"v6.12\"\n",
+        )
+        .expect("reference keys must deserialize");
+        assert_eq!(
+            git.reference_repository_path.as_deref(),
+            Some("/srv/sashiko/linux")
+        );
+        assert_eq!(git.reference_revision.as_deref(), Some("v6.12"));
+
+        // Absent means single-repository review, exactly as before.
+        let git: GitSettings = toml::from_str("repository_path = \"linux\"\n").unwrap();
+        assert!(git.reference_repository_path.is_none());
+        assert!(git.reference_revision.is_none());
     }
 
     #[test]

@@ -83,6 +83,20 @@ impl ProjectId {
             ProjectId::Sashiko => false,
         }
     }
+
+    /// Whether a review of this project may be grounded against a separate,
+    /// read-only kernel tree (`git.reference_repository_path`).
+    ///
+    /// Only the Linux prompt explains that tree to the model, and the tool
+    /// schema and errors describe it as a kernel. Offering it to a review of
+    /// any other project would hand the model a Linux checkout with no framing
+    /// for why it is there.
+    pub fn supports_reference_repository(self) -> bool {
+        match self {
+            ProjectId::Linux => true,
+            ProjectId::Sashiko => false,
+        }
+    }
 }
 
 impl fmt::Display for ProjectId {

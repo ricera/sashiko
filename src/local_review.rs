@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
@@ -51,6 +51,12 @@ pub struct WorkerOptions {
     pub scratch_clone: bool,
     pub current_tree: bool,
     pub agent: bool,
+    /// Read-only repository consulted for grounding, overriding
+    /// `git.reference_repository_path`. Needed because a `--repo` or
+    /// `--settings` override loads `LocalReviewSettings`, which has no `[git]`
+    /// section to read it from.
+    pub reference_repo: Option<PathBuf>,
+    pub reference_revision: Option<String>,
 }
 
 impl Default for WorkerOptions {
@@ -72,6 +78,8 @@ impl Default for WorkerOptions {
             scratch_clone: false,
             current_tree: false,
             agent: false,
+            reference_repo: None,
+            reference_revision: None,
         }
     }
 }
@@ -286,13 +294,50 @@ pub async fn run_git_review(
     .await
 }
 
+/// Merges the reference repository named on the command line over the one in
+/// settings.
+///
+/// A flag naming a repository replaces the configured one outright, revision
+/// and all: a pin chosen for one tree means nothing in another. A revision flag
+/// on its own re-pins the configured repository, so a one-off review against a
+/// different release does not need the path repeated.
+fn merge_reference(
+    from_settings: Option<(PathBuf, Option<String>)>,
+    flag_repo: Option<&PathBuf>,
+    flag_revision: Option<&String>,
+) -> Option<(PathBuf, Option<String>)> {
+    match (flag_repo, from_settings) {
+        (Some(path), _) => Some((path.clone(), flag_revision.cloned())),
+        (None, Some((path, revision))) => Some((path, flag_revision.cloned().or(revision))),
+        (None, None) => None,
+    }
+}
+
+/// Keeps a reference repository only for a project whose review can use one.
+///
+/// Only the Linux prompt tells the model what the second tree is and which
+/// in-tree conventions stop applying. Anywhere else it would be a kernel
+/// checkout offered with no explanation, so it is dropped rather than half
+/// wired up. The daemon refuses to start in that configuration; this covers
+/// the worker and `sashiko review`, which do not go through it.
+fn reference_for_project(
+    project: crate::project::ProjectId,
+    reference: Option<(PathBuf, Option<String>)>,
+) -> Option<(PathBuf, Option<String>)> {
+    if reference.is_some() && !project.supports_reference_repository() {
+        warn!("Ignoring reference repository: project '{project}' does not support one");
+        return None;
+    }
+    reference
+}
+
 pub async fn run_worker(
     input: ReviewInput,
     options: WorkerOptions,
     repo_override: Option<PathBuf>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    let (mut ai, configured_repo_path, concurrency, timeout_seconds) =
+    let (mut ai, configured_repo_path, concurrency, timeout_seconds, reference) =
         if let Some(path) = &options.settings_path {
             let local_settings = Settings::local_review_from_file(path)
                 .with_context(|| format!("Failed to load settings from {}", path.display()))?;
@@ -302,6 +347,7 @@ pub async fn run_worker(
                 None,
                 review.concurrency,
                 review.timeout_seconds,
+                None,
             )
         } else if repo_override.is_some() {
             let local_settings = Settings::local_review_settings()
@@ -312,16 +358,62 @@ pub async fn run_worker(
                 None,
                 review.concurrency,
                 review.timeout_seconds,
+                None,
             )
         } else {
             let settings = Settings::new().context("Failed to load settings")?;
+            // Only this branch reads full settings; the two above deserialize
+            // `LocalReviewSettings`, which has no `[git]` section at all. Those
+            // paths depend on the CLI flags applied just below.
+            let reference = settings
+                .git
+                .reference_repository_path
+                .as_ref()
+                .map(|path| (PathBuf::from(path), settings.git.reference_revision.clone()));
             (
                 settings.ai,
                 Some(PathBuf::from(settings.git.repository_path)),
                 settings.review.concurrency,
                 settings.review.timeout_seconds,
+                reference,
             )
         };
+
+    // An explicit flag wins over settings, and is the only source on the
+    // `--repo` and `--settings` paths.
+    let reference = merge_reference(
+        reference,
+        options.reference_repo.as_ref(),
+        options.reference_revision.as_ref(),
+    );
+    let reference = reference_for_project(options.project, reference);
+
+    // Validated here as well as at daemon startup, because this is the only
+    // check that runs on every path into a review, including builds without the
+    // server feature. The path is made absolute so it means the same thing
+    // whatever directory each tool's git command runs in, and the revision is
+    // pinned to the commit it resolved to now, so a fetch in the clone during
+    // the review cannot move what the rest of it reads.
+    let reference = match reference {
+        Some((path, revision)) => {
+            let commit =
+                crate::git_ops::validate_reference_repository(&path, revision.as_deref()).await?;
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            let revision = revision.unwrap_or_else(|| "HEAD".to_string());
+            info!(
+                "Grounding reads against reference repository {} at {} ({})",
+                path.display(),
+                revision,
+                commit
+            );
+            Some(crate::toolbox::ReferenceRepo {
+                path,
+                revision,
+                commit,
+            })
+        }
+        None => None,
+    };
 
     if let Some(provider) = &options.ai_provider {
         ai.provider = provider.clone();
@@ -420,6 +512,7 @@ pub async fn run_worker(
         &baseline_arg,
         &baseline_sha,
         &options,
+        reference,
         progress,
     )
     .await;
@@ -538,6 +631,7 @@ async fn review_single_patch(
     llm_semaphore: &Arc<Semaphore>,
     quota: &Arc<crate::ai::quota::QuotaManager>,
     timeout_seconds: u64,
+    reference: Option<&crate::toolbox::ReferenceRepo>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     let retry_budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>> =
@@ -599,6 +693,9 @@ async fn review_single_patch(
         );
 
         let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+        if let Some(reference) = reference {
+            tools = tools.with_reference(reference.clone());
+        }
         tools.set_active_patch_files(patch_files);
 
         if let Some(sha) = patch_shas.get(&p.index) {
@@ -805,6 +902,7 @@ async fn run_worker_in_worktree(
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
+    reference: Option<crate::toolbox::ReferenceRepo>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     info!("Worktree at {:?}", worktree.path);
@@ -997,6 +1095,7 @@ async fn run_worker_in_worktree(
         let rich_patches = rich_patches.clone();
         let patch_shas = &patch_shas;
         let options = &options;
+        let reference = reference.as_ref();
         let subject_clone = subject.clone();
         let all_patches = &patches;
         let llm_semaphore = &llm_semaphore;
@@ -1016,6 +1115,7 @@ async fn run_worker_in_worktree(
                 llm_semaphore,
                 quota,
                 timeout_seconds,
+                reference,
                 progress,
             )
             .await;
@@ -1493,6 +1593,51 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::sync::Arc;
+
+    /// A Linux review keeps its reference; any other project drops it, because
+    /// only the Linux prompt explains the second tree to the model.
+    #[test]
+    fn reference_is_kept_only_for_projects_that_can_use_it() {
+        use crate::project::ProjectId;
+        let reference = Some((PathBuf::from("/srv/linux"), Some("v6.12".to_string())));
+
+        assert_eq!(
+            reference_for_project(ProjectId::Linux, reference.clone()),
+            reference
+        );
+        assert_eq!(reference_for_project(ProjectId::Sashiko, reference), None);
+        assert_eq!(reference_for_project(ProjectId::Linux, None), None);
+    }
+
+    /// Flags override settings: a repository flag replaces the configured
+    /// reference with its own revision, and a revision flag alone re-pins the
+    /// configured repository.
+    #[test]
+    fn reference_flags_override_settings() {
+        let configured = Some((PathBuf::from("/srv/linux"), Some("v6.12".to_string())));
+        let flag_repo = PathBuf::from("/srv/other");
+        let flag_rev = "v6.13".to_string();
+
+        assert_eq!(merge_reference(configured.clone(), None, None), configured);
+        assert_eq!(merge_reference(None, None, Some(&flag_rev)), None);
+        assert_eq!(
+            merge_reference(configured.clone(), Some(&flag_repo), None),
+            Some((flag_repo.clone(), None)),
+            "a different tree must not inherit the configured pin"
+        );
+        assert_eq!(
+            merge_reference(configured.clone(), Some(&flag_repo), Some(&flag_rev)),
+            Some((flag_repo.clone(), Some(flag_rev.clone())))
+        );
+        assert_eq!(
+            merge_reference(configured, None, Some(&flag_rev)),
+            Some((PathBuf::from("/srv/linux"), Some(flag_rev.clone())))
+        );
+        assert_eq!(
+            merge_reference(None, Some(&flag_repo), Some(&flag_rev)),
+            Some((flag_repo, Some(flag_rev)))
+        );
+    }
 
     /// A provider that does nothing; the decoration tests only care about
     /// whether it was wrapped, which `Arc::ptr_eq` answers directly.

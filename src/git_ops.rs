@@ -780,6 +780,104 @@ pub async fn repack_repository(repo_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Checks that a reference repository exists and that its revision resolves,
+/// returning the commit the revision names.
+///
+/// Called before any review runs rather than lazily, because the failure is
+/// silent where it would otherwise land: a bad path or a tag that was never
+/// fetched reaches the model as a tool error, which it absorbs and works around
+/// by answering from memory. The review then looks normal and is ungrounded.
+///
+/// Git is run exactly as the review tools run it, through `git_cmd` and with no
+/// extra configuration, so a repository this accepts is one they can read. A
+/// check that relaxed, say, `safe.bareRepository` would pass a clone that every
+/// later tool call then fails on.
+pub async fn validate_reference_repository(path: &Path, revision: Option<&str>) -> Result<String> {
+    if !path.exists() {
+        return Err(anyhow!(
+            "git.reference_repository_path {} does not exist",
+            path.display()
+        ));
+    }
+
+    // The path must be the repository itself, not merely somewhere inside
+    // one. git searches upward for a repository and `git_cmd` clears
+    // GIT_CEILING_DIRECTORIES, so a mistyped or plain directory that happens
+    // to sit inside another checkout -- the module's own repository, a dotfiles
+    // repository in $HOME -- would otherwise resolve, and every kernel read
+    // would then be served from that enclosing repository instead.
+    let root = repository_root(path).await.map_err(|e| {
+        anyhow!(
+            "git.reference_repository_path {} is not a git repository: {}",
+            path.display(),
+            e
+        )
+    })?;
+    if std::fs::canonicalize(&root)? != std::fs::canonicalize(path)? {
+        return Err(anyhow!(
+            "git.reference_repository_path {} is not the top of a git repository; \
+             it lies inside {}",
+            path.display(),
+            root.display()
+        ));
+    }
+
+    let revision = revision.unwrap_or("HEAD");
+    // Every tool rejects a resolved revision that starts with '-', so a pin
+    // like that would get past rev-parse here (thanks to --end-of-options) and
+    // then fail every single read.
+    if revision.starts_with('-') {
+        return Err(anyhow!(
+            "git.reference_revision '{}' is not a valid revision name",
+            revision
+        ));
+    }
+
+    // `^{commit}` in get_commit_hash makes a directory that is not a
+    // repository, and a revision that names a tree or a missing tag, both fail.
+    let sha = get_commit_hash(path, revision).await.map_err(|e| {
+        anyhow!(
+            "git.reference_revision '{}' does not resolve in {}: {}",
+            revision,
+            path.display(),
+            e
+        )
+    })?;
+
+    info!(
+        "Reference repository {} validated at {} ({})",
+        path.display(),
+        revision,
+        sha
+    );
+    Ok(sha)
+}
+
+/// The directory a repository is rooted at, as git finds it from `path`: the
+/// top of the work tree, or the git directory itself for a bare clone.
+async fn repository_root(path: &Path) -> Result<PathBuf> {
+    let run = |arg: &'static str| async move {
+        let output = crate::git_cmd::in_dir_async(path)
+            .args(["rev-parse", arg])
+            .output()
+            .await?;
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(anyhow!(
+                "{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
+    };
+    let root = if run("--is-bare-repository").await? == "true" {
+        run("--absolute-git-dir").await?
+    } else {
+        run("--show-toplevel").await?
+    };
+    Ok(PathBuf::from(root))
+}
+
 #[allow(dead_code)]
 pub async fn cleanup_worktree_dir(worktree_dir: &Path) -> Result<()> {
     if !worktree_dir.exists() {
@@ -2118,6 +2216,83 @@ mod tests {
             "Command should NOT have been executed!"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reference_repository_validation_rejects_what_it_cannot_read() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        // A path that is not there at all.
+        let missing = temp.path().join("nope");
+        let err = validate_reference_repository(&missing, None)
+            .await
+            .expect_err("a missing path must not pass");
+        assert!(err.to_string().contains("does not exist"), "{err}");
+
+        // A directory that exists but is not a git repository.
+        let not_a_repo = temp.path().join("plain");
+        std::fs::create_dir(&not_a_repo)?;
+        assert!(
+            validate_reference_repository(&not_a_repo, None)
+                .await
+                .is_err(),
+            "a plain directory must not pass as a repository"
+        );
+
+        // A real repository, but a revision that was never fetched -- the
+        // likeliest misconfiguration, and the one that would otherwise reach the
+        // model as a tool error it works around.
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo)?;
+        for args in [
+            vec!["init"],
+            vec!["config", "user.name", "T"],
+            vec!["config", "user.email", "t@e"],
+            vec!["commit", "--allow-empty", "-m", "c"],
+        ] {
+            let status = crate::git_cmd::in_dir_async(&repo)
+                .args(&args)
+                .status()
+                .await?;
+            assert!(status.success());
+        }
+
+        let err = validate_reference_repository(&repo, Some("v6.12"))
+            .await
+            .expect_err("an unresolvable revision must not pass");
+        assert!(err.to_string().contains("v6.12"), "{err}");
+
+        // A leading dash would resolve under --end-of-options and then be
+        // refused by every tool, so it is refused here instead.
+        let err = validate_reference_repository(&repo, Some("-HEAD"))
+            .await
+            .expect_err("a revision the tools would refuse must not pass");
+        assert!(err.to_string().contains("-HEAD"), "{err}");
+
+        // A directory inside a repository is not that repository. git would
+        // search upward and serve every read from the enclosing checkout.
+        let nested = repo.join("include");
+        std::fs::create_dir(&nested)?;
+        let err = validate_reference_repository(&nested, None)
+            .await
+            .expect_err("a directory inside another repository must not pass");
+        assert!(err.to_string().contains("not the top"), "{err}");
+
+        let sha = validate_reference_repository(&repo, None).await?;
+        assert_eq!(sha.len(), 40, "the resolved commit is returned: {sha}");
+        validate_reference_repository(&repo, Some("HEAD")).await?;
+
+        // A bare clone is its own root, and is accepted.
+        let bare = temp.path().join("bare.git");
+        let status = crate::git_cmd::in_dir_async(temp.path())
+            .args(["clone", "--bare", "--quiet"])
+            .arg(&repo)
+            .arg(&bare)
+            .status()
+            .await?;
+        assert!(status.success());
+        assert_eq!(validate_reference_repository(&bare, None).await?, sha);
         Ok(())
     }
 
