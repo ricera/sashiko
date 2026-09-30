@@ -722,6 +722,64 @@ mod tests {
         assert_eq!(state.concerns, vec!["first: fresh", "second: fresh"]);
     }
 
+    /// Fails every request the way the daemon answers one it abandoned
+    /// because the review was cancelled.
+    struct CancelledProvider;
+
+    #[async_trait::async_trait]
+    impl AiProvider for CancelledProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            Err(crate::ai::RemoteAiError {
+                message: crate::ai::session::SESSION_CANCELLED.to_string(),
+                class: crate::ai::AiErrorClass::Fatal,
+            }
+            .into())
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "cancelled".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// A stage whose request the daemon abandoned for a cancel ends there, once,
+    /// and is reported as cancelled: not retried, and not counted as a stage
+    /// that broke.
+    #[tokio::test]
+    async fn test_a_request_abandoned_for_a_cancel_cancels_the_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = WorkflowEnv {
+            provider: Arc::new(CancelledProvider),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+        let workflow = Workflow::builder("cancelled_flow")
+            .parallel(
+                vec![Box::new(concerns_stage("stage_4")) as Box<dyn ExecutableStage<DummyState>>],
+                ParallelPolicy::BestEffort,
+            )
+            .build();
+
+        let mut state = DummyState::default();
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.stage_failures.len(), 1);
+        assert!(
+            outcome.stage_failures[0].cancelled,
+            "classified as a cancel: {}",
+            outcome.stage_failures[0].reason
+        );
+    }
+
     /// A finished stage hands out what it produced, parsed -- the same value
     /// its reducer receives, not the model's raw text around it.
     #[tokio::test]
