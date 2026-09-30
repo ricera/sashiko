@@ -78,8 +78,13 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
         let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
         cmd.args(["diff", "--diff-algorithm=histogram", base, target]);
 
+        // Always terminate the revisions with `--`, paths or not. Without it,
+        // two arguments that name files outside the work tree make git fall
+        // back to an implicit `--no-index` and diff them as plain files, so a
+        // "revision" of `/etc/passwd` would read an arbitrary host file. With
+        // the separator git must parse both as revisions and rejects them.
+        cmd.arg("--");
         if let Some(paths_val) = args["paths"].as_array() {
-            cmd.arg("--");
             for p in paths_val {
                 if let Some(p_str) = p.as_str() {
                     if p_str.starts_with('-') {

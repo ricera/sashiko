@@ -788,4 +788,34 @@ mod tests {
         assert_eq!(first, sorted, "declarations are not in name order");
         assert_eq!(first, names(&ToolBox::new(repo, Some(prompts))));
     }
+
+    /// Two "revisions" that are really paths outside the work tree make git
+    /// diff fall back to `--no-index` and compare them as plain files. The
+    /// model supplies both, so the tool must refuse them. Identical files are
+    /// the telling case: without the fix git exits 0 with an empty diff and
+    /// the tool reports success, confirming what a host file contains (and a
+    /// pair of differing files past the capture cap comes back verbatim).
+    #[test]
+    fn git_diff_revisions_cannot_name_host_files() {
+        let (_dir, repo_path) = setup_test_repo();
+        let outside = tempfile::tempdir().unwrap();
+        let a = outside.path().join("a.txt");
+        let b = outside.path().join("b.txt");
+        std::fs::write(&a, "host secret\n").unwrap();
+        std::fs::write(&b, "host secret\n").unwrap();
+
+        let toolbox = ToolBox::new(repo_path, None);
+        let rt = Runtime::new().unwrap();
+        let args = json!({
+            "base_revision": a.to_str().unwrap(),
+            "target_revision": b.to_str().unwrap(),
+        });
+        match rt.block_on(toolbox.call("git_diff", args)) {
+            Err(e) => assert!(
+                !e.to_string().contains("host secret"),
+                "the refusal must not echo the file: {e}"
+            ),
+            Ok(res) => panic!("a host path must not be diffed: {res}"),
+        }
+    }
 }
