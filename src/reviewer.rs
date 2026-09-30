@@ -1430,6 +1430,20 @@ impl Reviewer {
         let input_payload = input_payload.as_ref();
 
         loop {
+            // Checked before every attempt, retries included: every path that
+            // tries again comes back through here. Without it a cancel killed
+            // the running attempt and the loop started three more, each of
+            // which saw the fired token and quit within seconds -- four failed
+            // reviews per patch for one deliberate stop.
+            if cancel_requested(ctx, patchset_id).await {
+                info!(
+                    "Patchset {} was cancelled; not starting another attempt at patch {}",
+                    patchset_id, index
+                );
+                let _ = ctx.db.update_patch_status(patch_id, "Cancelled").await;
+                return Ok(PatchResult::ReviewFailed);
+            }
+
             let review_id = if let Some(id) = existing_pending_review_id.take() {
                 id
             } else {
@@ -1480,6 +1494,18 @@ impl Reviewer {
                 max_retries + 1,
             )
             .await;
+
+            // An attempt that ends because the patchset was cancelled did not
+            // fail: it was stopped. Recorded as such, it neither reads as a
+            // fault nor blocks the patch from a later rerun, and whatever
+            // stages it finished remain there to resume from.
+            let cancelled = cancel_requested(ctx, patchset_id).await;
+            let unfinished = if cancelled {
+                ReviewStatus::Cancelled
+            } else {
+                ReviewStatus::Failed
+            };
+            let patch_unfinished = if cancelled { "Cancelled" } else { "Failed" };
 
             // Stamped once per attempt with the cumulative elapsed time, so
             // whichever row ends up final carries the full total. Recorded here
@@ -1602,7 +1628,7 @@ impl Reviewer {
                                 .db
                                 .complete_review(
                                     review_id,
-                                    ReviewStatus::Failed.as_str(),
+                                    unfinished.as_str(),
                                     error_msg,
                                     None,
                                     interaction_id.as_deref(),
@@ -1615,7 +1641,8 @@ impl Reviewer {
                                 retries += 1;
                                 continue;
                             } else {
-                                let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                                let _ =
+                                    ctx.db.update_patch_status(patch_id, patch_unfinished).await;
                                 return Ok(PatchResult::ReviewFailed);
                             }
                         } else if let Some(review_content) = json_output.get("review") {
@@ -1683,7 +1710,7 @@ impl Reviewer {
                                         .db
                                         .complete_review(
                                             review_id,
-                                            ReviewStatus::Failed.as_str(),
+                                            unfinished.as_str(),
                                             "Tool error: Review tool timed out (active time \
                                              exceeded); findings salvaged from the stages that \
                                              had completed",
@@ -1785,7 +1812,10 @@ impl Reviewer {
                                     }
                                 }
                                 if !db_success {
-                                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                                    let _ = ctx
+                                        .db
+                                        .update_patch_status(patch_id, patch_unfinished)
+                                        .await;
                                     return Ok(PatchResult::ReviewFailed);
                                 }
                                 // Failing the patchset over a notification
@@ -1817,7 +1847,7 @@ impl Reviewer {
                                     .db
                                     .complete_review(
                                         review_id,
-                                        ReviewStatus::Failed.as_str(),
+                                        unfinished.as_str(),
                                         "AI returned null response",
                                         None,
                                         interaction_id.as_deref(),
@@ -1829,7 +1859,10 @@ impl Reviewer {
                                     retries += 1;
                                     continue;
                                 } else {
-                                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                                    let _ = ctx
+                                        .db
+                                        .update_patch_status(patch_id, patch_unfinished)
+                                        .await;
                                     return Ok(PatchResult::ReviewFailed);
                                 }
                             }
@@ -1841,7 +1874,7 @@ impl Reviewer {
                                 .db
                                 .complete_review(
                                     review_id,
-                                    ReviewStatus::Failed.as_str(),
+                                    unfinished.as_str(),
                                     error_msg,
                                     None,
                                     interaction_id.as_deref(),
@@ -1849,7 +1882,7 @@ impl Reviewer {
                                     logs_str.as_deref(),
                                 )
                                 .await;
-                            let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                            let _ = ctx.db.update_patch_status(patch_id, patch_unfinished).await;
                             return Ok(PatchResult::ReviewFailed);
                         }
                     } else {
@@ -1861,7 +1894,7 @@ impl Reviewer {
                             .db
                             .complete_review(
                                 review_id,
-                                ReviewStatus::Failed.as_str(),
+                                unfinished.as_str(),
                                 error_msg,
                                 None,
                                 interaction_id.as_deref(),
@@ -1873,7 +1906,7 @@ impl Reviewer {
                             retries += 1;
                             continue;
                         }
-                        let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                        let _ = ctx.db.update_patch_status(patch_id, patch_unfinished).await;
                         return Ok(PatchResult::ReviewFailed);
                     }
                 }
@@ -1887,7 +1920,7 @@ impl Reviewer {
                         .db
                         .complete_review(
                             review_id,
-                            ReviewStatus::Failed.as_str(),
+                            unfinished.as_str(),
                             &format!("Tool error: {}", e),
                             None,
                             None,
@@ -1903,12 +1936,34 @@ impl Reviewer {
                         retries += 1;
                         continue;
                     }
-                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                    let _ = ctx.db.update_patch_status(patch_id, patch_unfinished).await;
                     return Ok(PatchResult::ReviewFailed);
                 }
             }
         }
     }
+}
+
+/// Whether this patchset's review has been cancelled.
+///
+/// The token is what a cancel fires; the status is what it writes first, and
+/// is checked too so a cancel that landed before the token was registered is
+/// not missed.
+async fn cancel_requested(ctx: &ReviewContext, patchset_id: i64) -> bool {
+    if ctx
+        .cancels
+        .token_for(patchset_id)
+        .is_some_and(|token| token.is_cancelled())
+    {
+        return true;
+    }
+    ctx.db
+        .get_patchset_status(patchset_id)
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some(ReviewStatus::Cancelled.as_str())
 }
 
 /// How long a cancelled worker gets to wind down and report partial results
@@ -2391,7 +2446,20 @@ fn payload_for_patch<'a>(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A stand-in worker for tests that drive the whole retry loop. Per thread,
+    /// so it cannot leak into tests running beside it: a `#[tokio::test]` runs
+    /// its future on the thread that set it.
+    static TEST_WORKER: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn default_worker_command() -> Result<Command> {
+    #[cfg(test)]
+    if let Some(path) = TEST_WORKER.with(|w| w.borrow().clone()) {
+        return Ok(Command::new(path));
+    }
     let exe_path = std::env::current_exe()?;
     let bin_dir = exe_path
         .parent()
@@ -4272,6 +4340,181 @@ sleep 30
             "a timeout must be recognisable without matching on its message: {err}"
         );
 
+        Ok(())
+    }
+
+    /// A patchset and patch, with the context `process_patch_review` needs, and
+    /// the patchset's cancel token registered as a running review has it.
+    async fn cancellable_patch(
+        worker_script: &str,
+    ) -> Result<(ReviewContext, i64, i64, tempfile::TempDir)> {
+        let temp_dir = tempdir()?;
+        let bin_path = temp_dir.path().join("mock_worker");
+        std::fs::write(&bin_path, worker_script)?;
+        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+        TEST_WORKER.with(|w| *w.borrow_mut() = Some(bin_path));
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.timeout_seconds = 30;
+        settings.review.max_retries = 3;
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+
+        let thread_id = db.create_thread("c1", "Subject", 1000).await?;
+        db.create_message(
+            "c1p", thread_id, None, "Author", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "c1", "Subject", "Author", 1000, 1, 1, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await?
+            .expect("patchset");
+        let p_id = db
+            .create_patch(ps_id, "c1p", 1, "diff --git a/foo.c b/foo.c\n+int x;")
+            .await?;
+        db.update_patchset_status(ps_id, "In Review").await?;
+
+        let cancels = crate::cancel::CancelRegistry::new();
+        cancels.register(ps_id);
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(56)),
+            db,
+            settings,
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None).unwrap()),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+            activity: crate::activity::ActivityRegistry::new(),
+            cancels,
+        };
+        Ok((ctx, ps_id, p_id, temp_dir))
+    }
+
+    async fn review_statuses(db: &Database, patch_id: i64) -> Result<Vec<String>> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status FROM reviews WHERE patch_id = ? ORDER BY id",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let mut statuses = Vec::new();
+        while let Some(row) = rows.next().await? {
+            statuses.push(row.get::<String>(0)?);
+        }
+        Ok(statuses)
+    }
+
+    async fn patch_status(db: &Database, patch_id: i64) -> Result<String> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        Ok(rows.next().await?.expect("patch").get(0)?)
+    }
+
+    /// linux-ionic PR 974: a cancel stopped the running attempt, and the retry
+    /// loop then started three more, each of which saw the fired token and quit
+    /// -- four failed reviews per patch for one deliberate stop. A cancelled
+    /// attempt is recorded as cancelled, and nothing is started after it.
+    #[tokio::test]
+    async fn test_a_cancel_mid_review_stops_the_retries() -> Result<()> {
+        // Waits for the cancel request, then stops, as a real worker does.
+        let worker = r#"#!/bin/sh
+read -r _payload
+while read -r msg; do
+  case "$msg" in
+    *'"type":"cancel"'*)
+      echo '{"patchset_id":1,"cancelled":true,"patches":[],"stage_failures":[]}'
+      exit 0
+      ;;
+  esac
+done
+"#;
+        let (ctx, ps_id, p_id, _dir) = cancellable_patch(worker).await?;
+
+        // Cancels once the attempt is under way, the way the API does it.
+        let db = ctx.db.clone();
+        let cancels = ctx.cancels.clone();
+        let canceller = tokio::spawn(async move {
+            loop {
+                if review_statuses(&db, p_id).await.unwrap() == ["In Review"] {
+                    db.cancel_patchset(ps_id, true).await.unwrap();
+                    cancels.cancel(ps_id);
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            Reviewer::process_patch_review(
+                &ctx,
+                ps_id,
+                p_id,
+                1,
+                "HEAD",
+                None,
+                &json!({}),
+                None,
+                None,
+                None,
+                "diff --git a/foo.c b/foo.c\n+int x;",
+                None,
+            ),
+        )
+        .await
+        .expect("a cancelled review must not keep retrying")?;
+        canceller.await?;
+
+        assert!(matches!(result, PatchResult::ReviewFailed));
+        assert_eq!(
+            review_statuses(&ctx.db, p_id).await?,
+            vec!["Cancelled"],
+            "one attempt, recorded as stopped rather than failed"
+        );
+        assert_eq!(patch_status(&ctx.db, p_id).await?, "Cancelled");
+        Ok(())
+    }
+
+    /// A patch whose turn comes after the cancel is not started at all: no
+    /// worker, and no review row claiming an attempt that never happened.
+    #[tokio::test]
+    async fn test_a_patch_is_not_started_after_its_patchset_is_cancelled() -> Result<()> {
+        let worker = "#!/bin/sh\necho started >&2\nexit 1\n";
+        let (ctx, ps_id, p_id, _dir) = cancellable_patch(worker).await?;
+        // Only the status: a cancel written before the token was registered
+        // must still be seen.
+        ctx.db.cancel_patchset(ps_id, true).await?;
+
+        let result = Reviewer::process_patch_review(
+            &ctx,
+            ps_id,
+            p_id,
+            1,
+            "HEAD",
+            None,
+            &json!({}),
+            None,
+            None,
+            None,
+            "diff --git a/foo.c b/foo.c\n+int x;",
+            None,
+        )
+        .await?;
+
+        assert!(matches!(result, PatchResult::ReviewFailed));
+        assert!(review_statuses(&ctx.db, p_id).await?.is_empty());
+        assert_eq!(patch_status(&ctx.db, p_id).await?, "Cancelled");
         Ok(())
     }
 
