@@ -36,6 +36,7 @@ impl LlmTool<SashikoToolContext> for GitFindFilesTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "revision": { "type": "string", "description": "The Git commit SHA or reference to search in." },
                 "pattern": { "type": "string", "description": "Glob pattern to match (e.g., '*.rs' or 'src/**/mod.rs')." },
                 "path": { "type": "string", "description": "Optional relative path to restrict the search (e.g., 'drivers/net/')." }
@@ -58,7 +59,7 @@ impl LlmTool<SashikoToolContext> for GitFindFilesTool {
         let revision_raw = args["revision"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing revision"))?;
-        let revision_virt = context.virtualize_ref(revision_raw);
+        let revision_virt = context.resolve_ref(&args, revision_raw)?;
         let revision = revision_virt.as_str();
         let pattern = args["pattern"]
             .as_str()
@@ -70,7 +71,7 @@ impl LlmTool<SashikoToolContext> for GitFindFilesTool {
             return Err(anyhow!("Invalid revision"));
         }
 
-        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        let mut cmd = crate::git_cmd::in_dir_async(context.repo_root(&args)?);
         cmd.args(["ls-tree", "-r", "--name-only", revision]);
 
         if let Some(p) = path_str
@@ -80,7 +81,7 @@ impl LlmTool<SashikoToolContext> for GitFindFilesTool {
             if p.starts_with('-') {
                 return Err(anyhow!("Invalid path parameter"));
             }
-            validate_path(p, &context.worktree_path)?;
+            validate_path(p, context.repo_root(&args)?)?;
             cmd.arg("--").arg(p);
         }
 

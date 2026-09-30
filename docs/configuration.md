@@ -244,6 +244,76 @@ SASHIKO__SERVER__ACL__ADMINS="first@example.org,second@example.org"
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `repository_path` | string | -- | Path to the kernel git repository used for patch application and context. |
+| `reference_repository_path` | string | unset | Optional read-only second repository consulted for grounding. Linux project only. See [Reviewing out-of-tree modules](#reviewing-out-of-tree-modules). |
+| `reference_revision` | string | `HEAD` | Revision to read the reference repository at. |
+
+#### Reviewing out-of-tree modules
+
+When `repository_path` is an out-of-tree kernel module rather than a kernel tree,
+the review has no `include/linux/` to read. The model then answers questions
+about kernel APIs from training recall -- unversioned, possibly wrong for the
+kernel you build against, and with no signal that it is doing so.
+
+Point `reference_repository_path` at a separate kernel checkout to fix that:
+
+```toml
+[git]
+repository_path = "/srv/sashiko/driver-a"
+reference_repository_path = "/srv/sashiko/linux"
+reference_revision = "v6.12"
+```
+
+or, through the environment:
+
+```bash
+SASHIKO__GIT__REFERENCE_REPOSITORY_PATH=/srv/sashiko/linux
+SASHIKO__GIT__REFERENCE_REVISION=v6.12
+```
+
+This does three things. The git tools gain a `repo` argument, so the model can
+read the kernel tree with `repo: "kernel"` while the code under review stays the
+default. The system prompt gains a block stating the repository is out-of-tree,
+naming the pinned kernel, and withdrawing the in-tree conventions that do not
+apply here -- `Fixes:` tags, lore threads, and treating compat `#ifdef`s as
+needless complexity. And the path and revision are validated before any review
+runs, at daemon startup and again each time a review worker starts, because a
+reference that does not resolve otherwise surfaces as tool errors the model
+works around, leaving a review that looks normal and is ungrounded.
+
+Notes:
+
+- **The daemon never writes to or fetches the reference repository.** Clone and
+  update it yourself.
+- **Pin `reference_revision`.** Left at `HEAD` on a tracking clone, the answers
+  change from one review to the next as the tree moves. Each worker resolves
+  the revision to a commit when it starts and serves that commit for the whole
+  review, so a fetch mid-review does not move it. `HEAD` in a kernel-tree read
+  -- including forms such as `HEAD:include/linux/netdevice.h` or
+  `HEAD~5..HEAD`, and git's `@` shorthand for it -- means that commit, never
+  the tip of the clone. A revision named explicitly, including the pin's own
+  name, is passed to git as written. Each kernel-tree tool result carries a
+  `revision_read` field naming what was actually read, with `HEAD` reported as
+  the commit SHA it was served.
+- **Point at the top of the repository.** The path must be the root of the
+  work tree, or the git directory of a bare clone. A directory inside some other
+  repository is refused, since git would otherwise serve every read from the
+  enclosing one.
+- **A nested clone or submodule inside the module repo does not work.** `git grep`
+  and `git show <rev>:<path>` read the repository's own index, so only this
+  setting makes a second tree reachable.
+- **Linux project only.** Only the Linux review prompt explains the second tree
+  to the model. With `[project].kind = "sashiko"` (or `--project sashiko`) the
+  daemon refuses to start when `reference_repository_path` is set, and a
+  standalone worker ignores it with a warning.
+- Leaving `reference_repository_path` unset reproduces the previous behaviour
+  exactly: no `repo` argument is advertised to the model, and no out-of-tree
+  block is added to the prompt.
+- The daemon, its review workers and `sashiko review` all read the setting
+  from the same file. The hidden `sashiko worker` subcommand also accepts
+  `--reference-repo` and `--reference-revision`, which override it.
+  `--reference-repo` replaces the configured repository together with its
+  revision; `--reference-revision` on its own re-pins the configured
+  repository.
 
 #### `[[git.custom_remotes]]`
 

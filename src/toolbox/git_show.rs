@@ -37,6 +37,7 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "object": { "type": "string", "description": "Git object specifier (e.g. 'HEAD:README.md' or 'HEAD')." },
                 "suppress_diff": { "type": "boolean", "description": "If true, suppresses commit diff output." },
                 "start_line": { "type": "integer", "description": "Focus start line (blobs only, optional)." },
@@ -77,7 +78,7 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
         let object_raw = args["object"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing object"))?;
-        let object_virt = context.virtualize_ref(object_raw);
+        let object_virt = context.resolve_ref(&args, object_raw)?;
         let object = object_virt.as_str();
         let suppress_diff = args["suppress_diff"].as_bool().unwrap_or(false);
         let start_line = args["start_line"].as_u64().map(|v| v as usize);
@@ -95,7 +96,7 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
             if path_part.starts_with('-') {
                 return Err(anyhow!("Invalid path parameter: {}", path_part));
             }
-            validate_path(path_part, &context.worktree_path)?;
+            validate_path(path_part, context.repo_root(&args)?)?;
         }
 
         let mut path_args = Vec::new();
@@ -105,14 +106,19 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
                     if p_str.starts_with('-') {
                         return Err(anyhow!("Invalid path parameter: {}", p_str));
                     }
-                    validate_path(p_str, &context.worktree_path)?;
+                    validate_path(p_str, context.repo_root(&args)?)?;
                     path_args.push(p_str);
                 }
             }
         }
 
+        // The repository belongs in this key as much as the object does. A tag
+        // like `v6.12` names a different commit in the reference tree than in
+        // the repository under review, and serving one for the other is a wrong
+        // answer with no symptom.
         let raw_key = format!(
-            "git_show_raw:{}:{}:{:?}",
+            "git_show_raw:{:?}:{}:{}:{:?}",
+            context.repo_target(&args)?,
             object,
             suppress_diff,
             args.get("paths")
@@ -127,7 +133,7 @@ impl LlmTool<SashikoToolContext> for GitShowTool {
             if let Some(Value::String(raw_str)) = cached_raw {
                 raw_str
             } else {
-                let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+                let mut cmd = crate::git_cmd::in_dir_async(context.repo_root(&args)?);
                 cmd.arg("show");
 
                 if suppress_diff {

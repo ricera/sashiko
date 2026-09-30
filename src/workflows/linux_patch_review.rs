@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::toolbox::{REPO_ARG, REPO_ARG_REFERENCE};
 use crate::workflow::graph::Workflow;
 use crate::workflow::output::OutputFormat;
 use crate::workflow::policy::{ParallelPolicy, RecitationPolicy, StagePolicy, ToolScope};
@@ -42,6 +43,10 @@ pub struct LinuxPatchReviewState {
     pub prefetch_failed: bool,
     pub series_range: Option<String>,
     pub follow_up_series_context: Option<String>,
+    /// Revision of the reference kernel tree, when one is configured. Its
+    /// presence is what marks this review as out-of-tree: the repository has no
+    /// mainline history and no kernel headers of its own.
+    pub reference_revision: Option<String>,
 
     /// Subsystem guide markdown files selected during the pre-screen and
     /// shared with every stage.
@@ -162,7 +167,7 @@ The following documents contain the official technical patterns, architectural r
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
 Baseline SHA: {{{{baseline_sha}}}}
-===========================
+==========================={{{{oot_context_block}}}}
 
 Target Commit:
 {diff_var}
@@ -172,6 +177,37 @@ Target Commit:
     .with_var("baseline_sha", |s: &LinuxPatchReviewState| s.baseline_sha.clone())
     .with_var("target_commit_diff", |s: &LinuxPatchReviewState| s.target_commit_diff.clone())
     .with_var("target_commit_diff_only", |s: &LinuxPatchReviewState| s.target_commit_diff_only.clone())
+    // Out-of-tree review differs from in-tree in two directions, and both need
+    // saying. The model has somewhere else to look for kernel APIs, which it
+    // will not use unless told; and several in-tree conventions it would
+    // otherwise enforce do not exist here, which produces confident findings
+    // about a tree that was never claiming to follow them.
+    .with_var("oot_context_block", |s: &LinuxPatchReviewState| {
+        s.reference_revision.as_deref().map_or_else(String::new, |revision| {
+            format!(
+                "\n\n=== Out-of-Tree Module ===\n\
+                 The repository under review is an out-of-tree Linux kernel module, not a \
+                 mainline kernel tree. It contains the module's own sources and nothing else: \
+                 there is no include/linux/, no kernel core code, and no mainline history.\n\n\
+                 The kernel this module builds against is available as a separate, read-only \
+                 repository, pinned at {revision}. Reach it by passing {REPO_ARG}=\"{REPO_ARG_REFERENCE}\" to any \
+                 git tool. Verify API contracts, struct layouts, and helper semantics by \
+                 reading that tree rather than recalling them -- your recollection is not \
+                 pinned to this kernel version and may describe a different one.\n\n\
+                 Consequences of being out-of-tree, all of which change what counts as a \
+                 finding:\n\
+                 - Fixes: tags, lore threads, and 'look forward in git history for the fix' do \
+                 not apply. There is no mainline history in this repository to search, and a \
+                 missing Fixes: tag is not a defect here.\n\
+                 - Compatibility shims and kernel-version #ifdefs are expected in this \
+                 codebase; they exist because the module supports several kernel releases. Do \
+                 not report them as unnecessary complexity unless the specific logic is wrong.\n\
+                 - File paths will not match mainline paths. Do not conclude that code is \
+                 missing or misplaced from its path alone.\n\
+                 ==========================="
+            )
+        })
+    })
     .with_var("prefetched_block", |s: &LinuxPatchReviewState| {
         if s.prefetch_failed {
             format!(
@@ -3531,6 +3567,42 @@ mod tests {
                 "{without}\n\n<custom_instructions>\nCheck the locking.\n</custom_instructions>"
             ),
             "the custom prompt closes the system prompt"
+        );
+    }
+
+    /// The out-of-tree framing must reach the model when a reference kernel is
+    /// attached, and must leave an in-tree review untouched -- telling an
+    /// in-tree review that Fixes: tags do not apply would suppress real
+    /// findings.
+    #[test]
+    fn oot_context_renders_only_when_a_reference_is_attached() {
+        let render = |reference_revision| {
+            linux_system_prompt(true).render_for_log(&LinuxPatchReviewState {
+                reference_revision,
+                ..Default::default()
+            })
+        };
+        let in_tree = render(None);
+        assert!(
+            !in_tree.contains("Out-of-Tree Module"),
+            "an in-tree review must not be told to relax in-tree conventions"
+        );
+
+        let grounded = render(Some("v6.12".to_string()));
+        for needle in ["Out-of-Tree Module", "v6.12", r#"repo="kernel""#, "Fixes:"] {
+            assert!(grounded.contains(needle), "missing {needle}: {grounded}");
+        }
+        // Nothing else about the prompt moves: the block is inserted after the
+        // git metadata and the rest renders exactly as it did in-tree.
+        let block_start = grounded.find("\n\n=== Out-of-Tree Module ===").unwrap();
+        let block_end = block_start
+            + grounded[block_start..]
+                .find("\n===========================")
+                .unwrap()
+            + "\n===========================".len();
+        assert_eq!(
+            format!("{}{}", &grounded[..block_start], &grounded[block_end..]),
+            in_tree
         );
     }
 

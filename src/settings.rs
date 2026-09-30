@@ -922,6 +922,20 @@ pub struct GitSettings {
     #[serde(default)]
     pub repository_path: String,
     pub custom_remotes: Option<Vec<CustomRemoteSettings>>,
+    /// A second, read-only repository the review can consult for grounding.
+    ///
+    /// Set when `repository_path` is an out-of-tree kernel module: the module's
+    /// own tree has no `include/linux/`, so without this the model answers
+    /// questions about kernel API contracts from recall rather than from source,
+    /// and does so silently. Absent means single-repository review, exactly as
+    /// before. Linux project only.
+    #[serde(default)]
+    pub reference_repository_path: Option<String>,
+    /// Revision to read the reference repository at, e.g. the tag the module is
+    /// built against. Defaults to `HEAD`, which on a tracking clone means
+    /// whatever was last fetched -- pin it to keep reviews reproducible.
+    #[serde(default)]
+    pub reference_revision: Option<String>,
 }
 
 /// No repository. A local review has none to configure, since it reviews the
@@ -932,6 +946,8 @@ impl Default for GitSettings {
         Self {
             repository_path: String::new(),
             custom_remotes: None,
+            reference_repository_path: None,
+            reference_revision: None,
         }
     }
 }
@@ -1134,6 +1150,8 @@ pub struct Settings {
 #[derive(Debug, Default)]
 pub struct Overrides {
     pub repository_path: Option<String>,
+    pub reference_repository_path: Option<String>,
+    pub reference_revision: Option<String>,
     pub worktree_dir: Option<String>,
     pub no_ai: bool,
     pub ai_provider: Option<String>,
@@ -1155,6 +1173,17 @@ impl Settings {
         let mut changed = Vec::new();
         if let Some(path) = overrides.repository_path {
             self.git.repository_path = path;
+        }
+        // A flag naming a reference repository replaces the configured one
+        // outright, revision and all: a pin chosen for one tree means nothing
+        // in another. A revision flag on its own re-pins the configured
+        // repository, so a one-off review against a different release does not
+        // need the path repeated.
+        if let Some(path) = overrides.reference_repository_path {
+            self.git.reference_repository_path = Some(path);
+            self.git.reference_revision = overrides.reference_revision;
+        } else if let Some(revision) = overrides.reference_revision {
+            self.git.reference_revision = Some(revision);
         }
         if let Some(dir) = overrides.worktree_dir {
             self.review.worktree_dir = Some(dir);
@@ -1427,6 +1456,105 @@ mod tests {
         }
     }
 
+    /// `GitSettings` denies unknown fields, so a Settings.toml naming a
+    /// reference repository fails to load unless both keys are declared.
+    #[test]
+    fn git_settings_accept_a_reference_repository() {
+        let git: GitSettings = toml::from_str(
+            "repository_path = \"/srv/sashiko/driver-a\"\n\
+             reference_repository_path = \"/srv/sashiko/linux\"\n\
+             reference_revision = \"v6.12\"\n",
+        )
+        .expect("reference keys must deserialize");
+        assert_eq!(
+            git.reference_repository_path.as_deref(),
+            Some("/srv/sashiko/linux")
+        );
+        assert_eq!(git.reference_revision.as_deref(), Some("v6.12"));
+
+        // Absent means single-repository review, exactly as before.
+        let git: GitSettings = toml::from_str("repository_path = \"linux\"\n").unwrap();
+        assert!(git.reference_repository_path.is_none());
+        assert!(git.reference_revision.is_none());
+    }
+
+    /// Flags override settings: a repository flag replaces the configured
+    /// reference with its own revision, and a revision flag alone re-pins the
+    /// configured repository.
+    #[test]
+    fn reference_flags_override_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("Settings.toml");
+        std::fs::write(
+            &file,
+            "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n\n[review]\nconcurrency = 8\n",
+        )
+        .unwrap();
+        let reference = |path: Option<&str>, revision: Option<&str>| {
+            let mut settings = Settings::load(Some(&file)).unwrap();
+            settings.git.reference_repository_path = path.map(str::to_string);
+            settings.git.reference_revision = revision.map(str::to_string);
+            settings
+        };
+        let flags = |path: Option<&str>, revision: Option<&str>| Overrides {
+            reference_repository_path: path.map(str::to_string),
+            reference_revision: revision.map(str::to_string),
+            ..Default::default()
+        };
+        let merged = |mut settings: Settings, overrides: Overrides| {
+            settings.apply_overrides(overrides);
+            (
+                settings.git.reference_repository_path,
+                settings.git.reference_revision,
+            )
+        };
+        let pair = |path: &str, revision: Option<&str>| {
+            (Some(path.to_string()), revision.map(str::to_string))
+        };
+
+        assert_eq!(
+            merged(
+                reference(Some("/srv/linux"), Some("v6.12")),
+                flags(None, None)
+            ),
+            pair("/srv/linux", Some("v6.12"))
+        );
+        assert_eq!(
+            merged(reference(None, None), flags(None, Some("v6.13"))).0,
+            None,
+            "a revision alone names no repository"
+        );
+        assert_eq!(
+            merged(
+                reference(Some("/srv/linux"), Some("v6.12")),
+                flags(Some("/srv/other"), None)
+            ),
+            pair("/srv/other", None),
+            "a different tree must not inherit the configured pin"
+        );
+        assert_eq!(
+            merged(
+                reference(Some("/srv/linux"), Some("v6.12")),
+                flags(Some("/srv/other"), Some("v6.13"))
+            ),
+            pair("/srv/other", Some("v6.13"))
+        );
+        assert_eq!(
+            merged(
+                reference(Some("/srv/linux"), Some("v6.12")),
+                flags(None, Some("v6.13"))
+            ),
+            pair("/srv/linux", Some("v6.13"))
+        );
+        assert_eq!(
+            merged(
+                reference(None, None),
+                flags(Some("/srv/other"), Some("v6.13"))
+            ),
+            pair("/srv/other", Some("v6.13"))
+        );
+    }
+
     #[test]
     fn test_project_settings_attribution_and_domain() {
         let default_proj = ProjectSettings::default();
@@ -1564,6 +1692,8 @@ mod tests {
 
         let changed = settings.apply_overrides(Overrides {
             repository_path: Some("from_flag".to_string()),
+            reference_repository_path: Some("from_flag".to_string()),
+            reference_revision: Some("v6.13".to_string()),
             worktree_dir: Some("from_flag".to_string()),
             no_ai: true,
             ai_provider: Some("stdio-claude".to_string()),
@@ -1584,6 +1714,11 @@ mod tests {
             ]
         );
         assert_eq!(settings.git.repository_path, "from_flag");
+        assert_eq!(
+            settings.git.reference_repository_path.as_deref(),
+            Some("from_flag")
+        );
+        assert_eq!(settings.git.reference_revision.as_deref(), Some("v6.13"));
         assert_eq!(settings.review.worktree_dir.as_deref(), Some("from_flag"));
         assert!(settings.ai.no_ai);
         assert_eq!(settings.ai.provider, "stdio-claude");

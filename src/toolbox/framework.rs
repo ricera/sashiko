@@ -90,6 +90,11 @@ impl<C> ToolRegistry<C> {
             .collect()
     }
 
+    /// Returns the parameter schema of the tool registered under `name`.
+    pub fn parameters(&self, name: &str) -> Option<Value> {
+        self.tools.get(name).map(|t| t.parameters())
+    }
+
     /// Normalizes the arguments for a specific tool by name.
     ///
     /// If the tool is registered, it delegates to the tool's `normalize_args` method.

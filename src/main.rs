@@ -235,6 +235,16 @@ enum Commands {
         /// Include pre-existing bugs in verification and report generation
         #[arg(long, hide = true)]
         report_preexisting: bool,
+
+        /// Read-only kernel tree to consult for API contracts and headers.
+        /// Overrides git.reference_repository_path. Linux project only.
+        #[arg(long)]
+        reference_repo: Option<PathBuf>,
+
+        /// Revision to read the reference repository at. Default: HEAD. On its
+        /// own, re-pins the configured git.reference_repository_path.
+        #[arg(long)]
+        reference_revision: Option<String>,
     },
 }
 
@@ -282,9 +292,13 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             ai_provider,
             effort,
             stages,
+            reference_repo,
+            reference_revision,
             ..
         }) => Overrides {
             repository_path: repo.as_deref().map(path_string),
+            reference_repository_path: reference_repo.as_deref().map(path_string),
+            reference_revision: reference_revision.clone(),
             worktree_dir: worktree_dir.as_deref().map(path_string),
             no_ai: *no_ai,
             ai_provider: ai_provider.clone(),
@@ -564,6 +578,27 @@ async fn run_daemon(
     {
         error!("Refusing to start: {}", reason);
         return Err(reason.into());
+    }
+
+    // A reference repository that does not resolve is worth refusing to start
+    // over. Left to the review, it surfaces as tool errors the model absorbs and
+    // works around, and the run reads as a normal review that quietly did its
+    // grounding from memory. One configured for a project whose prompt cannot
+    // explain it is refused too, as a mismatched [project].kind is: the worker
+    // would ignore it, and a setting that silently does nothing is worse than
+    // one that stops the daemon.
+    if let Some(reason) =
+        reference_repository_refusal(project, settings.git.reference_repository_path.as_deref())
+    {
+        error!("Refusing to start: {}", reason);
+        return Err(reason.into());
+    }
+    if let Some(path) = &settings.git.reference_repository_path {
+        sashiko::git_ops::validate_reference_repository(
+            std::path::Path::new(path),
+            settings.git.reference_revision.as_deref(),
+        )
+        .await?;
     }
 
     // Initialize Database
@@ -1514,6 +1549,24 @@ fn handle_init_command(
     let prompts_root = prompt_bundle::install_prompt_bundle(reinstall_prompts)?;
     println!("Installed prompts in {}", prompts_root.display());
     Ok(())
+}
+
+/// Why the daemon must not start with this reference repository setting, if
+/// it must not.
+///
+/// Only a Linux review's prompt explains the second tree, so a reference set
+/// for any other project would be silently ignored by every worker.
+#[cfg(feature = "server")]
+fn reference_repository_refusal(
+    project: ProjectId,
+    reference_repository_path: Option<&str>,
+) -> Option<String> {
+    (reference_repository_path.is_some() && !project.supports_reference_repository()).then(|| {
+        format!(
+            "git.reference_repository_path is set, but project '{project}' does not \
+             support a reference repository; it is only used for Linux reviews"
+        )
+    })
 }
 
 /// The project this invocation is for.
@@ -4807,6 +4860,56 @@ mod tests {
             }
             _ => panic!("expected worker command"),
         }
+    }
+
+    #[test]
+    fn test_cli_worker_reference_flags() {
+        let cli = Cli::try_parse_from([
+            "sashiko",
+            "worker",
+            "--reference-repo",
+            "/srv/linux",
+            "--reference-revision",
+            "v6.12",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Worker {
+                reference_repo,
+                reference_revision,
+                ..
+            }) => {
+                assert_eq!(reference_repo, Some(PathBuf::from("/srv/linux")));
+                assert_eq!(reference_revision.as_deref(), Some("v6.12"));
+            }
+            _ => panic!("expected worker command"),
+        }
+
+        let cli = Cli::try_parse_from(["sashiko", "worker"]).unwrap();
+        match cli.command {
+            Some(Commands::Worker {
+                reference_repo,
+                reference_revision,
+                ..
+            }) => {
+                assert!(reference_repo.is_none());
+                assert!(reference_revision.is_none());
+            }
+            _ => panic!("expected worker command"),
+        }
+    }
+
+    /// The daemon refuses a reference repository only for a project whose
+    /// prompt cannot explain it, and never when none is configured.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_reference_repository_refusal() {
+        assert!(reference_repository_refusal(ProjectId::Linux, Some("/srv/linux")).is_none());
+        assert!(reference_repository_refusal(ProjectId::Linux, None).is_none());
+        assert!(reference_repository_refusal(ProjectId::Sashiko, None).is_none());
+        let reason = reference_repository_refusal(ProjectId::Sashiko, Some("/srv/linux"))
+            .expect("a non-Linux project with a reference must be refused");
+        assert!(reason.contains("reference_repository_path"), "{reason}");
     }
 
     #[cfg(feature = "server")]

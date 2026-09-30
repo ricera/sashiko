@@ -37,6 +37,7 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
         json!({
             "type": "object",
             "properties": {
+                "repo": crate::toolbox::repo_arg_schema(),
                 "base_revision": { "type": "string", "description": "The baseline commit SHA or revision reference." },
                 "target_revision": { "type": "string", "description": "The target commit SHA or revision reference to compare against." },
                 "paths": {
@@ -63,19 +64,19 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
         let base_raw = args["base_revision"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing base_revision"))?;
-        let base_virt = context.virtualize_ref(base_raw);
+        let base_virt = context.resolve_ref(&args, base_raw)?;
         let base = base_virt.as_str();
         let target_raw = args["target_revision"]
             .as_str()
             .ok_or_else(|| anyhow!("Missing target_revision"))?;
-        let target_virt = context.virtualize_ref(target_raw);
+        let target_virt = context.resolve_ref(&args, target_raw)?;
         let target = target_virt.as_str();
 
         if base.starts_with('-') || target.starts_with('-') {
             return Err(anyhow!("Invalid revision names"));
         }
 
-        let mut cmd = crate::git_cmd::in_dir_async(&context.worktree_path);
+        let mut cmd = crate::git_cmd::in_dir_async(context.repo_root(&args)?);
         cmd.args(["diff", "--diff-algorithm=histogram", base, target]);
 
         // Always terminate the revisions with `--`, paths or not. Without it,
@@ -90,7 +91,7 @@ impl LlmTool<SashikoToolContext> for GitDiffTool {
                     if p_str.starts_with('-') {
                         return Err(anyhow!("Invalid path parameter: {}", p_str));
                     }
-                    validate_path(p_str, &context.worktree_path)?;
+                    validate_path(p_str, context.repo_root(&args)?)?;
                     cmd.arg(p_str);
                 }
             }

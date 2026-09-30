@@ -31,7 +31,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// What a worker is asked to do: only what the settings have no notion of, such
 /// as which patch, which baseline, and where the prompts are.
@@ -274,6 +274,24 @@ pub async fn run_git_review(
     .await
 }
 
+/// Keeps a reference repository only for a project whose review can use one.
+///
+/// Only the Linux prompt tells the model what the second tree is and which
+/// in-tree conventions stop applying. Anywhere else it would be a kernel
+/// checkout offered with no explanation, so it is dropped rather than half
+/// wired up. The daemon refuses to start in that configuration; this covers
+/// the worker and `sashiko review`, which do not go through it.
+fn reference_for_project(
+    project: crate::project::ProjectId,
+    reference: Option<(PathBuf, Option<String>)>,
+) -> Option<(PathBuf, Option<String>)> {
+    if reference.is_some() && !project.supports_reference_repository() {
+        warn!("Ignoring reference repository: project '{project}' does not support one");
+        return None;
+    }
+    reference
+}
+
 pub async fn run_worker(
     input: ReviewInput,
     options: WorkerOptions,
@@ -285,6 +303,43 @@ pub async fn run_worker(
     let concurrency = settings.review.concurrency;
     let timeout_seconds = settings.review.timeout_seconds;
     let worktree_dir = settings.review.worktree_dir.as_deref().map(Path::new);
+
+    // The reference is a [git] setting like the repository itself; a
+    // --reference-repo or --reference-revision flag has already been merged
+    // onto it.
+    let reference = settings
+        .git
+        .reference_repository_path
+        .as_ref()
+        .map(|path| (PathBuf::from(path), settings.git.reference_revision.clone()));
+    let reference = reference_for_project(options.project, reference);
+
+    // Validated here as well as at daemon startup, because this is the only
+    // check that runs on every path into a review, including builds without the
+    // server feature. The path is made absolute so it means the same thing
+    // whatever directory each tool's git command runs in, and the revision is
+    // pinned to the commit it resolved to now, so a fetch in the clone during
+    // the review cannot move what the rest of it reads.
+    let reference = match reference {
+        Some((path, revision)) => {
+            let commit =
+                crate::git_ops::validate_reference_repository(&path, revision.as_deref()).await?;
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            let revision = revision.unwrap_or_else(|| "HEAD".to_string());
+            info!(
+                "Grounding reads against reference repository {} at {} ({})",
+                path.display(),
+                revision,
+                commit
+            );
+            Some(crate::toolbox::ReferenceRepo {
+                path,
+                revision,
+                commit,
+            })
+        }
+        None => None,
+    };
 
     let patchset_id = input.id;
     let subject = input.subject;
@@ -378,6 +433,7 @@ pub async fn run_worker(
         &baseline_arg,
         &baseline_sha,
         &options,
+        reference,
         progress,
     )
     .await;
@@ -496,6 +552,7 @@ async fn review_single_patch(
     llm_semaphore: &Arc<Semaphore>,
     quota: &Arc<crate::ai::quota::QuotaManager>,
     timeout_seconds: u64,
+    reference: Option<&crate::toolbox::ReferenceRepo>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     // The AI section and the stage list as this process resolved them, command
@@ -561,6 +618,9 @@ async fn review_single_patch(
         );
 
         let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path);
+        if let Some(reference) = reference {
+            tools = tools.with_reference(reference.clone());
+        }
         tools.set_active_patch_files(patch_files);
 
         if let Some(sha) = patch_shas.get(&p.index) {
@@ -834,6 +894,7 @@ async fn run_worker_in_worktree(
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
+    reference: Option<crate::toolbox::ReferenceRepo>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
     info!("Worktree at {:?}", worktree.path);
@@ -1026,6 +1087,7 @@ async fn run_worker_in_worktree(
         let rich_patches = rich_patches.clone();
         let patch_shas = &patch_shas;
         let options = &options;
+        let reference = reference.as_ref();
         let subject_clone = subject.clone();
         let all_patches = &patches;
         let llm_semaphore = &llm_semaphore;
@@ -1045,6 +1107,7 @@ async fn run_worker_in_worktree(
                 llm_semaphore,
                 quota,
                 timeout_seconds,
+                reference,
                 progress,
             )
             .await;
@@ -1559,6 +1622,21 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::sync::Arc;
+
+    /// A Linux review keeps its reference; any other project drops it, because
+    /// only the Linux prompt explains the second tree to the model.
+    #[test]
+    fn reference_is_kept_only_for_projects_that_can_use_it() {
+        use crate::project::ProjectId;
+        let reference = Some((PathBuf::from("/srv/linux"), Some("v6.12".to_string())));
+
+        assert_eq!(
+            reference_for_project(ProjectId::Linux, reference.clone()),
+            reference
+        );
+        assert_eq!(reference_for_project(ProjectId::Sashiko, reference), None);
+        assert_eq!(reference_for_project(ProjectId::Linux, None), None);
+    }
 
     /// A provider that does nothing; the decoration tests only care about
     /// whether it was wrapped, which `Arc::ptr_eq` answers directly.
