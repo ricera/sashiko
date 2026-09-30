@@ -114,6 +114,19 @@ impl RetryBudget for DeadlineBudget {
     }
 }
 
+/// Told how long each request was held back, and why.
+///
+/// A rate-limit wait and a transient backoff look the same from outside --
+/// a request that took longer than it should have -- but only the first says
+/// the provider is saturated. Reported per request so the caller can say which
+/// stage paid for it.
+pub trait WaitObserver: Send + Sync {
+    /// Held at the shared rate-limit gate before being sent.
+    fn rate_limited(&self, request: &AiRequest, waited: Duration);
+    /// Slept after a transient server error before trying again.
+    fn backed_off(&self, request: &AiRequest, waited: Duration);
+}
+
 /// Adds rate-limit and transient retry with backoff around an inner provider.
 pub struct BackoffProvider {
     inner: Arc<dyn AiProvider>,
@@ -126,6 +139,7 @@ pub struct BackoffProvider {
     /// Attempt ceiling, or None to retry until `budget` says to stop.
     max_attempts: Option<u32>,
     budget: Option<Arc<dyn RetryBudget>>,
+    observer: Option<Arc<dyn WaitObserver>>,
 }
 
 impl BackoffProvider {
@@ -143,7 +157,14 @@ impl BackoffProvider {
             base_delay: Duration::from_secs(1),
             max_attempts: budget.is_none().then_some(MAX_ATTEMPTS),
             budget,
+            observer: None,
         }
+    }
+
+    /// Reports each wait to `observer`, attributed to the request that waited.
+    pub fn with_wait_observer(mut self, observer: Arc<dyn WaitObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 }
 
@@ -156,6 +177,11 @@ impl AiProvider for BackoffProvider {
             // Honour any active global rate-limit window before trying. The
             // wait is reported so a caller can keep it off its own deadline.
             let slept = self.quota.wait_for_access().await;
+            if let Some(observer) = &self.observer
+                && !slept.is_zero()
+            {
+                observer.rate_limited(&request, slept);
+            }
             if let Some(budget) = &self.budget {
                 budget.credit_wait(slept);
                 budget.check()?;
@@ -201,6 +227,9 @@ impl AiProvider for BackoffProvider {
                                 e
                             );
                             sleep(jittered).await;
+                            if let Some(observer) = &self.observer {
+                                observer.backed_off(&request, jittered);
+                            }
                         }
                         AiErrorClass::Fatal => return Err(e),
                     }
@@ -300,6 +329,7 @@ mod tests {
             base_delay: Duration::from_millis(1),
             max_attempts: Some(MAX_ATTEMPTS),
             budget: None,
+            observer: None,
         }
     }
 
@@ -378,6 +408,52 @@ mod tests {
             .unwrap();
         assert_eq!(resp.content.as_deref(), Some("ok"));
         assert_eq!(m.calls.load(Ordering::SeqCst), 3); // 2 rate-limit failures + success
+    }
+
+    #[derive(Default)]
+    struct RecordingWaits {
+        rate_limited: std::sync::Mutex<Vec<Duration>>,
+        backed_off: std::sync::Mutex<Vec<Duration>>,
+    }
+
+    impl WaitObserver for RecordingWaits {
+        fn rate_limited(&self, _request: &AiRequest, waited: Duration) {
+            self.rate_limited.lock().unwrap().push(waited);
+        }
+        fn backed_off(&self, _request: &AiRequest, waited: Duration) {
+            self.backed_off.lock().unwrap().push(waited);
+        }
+    }
+
+    /// Each wait is reported as the kind it was. A rate limit and a transient
+    /// backoff both just look like a slow call from outside, and they say
+    /// opposite things about the provider.
+    #[tokio::test]
+    async fn waits_are_reported_by_kind() {
+        let observer = Arc::new(RecordingWaits::default());
+        let m = mock(Behaviour::RateLimit, 2, Duration::from_millis(5));
+        fast(m)
+            .with_wait_observer(observer.clone())
+            .generate_content(dummy_request())
+            .await
+            .unwrap();
+        let limited = observer.rate_limited.lock().unwrap().clone();
+        assert_eq!(limited.len(), 2, "held at the gate after each rate limit");
+        assert!(limited.iter().all(|d| !d.is_zero()));
+        assert!(observer.backed_off.lock().unwrap().is_empty());
+
+        let observer = Arc::new(RecordingWaits::default());
+        let m = mock(Behaviour::Transient, 3, Duration::ZERO);
+        fast(m)
+            .with_wait_observer(observer.clone())
+            .generate_content(dummy_request())
+            .await
+            .unwrap();
+        assert_eq!(observer.backed_off.lock().unwrap().len(), 3);
+        assert!(
+            observer.rate_limited.lock().unwrap().is_empty(),
+            "a free gate is not a wait"
+        );
     }
 
     #[tokio::test]

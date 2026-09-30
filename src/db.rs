@@ -716,6 +716,7 @@ impl Database {
         let _ = self
             .try_add_column("reviews", "resumed_from", "INTEGER")
             .await;
+        let _ = self.try_add_column("reviews", "waits", "TEXT").await;
         let _ = self
             .try_add_column("patchsets", "review_duration_seconds", "INTEGER")
             .await;
@@ -1640,6 +1641,19 @@ impl Database {
             .execute(
                 "UPDATE reviews SET stage_outputs = NULL WHERE id = ?",
                 libsql::params![review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Records a review's model calls and how long they were held back, as the
+    /// JSON object the reviewer's wait ledger produces. Scoped to one attempt,
+    /// like the stage timings it sits beside.
+    pub async fn set_review_waits(&self, review_id: i64, waits_json: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE reviews SET waits = ? WHERE id = ?",
+                libsql::params![waits_json, review_id],
             )
             .await?;
         Ok(())
@@ -3873,7 +3887,7 @@ impl Database {
                         r.result_description, r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.stage_failures, r.attempt, r.duration_seconds, r.stage_durations,
                         (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id) AS tool_calls,
                         (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id AND tu.repo = 'kernel') AS reference_tool_calls,
-                        r.resumed_from
+                        r.resumed_from, r.waits
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -3916,6 +3930,9 @@ impl Database {
                     "reference_tool_calls": r.get::<i64>(18).ok(),
                     // The review whose saved stages this one picked up from.
                     "resumed_from": r.get::<Option<i64>>(19).ok().flatten(),
+                    // Model calls and how long they were held back, per stage.
+                    "waits": r.get::<Option<String>>(20).ok().flatten()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -4137,7 +4154,7 @@ impl Database {
                         r.result_description, r.status, r.inline_review, ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached, r.stage_failures, r.attempt, r.duration_seconds, r.stage_durations,
                         (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id) AS tool_calls,
                         (SELECT COUNT(*) FROM tool_usages tu WHERE tu.review_id = r.id AND tu.repo = 'kernel') AS reference_tool_calls,
-                        r.resumed_from
+                        r.resumed_from, r.waits
                  FROM reviews r
                  LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
                  WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -4179,6 +4196,9 @@ impl Database {
                     "reference_tool_calls": r.get::<i64>(16).ok(),
                     // The review whose saved stages this one picked up from.
                     "resumed_from": r.get::<Option<i64>>(17).ok().flatten(),
+                    // Model calls and how long they were held back, per stage.
+                    "waits": r.get::<Option<String>>(18).ok().flatten()
+                        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                     "model": model_name.clone(),
                     "provider": provider.clone(),
                     "prompts_hash": prompts_git_hash.clone(),
@@ -4410,7 +4430,7 @@ impl Database {
                         b.repo_url, b.branch, b.last_known_commit,
                         r.provider, r.prompts_hash, r.result_description,
                         r.status, r.inline_review, r.logs, ai.tokens_in, ai.tokens_out, r.patch_id, ai.tokens_cached,
-                        r.stage_outputs, r.resumed_from
+                        r.stage_outputs, r.resumed_from, r.waits
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -4448,6 +4468,8 @@ impl Database {
                 "stage_outputs": r.get::<Option<String>>(19).ok().flatten()
                     .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
                 "resumed_from": r.get::<Option<i64>>(20).ok().flatten(),
+                "waits": r.get::<Option<String>>(21).ok().flatten()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
             })))
         } else {
             Ok(None)

@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     stage_durations TEXT,      -- JSON array of {stage, seconds} for this attempt
     stage_outputs TEXT,        -- JSON object: stage name -> what it produced, written as each finishes
     resumed_from INTEGER,      -- review whose saved stage outputs this one was resumed from
+    waits TEXT,                -- JSON: model calls and time held back (slot, rate limit, backoff), per stage
     baseline_id INTEGER,
     model TEXT,
     prompts_hash TEXT,

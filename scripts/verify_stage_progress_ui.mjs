@@ -58,7 +58,8 @@ const NAMES = ['escapeHtml', 'formatDuration', 'describeStageWait', 'summarizeRe
                'stageRowsFromActivity', 'formatToolCalls', 'applyToolCallCounts',
                'parseSeverityCalibration', 'renderSeverityCalibration',
                'isSpeculativeFinding', 'findingHeadline', 'renderFindingLocations',
-               'renderFindingsTable', 'toggleFindingReasoning'];
+               'renderFindingsTable', 'toggleFindingReasoning',
+               'stageWaitsFor', 'describeWaits', 'waitTotalsHtml'];
 const ctx = {};
 new Function('ctx', CONSTS.map(grabConst).join('\n\n') + '\n\n' +
     NAMES.map(grab).join('\n\n') +
@@ -735,6 +736,59 @@ check('finding text is escaped',
         && nasty.includes('&lt;script&gt;'), nasty.slice(0, 400));
 check('a location is shown as file:function:line',
     nasty.includes('f:12'), nasty.slice(0, 600));
+
+// ---- waits: what held a review's model calls back --------------------------
+// Recorded per stage by the daemon's wait ledger. A stage that sat in a queue
+// for a model slot has to read differently from one that was merely slow, or
+// the numbers cannot tell anyone whether `concurrency` is too low.
+const waits = {
+    calls: 40, queued_calls: 6, slot_wait_seconds: 312.4,
+    rate_limited_calls: 2, rate_limit_wait_seconds: 0.4, backoffs: 0, backoff_seconds: 0,
+    stages: {
+        'locking': { calls: 30, queued_calls: 6, slot_wait_seconds: 312.4,
+                     rate_limited_calls: 2, rate_limit_wait_seconds: 0.4, backoffs: 0, backoff_seconds: 0 },
+        'goal': { calls: 10, queued_calls: 0, slot_wait_seconds: 0,
+                  rate_limited_calls: 0, rate_limit_wait_seconds: 0, backoffs: 0, backoff_seconds: 0 },
+        'security': { calls: 5, queued_calls: 0, slot_wait_seconds: 0,
+                      rate_limited_calls: 0, rate_limit_wait_seconds: 0, backoffs: 3, backoff_seconds: 21 },
+    },
+};
+const waited = ctx.renderReviewCard({
+    id: 50, status: 'Reviewed', patch_id: 12,
+    stage_durations: [
+        { stage: 'locking', seconds: 1800, turns: 30 },
+        { stage: 'goal', seconds: 600, turns: 10 },
+    ],
+    stage_failures: [
+        { stage: 'security', reason: 'still running when the review stopped', cancelled: true },
+    ],
+    waits,
+});
+check('a queued stage says how long it waited for a slot, and how often',
+    waited.includes('queued for a slot 5m 12s (6 calls)'), waited);
+check('a sub-second wait is not rounded away to nothing',
+    waited.includes('rate-limited &lt;1s (2 calls)'), waited);
+const goalRow = waited.split('<tr').find(r => r.includes('>Stage goal<')) || '';
+check('a stage that never waited says nothing about waiting',
+    goalRow && !goalRow.includes('queued') && !goalRow.includes('rate-limited'), goalRow);
+check('a stopped stage still reports the waits it had',
+    waited.includes('backed off 21s (3 retries)'), waited);
+check('the review totals are shown, and say they are summed',
+    waited.includes('40 model calls;') && waited.includes('summed across stages'), waited);
+const calm = ctx.renderReviewCard({
+    id: 51, status: 'Reviewed', patch_id: 13,
+    stage_durations: [{ stage: 'goal', seconds: 60, turns: 3 }],
+    waits: { calls: 3, queued_calls: 0, slot_wait_seconds: 0, rate_limited_calls: 0,
+             rate_limit_wait_seconds: 0, backoffs: 0, backoff_seconds: 0,
+             stages: { goal: { calls: 3 } } },
+});
+check('a review nothing held back says so', calm.includes('3 model calls; none held back'), calm);
+const older = ctx.renderReviewCard({
+    id: 52, status: 'Reviewed', patch_id: 14,
+    stage_durations: [{ stage: 'goal', seconds: 60, turns: 3 }],
+});
+check('a review recorded before waits were kept renders as before',
+    older.includes('>Stage goal<') && !older.includes('stage-waits'), older);
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);

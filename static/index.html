@@ -2431,21 +2431,73 @@
         // same list to a reader, so they are merged here rather than shown as two
         // things. A stopped stage has no duration to report: the daemon records
         // only its reason, which already carries the elapsed time in its text.
-        function stageRowsFromRecord(stageDurations, stageFailures) {
+        //
+        // `waits` is the review's wait ledger; each row carries its own stage's
+        // part, so a slow stage can be told apart from one that sat in a queue.
+        function stageRowsFromRecord(stageDurations, stageFailures, waits) {
             const rows = [];
             for (const st of (Array.isArray(stageDurations) ? stageDurations : [])) {
                 rows.push({
                     stage: st.stage, state: 'done',
                     seconds: st.seconds || 0, turns: st.turns || 0,
+                    waits: stageWaitsFor(waits, st.stage),
                 });
             }
             for (const f of (Array.isArray(stageFailures) ? stageFailures : [])) {
                 rows.push({
                     stage: f.stage, state: 'stopped',
                     reason: f.reason || '', cancelled: !!f.cancelled,
+                    waits: stageWaitsFor(waits, f.stage),
                 });
             }
             return rows.sort((a, b) => stageRank(a.stage) - stageRank(b.stage));
+        }
+
+        // One stage's part of a review's wait ledger, or null.
+        function stageWaitsFor(waits, stage) {
+            const stages = waits && waits.stages;
+            if (!stages || stage == null) return null;
+            return stages[String(stage)] || null;
+        }
+
+        // What held a stage's model calls back, in words; '' when nothing did.
+        //
+        // The three are named apart because they call for different things: a
+        // queue for a model slot says `concurrency` is too low for the work, a
+        // rate limit says the provider is saturated, a backoff that it is
+        // unwell. Waits under a second still count -- a hundred of them add up.
+        function describeWaits(w) {
+            if (!w) return '';
+            const calls = n => n === 1 ? '1 call' : `${n} calls`;
+            const dur = secs => (secs || 0) < 1 ? '<1s' : formatDuration(secs);
+            const parts = [];
+            if (w.queued_calls) {
+                parts.push(`queued for a slot ${dur(w.slot_wait_seconds)} (${calls(w.queued_calls)})`);
+            }
+            if (w.rate_limited_calls) {
+                parts.push(`rate-limited ${dur(w.rate_limit_wait_seconds)} (${calls(w.rate_limited_calls)})`);
+            }
+            if (w.backoffs) {
+                const retries = w.backoffs === 1 ? '1 retry' : `${w.backoffs} retries`;
+                parts.push(`backed off ${dur(w.backoff_seconds)} (${retries})`);
+            }
+            return parts.join(', ');
+        }
+
+        // The review's model calls and waits, under its recorded stage table.
+        //
+        // Summed across stages, and said so: stages run side by side, so their
+        // waits overlap, and the total measures calls held back rather than
+        // time the review lost.
+        function waitTotalsHtml(waits) {
+            if (!waits || !waits.calls) return '';
+            const held = describeWaits(waits);
+            return `<div class="stage-waits" style="margin:4px 0 0 12px; color:var(--text-muted);">`
+                + `${waits.calls} model call${waits.calls === 1 ? '' : 's'}; `
+                + (held
+                    ? `${escapeHtml(held)}, summed across stages`
+                    : 'none held back')
+                + `</div>`;
         }
 
         // The same rows, from the activity registry instead of the database.
@@ -2557,12 +2609,16 @@
                 const turns = !row.turns
                     ? '—'
                     : row.turns === 1 ? '1 turn' : `${row.turns} turns`;
+                // Only a recorded row has waits; a live one is still accruing.
+                const held = describeWaits(row.waits);
                 return `<tr style="color:var(--text-muted);">`
                     + `<td style="${cell}">${label}</td>`
                     + `<td style="${num}">${formatDuration(row.seconds || 0)}</td>`
                     + `<td style="${num}">${turns}</td>`
                     + `<td style="padding:2px 0; color:var(--status-reviewed, var(--text-muted));">`
-                    + `done</td></tr>`;
+                    + `done`
+                    + (held ? `<span style="color:var(--text-muted);"> · ${escapeHtml(held)}</span>` : '')
+                    + `</td></tr>`;
             }
 
             // Stopped. Kept rather than dropped: a stage that vanished would be
@@ -2573,12 +2629,15 @@
                 const what = row.cancelled ? 'stopped' : 'failed';
                 const colour = row.cancelled ? 'var(--text-muted)' : 'var(--status-failed)';
                 const when = row.age ? `${formatDuration(row.age)} ago` : '—';
+                const held = describeWaits(row.waits);
                 return `<tr title="${escapeHtml(row.reason || '')}">`
                     + `<td style="${cell}">${label}</td>`
                     + `<td style="${num} color:var(--text-muted);">${when}</td>`
                     + `<td style="${num}">—</td>`
                     + `<td style="padding:2px 0; color:${colour};">`
-                    + `${what}: ${escapeHtml(summarizeReason(row.reason))}</td></tr>`;
+                    + `${what}: ${escapeHtml(summarizeReason(row.reason))}`
+                    + (held ? `<span style="color:var(--text-muted);"> · ${escapeHtml(held)}</span>` : '')
+                    + `</td></tr>`;
             }
 
             const age = row.age || 0;
@@ -3345,7 +3404,7 @@
             // shows the stages of the attempt that produced it rather than a
             // meaningless mix across attempts.
             let stageTimingHtml = '';
-            const recordedRows = stageRowsFromRecord(r.stage_durations, r.stage_failures);
+            const recordedRows = stageRowsFromRecord(r.stage_durations, r.stage_failures, r.waits);
             if (recordedRows.length > 0) {
                 // Marked recorded, so refreshActivity leaves it alone. The
                 // registry keeps a patch's stage entries until the whole patchset
@@ -3361,7 +3420,8 @@
                     + ` style="margin:6px 0; font-size:0.9em;">`
                     + `<summary style="cursor:pointer; color:var(--text-muted);">`
                     + `${parts.summaryHtml}</summary>`
-                    + `<div class="stage-progress-body">${parts.bodyHtml}</div>`
+                    + `<div class="stage-progress-body">${parts.bodyHtml}`
+                    + `${waitTotalsHtml(r.waits)}</div>`
                     + `</details>`;
             } else if (!showDetails && r.patch_id != null) {
                 // Rendered empty and hidden: this view is built once, while the

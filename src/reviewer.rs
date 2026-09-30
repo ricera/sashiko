@@ -155,6 +155,62 @@ impl Drop for ReviewClockGuard {
     }
 }
 
+/// Writes a review attempt's wait ledger to its row on an interval.
+///
+/// The ledger is otherwise written once, when the run ends -- however it ends,
+/// except by the daemon dying, which takes the ledger with it. The interval is
+/// the review clock's, and a tick that finds nothing new writes nothing.
+struct WaitCheckpoint {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl WaitCheckpoint {
+    fn new(db: Arc<Database>, review_id: i64, ledger: Arc<WaitLedger>) -> Self {
+        Self::every(std::time::Duration::from_secs(30), db, review_id, ledger)
+    }
+
+    fn every(
+        interval: std::time::Duration,
+        db: Arc<Database>,
+        review_id: i64,
+        ledger: Arc<WaitLedger>,
+    ) -> Self {
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.tick().await;
+            let mut last_written = String::new();
+            loop {
+                ticker.tick().await;
+                if ledger.is_empty() {
+                    continue;
+                }
+                let json = ledger.to_json().to_string();
+                if json == last_written {
+                    continue;
+                }
+                // Best effort, like the clock: accounting must never be able
+                // to fail a review.
+                match db.set_review_waits(review_id, &json).await {
+                    Ok(()) => last_written = json,
+                    Err(e) => tracing::debug!(
+                        "Failed to checkpoint waits for review {}: {}",
+                        review_id,
+                        e
+                    ),
+                }
+            }
+        });
+
+        Self { handle }
+    }
+}
+
+impl Drop for WaitCheckpoint {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 impl Reviewer {
     /// Creates a new `Reviewer` instance.
     ///
@@ -2106,6 +2162,113 @@ fn stage_from_context_tag(tag: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// Model calls a review made, and how long they were held back, per stage.
+///
+/// Three waits, told apart because they call for different responses: a call
+/// queued for a model slot says `concurrency` is too low for the work; one held
+/// at the rate-limit gate says the provider is saturated; a transient backoff
+/// says the provider is unwell. Only the first counts against the review's
+/// deadline -- a rate-limit wait is credited back -- which is exactly why it is
+/// worth knowing how much of a slow review it was.
+///
+/// Kept per stage because a stage makes one call at a time, so its figures are
+/// real elapsed time for that stage. Totals across stages add up waits that
+/// overlapped, so they measure calls held back, not wall-clock lost.
+#[derive(Default)]
+struct WaitLedger {
+    stages: std::sync::Mutex<std::collections::BTreeMap<String, StageWaits>>,
+}
+
+#[derive(Default, Clone, Copy)]
+struct StageWaits {
+    calls: u64,
+    queued_calls: u64,
+    slot_wait: std::time::Duration,
+    rate_limited_calls: u64,
+    rate_limit_wait: std::time::Duration,
+    backoffs: u64,
+    backoff_wait: std::time::Duration,
+}
+
+impl WaitLedger {
+    /// Requests the stage layer did not tag go under their own name rather than
+    /// being dropped, so the totals still add up.
+    fn stage_of(request: &crate::ai::AiRequest) -> String {
+        request
+            .context_tag
+            .as_deref()
+            .and_then(stage_from_context_tag)
+            .unwrap_or_else(|| "unattributed".to_string())
+    }
+
+    fn update(&self, request: &crate::ai::AiRequest, apply: impl FnOnce(&mut StageWaits)) {
+        let stage = Self::stage_of(request);
+        apply(self.stages.lock().unwrap().entry(stage).or_default());
+    }
+
+    fn record_call(&self, request: &crate::ai::AiRequest) {
+        self.update(request, |w| w.calls += 1);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.stages.lock().unwrap().is_empty()
+    }
+
+    /// `{calls, queued_calls, slot_wait_seconds, rate_limited_calls,
+    /// rate_limit_wait_seconds, backoffs, backoff_seconds, stages: {name: same}}`,
+    /// seconds to a tenth.
+    fn to_json(&self) -> serde_json::Value {
+        fn secs(d: std::time::Duration) -> f64 {
+            (d.as_secs_f64() * 10.0).round() / 10.0
+        }
+        fn entry(w: &StageWaits) -> serde_json::Value {
+            json!({
+                "calls": w.calls,
+                "queued_calls": w.queued_calls,
+                "slot_wait_seconds": secs(w.slot_wait),
+                "rate_limited_calls": w.rate_limited_calls,
+                "rate_limit_wait_seconds": secs(w.rate_limit_wait),
+                "backoffs": w.backoffs,
+                "backoff_seconds": secs(w.backoff_wait),
+            })
+        }
+        let stages = self.stages.lock().unwrap();
+        let mut total = StageWaits::default();
+        for w in stages.values() {
+            total.calls += w.calls;
+            total.queued_calls += w.queued_calls;
+            total.slot_wait += w.slot_wait;
+            total.rate_limited_calls += w.rate_limited_calls;
+            total.rate_limit_wait += w.rate_limit_wait;
+            total.backoffs += w.backoffs;
+            total.backoff_wait += w.backoff_wait;
+        }
+        let mut out = entry(&total);
+        out["stages"] = stages
+            .iter()
+            .map(|(stage, w)| (stage.clone(), entry(w)))
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+        out
+    }
+}
+
+impl crate::ai::backoff_provider::WaitObserver for WaitLedger {
+    fn rate_limited(&self, request: &crate::ai::AiRequest, waited: std::time::Duration) {
+        self.update(request, |w| {
+            w.rate_limited_calls += 1;
+            w.rate_limit_wait += waited;
+        });
+    }
+
+    fn backed_off(&self, request: &crate::ai::AiRequest, waited: std::time::Duration) {
+        self.update(request, |w| {
+            w.backoffs += 1;
+            w.backoff_wait += waited;
+        });
+    }
+}
+
 /// Reports a stage's wait for a model slot to the activity registry.
 ///
 /// Queueing is invisible without this. A stage waiting its turn behind its
@@ -2115,6 +2278,8 @@ struct StageSlotObserver {
     activity: Arc<crate::activity::ActivityRegistry>,
     patchset_id: i64,
     patch_id: i64,
+    /// Where the length of each wait is kept once it is over.
+    ledger: Arc<WaitLedger>,
 }
 
 impl StageSlotObserver {
@@ -2159,6 +2324,13 @@ impl crate::ai::concurrency_limited_provider::SlotObserver for StageSlotObserver
 
     fn running(&self, request: &crate::ai::AiRequest) {
         self.mark(request, crate::activity::StageWait::Model);
+    }
+
+    fn waited(&self, request: &crate::ai::AiRequest, waited: std::time::Duration) {
+        self.ledger.update(request, |w| {
+            w.queued_calls += 1;
+            w.slot_wait += waited;
+        });
     }
 }
 
@@ -2509,6 +2681,8 @@ async fn run_review_tool_with_cmd(
     // semaphore by hand around each call. This also releases the permit as soon
     // as the call returns, so a request that is backing off no longer occupies
     // a slot while it sleeps.
+    let ledger = Arc::new(WaitLedger::default());
+    let wait_checkpoint = WaitCheckpoint::new(db.clone(), review_id, ledger.clone());
     let provider: Arc<dyn AiProvider> = Arc::new(
         crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
             provider,
@@ -2520,6 +2694,7 @@ async fn run_review_tool_with_cmd(
             activity: activity.clone(),
             patchset_id,
             patch_id,
+            ledger: ledger.clone(),
         })),
     );
     cmd.args([
@@ -2639,14 +2814,16 @@ async fn run_review_tool_with_cmd(
     // than an open-coded loop. A review is bounded by its activity deadline
     // rather than an attempt count, and time spent waiting out a rate limit is
     // credited back so it does not consume that budget.
-    let provider: Arc<dyn AiProvider> =
-        Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
+    let provider: Arc<dyn AiProvider> = Arc::new(
+        crate::ai::backoff_provider::BackoffProvider::new(
             provider,
             quota_manager.clone(),
             Some(Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(
                 deadline.clone(),
             ))),
-        ));
+        )
+        .with_wait_observer(ledger.clone()),
+    );
 
     let mut spawned_tasks = Vec::new();
     // Per-stage timing, derived from the progress events the worker already
@@ -2811,6 +2988,7 @@ async fn run_review_tool_with_cmd(
                                         let total_output_tokens_used_clone = total_output_tokens_used.clone();
                                         let abort_tx_clone = abort_tx.clone();
                                         let cancel_clone = cancel_token.clone();
+                                        let ledger_clone = ledger.clone();
 
                                         let handle = tokio::spawn(async move {
                                             let req: AiRequest = match serde_json::from_value(payload) {
@@ -2850,6 +3028,7 @@ async fn run_review_tool_with_cmd(
                                                 }
                                             }
 
+                                            ledger_clone.record_call(&req);
                                             let ctx_tag = req.context_tag.clone().unwrap_or_default();
                                             // Raced against the cancel. The worker
                                             // only notices a cancel between turns,
@@ -3229,6 +3408,16 @@ async fn run_review_tool_with_cmd(
             .collect();
         let _ = db
             .set_review_stage_durations(review_id, &serde_json::Value::Array(payload).to_string())
+            .await;
+    }
+
+    // Kept however the run ended, like the timings above: a review that ran
+    // out of time is the one whose waits most need explaining. The checkpoint
+    // stops first, so a tick cannot land after this and be the last word.
+    drop(wait_checkpoint);
+    if !ledger.is_empty() {
+        let _ = db
+            .set_review_waits(review_id, &ledger.to_json().to_string())
             .await;
     }
 
@@ -4608,6 +4797,152 @@ done
         Ok(())
     }
 
+    fn tagged(stage: Option<&str>) -> AiRequest {
+        AiRequest {
+            system: None,
+            messages: Vec::new(),
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: stage.map(|s| format!("[ps:1 p:2] [s:{s}] ")),
+        }
+    }
+
+    /// The ledger keeps each stage's waits apart and totals them, to a tenth
+    /// of a second -- and keeps an untagged call rather than losing it.
+    #[test]
+    fn wait_ledger_totals_per_stage_and_overall() {
+        use crate::ai::backoff_provider::WaitObserver;
+        use crate::ai::concurrency_limited_provider::SlotObserver;
+        use std::time::Duration;
+
+        let ledger = Arc::new(WaitLedger::default());
+        let slots = StageSlotObserver {
+            activity: crate::activity::ActivityRegistry::new(),
+            patchset_id: 1,
+            patch_id: 2,
+            ledger: ledger.clone(),
+        };
+        let locking = tagged(Some("locking"));
+        for _ in 0..3 {
+            ledger.record_call(&locking);
+        }
+        slots.waited(&locking, Duration::from_millis(1_234));
+        slots.waited(&locking, Duration::from_millis(66));
+        ledger.rate_limited(&locking, Duration::from_millis(500));
+        ledger.record_call(&tagged(Some("goal")));
+        ledger.backed_off(&tagged(Some("goal")), Duration::from_secs(4));
+        ledger.record_call(&tagged(None));
+
+        let json = ledger.to_json();
+        assert_eq!(json["calls"], 5);
+        assert_eq!(json["queued_calls"], 2);
+        assert_eq!(json["slot_wait_seconds"], 1.3);
+        assert_eq!(json["rate_limit_wait_seconds"], 0.5);
+        assert_eq!(json["backoff_seconds"], 4.0);
+        assert_eq!(json["stages"]["locking"]["calls"], 3);
+        assert_eq!(json["stages"]["locking"]["queued_calls"], 2);
+        assert_eq!(json["stages"]["goal"]["backoffs"], 1);
+        assert_eq!(json["stages"]["unattributed"]["calls"], 1);
+    }
+
+    /// A review still running has its waits on its row within half a minute,
+    /// so a daemon that dies mid-review leaves them behind, as it does the
+    /// review's duration.
+    #[tokio::test]
+    async fn test_waits_are_checkpointed_while_the_review_runs() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let thread_id = db.create_thread("w1", "Subject", 1000).await?;
+        db.create_message(
+            "w1p", thread_id, None, "Author", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "w1", "Subject", "Author", 1000, 1, 1, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await?
+            .expect("patchset");
+        let p_id = db.create_patch(ps_id, "w1p", 1, "diff").await?;
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await?;
+
+        let ledger = Arc::new(WaitLedger::default());
+        ledger.record_call(&tagged(Some("goal")));
+        let checkpoint = WaitCheckpoint::every(
+            std::time::Duration::from_millis(50),
+            db.clone(),
+            review_id,
+            ledger.clone(),
+        );
+
+        let mut calls = serde_json::Value::Null;
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            calls = db.get_review_details(review_id).await?.expect("row")["waits"]["calls"].clone();
+            if calls == 1 {
+                break;
+            }
+        }
+        assert_eq!(calls, 1, "the ledger reaches the row before the run ends");
+        drop(checkpoint);
+        Ok(())
+    }
+
+    /// Recorded from a real run of the review tool: the worker's model call is
+    /// counted against the stage that made it, and the record lands on the
+    /// review row where the API reads it.
+    #[tokio::test]
+    async fn test_a_review_records_its_model_calls_and_waits() -> Result<()> {
+        let mock = r#"#!/bin/sh
+read -r _payload
+echo '{"type":"ai_request","tx_id":1,"payload":{"messages":[{"role":"user","content":"hi"}],"context_tag":"[ps:1 p:1] [s:locking] "}}'
+read -r _reply
+echo '{"patchset_id":1,"patches":[{"index":1,"status":"applied"}]}'
+"#;
+        let run = run_mock_review(mock, Arc::new(MockProvider), None, |_| {}).await?;
+        run.outcome?;
+
+        let review = run
+            .db
+            .get_review_details(run.review_id)
+            .await?
+            .expect("review row");
+        let waits = &review["waits"];
+        assert_eq!(waits["calls"], 1, "{waits}");
+        assert_eq!(waits["stages"]["locking"]["calls"], 1, "{waits}");
+        assert_eq!(waits["queued_calls"], 0, "nothing else was running");
+
+        // The patchset listing the web page reads carries it too.
+        let mut rows = run
+            .db
+            .conn
+            .query(
+                "SELECT patchset_id FROM reviews WHERE id = ?",
+                libsql::params![run.review_id],
+            )
+            .await?;
+        let ps_id: i64 = rows.next().await?.expect("row").get(0)?;
+        let summary = run
+            .db
+            .get_patchset_summary(ps_id, None, None)
+            .await?
+            .expect("summary");
+        let listed = summary["reviews"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == run.review_id)
+            .expect("listed");
+        assert_eq!(listed["waits"]["calls"], 1);
+        Ok(())
+    }
+
     /// A worker killed at the deadline still leaves behind the stages it finished.
     ///
     /// The case this exists for: a review whose analysis took nearly all of its
@@ -5368,6 +5703,7 @@ echo '{"patchset_id":1,"patches":[{"index":1,"status":"applied"}]}'
             activity: activity.clone(),
             patchset_id: 5,
             patch_id: 19,
+            ledger: Arc::new(WaitLedger::default()),
         };
         let request = |stage: &str| crate::ai::AiRequest {
             system: None,
