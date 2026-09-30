@@ -2162,7 +2162,8 @@ fn stage_from_context_tag(tag: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// Model calls a review made, and how long they were held back, per stage.
+/// Model calls a review made, how long the model took to answer them, and how
+/// long they were held back, per stage.
 ///
 /// Three waits, told apart because they call for different responses: a call
 /// queued for a model slot says `concurrency` is too low for the work; one held
@@ -2182,6 +2183,10 @@ struct WaitLedger {
 #[derive(Default, Clone, Copy)]
 struct StageWaits {
     calls: u64,
+    /// Answers received, retries included, and the time spent waiting on them:
+    /// what the live view calls "awaiting model".
+    model_calls: u64,
+    model_time: std::time::Duration,
     queued_calls: u64,
     slot_wait: std::time::Duration,
     rate_limited_calls: u64,
@@ -2193,16 +2198,18 @@ struct StageWaits {
 impl WaitLedger {
     /// Requests the stage layer did not tag go under their own name rather than
     /// being dropped, so the totals still add up.
-    fn stage_of(request: &crate::ai::AiRequest) -> String {
-        request
-            .context_tag
-            .as_deref()
+    fn stage_of(context_tag: Option<&str>) -> String {
+        context_tag
             .and_then(stage_from_context_tag)
             .unwrap_or_else(|| "unattributed".to_string())
     }
 
     fn update(&self, request: &crate::ai::AiRequest, apply: impl FnOnce(&mut StageWaits)) {
-        let stage = Self::stage_of(request);
+        self.update_tagged(request.context_tag.as_deref(), apply);
+    }
+
+    fn update_tagged(&self, context_tag: Option<&str>, apply: impl FnOnce(&mut StageWaits)) {
+        let stage = Self::stage_of(context_tag);
         apply(self.stages.lock().unwrap().entry(stage).or_default());
     }
 
@@ -2214,9 +2221,9 @@ impl WaitLedger {
         self.stages.lock().unwrap().is_empty()
     }
 
-    /// `{calls, queued_calls, slot_wait_seconds, rate_limited_calls,
-    /// rate_limit_wait_seconds, backoffs, backoff_seconds, stages: {name: same}}`,
-    /// seconds to a tenth.
+    /// `{calls, model_calls, model_seconds, queued_calls, slot_wait_seconds,
+    /// rate_limited_calls, rate_limit_wait_seconds, backoffs, backoff_seconds,
+    /// stages: {name: same}}`, seconds to a tenth.
     fn to_json(&self) -> serde_json::Value {
         fn secs(d: std::time::Duration) -> f64 {
             (d.as_secs_f64() * 10.0).round() / 10.0
@@ -2224,6 +2231,8 @@ impl WaitLedger {
         fn entry(w: &StageWaits) -> serde_json::Value {
             json!({
                 "calls": w.calls,
+                "model_calls": w.model_calls,
+                "model_seconds": secs(w.model_time),
                 "queued_calls": w.queued_calls,
                 "slot_wait_seconds": secs(w.slot_wait),
                 "rate_limited_calls": w.rate_limited_calls,
@@ -2236,6 +2245,8 @@ impl WaitLedger {
         let mut total = StageWaits::default();
         for w in stages.values() {
             total.calls += w.calls;
+            total.model_calls += w.model_calls;
+            total.model_time += w.model_time;
             total.queued_calls += w.queued_calls;
             total.slot_wait += w.slot_wait;
             total.rate_limited_calls += w.rate_limited_calls;
@@ -2330,6 +2341,13 @@ impl crate::ai::concurrency_limited_provider::SlotObserver for StageSlotObserver
         self.ledger.update(request, |w| {
             w.queued_calls += 1;
             w.slot_wait += waited;
+        });
+    }
+
+    fn answered(&self, context_tag: Option<&str>, took: std::time::Duration) {
+        self.ledger.update_tagged(context_tag, |w| {
+            w.model_calls += 1;
+            w.model_time += took;
         });
     }
 }
@@ -4833,9 +4851,20 @@ done
         ledger.record_call(&tagged(Some("goal")));
         ledger.backed_off(&tagged(Some("goal")), Duration::from_secs(4));
         ledger.record_call(&tagged(None));
+        slots.answered(
+            Some("[ps:1 p:2] [s:locking] "),
+            Duration::from_millis(40_050),
+        );
+        slots.answered(Some("[ps:1 p:2] [s:locking] "), Duration::from_secs(20));
+        slots.answered(None, Duration::from_secs(1));
 
         let json = ledger.to_json();
         assert_eq!(json["calls"], 5);
+        assert_eq!(json["model_calls"], 3);
+        assert_eq!(json["model_seconds"], 61.1);
+        assert_eq!(json["stages"]["locking"]["model_calls"], 2);
+        assert_eq!(json["stages"]["locking"]["model_seconds"], 60.1);
+        assert_eq!(json["stages"]["unattributed"]["model_calls"], 1);
         assert_eq!(json["queued_calls"], 2);
         assert_eq!(json["slot_wait_seconds"], 1.3);
         assert_eq!(json["rate_limit_wait_seconds"], 0.5);
@@ -4916,6 +4945,10 @@ echo '{"patchset_id":1,"patches":[{"index":1,"status":"applied"}]}'
         let waits = &review["waits"];
         assert_eq!(waits["calls"], 1, "{waits}");
         assert_eq!(waits["stages"]["locking"]["calls"], 1, "{waits}");
+        assert_eq!(
+            waits["stages"]["locking"]["model_calls"], 1,
+            "the model's answer is timed against the stage that asked: {waits}"
+        );
         assert_eq!(waits["queued_calls"], 0, "nothing else was running");
 
         // The patchset listing the web page reads carries it too.

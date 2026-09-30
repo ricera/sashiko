@@ -2484,6 +2484,29 @@
             return parts.join(', ');
         }
 
+        // How long a stage spent awaiting the model's answers, and the average
+        // per call; '' for a review recorded before this was measured.
+        //
+        // Measured from the moment a call holds a model slot to its reply, so
+        // it is the model's time alone: no queue, no rate limit, and none of
+        // the git tools the stage ran between calls.
+        function describeModelTime(w) {
+            if (!w || !w.model_calls) return '';
+            const total = w.model_seconds || 0;
+            const avg = total / w.model_calls;
+            const avgText = avg < 1 ? '<1s'
+                : avg < 10 ? `${avg.toFixed(1)}s`
+                : formatDuration(avg);
+            const calls = w.model_calls === 1 ? '1 call' : `${w.model_calls} calls`;
+            const totalText = total < 1 ? '<1s' : formatDuration(total);
+            return `awaiting model ${totalText}, avg ${avgText} over ${calls}`;
+        }
+
+        // Everything recorded about a stage's model calls, in one phrase.
+        function describeStageCalls(w) {
+            return [describeModelTime(w), describeWaits(w)].filter(Boolean).join('; ');
+        }
+
         // The review's model calls and waits, under its recorded stage table.
         //
         // Summed across stages, and said so: stages run side by side, so their
@@ -2491,12 +2514,13 @@
         // time the review lost.
         function waitTotalsHtml(waits) {
             if (!waits || !waits.calls) return '';
+            const model = describeModelTime(waits);
             const held = describeWaits(waits);
+            const parts = [model, held || 'none held back'].filter(Boolean);
             return `<div class="stage-waits" style="margin:4px 0 0 12px; color:var(--text-muted);">`
                 + `${waits.calls} model call${waits.calls === 1 ? '' : 's'}; `
-                + (held
-                    ? `${escapeHtml(held)}, summed across stages`
-                    : 'none held back')
+                + escapeHtml(parts.join('; '))
+                + (model || held ? ', summed across stages' : '')
                 + `</div>`;
         }
 
@@ -2610,7 +2634,7 @@
                     ? '—'
                     : row.turns === 1 ? '1 turn' : `${row.turns} turns`;
                 // Only a recorded row has waits; a live one is still accruing.
-                const held = describeWaits(row.waits);
+                const held = describeStageCalls(row.waits);
                 return `<tr style="color:var(--text-muted);">`
                     + `<td style="${cell}">${label}</td>`
                     + `<td style="${num}">${formatDuration(row.seconds || 0)}</td>`
@@ -2629,7 +2653,7 @@
                 const what = row.cancelled ? 'stopped' : 'failed';
                 const colour = row.cancelled ? 'var(--text-muted)' : 'var(--status-failed)';
                 const when = row.age ? `${formatDuration(row.age)} ago` : '—';
-                const held = describeWaits(row.waits);
+                const held = describeStageCalls(row.waits);
                 return `<tr title="${escapeHtml(row.reason || '')}">`
                     + `<td style="${cell}">${label}</td>`
                     + `<td style="${num} color:var(--text-muted);">${when}</td>`

@@ -60,6 +60,15 @@ pub trait SlotObserver: Send + Sync {
     /// How long the request waited for its permit, reported with `running`.
     /// A separate hook so an observer that only shows state need not care.
     fn waited(&self, _request: &AiRequest, _waited: std::time::Duration) {}
+    /// How long the model took to answer, from holding the permit to having
+    /// the reply, whether or not the request had to queue first. Failures are
+    /// reported too: the model was being waited on all the same.
+    ///
+    /// Given the request's context tag rather than the request, which has
+    /// moved into the call by the time it returns: the tag is all that names
+    /// who was waiting, and keeping the whole conversation for it would copy
+    /// the conversation on every call.
+    fn answered(&self, _context_tag: Option<&str>, _took: std::time::Duration) {}
 }
 
 /// Limits concurrent model calls to the permits of a shared semaphore. All
@@ -115,7 +124,16 @@ impl AiProvider for ConcurrencyLimitedProvider {
                 permit
             }
         };
-        self.inner.generate_content(request).await
+        let started = std::time::Instant::now();
+        let tag = self
+            .observer
+            .as_ref()
+            .and_then(|_| request.context_tag.clone());
+        let result = self.inner.generate_content(request).await;
+        if let Some(observer) = &self.observer {
+            observer.answered(tag.as_deref(), started.elapsed());
+        }
+        result
     }
 
     fn estimate_tokens(&self, request: &AiRequest) -> usize {
@@ -182,6 +200,7 @@ mod tests {
     struct RecordingObserver {
         events: std::sync::Mutex<Vec<&'static str>>,
         waits: std::sync::Mutex<Vec<std::time::Duration>>,
+        answers: std::sync::Mutex<Vec<(Option<String>, std::time::Duration)>>,
     }
 
     impl SlotObserver for RecordingObserver {
@@ -193,6 +212,12 @@ mod tests {
         }
         fn waited(&self, _request: &AiRequest, waited: std::time::Duration) {
             self.waits.lock().unwrap().push(waited);
+        }
+        fn answered(&self, context_tag: Option<&str>, took: std::time::Duration) {
+            self.answers
+                .lock()
+                .unwrap()
+                .push((context_tag.map(str::to_string), took));
         }
     }
 
@@ -289,6 +314,40 @@ mod tests {
         assert!(
             observer.events.lock().unwrap().is_empty(),
             "a request that never waited has nothing to report"
+        );
+    }
+
+    /// Every call reports how long the model took, queued or not: the model's
+    /// time is what "awaiting model" means, and a free slot does not make it
+    /// any shorter.
+    #[tokio::test]
+    async fn test_every_call_reports_how_long_the_model_took() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let observer = Arc::new(RecordingObserver::default());
+        let limiter = ConcurrencyLimitedProvider::new(
+            Arc::new(GatedProvider { gate: gate.clone() }),
+            Arc::new(Semaphore::new(4)),
+        )
+        .with_observer(observer.clone());
+
+        let mut tagged = request();
+        tagged.context_tag = Some("[ps:1 p:2] [s:locking] ".to_string());
+        let call = tokio::spawn(async move { limiter.generate_content(tagged).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.notify_waiters();
+        let _ = call.await.unwrap();
+
+        let answers = observer.answers.lock().unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].0.as_deref(), Some("[ps:1 p:2] [s:locking] "));
+        assert!(
+            answers[0].1 >= std::time::Duration::from_millis(40),
+            "the time the model held the call: {:?}",
+            answers[0].1
+        );
+        assert!(
+            observer.events.lock().unwrap().is_empty(),
+            "it never queued"
         );
     }
 }

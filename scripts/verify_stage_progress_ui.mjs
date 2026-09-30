@@ -59,7 +59,8 @@ const NAMES = ['escapeHtml', 'formatDuration', 'describeStageWait', 'summarizeRe
                'parseSeverityCalibration', 'renderSeverityCalibration',
                'isSpeculativeFinding', 'findingHeadline', 'renderFindingLocations',
                'renderFindingsTable', 'toggleFindingReasoning',
-               'stageWaitsFor', 'describeWaits', 'waitTotalsHtml'];
+               'stageWaitsFor', 'describeWaits', 'waitTotalsHtml',
+               'describeModelTime', 'describeStageCalls'];
 const ctx = {};
 new Function('ctx', CONSTS.map(grabConst).join('\n\n') + '\n\n' +
     NAMES.map(grab).join('\n\n') +
@@ -789,6 +790,38 @@ const older = ctx.renderReviewCard({
 });
 check('a review recorded before waits were kept renders as before',
     older.includes('>Stage goal<') && !older.includes('stage-waits'), older);
+
+// ---- the model's own time, per stage ----------------------------------------
+// Averaged per call, so a stage whose model answers slowly stands out from one
+// that merely made many calls.
+const timed = ctx.renderReviewCard({
+    id: 60, status: 'Reviewed', patch_id: 15,
+    stage_durations: [
+        { stage: 'locking', seconds: 1800, turns: 30 },
+        { stage: 'goal', seconds: 60, turns: 3 },
+    ],
+    waits: {
+        calls: 33, model_calls: 34, model_seconds: 1301.8,
+        queued_calls: 0, slot_wait_seconds: 0, rate_limited_calls: 0,
+        rate_limit_wait_seconds: 0, backoffs: 0, backoff_seconds: 0,
+        stages: {
+            locking: { calls: 30, model_calls: 31, model_seconds: 1294.6, queued_calls: 2,
+                       slot_wait_seconds: 40 },
+            goal: { calls: 3, model_calls: 3, model_seconds: 7.2 },
+        },
+    },
+});
+check('a stage says how long it awaited the model, and the average per call',
+    timed.includes('awaiting model 21m 34s, avg 41s over 31 calls'), timed);
+check('an average under ten seconds keeps its tenth',
+    timed.includes('awaiting model 7s, avg 2.4s over 3 calls'), timed);
+check('model time and waits read as one phrase',
+    timed.includes('over 31 calls; queued for a slot 40s (2 calls)'), timed);
+check('the totals carry the model time too',
+    timed.includes('33 model calls; awaiting model 21m 41s, avg 38s over 34 calls; none held back, summed across stages'),
+    timed);
+check('a review recorded before model time was kept says nothing of it',
+    !waited.includes('awaiting model'), waited);
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
 process.exit(failures ? 1 : 0);
