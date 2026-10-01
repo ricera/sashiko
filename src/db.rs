@@ -36,7 +36,7 @@ use tracing::{info, warn};
 /// A review that runs long enough to reach this keeps streaming nothing more
 /// until its final log lands; the page says the live view was capped.
 #[cfg(feature = "server")]
-const MAX_LIVE_LOG_ENTRIES: i64 = 2000;
+pub(crate) const MAX_LIVE_LOG_ENTRIES: i64 = 2000;
 
 /// Where a review's streamed conversation stands.
 #[cfg(feature = "server")]
@@ -2533,7 +2533,8 @@ impl Database {
                 seq: row.get::<i64>(0)?,
                 stage: row.get::<Option<String>>(1)?,
                 // The project is the daemon's setting, not the database's;
-                // the route that serves the entries adds the label.
+                // the live-log route that serves the entries and the reviewer
+                // that keeps them as an unfinished review's log add the label.
                 stage_label: None,
                 created_at: row.get::<i64>(3)?,
                 message,

@@ -940,6 +940,20 @@ console.log('live log');
     await logPage(ctx, { id: 42, status: 'Failed', logs: null });
     check('an ended review without a log is not polled', pending() === 0, String(pending()));
 
+    // A review that did not finish keeps what it streamed as its final log,
+    // headed by a system message and with each entry's stage. That finished
+    // log is drawn with the stage marks the live view had, and is not polled.
+    timers.clear();
+    const header = { role: 'system',
+        content: '[The review did not finish. This is the conversation streamed while it ran.]' };
+    const promoted = await logPage(ctx, { id: 42, status: 'Failed',
+        logs: JSON.stringify([header, ...withSeq(MESSAGES)]) }) || '';
+    check('an unfinished review\'s log shows its header', promoted.includes('The review did not finish'));
+    check('and marks every staged entry, as the live view does',
+        promoted.split('class="log-stage"').length - 1 === MESSAGES.length - 1
+        && promoted.includes('>Goal Analysis<'), promoted.slice(0, 600));
+    check('and is not polled', pending() === 0, String(pending()));
+
     // The status is data and is escaped.
     await logPage(ctx, { id: 42, status: '<img src=x onerror=alert(1)>', logs: '[]' });
     check('the status in the header is escaped', !app.innerHTML.includes('<img'), app.innerHTML.slice(0, 600));

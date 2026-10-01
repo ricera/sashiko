@@ -1879,8 +1879,14 @@ impl Reviewer {
                     "Patchset {} was cancelled before reviewing patch {}/{}",
                     patchset_id, patchset_id, index
                 );
-                Self::mark_attempt_cancelled(ctx, existing_pending_review_id.take(), patch_id)
-                    .await;
+                Self::mark_attempt_cancelled(
+                    ctx,
+                    existing_pending_review_id.take(),
+                    patch_id,
+                    None,
+                    None,
+                )
+                .await;
                 return Ok(PatchResult::Cancelled);
             }
 
@@ -1950,25 +1956,31 @@ impl Reviewer {
                 .set_review_duration(review_id, review_started.elapsed().as_secs())
                 .await;
 
-            // A cancel decides the end whatever the run returned: the patchset
-            // is no longer wanted, so neither is its result.
-            let end = if Self::patchset_cancelled(ctx, patchset_id).await {
-                AttemptEnd::Cancelled
-            } else {
-                AttemptEnd::classify(result, index, ctx.settings.ai.no_ai)
-            };
-            Self::settle_attempt(ctx, review_id, &mut stages, &end).await;
+            let end = AttemptEnd::decide(
+                result,
+                index,
+                ctx.settings.ai.no_ai,
+                Self::patchset_cancelled(ctx, patchset_id).await,
+            );
+            let conversation = Self::settle_attempt(ctx, review_id, &mut stages, &end).await;
 
             let verdict = match end {
                 AttemptEnd::Finished { output } => {
                     Self::store_finished_attempt(ctx, &patch, review_id, &output).await?
                 }
-                AttemptEnd::Cancelled => {
+                AttemptEnd::Cancelled { output } => {
                     info!(
                         "Review {} of patch {}/{} was cancelled",
                         review_id, patchset_id, index
                     );
-                    Self::mark_attempt_cancelled(ctx, Some(review_id), patch_id).await;
+                    Self::mark_attempt_cancelled(
+                        ctx,
+                        Some(review_id),
+                        patch_id,
+                        output.as_ref(),
+                        conversation,
+                    )
+                    .await;
                     AttemptVerdict::Final(PatchResult::Cancelled)
                 }
                 AttemptEnd::TimedOut { timeout } => {
@@ -1981,6 +1993,7 @@ impl Reviewer {
                         review_id,
                         &format!("Tool error: {}", timeout),
                         None,
+                        conversation,
                     )
                     .await;
                     AttemptVerdict::Retry
@@ -1990,7 +2003,8 @@ impl Reviewer {
                         "Review {} of patch {}/{} failed: {}",
                         review_id, patchset_id, index, reason
                     );
-                    Self::fail_review_row(ctx, review_id, &reason, output.as_ref()).await;
+                    Self::fail_review_row(ctx, review_id, &reason, output.as_ref(), conversation)
+                        .await;
                     AttemptVerdict::Retry
                 }
             };
@@ -2020,23 +2034,33 @@ impl Reviewer {
     }
 
     /// Marks the attempt's review row, when it has one, and the patch as
-    /// cancelled.
-    async fn mark_attempt_cancelled(ctx: &ReviewContext, review_id: Option<i64>, patch_id: i64) {
-        if let Some(rid) = review_id
-            && let Err(e) = ctx
+    /// cancelled. `output` is the worker's output when it returned a review
+    /// before the cancel was seen, and `conversation` is what the attempt
+    /// streamed when it returned none; see [`Self::attempt_record`].
+    async fn mark_attempt_cancelled(
+        ctx: &ReviewContext,
+        review_id: Option<i64>,
+        patch_id: i64,
+        output: Option<&Value>,
+        conversation: Option<String>,
+    ) {
+        if let Some(rid) = review_id {
+            let (interaction_id, logs) = Self::attempt_record(ctx, output, conversation).await;
+            if let Err(e) = ctx
                 .db
                 .complete_review(
                     rid,
                     ReviewStatus::Cancelled.as_str(),
                     "Cancelled because patchset was superseded or cancelled",
                     None,
+                    interaction_id.as_deref(),
                     None,
-                    None,
-                    None,
+                    logs.as_deref(),
                 )
                 .await
-        {
-            warn!("Failed to mark review {} as Cancelled: {}", rid, e);
+            {
+                warn!("Failed to mark review {} as Cancelled: {}", rid, e);
+            }
         }
         if let Err(e) = ctx
             .db
@@ -2049,18 +2073,20 @@ impl Reviewer {
 
     /// Settles the stages still running when the worker stopped, and writes
     /// the daemon's record of an attempt that ended without a review from the
-    /// worker.
+    /// worker. Returns the conversation that attempt streamed, for its review
+    /// row's log, or `None` when the worker returned a review or nothing was
+    /// streamed.
     ///
     /// Settling always runs, because it is also what stops a killed worker's
     /// stage rows claiming to be mid-turn. When the worker returned a review,
-    /// its own list of stage failures is the record, and nothing is still
-    /// running in practice.
+    /// its own list of stage failures and its own history are the record, and
+    /// nothing is still running in practice.
     async fn settle_attempt(
         ctx: &ReviewContext,
         review_id: i64,
         stages: &mut crate::activity::StageTracker,
         end: &AttemptEnd,
-    ) {
+    ) -> Option<String> {
         let settled = stages.settle(end.settle_cause());
         if !settled.is_empty() {
             info!(
@@ -2070,24 +2096,51 @@ impl Reviewer {
                 settled.iter().map(|s| s.stage.as_str()).collect::<Vec<_>>()
             );
         }
-        if !end.has_worker_review() {
-            Self::record_unfinished_attempt(ctx, review_id, stages).await;
+        if end.has_worker_review() {
+            return None;
         }
+        Self::record_unfinished_attempt(ctx, review_id, stages).await
     }
 
-    /// Writes which stages of an attempt with no review from the worker did
-    /// not run to completion, and why.
+    /// Writes the daemon's record of an attempt with no review from the
+    /// worker: which stages did not run to completion and why. Returns the
+    /// conversation the attempt streamed, promoted to a final log.
     ///
-    /// Taken from the stage tracker, which saw every stage failure the worker
-    /// reported as well as the stages settled when it stopped. The worker's
-    /// own output carries no list for a patch whose review failed, so without
-    /// this a failed or timed-out row could not say which stage was stuck.
+    /// The worker's output carries neither for a patch whose review failed,
+    /// and a killed worker returns no output at all, so without this a failed
+    /// or timed-out row could not say which stage was stuck or what the model
+    /// was doing when it stopped. The conversation is read here, before the
+    /// row is completed, because completing it deletes the streamed copy.
     async fn record_unfinished_attempt(
         ctx: &ReviewContext,
         review_id: i64,
         stages: &crate::activity::StageTracker,
-    ) {
+    ) -> Option<String> {
         let project = ctx.settings.project.kind.unwrap_or_default();
+        Self::store_stopped_stages(ctx, review_id, project, stages).await;
+        match promoted_live_log(&ctx.db, review_id, project).await {
+            Ok(log) => log,
+            Err(e) => {
+                warn!(
+                    "Failed to keep the streamed conversation of review {}: {}",
+                    review_id, e
+                );
+                None
+            }
+        }
+    }
+
+    /// Writes the stages of an unfinished attempt that did not run to
+    /// completion, in pipeline order.
+    ///
+    /// Taken from the stage tracker, which saw every stage failure the worker
+    /// reported as well as the stages settled when it stopped.
+    async fn store_stopped_stages(
+        ctx: &ReviewContext,
+        review_id: i64,
+        project: crate::project::ProjectId,
+        stages: &crate::activity::StageTracker,
+    ) {
         let mut failures = stages.stopped();
         if failures.is_empty() {
             return;
@@ -2106,18 +2159,16 @@ impl Reviewer {
     }
 
     /// Marks an attempt's review row Failed with `reason`. `output` is the
-    /// worker's output when it returned one; its token counts and history are
-    /// kept with the row.
+    /// worker's output when it returned one, and `conversation` is what the
+    /// attempt streamed; see [`Self::attempt_record`].
     async fn fail_review_row(
         ctx: &ReviewContext,
         review_id: i64,
         reason: &str,
         output: Option<&Value>,
+        conversation: Option<String>,
     ) {
-        let (interaction_id, logs) = match output {
-            Some(output) => Self::record_worker_output(ctx, output).await,
-            None => (None, None),
-        };
+        let (interaction_id, logs) = Self::attempt_record(ctx, output, conversation).await;
         if let Err(e) = ctx
             .db
             .complete_review(
@@ -2133,6 +2184,27 @@ impl Reviewer {
         {
             warn!("Failed to mark review {} as Failed: {}", review_id, e);
         }
+    }
+
+    /// The AI interaction and the log a review row keeps of an attempt that
+    /// did not store a review: `(interaction_id, logs)`.
+    ///
+    /// `output` is the worker's output when it returned one; its token counts
+    /// are stored as the interaction. `conversation` is what the attempt
+    /// streamed, which [`Self::settle_attempt`] gives only for an attempt with
+    /// no review from the worker, and is the log when there is one: a worker
+    /// output with no review carries an empty history, so the worker's
+    /// history is the log only in its absence.
+    async fn attempt_record(
+        ctx: &ReviewContext,
+        output: Option<&Value>,
+        conversation: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let (interaction_id, history) = match output {
+            Some(output) => Self::record_worker_output(ctx, output).await,
+            None => (None, None),
+        };
+        (interaction_id, conversation.or(history))
     }
 
     /// Stores the worker output's token counts as an AI interaction, and
@@ -2527,8 +2599,11 @@ enum AttemptEnd {
     Finished { output: Value },
     /// The review's deadline passed and the worker was killed.
     TimedOut { timeout: ReviewTimedOut },
-    /// The patchset was cancelled while the patch was reviewed.
-    Cancelled,
+    /// The patchset was cancelled while the patch was reviewed. `output` is
+    /// the worker's output when it returned a review before the cancel was
+    /// seen: the review is no longer wanted, but the worker's history is
+    /// still the full record of what the attempt did.
+    Cancelled { output: Option<Value> },
     /// Any other end with no review for the patch. `output` is the worker's
     /// output when it returned one, kept for its token counts and history.
     Failed {
@@ -2538,6 +2613,24 @@ enum AttemptEnd {
 }
 
 impl AttemptEnd {
+    /// Decides how a run of the worker for patch `index` ended, given
+    /// whether its patchset was `cancelled` by then.
+    ///
+    /// A cancel decides the end whatever the run returned, because the
+    /// patchset is no longer wanted and neither is its result. A review the
+    /// worker did return is kept with the cancel, so that the row records the
+    /// worker's own history rather than calling a finished review unfinished.
+    fn decide(result: Result<Value>, index: i64, no_ai: bool, cancelled: bool) -> Self {
+        match Self::classify(result, index, no_ai) {
+            end if !cancelled => end,
+            Self::Finished { output } => Self::Cancelled {
+                output: Some(output),
+            },
+            Self::Cancelled { output } => Self::Cancelled { output },
+            Self::TimedOut { .. } | Self::Failed { .. } => Self::Cancelled { output: None },
+        }
+    }
+
     /// Classifies what a run of the worker for patch `index` returned.
     /// `no_ai` is whether the AI review was turned off, which makes a null
     /// review the expected answer rather than a failure.
@@ -2563,7 +2656,7 @@ impl AttemptEnd {
             e.downcast_ref::<ReviewError>(),
             Some(ReviewError::Cancelled)
         ) {
-            return Self::Cancelled;
+            return Self::Cancelled { output: None };
         }
         Self::Failed {
             reason: format!("Tool error: {}", e),
@@ -2576,15 +2669,19 @@ impl AttemptEnd {
         use crate::workflow::StageStopCause;
         match self {
             Self::TimedOut { .. } => StageStopCause::OutOfTime,
-            Self::Cancelled => StageStopCause::Cancelled,
+            Self::Cancelled { .. } => StageStopCause::Cancelled,
             Self::Finished { .. } | Self::Failed { .. } => StageStopCause::Interrupted,
         }
     }
 
-    /// Whether the worker returned a review for the patch. Every other end
-    /// gets the daemon's record of what the attempt did.
+    /// Whether the worker returned a review for the patch, including one
+    /// returned just before a cancel was seen. Every other end gets the
+    /// daemon's record of what the attempt did.
     fn has_worker_review(&self) -> bool {
-        matches!(self, Self::Finished { .. })
+        matches!(
+            self,
+            Self::Finished { .. } | Self::Cancelled { output: Some(_) }
+        )
     }
 }
 
@@ -2619,6 +2716,59 @@ fn missing_review(output: &Value, index: i64, no_ai: bool) -> Option<String> {
 enum AttemptVerdict {
     Final(PatchResult),
     Retry,
+}
+
+/// The conversation review `review_id` streamed, as a final log for a review
+/// that did not finish, or `None` when it streamed nothing.
+///
+/// Reads the review's live log, which must happen before the row is
+/// completed, since completing it deletes the streamed entries.
+async fn promoted_live_log(
+    db: &Database,
+    review_id: i64,
+    project: crate::project::ProjectId,
+) -> Result<Option<String>> {
+    let mut entries = db.get_review_log_entries(review_id, None).await?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    for entry in &mut entries {
+        entry.label_stage(project);
+    }
+    let capped = db.review_live_log_span(review_id).await?.capped;
+    let log = unfinished_log(entries, capped)?;
+    Ok(Some(serde_json::to_string_pretty(&log)?))
+}
+
+/// The final log of a review that did not finish, built from what it
+/// streamed.
+///
+/// A system message heads it, so a reader does not take the conversation for
+/// the whole review. The entries keep their stage: stages run concurrently, so
+/// the stream interleaves their conversations, and the page tells them apart
+/// by it as it does in the live view. Each entry is a finished-log message
+/// plus where it sat, so the page draws it with the same renderer.
+fn unfinished_log(entries: Vec<crate::api::LiveLogEntry>, capped: bool) -> Result<Value> {
+    let cap_note = if capped {
+        format!(", capped at {} entries", crate::db::MAX_LIVE_LOG_ENTRIES)
+    } else {
+        String::new()
+    };
+    let header = crate::ai::AiMessage {
+        role: crate::ai::AiRole::System,
+        content: Some(format!(
+            "[The review did not finish. This is the conversation streamed while it ran{cap_note}.]"
+        )),
+        thought: None,
+        thought_signature: None,
+        tool_calls: None,
+        tool_call_id: None,
+    };
+    let mut log = vec![serde_json::to_value(header)?];
+    for entry in entries {
+        log.push(serde_json::to_value(entry)?);
+    }
+    Ok(Value::Array(log))
 }
 
 /// Where `stage` sits in the project's pipeline, as a sort key: stages the
@@ -6798,7 +6948,10 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert!(!end.has_worker_review());
 
         let end = AttemptEnd::classify(Err(ReviewError::Cancelled.into()), 1, false);
-        assert!(matches!(end, AttemptEnd::Cancelled), "{end:?}");
+        assert!(
+            matches!(end, AttemptEnd::Cancelled { output: None }),
+            "{end:?}"
+        );
         assert_eq!(end.settle_cause(), StageStopCause::Cancelled);
 
         let end = AttemptEnd::classify(Err(anyhow!("worker exited")), 1, false);
@@ -6857,6 +7010,48 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         }
     }
 
+    /// A cancel decides the end whatever the run returned, and keeps only a
+    /// review the worker returned.
+    #[test]
+    fn a_cancel_decides_the_end_and_keeps_a_returned_review() {
+        use crate::workflow::StageStopCause;
+
+        let reviewed = json!({
+            "patchset_id": 1,
+            "patches": [{"index": 1, "status": "applied"}],
+            "review": {"findings": []},
+        });
+        let end = AttemptEnd::decide(Ok(reviewed.clone()), 1, false, true);
+        assert!(
+            matches!(&end, AttemptEnd::Cancelled { output: Some(o) } if *o == reviewed),
+            "{end:?}"
+        );
+        assert!(end.has_worker_review(), "the worker's own record is kept");
+        assert_eq!(end.settle_cause(), StageStopCause::Cancelled);
+
+        let end = AttemptEnd::decide(Ok(reviewed), 1, false, false);
+        assert!(matches!(end, AttemptEnd::Finished { .. }), "{end:?}");
+
+        let no_review = json!({"patchset_id": 1, "patches": [{"index": 1, "status": "error"}]});
+        let timeout = ReviewTimedOut {
+            active_seconds: 60,
+            salvage_seconds: 0,
+        };
+        for result in [
+            Ok(no_review),
+            Err(anyhow::Error::new(timeout)),
+            Err(ReviewError::Cancelled.into()),
+            Err(anyhow!("worker exited")),
+        ] {
+            let end = AttemptEnd::decide(result, 1, false, true);
+            assert!(
+                matches!(end, AttemptEnd::Cancelled { output: None }),
+                "{end:?}"
+            );
+            assert!(!end.has_worker_review(), "{end:?}");
+        }
+    }
+
     /// A mock worker that reports `lines` and then runs `then`: the shell
     /// that ends its run.
     fn worker_reporting_then(lines: &[String], then: &str) -> String {
@@ -6903,6 +7098,21 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         script: &str,
         configure: impl FnOnce(&mut Settings),
     ) -> Result<WorkerReview> {
+        review_patch_with_worker_while(script, configure, |_, _| async { Ok(()) }).await
+    }
+
+    /// As [`review_patch_with_worker`], running `during` alongside the review
+    /// with the database and the patchset's id, to act on the review while
+    /// its worker runs.
+    async fn review_patch_with_worker_while<F, Fut>(
+        script: &str,
+        configure: impl FnOnce(&mut Settings),
+        during: F,
+    ) -> Result<WorkerReview>
+    where
+        F: FnOnce(Arc<Database>, i64) -> Fut,
+        Fut: std::future::Future<Output = Result<()>>,
+    {
         let temp_dir = tempdir()?;
         let bin_path = temp_dir.path().join("mock_worker");
         std::fs::write(&bin_path, script)?;
@@ -6952,21 +7162,24 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         let diff = "diff --git a/foo.c b/foo.c\n+int x;";
         let patch_id = db.create_patch(patchset_id, "msg_id_p1", 1, diff).await?;
 
-        let result = Reviewer::process_patch_review(
+        let input_payload = json!({});
+        let review = Reviewer::process_patch_review(
             &ctx,
             patchset_id,
             patch_id,
             1,
             "HEAD",
             None,
-            &json!({}),
+            &input_payload,
             None,
             None,
             None,
             diff,
             None,
-        )
-        .await?;
+        );
+        let (result, during) = tokio::join!(review, during(db.clone(), patchset_id));
+        during?;
+        let result = result?;
         Ok(WorkerReview {
             result,
             db,
@@ -7034,6 +7247,61 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .collect()
     }
 
+    /// A worker's line streaming `content` from `stage` to the live log.
+    fn streamed(stage: Option<&str>, content: &str) -> String {
+        use crate::ai::{AiMessage, AiRole};
+        progress(
+            1,
+            crate::activity::ProgressWire::LogEntry {
+                stage: stage.map(str::to_string),
+                message: AiMessage {
+                    role: if stage.is_some() {
+                        AiRole::Assistant
+                    } else {
+                        AiRole::System
+                    },
+                    content: Some(content.to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            },
+        )
+    }
+
+    /// The header a promoted live log opens with when it was not capped.
+    const UNFINISHED_LOG_HEADER: &str =
+        "[The review did not finish. This is the conversation streamed while it ran.]";
+
+    /// A review row's stored log as (stage, content) pairs, in order.
+    fn recorded_log(review: &Value) -> Vec<(Option<String>, String)> {
+        let logs: Vec<Value> = review["logs"]
+            .as_str()
+            .and_then(|l| serde_json::from_str(l).ok())
+            .unwrap_or_default();
+        logs.iter()
+            .map(|m| {
+                (
+                    m["stage"].as_str().map(str::to_string),
+                    m["content"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The log a row keeps of an attempt that streamed `entries` and then
+    /// stopped: the header, then each entry with its stage.
+    fn promoted(entries: &[(Option<&str>, &str)]) -> Vec<(Option<String>, String)> {
+        std::iter::once((None, UNFINISHED_LOG_HEADER.to_string()))
+            .chain(
+                entries
+                    .iter()
+                    .map(|(stage, content)| (stage.map(str::to_string), content.to_string())),
+            )
+            .collect()
+    }
+
     /// A worker whose review fails reports it in an output, not an error, and
     /// that output carries no stage list. The row must still say which stages
     /// stopped and how far each got, and the attempt is retried as before.
@@ -7058,6 +7326,8 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             },
         ));
         lines.extend(stage_reaching("locking", 3));
+        lines.push(streamed(None, "system prompt"));
+        lines.push(streamed(Some("locking"), "reading the lock order"));
         let error_output = r#"{"patchset_id": 1, "patches": [{"index": 1, "status": "applied", "review_status": "incomplete", "review_error": "boom"}], "review": {"findings": []}, "error": "boom", "history": []}"#;
         let script = worker_reporting_then(&lines, &format!("echo '{error_output}'\n"));
 
@@ -7094,7 +7364,29 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 vec![("goal".to_string(), 2)],
                 "a failed attempt keeps its timings: {review}"
             );
+            assert_eq!(
+                recorded_log(review),
+                promoted(&[
+                    (None, "system prompt"),
+                    (Some("locking"), "reading the lock order")
+                ]),
+                "the streamed conversation replaces the output's empty history: {review}"
+            );
         }
+        let streamed_left = run
+            .db
+            .conn
+            .query("SELECT COUNT(*) FROM review_log_entries", ())
+            .await?
+            .next()
+            .await?
+            .map(|row| row.get::<i64>(0))
+            .transpose()?;
+        assert_eq!(
+            streamed_left,
+            Some(0),
+            "the streamed copy is not kept twice"
+        );
 
         // The stage left running no longer claims to be mid-turn.
         let locking = run
@@ -7133,6 +7425,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             },
         ));
         lines.extend(stage_reaching("security", 4));
+        lines.push(streamed(Some("security"), "tracing the user copy"));
         let script = worker_reporting_then(&lines, "exec sleep 30\n");
 
         let run = review_patch_with_worker(&script, |s| {
@@ -7165,6 +7458,224 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             vec![("goal".to_string(), 1)],
             "{review}"
         );
+        assert_eq!(
+            recorded_log(review),
+            promoted(&[(Some("security"), "tracing the user copy")]),
+            "a killed worker returns no history, so the stream is all there is: {review}"
+        );
+        Ok(())
+    }
+
+    /// A review cancelled while its worker runs keeps what it streamed, and
+    /// the stage it was running is recorded as cancelled.
+    #[tokio::test]
+    async fn test_a_cancelled_attempt_keeps_its_conversation() -> Result<()> {
+        let mut lines = stage_reaching("security", 2);
+        lines.push(streamed(Some("security"), "checking the bounds"));
+        let script = worker_reporting_then(&lines, "exec sleep 30\n");
+
+        let run = review_patch_with_worker_while(
+            &script,
+            |s| s.review.max_retries = 0,
+            cancel_once_streamed,
+        )
+        .await?;
+        assert!(matches!(run.result, PatchResult::Cancelled));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1);
+        let review = &reviews[0];
+        assert_eq!(review["status"], "Cancelled", "{review}");
+        assert_eq!(
+            recorded_log(review),
+            promoted(&[(Some("security"), "checking the bounds")]),
+            "{review}"
+        );
+        let failures = recorded_failures(review);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            (failures[0].0.as_str(), failures[0].1.as_str()),
+            ("security", "cancelled")
+        );
+        Ok(())
+    }
+
+    /// Cancels the patchset once the review's conversation has reached the
+    /// live log, so the cancel cannot land before there is anything to keep.
+    async fn cancel_once_streamed(db: Arc<Database>, patchset_id: i64) -> Result<()> {
+        let streamed = || async {
+            let mut rows = db
+                .conn
+                .query("SELECT COUNT(*) FROM review_log_entries", ())
+                .await?;
+            let count = match rows.next().await? {
+                Some(row) => row.get::<i64>(0)?,
+                None => 0,
+            };
+            anyhow::Ok(count > 0)
+        };
+        let wait = async {
+            while !streamed().await? {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            anyhow::Ok(())
+        };
+        tokio::time::timeout(Duration::from_secs(20), wait).await??;
+        db.update_patchset_status(patchset_id, ReviewStatus::Cancelled.as_str())
+            .await
+    }
+
+    /// A worker that returns its review after the patchset was cancelled,
+    /// but before the run noticed, did finish. Its row is still cancelled,
+    /// and keeps the worker's own history and token counts rather than the
+    /// streamed copy under a header saying the review did not finish.
+    #[tokio::test]
+    async fn test_a_review_finished_as_it_was_cancelled_keeps_the_workers_history() -> Result<()> {
+        let signal_dir = tempdir()?;
+        let cancelled = signal_dir.path().join("cancelled");
+        let lines = [streamed(Some("security"), "checking the bounds")];
+        let finished = r#"{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}], "review": {"findings": []}, "tokens_in": 7, "tokens_out": 3, "history": [{"role": "assistant", "content": "the whole review"}]}"#;
+        // The worker waits for the cancel and then returns at once, well
+        // inside the run's two-second cancel poll, so only the check after
+        // the run sees the cancel.
+        let script = worker_reporting_then(
+            &lines,
+            &format!(
+                "while [ ! -f '{}' ]; do sleep 0.02; done\necho '{finished}'\n",
+                cancelled.display()
+            ),
+        );
+
+        let cancel_then_finish = |db: Arc<Database>, patchset_id: i64| async move {
+            cancel_once_streamed(db, patchset_id).await?;
+            std::fs::write(&cancelled, "")?;
+            Ok(())
+        };
+        let run = review_patch_with_worker_while(
+            &script,
+            |s| s.review.max_retries = 0,
+            cancel_then_finish,
+        )
+        .await?;
+        assert!(matches!(run.result, PatchResult::Cancelled));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1);
+        let review = &reviews[0];
+        assert_eq!(review["status"], "Cancelled", "{review}");
+        assert_eq!(
+            recorded_log(review),
+            vec![(None, "the whole review".to_string())],
+            "{review}"
+        );
+        assert_eq!(review["tokens_in"], 7, "{review}");
+        assert!(recorded_failures(review).is_empty(), "{review}");
+        Ok(())
+    }
+
+    /// A promoted log opens with a header saying the review did not finish,
+    /// and keeps each entry whole, with its stage, in the order streamed.
+    #[test]
+    fn an_unfinished_log_is_headed_and_keeps_each_entry_whole() -> Result<()> {
+        use crate::ai::{AiMessage, AiRole};
+
+        let entry = |seq: i64, stage: Option<&str>, content: &str| crate::api::LiveLogEntry {
+            seq,
+            stage: stage.map(str::to_string),
+            stage_label: stage.map(|s| format!("label of {s}")),
+            created_at: 100 + seq,
+            message: AiMessage {
+                role: AiRole::User,
+                content: Some(content.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        };
+        let entries = vec![entry(3, None, "first"), entry(4, Some("goal"), "second")];
+
+        let log = unfinished_log(entries.clone(), false)?;
+        let log = log.as_array().cloned().unwrap_or_default();
+        assert_eq!(log.len(), 3);
+        assert_eq!(
+            log[0],
+            json!({"role": "system", "content": UNFINISHED_LOG_HEADER})
+        );
+        for (stored, entry) in log[1..].iter().zip(&entries) {
+            let back: crate::api::LiveLogEntry = serde_json::from_value(stored.clone())?;
+            assert_eq!(&back, entry, "the entry is stored whole");
+        }
+        assert_eq!(log[2]["role"], "user", "the message's fields stay flat");
+        assert_eq!(log[2]["stage_label"], "label of goal");
+
+        let capped = unfinished_log(entries, true)?;
+        assert_eq!(
+            capped[0]["content"],
+            format!(
+                "[The review did not finish. This is the conversation streamed while it ran, \
+                 capped at {} entries.]",
+                crate::db::MAX_LIVE_LOG_ENTRIES
+            ),
+            "a capped stream says it is not the whole conversation"
+        );
+        Ok(())
+    }
+
+    /// A review that streamed nothing promotes nothing, so the row keeps what
+    /// it would have kept without promotion; one that did gets its entries
+    /// with the project's stage labels.
+    #[tokio::test]
+    async fn test_promoted_live_log_reads_the_stream_with_its_labels() -> Result<()> {
+        use crate::project::ProjectId;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        let db = Database::new(&settings.database).await?;
+        db.migrate().await?;
+        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+        let patchset_id = db
+            .create_patchset(
+                thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                None, false, None, None,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("patchset was not created"))?;
+        let review_id = db
+            .create_review(patchset_id, None, "p", "m", None, None)
+            .await?;
+
+        assert_eq!(
+            promoted_live_log(&db, review_id, ProjectId::Linux).await?,
+            None
+        );
+
+        let message = |content: &str| json!({"role": "assistant", "content": content}).to_string();
+        db.append_review_log_entry(review_id, 0, Some("goal"), "assistant", &message("a"))
+            .await?;
+        db.append_review_log_entry(
+            review_id,
+            1,
+            Some("no_such_stage"),
+            "assistant",
+            &message("b"),
+        )
+        .await?;
+        let log = promoted_live_log(&db, review_id, ProjectId::Linux)
+            .await?
+            .ok_or_else(|| anyhow!("the stream was promoted"))?;
+        let log: Vec<Value> = serde_json::from_str(&log)?;
+        assert_eq!(log[0]["content"], UNFINISHED_LOG_HEADER);
+        assert_eq!(
+            log[1]["stage_label"],
+            crate::workflows::stage_short_label(ProjectId::Linux, "goal")
+                .ok_or_else(|| anyhow!("goal has a label"))?
+        );
+        assert!(
+            log[2]["stage_label"].is_null(),
+            "an unknown stage has no label"
+        );
+        assert_eq!(log[2]["content"], "b");
         Ok(())
     }
 }
