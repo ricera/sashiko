@@ -135,4 +135,78 @@ impl ReviewStatus {
         }
     }
 }
+
+/// The verdict the reviewer writes to a patch's status column.
+///
+/// The type is narrower than `ReviewStatus` on purpose: it rules out
+/// in-flight values such as `Pending` or `In Review`, which a finished
+/// attempt must never leave on a patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchOutcome {
+    /// The patch has a full review.
+    Reviewed,
+    /// The patch has no review because its attempts failed.
+    Failed,
+    /// The patch was deliberately not reviewed.
+    Skipped,
+    /// The review of the patch was cancelled.
+    Cancelled,
+}
+
+impl PatchOutcome {
+    /// The stored spelling. Values shared with `ReviewStatus` take its
+    /// spelling so the two vocabularies cannot drift apart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reviewed => ReviewStatus::Reviewed.as_str(),
+            Self::Failed => ReviewStatus::Failed.as_str(),
+            Self::Skipped => ReviewStatus::Skipped.as_str(),
+            Self::Cancelled => ReviewStatus::Cancelled.as_str(),
+        }
+    }
+}
+
+impl fmt::Display for PatchOutcome {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 pub mod logging;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `ReviewStatus` each outcome shares its spelling with. The match
+    /// is exhaustive, so a new outcome must state its counterpart here.
+    fn shared_status(outcome: PatchOutcome) -> ReviewStatus {
+        match outcome {
+            PatchOutcome::Reviewed => ReviewStatus::Reviewed,
+            PatchOutcome::Failed => ReviewStatus::Failed,
+            PatchOutcome::Skipped => ReviewStatus::Skipped,
+            PatchOutcome::Cancelled => ReviewStatus::Cancelled,
+        }
+    }
+
+    const ALL_OUTCOMES: [PatchOutcome; 4] = [
+        PatchOutcome::Reviewed,
+        PatchOutcome::Failed,
+        PatchOutcome::Skipped,
+        PatchOutcome::Cancelled,
+    ];
+
+    #[test]
+    fn a_patch_outcome_is_spelled_like_its_review_status() {
+        for outcome in ALL_OUTCOMES {
+            let status = shared_status(outcome);
+            assert_eq!(outcome.as_str(), status.as_str(), "{outcome:?}");
+            assert_eq!(outcome.to_string(), status.to_string(), "{outcome:?}");
+            assert_eq!(
+                ReviewStatus::from_str(outcome.as_str()),
+                Ok(status),
+                "{outcome:?} does not read back as the status it shares"
+            );
+        }
+    }
+}

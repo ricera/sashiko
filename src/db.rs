@@ -13,9 +13,9 @@
 // limitations under the License.
 
 #[cfg(feature = "server")]
-use crate::ReviewStatus;
-#[cfg(feature = "server")]
 use crate::settings::DatabaseSettings;
+#[cfg(feature = "server")]
+use crate::{PatchOutcome, ReviewStatus};
 #[cfg(feature = "server")]
 use anyhow::Context;
 use anyhow::{Result, bail};
@@ -2154,12 +2154,18 @@ impl Database {
         }
     }
 
-    pub async fn has_failed_review(
+    /// The verdict an earlier run already reached for a patch that must
+    /// not be reviewed again when its patchset is processed again, as
+    /// after a daemon restart.
+    ///
+    /// A patch is final as `Failed` when it has a failed review row that
+    /// never reached the model (no interaction), so the failure stays
+    /// visible instead of being retried on every restart.
+    pub async fn prior_final_outcome(
         &self,
         patchset_id: i64,
         patch_id: i64,
-        _baseline_id: Option<i64>,
-    ) -> Result<bool> {
+    ) -> Result<Option<PatchOutcome>> {
         let mut rows = self.conn
             .query(
                 "SELECT 1 FROM reviews WHERE patchset_id = ? AND patch_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
@@ -2167,7 +2173,7 @@ impl Database {
             )
             .await?;
 
-        Ok(rows.next().await.ok().flatten().is_some())
+        Ok(rows.next().await?.map(|_| PatchOutcome::Failed))
     }
 
     pub async fn update_review_status(
@@ -8826,11 +8832,11 @@ impl Database {
         Ok(count > 0)
     }
 
-    pub async fn update_patch_status(&self, patch_id: i64, status: &str) -> Result<()> {
+    pub async fn update_patch_status(&self, patch_id: i64, outcome: PatchOutcome) -> Result<()> {
         self.conn
             .execute(
                 "UPDATE patches SET status = ? WHERE id = ?",
-                libsql::params![status, patch_id],
+                libsql::params![outcome.as_str(), patch_id],
             )
             .await?;
         Ok(())
@@ -12646,7 +12652,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_has_failed_review_logic() {
+    async fn test_update_patch_status_writes_the_outcome_spelling() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        db.create_message(
+            "msg1", thread_id, None, "Author", "Subject", 100, "", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "msg1", "Subject", "Author", 100, 1, 1, "", "", None, 1, None,
+                true, None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db.create_patch(ps_id, "msg1", 1, "diff").await.unwrap();
+
+        for outcome in [
+            PatchOutcome::Reviewed,
+            PatchOutcome::Failed,
+            PatchOutcome::Skipped,
+            PatchOutcome::Cancelled,
+        ] {
+            db.update_patch_status(patch_id, outcome).await.unwrap();
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT status FROM patches WHERE id = ?",
+                    libsql::params![patch_id],
+                )
+                .await
+                .unwrap();
+            let stored: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(stored, outcome.as_str());
+
+            // The guard's rule reads review rows only: a patch status with no
+            // failed review behind it is not a prior final outcome.
+            assert_eq!(db.prior_final_outcome(ps_id, patch_id).await.unwrap(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prior_final_outcome_keeps_a_failed_review_final() {
         let db = setup_db().await;
 
         // Setup patchset
@@ -12681,7 +12730,7 @@ mod tests {
         let patch_id = db.create_patch(ps_id, "msg1", 1, "diff").await.unwrap();
 
         // 1. Initial State: No reviews
-        assert!(!db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+        assert_eq!(db.prior_final_outcome(ps_id, patch_id).await.unwrap(), None);
 
         // 2. Failed Review (No interaction) -> Should be detected
         let review_id = db
@@ -12692,19 +12741,25 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+        assert_eq!(
+            db.prior_final_outcome(ps_id, patch_id).await.unwrap(),
+            Some(PatchOutcome::Failed)
+        );
 
         // 3. Status "Failed" (No interaction) -> Should be detected
         db.update_review_status(review_id, "Failed", None)
             .await
             .unwrap();
-        assert!(db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+        assert_eq!(
+            db.prior_final_outcome(ps_id, patch_id).await.unwrap(),
+            Some(PatchOutcome::Failed)
+        );
 
         // 4. Status "Reviewed" (Success) -> Should NOT be detected
         db.update_review_status(review_id, "Reviewed", None)
             .await
             .unwrap();
-        assert!(!db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+        assert_eq!(db.prior_final_outcome(ps_id, patch_id).await.unwrap(), None);
 
         // 5. Status "Failed" WITH interaction_id -> Should NOT be detected (reached AI)
         // Revert to Failed first
@@ -12741,7 +12796,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!db.has_failed_review(ps_id, patch_id, None).await.unwrap());
+        assert_eq!(db.prior_final_outcome(ps_id, patch_id).await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -13026,10 +13081,9 @@ mod tests {
         assert_eq!(target, 1);
 
         // Verify blocking review is present
-        assert!(
-            db.has_failed_review(ps_failed, patch_id, None)
-                .await
-                .unwrap()
+        assert_eq!(
+            db.prior_final_outcome(ps_failed, patch_id).await.unwrap(),
+            Some(PatchOutcome::Failed)
         );
 
         // RERUN Reviewed patchset -> Should increment target count
@@ -13072,10 +13126,9 @@ mod tests {
         assert!(rows.next().await.unwrap().is_none());
 
         // Verify blocking review is NO LONGER blocking
-        assert!(
-            !db.has_failed_review(ps_failed, patch_id, None)
-                .await
-                .unwrap()
+        assert_eq!(
+            db.prior_final_outcome(ps_failed, patch_id).await.unwrap(),
+            None
         );
 
         // Verify AI failure review is NOT cancelled (remains Failed)
