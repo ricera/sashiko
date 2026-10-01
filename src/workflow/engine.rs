@@ -15,6 +15,7 @@
 //! Runtime execution engine for declarative workflows.
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::ai::AiMessage;
@@ -41,14 +42,94 @@ pub struct WorkflowOutcome {
     pub stage_failures: Vec<StageFailure>,
 }
 
+/// Why a stage stopped without completing.
+///
+/// Carried by every hop from the workflow to the stored review, so the reader
+/// of a stopped stage learns whether to look for a defect, a cancel or a
+/// deadline without parsing the reason text. Serialised in snake case, which
+/// is the spelling the stored `stage_failures` JSON and the page use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StageStopCause {
+    /// The stage failed on its own: provider, validation or tool error.
+    Error,
+    /// The review was cancelled while the stage ran.
+    Cancelled,
+    /// Stopped by the wind-down before it produced output.
+    OutOfTime,
+    /// Wound down after gathering evidence; its output was kept but covers
+    /// less than a full run.
+    CutShort,
+    /// Still running when the worker stopped; reported by the daemon, not the
+    /// worker.
+    Interrupted,
+}
+
+impl StageStopCause {
+    /// Whether the review's deadline, rather than a fault or a cancel, is what
+    /// stopped the stage.
+    pub fn is_deadline(self) -> bool {
+        matches!(self, Self::OutOfTime | Self::CutShort)
+    }
+
+    /// The words that follow a stage's name wherever a stopped stage is shown:
+    /// the activity description, the local progress line and the CLI. The web
+    /// page spells the same labels in `stageStopLabel`, so a stage reads the
+    /// same in every view.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Error => "failed",
+            Self::Cancelled => "cancelled",
+            Self::OutOfTime => "stopped: out of time",
+            Self::CutShort => "cut short",
+            Self::Interrupted => "still running when the review stopped",
+        }
+    }
+}
+
 /// A stage that failed while its siblings kept running.
 #[derive(Debug, Clone)]
 pub struct StageFailure {
     pub stage_name: &'static str,
     pub reason: String,
-    /// Cancellation is not a defect, and is classified apart from one. Always
-    /// false until the cooperative cancel token lets a stage observe it.
-    pub cancelled: bool,
+    /// Why it stopped. A cancel or a deadline is not a defect in the stage, and
+    /// is classified apart from one.
+    pub cause: StageStopCause,
+}
+
+/// The context of the error a `BestEffort` group returns when none of its
+/// stages produced anything.
+///
+/// Typed so a caller can ask why the group failed with `downcast_ref` instead
+/// of reading the text, and so the answer covers every stage of the group
+/// rather than only the one whose error the context wraps.
+#[derive(Debug, Clone)]
+pub struct ParallelGroupFailed {
+    /// Every stage of the group, in the order the group lists them.
+    pub failures: Vec<StageFailure>,
+}
+
+impl ParallelGroupFailed {
+    /// Whether the deadline stopped any stage of the group. Asked of the whole
+    /// group because the stage whose error is wrapped is only the first to
+    /// fail, and a deadline stop further down the list counts as much.
+    pub fn stopped_by_deadline(&self) -> bool {
+        self.failures.iter().any(|f| f.cause.is_deadline())
+    }
+}
+
+impl std::fmt::Display for ParallelGroupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "All {} parallel stages failed under BestEffort policy",
+            self.failures.len()
+        )?;
+        match self.failures.first() {
+            Some(first) => write!(f, " (first failure in stage '{}')", first.stage_name),
+            None => Ok(()),
+        }
+    }
 }
 
 /// The runtime engine that drives workflow execution.
@@ -200,6 +281,8 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
 
             let mut successes = 0;
             let mut first_error = None;
+            // This group's failures only: `outcome` also holds earlier groups'.
+            let mut failures = Vec::new();
 
             for (stage, res) in stages.iter().zip(results) {
                 match res {
@@ -217,18 +300,14 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                             stage.name(),
                             err
                         );
-                        outcome.stage_failures.push(StageFailure {
+                        // Every stage error is the stage's own until the
+                        // wind-down gives a session a typed way to stop.
+                        failures.push(StageFailure {
                             stage_name: stage.name(),
                             reason: format!("{:#}", err),
-                            cancelled: false,
+                            cause: StageStopCause::Error,
                         });
-                        if first_error.is_none() {
-                            first_error = Some(err.context(format!(
-                                "All {} parallel stages failed under BestEffort policy (first failure in stage '{}')",
-                                stages.len(),
-                                stage.name()
-                            )));
-                        }
+                        first_error.get_or_insert(err);
                     }
                 }
             }
@@ -237,8 +316,9 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                 && successes == 0
                 && let Some(err) = first_error
             {
-                return Err(err);
+                return Err(err.context(ParallelGroupFailed { failures }));
             }
+            outcome.stage_failures.extend(failures);
         }
     }
 
@@ -492,6 +572,14 @@ mod tests {
             .expect("BestEffort should succeed when at least one stage succeeds");
         assert!(!outcome.early_exit);
         assert_eq!(state.concerns, vec!["concern_ok".to_string()]);
+        assert_eq!(outcome.stage_failures.len(), 1, "{outcome:?}");
+        let failure = &outcome.stage_failures[0];
+        assert_eq!(failure.stage_name, "stage_fail");
+        assert_eq!(failure.cause, StageStopCause::Error);
+        assert!(
+            failure.reason.contains("simulated fatal provider error"),
+            "{failure:?}"
+        );
     }
 
     #[tokio::test]
@@ -534,9 +622,84 @@ mod tests {
             .build();
 
         let res = WorkflowEngine::execute(&workflow, &env, &mut state, None).await;
-        assert!(
-            res.is_err(),
-            "BestEffort should fail when all parallel stages fail"
+        let err = res.expect_err("BestEffort should fail when all parallel stages fail");
+        assert_eq!(
+            err.to_string(),
+            "All 2 parallel stages failed under BestEffort policy \
+             (first failure in stage 'stage_fail_1')",
+            "the group error reads as it always has"
         );
+        let group = err
+            .downcast_ref::<ParallelGroupFailed>()
+            .expect("the group error is typed");
+        let names: Vec<_> = group.failures.iter().map(|f| f.stage_name).collect();
+        assert_eq!(names, ["stage_fail_1", "stage_fail_2"]);
+        assert!(
+            group
+                .failures
+                .iter()
+                .all(|f| f.cause == StageStopCause::Error)
+        );
+        assert!(!group.stopped_by_deadline());
+        assert!(
+            format!("{err:#}").contains("simulated fatal provider error"),
+            "the first stage's own error stays in the chain: {err:#}"
+        );
+    }
+
+    fn failure(stage_name: &'static str, cause: StageStopCause) -> StageFailure {
+        StageFailure {
+            stage_name,
+            reason: "x".to_string(),
+            cause,
+        }
+    }
+
+    /// The deadline counts wherever it stopped a stage in the group, not only
+    /// when it stopped the stage whose error the context wraps.
+    #[test]
+    fn a_group_was_stopped_by_the_deadline_if_any_stage_was() {
+        for deadline in [StageStopCause::OutOfTime, StageStopCause::CutShort] {
+            let group = ParallelGroupFailed {
+                failures: vec![
+                    failure("goal", StageStopCause::Error),
+                    failure("security", deadline),
+                ],
+            };
+            assert!(group.stopped_by_deadline(), "{deadline:?}");
+        }
+        let group = ParallelGroupFailed {
+            failures: vec![
+                failure("goal", StageStopCause::Error),
+                failure("security", StageStopCause::Cancelled),
+                failure("locking", StageStopCause::Interrupted),
+            ],
+        };
+        assert!(!group.stopped_by_deadline());
+        assert!(
+            !ParallelGroupFailed { failures: vec![] }.stopped_by_deadline(),
+            "an empty group was stopped by nothing"
+        );
+    }
+
+    /// The spelling is stored in `reviews.stage_failures` and read by the
+    /// page and the CLI, so it is pinned here.
+    #[test]
+    fn a_stop_cause_is_stored_in_snake_case() {
+        for (cause, spelled, deadline) in [
+            (StageStopCause::Error, "error", false),
+            (StageStopCause::Cancelled, "cancelled", false),
+            (StageStopCause::OutOfTime, "out_of_time", true),
+            (StageStopCause::CutShort, "cut_short", true),
+            (StageStopCause::Interrupted, "interrupted", false),
+        ] {
+            let json = serde_json::to_value(cause).unwrap();
+            assert_eq!(json, serde_json::json!(spelled));
+            assert_eq!(
+                serde_json::from_value::<StageStopCause>(json).unwrap(),
+                cause
+            );
+            assert_eq!(cause.is_deadline(), deadline, "{cause:?}");
+        }
     }
 }

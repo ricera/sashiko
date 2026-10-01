@@ -48,7 +48,7 @@ impl ClassifyAiError for ReviewError {
 }
 
 use crate::project::ProjectId;
-use crate::workflow::{WorkflowEngine, WorkflowEnv, WorkflowEvent};
+use crate::workflow::{StageFailure, StageStopCause, WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use crate::workflows::linux_patch_review::{
     LinuxPatchReviewState, build_linux_patch_review_workflow_with_options, linux_system_prompt,
 };
@@ -142,7 +142,7 @@ pub enum WorkerProgressEvent {
     StageFailed {
         stage: String,
         reason: String,
-        cancelled: bool,
+        cause: StageStopCause,
     },
     /// One message joining the conversation log, streamed so a running review
     /// can be read before it finishes. `stage` is `None` only for the system
@@ -196,6 +196,113 @@ pub(crate) fn live_log_message(msg: &AiMessage) -> AiMessage {
         }),
         tool_call_id: msg.tool_call_id.clone(),
     }
+}
+
+/// The progress event the worker reports for a workflow event, if any.
+///
+/// Kept apart from the callback so the mapping can be tested on its own: it is
+/// the hop that carries a stopped stage's cause from the engine to the worker's
+/// caller, and an engine test can only drive it with the causes the engine
+/// produces today.
+fn worker_progress_event(
+    project: ProjectId,
+    skip_report: bool,
+    event: WorkflowEvent,
+) -> Option<WorkerProgressEvent> {
+    let counted = |stage_name: &str| crate::workflows::is_counted_stage(project, stage_name);
+    match event {
+        WorkflowEvent::StageStarted { stage_name } => match stage_name {
+            "pre-screen" => Some(WorkerProgressEvent::PreScreenStarted),
+            "planning" => Some(WorkerProgressEvent::PlanningStarted),
+            _ if counted(stage_name) => Some(WorkerProgressEvent::StageStarted {
+                stage: stage_name.to_string(),
+            }),
+            _ => None,
+        },
+        WorkflowEvent::ParallelResolved { stage_names } => {
+            let mut planned_stages = crate::workflows::planned_stages_from(project, &stage_names);
+            if skip_report {
+                planned_stages.retain(|s| s != "report" && s != "summary");
+            }
+            Some(WorkerProgressEvent::ReviewStarted { planned_stages })
+        }
+        WorkflowEvent::StageFinished { stage_name, .. } if counted(stage_name) => {
+            Some(WorkerProgressEvent::StageFinished {
+                stage: stage_name.to_string(),
+            })
+        }
+        WorkflowEvent::StageTurn {
+            stage_name,
+            turn,
+            max_turns,
+        } if counted(stage_name) => Some(WorkerProgressEvent::StageTurn {
+            stage: stage_name.to_string(),
+            turn,
+            max_turns,
+        }),
+        WorkflowEvent::StageTools {
+            stage_name,
+            tools,
+            turn,
+            max_turns,
+        } if counted(stage_name) => Some(WorkerProgressEvent::StageTools {
+            stage: stage_name.to_string(),
+            tools,
+            turn,
+            max_turns,
+        }),
+        WorkflowEvent::StageBackoff {
+            stage_name,
+            retry_in_seconds,
+            turn,
+            max_turns,
+        } if counted(stage_name) => Some(WorkerProgressEvent::StageBackoff {
+            stage: stage_name.to_string(),
+            retry_in_seconds,
+            turn,
+            max_turns,
+        }),
+        WorkflowEvent::StageFailed {
+            stage_name,
+            reason,
+            cause,
+        } if counted(stage_name) => Some(WorkerProgressEvent::StageFailed {
+            stage: stage_name.to_string(),
+            reason,
+            cause,
+        }),
+        // Every stage, not only the counted ones. The finished log holds the
+        // pre-screen, planning and consolidation conversations too; the
+        // counted-stage gate above is about which stages count on the progress
+        // bar, and applying it here would make the live log a subset of the
+        // finished one.
+        WorkflowEvent::StageMessage {
+            stage_name,
+            message,
+        } => Some(WorkerProgressEvent::LogEntry {
+            stage: Some(stage_name.to_string()),
+            message: live_log_message(&message),
+        }),
+        _ => None,
+    }
+}
+
+/// The `stage_failures` array of the worker's output, which the caller stores
+/// as `reviews.stage_failures`.
+///
+/// Each entry is `{stage, reason, cause}`, with the cause in its stored snake
+/// case spelling.
+fn stage_failures_json(failures: &[StageFailure]) -> Vec<Value> {
+    failures
+        .iter()
+        .map(|f| {
+            json!({
+                "stage": f.stage_name,
+                "reason": f.reason,
+                "cause": f.cause,
+            })
+        })
+        .collect()
 }
 
 pub struct WorkerResult {
@@ -484,99 +591,10 @@ impl Worker {
         let project = self.project;
         let skip_report = self.skip_report;
         let event_cb = move |event: WorkflowEvent| {
-            if let Some(progress_cb) = progress {
-                match event {
-                    WorkflowEvent::StageStarted { stage_name } => {
-                        if stage_name == "pre-screen" {
-                            progress_cb(WorkerProgressEvent::PreScreenStarted);
-                        } else if stage_name == "planning" {
-                            progress_cb(WorkerProgressEvent::PlanningStarted);
-                        } else if crate::workflows::is_counted_stage(project, stage_name) {
-                            progress_cb(WorkerProgressEvent::StageStarted {
-                                stage: stage_name.to_string(),
-                            });
-                        }
-                    }
-                    WorkflowEvent::ParallelResolved { stage_names } => {
-                        let mut planned_stages =
-                            crate::workflows::planned_stages_from(project, &stage_names);
-                        if skip_report {
-                            planned_stages.retain(|s| s != "report" && s != "summary");
-                        }
-                        progress_cb(WorkerProgressEvent::ReviewStarted { planned_stages });
-                    }
-                    WorkflowEvent::StageFinished { stage_name, .. } => {
-                        if crate::workflows::is_counted_stage(project, stage_name) {
-                            progress_cb(WorkerProgressEvent::StageFinished {
-                                stage: stage_name.to_string(),
-                            });
-                        }
-                    }
-                    WorkflowEvent::StageTurn {
-                        stage_name,
-                        turn,
-                        max_turns,
-                    } if crate::workflows::is_counted_stage(project, stage_name) => {
-                        progress_cb(WorkerProgressEvent::StageTurn {
-                            stage: stage_name.to_string(),
-                            turn,
-                            max_turns,
-                        });
-                    }
-                    WorkflowEvent::StageTools {
-                        stage_name,
-                        tools,
-                        turn,
-                        max_turns,
-                    } if crate::workflows::is_counted_stage(project, stage_name) => {
-                        progress_cb(WorkerProgressEvent::StageTools {
-                            stage: stage_name.to_string(),
-                            tools,
-                            turn,
-                            max_turns,
-                        });
-                    }
-                    WorkflowEvent::StageBackoff {
-                        stage_name,
-                        retry_in_seconds,
-                        turn,
-                        max_turns,
-                    } if crate::workflows::is_counted_stage(project, stage_name) => {
-                        progress_cb(WorkerProgressEvent::StageBackoff {
-                            stage: stage_name.to_string(),
-                            retry_in_seconds,
-                            turn,
-                            max_turns,
-                        });
-                    }
-                    WorkflowEvent::StageFailed {
-                        stage_name,
-                        reason,
-                        cancelled,
-                    } if crate::workflows::is_counted_stage(project, stage_name) => {
-                        progress_cb(WorkerProgressEvent::StageFailed {
-                            stage: stage_name.to_string(),
-                            reason,
-                            cancelled,
-                        });
-                    }
-                    // Every stage, not only the counted ones. The finished
-                    // log holds the pre-screen, planning and consolidation
-                    // conversations too; the is_counted_stage gate above is
-                    // about which stages count on the progress bar, and
-                    // applying it here would make the live log a subset of
-                    // the finished one.
-                    WorkflowEvent::StageMessage {
-                        stage_name,
-                        message,
-                    } => {
-                        progress_cb(WorkerProgressEvent::LogEntry {
-                            stage: Some(stage_name.to_string()),
-                            message: live_log_message(&message),
-                        });
-                    }
-                    _ => {}
-                }
+            if let Some(progress_cb) = progress
+                && let Some(event) = worker_progress_event(project, skip_report, event)
+            {
+                progress_cb(event);
             }
         };
 
@@ -601,17 +619,7 @@ impl Worker {
         // can report which parts of the review are missing instead of
         // presenting partial coverage as full. A batch where every stage failed
         // never gets here: the engine turns that into an error.
-        let stage_failures: Vec<Value> = outcome
-            .stage_failures
-            .iter()
-            .map(|f| {
-                json!({
-                    "stage": f.stage_name,
-                    "reason": f.reason,
-                    "cancelled": f.cancelled,
-                })
-            })
-            .collect();
+        let stage_failures = stage_failures_json(&outcome.stage_failures);
 
         if !stage_failures.is_empty() {
             tracing::warn!(
@@ -1404,10 +1412,11 @@ mod tests {
             "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
         });
 
-        let failed: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let failed: std::sync::Mutex<Vec<(String, StageStopCause)>> =
+            std::sync::Mutex::new(Vec::new());
         let record = |e: WorkerProgressEvent| {
-            if let WorkerProgressEvent::StageFailed { stage, .. } = e {
-                failed.lock().unwrap().push(stage);
+            if let WorkerProgressEvent::StageFailed { stage, cause, .. } = e {
+                failed.lock().unwrap().push((stage, cause));
             }
         };
 
@@ -1419,7 +1428,8 @@ mod tests {
         let failures = output["stage_failures"].as_array().expect("array");
         assert_eq!(failures.len(), 1, "{output}");
         assert_eq!(failures[0]["stage"], "goal");
-        assert_eq!(failures[0]["cancelled"], false);
+        assert_eq!(failures[0]["cause"], "error", "{output}");
+        assert!(failures[0].get("cancelled").is_none(), "{output}");
         assert!(
             failures[0]["reason"]
                 .as_str()
@@ -1429,9 +1439,78 @@ mod tests {
         );
         assert_eq!(
             *failed.lock().unwrap(),
-            ["goal"],
-            "the failing stage must also report itself live"
+            [("goal".to_string(), StageStopCause::Error)],
+            "the failing stage must also report itself live, with its cause"
         );
+    }
+
+    /// Every stop cause the engine can name, in one place for the tests that
+    /// must carry each of them unchanged.
+    const ALL_STOP_CAUSES: [StageStopCause; 5] = [
+        StageStopCause::Error,
+        StageStopCause::Cancelled,
+        StageStopCause::OutOfTime,
+        StageStopCause::CutShort,
+        StageStopCause::Interrupted,
+    ];
+
+    #[test]
+    fn worker_progress_event_carries_the_stop_cause() {
+        for cause in ALL_STOP_CAUSES {
+            let event = worker_progress_event(
+                ProjectId::Linux,
+                false,
+                WorkflowEvent::StageFailed {
+                    stage_name: "goal",
+                    reason: "stopped".to_string(),
+                    cause,
+                },
+            );
+            match event {
+                Some(WorkerProgressEvent::StageFailed {
+                    stage,
+                    reason,
+                    cause: got,
+                }) => {
+                    assert_eq!(stage, "goal");
+                    assert_eq!(reason, "stopped");
+                    assert_eq!(got, cause, "the cause must reach the worker's caller");
+                }
+                other => panic!("expected StageFailed for {cause:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn stage_failures_json_writes_the_cause_in_its_stored_spelling() {
+        let failures: Vec<StageFailure> = ALL_STOP_CAUSES
+            .iter()
+            .map(|&cause| StageFailure {
+                stage_name: "goal",
+                reason: "stopped".to_string(),
+                cause,
+            })
+            .collect();
+        let json = stage_failures_json(&failures);
+        let spellings: Vec<&str> = json
+            .iter()
+            .map(|f| f["cause"].as_str().expect("cause is a string"))
+            .collect();
+        assert_eq!(
+            spellings,
+            [
+                "error",
+                "cancelled",
+                "out_of_time",
+                "cut_short",
+                "interrupted"
+            ]
+        );
+        for f in &json {
+            assert_eq!(f["stage"], "goal");
+            assert_eq!(f["reason"], "stopped");
+            assert!(f.get("cancelled").is_none(), "{f}");
+        }
     }
 
     // ReviewError tests

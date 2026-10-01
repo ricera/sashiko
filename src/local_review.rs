@@ -195,7 +195,7 @@ pub enum ProgressEvent {
         patch_index: i64,
         stage: String,
         reason: String,
-        cancelled: bool,
+        cause: crate::workflow::StageStopCause,
     },
     /// One message joining a stage's conversation log, so a daemon can show
     /// a running review's conversation before it finishes. `stage` is `None`
@@ -722,13 +722,13 @@ fn to_wire(event: &ProgressEvent) -> Option<(i64, crate::activity::ProgressWire)
             patch_index,
             stage,
             reason,
-            cancelled,
+            cause,
         } => (
             patch_index,
             ProgressWire::StageFailed {
                 stage,
                 reason,
-                cancelled,
+                cause,
             },
         ),
         // Forwarded only on this path, which runs only for a daemon-spawned
@@ -741,6 +741,83 @@ fn to_wire(event: &ProgressEvent) -> Option<(i64, crate::activity::ProgressWire)
         _ => return None,
     };
     Some((patch_index, wire))
+}
+
+/// The local view of one worker progress event, for the patch it belongs to.
+///
+/// Every field is carried across unchanged; only the patch index is added.
+fn from_worker_progress(
+    patch_index: i64,
+    event: crate::worker::WorkerProgressEvent,
+) -> ProgressEvent {
+    use crate::worker::WorkerProgressEvent;
+    match event {
+        WorkerProgressEvent::PreScreenStarted => {
+            ProgressEvent::AiReviewPreScreenStarted { patch_index }
+        }
+        WorkerProgressEvent::PlanningStarted => {
+            ProgressEvent::AiReviewPlanningStarted { patch_index }
+        }
+        WorkerProgressEvent::ReviewStarted { planned_stages } => ProgressEvent::AiReviewPlanReady {
+            patch_index,
+            planned_stages,
+        },
+        WorkerProgressEvent::StageStarted { stage } => {
+            ProgressEvent::AiReviewStageStarted { patch_index, stage }
+        }
+        WorkerProgressEvent::StageTurn {
+            stage,
+            turn,
+            max_turns,
+        } => ProgressEvent::AiReviewStageTurn {
+            patch_index,
+            stage,
+            turn,
+            max_turns,
+        },
+        WorkerProgressEvent::StageTools {
+            stage,
+            tools,
+            turn,
+            max_turns,
+        } => ProgressEvent::AiReviewStageTools {
+            patch_index,
+            stage,
+            tools,
+            turn,
+            max_turns,
+        },
+        WorkerProgressEvent::StageBackoff {
+            stage,
+            retry_in_seconds,
+            turn,
+            max_turns,
+        } => ProgressEvent::AiReviewStageBackoff {
+            patch_index,
+            stage,
+            retry_in_seconds,
+            turn,
+            max_turns,
+        },
+        WorkerProgressEvent::StageFinished { stage } => {
+            ProgressEvent::AiReviewStageFinished { patch_index, stage }
+        }
+        WorkerProgressEvent::StageFailed {
+            stage,
+            reason,
+            cause,
+        } => ProgressEvent::AiReviewStageFailed {
+            patch_index,
+            stage,
+            reason,
+            cause,
+        },
+        WorkerProgressEvent::LogEntry { stage, message } => ProgressEvent::AiReviewLogEntry {
+            patch_index,
+            stage,
+            message,
+        },
+    }
 }
 
 /// Daemon-spawned workers (`stdio-*`) already have their retry lifecycle managed
@@ -1253,97 +1330,7 @@ async fn review_patch_attempts(
         );
 
         let p_index = p.index;
-        let progress_cb = progress.map(|cb| {
-            move |event| match event {
-                crate::worker::WorkerProgressEvent::PreScreenStarted => {
-                    cb(ProgressEvent::AiReviewPreScreenStarted {
-                        patch_index: p_index,
-                    });
-                }
-                crate::worker::WorkerProgressEvent::PlanningStarted => {
-                    cb(ProgressEvent::AiReviewPlanningStarted {
-                        patch_index: p_index,
-                    });
-                }
-                crate::worker::WorkerProgressEvent::ReviewStarted { planned_stages } => {
-                    cb(ProgressEvent::AiReviewPlanReady {
-                        patch_index: p_index,
-                        planned_stages,
-                    });
-                }
-                crate::worker::WorkerProgressEvent::StageStarted { stage } => {
-                    cb(ProgressEvent::AiReviewStageStarted {
-                        patch_index: p_index,
-                        stage,
-                    });
-                }
-                crate::worker::WorkerProgressEvent::StageTurn {
-                    stage,
-                    turn,
-                    max_turns,
-                } => {
-                    cb(ProgressEvent::AiReviewStageTurn {
-                        patch_index: p_index,
-                        stage,
-                        turn,
-                        max_turns,
-                    });
-                }
-                crate::worker::WorkerProgressEvent::StageTools {
-                    stage,
-                    tools,
-                    turn,
-                    max_turns,
-                } => {
-                    cb(ProgressEvent::AiReviewStageTools {
-                        patch_index: p_index,
-                        stage,
-                        tools,
-                        turn,
-                        max_turns,
-                    });
-                }
-                crate::worker::WorkerProgressEvent::StageBackoff {
-                    stage,
-                    retry_in_seconds,
-                    turn,
-                    max_turns,
-                } => {
-                    cb(ProgressEvent::AiReviewStageBackoff {
-                        patch_index: p_index,
-                        stage,
-                        retry_in_seconds,
-                        turn,
-                        max_turns,
-                    });
-                }
-                crate::worker::WorkerProgressEvent::StageFinished { stage } => {
-                    cb(ProgressEvent::AiReviewStageFinished {
-                        patch_index: p_index,
-                        stage,
-                    });
-                }
-                crate::worker::WorkerProgressEvent::StageFailed {
-                    stage,
-                    reason,
-                    cancelled,
-                } => {
-                    cb(ProgressEvent::AiReviewStageFailed {
-                        patch_index: p_index,
-                        stage,
-                        reason,
-                        cancelled,
-                    });
-                }
-                crate::worker::WorkerProgressEvent::LogEntry { stage, message } => {
-                    cb(ProgressEvent::AiReviewLogEntry {
-                        patch_index: p_index,
-                        stage,
-                        message,
-                    });
-                }
-            }
-        });
+        let progress_cb = progress.map(|cb| move |event| cb(from_worker_progress(p_index, event)));
 
         let patchset_val = json!({
             "id": patchset_id,
@@ -1941,11 +1928,15 @@ pub fn progress_line(event: ProgressEvent) -> Option<String> {
         // Without the reason, deliberately. `sashiko-cli local` treats any
         // line containing " turn " as a turn tick, and a provider's error text
         // can contain those words; the reason reaches the daemon and the
-        // review's record by other routes.
+        // review's record by other routes. The cause's label is fixed text
+        // with no such words, and says whether to look for a fault.
         ProgressEvent::AiReviewStageFailed {
-            patch_index, stage, ..
+            patch_index,
+            stage,
+            cause,
+            ..
         } => {
-            format!("patch {patch_index}: {stage} failed")
+            format!("patch {patch_index}: {stage} {}", cause.label())
         }
         ProgressEvent::AiReviewAttempt {
             patch_index,
@@ -3060,12 +3051,38 @@ mod tests {
                     patch_index: 1,
                     stage: "locking".to_string(),
                     reason: "Session exceeded max turns limit; last turn 20".to_string(),
-                    cancelled: false,
+                    cause: crate::workflow::StageStopCause::Error,
                 },
                 "patch 1: locking failed",
             ),
         ] {
             let line = progress_line(event).unwrap();
+            assert_eq!(line, expected);
+            assert!(!line.contains(" turn "), "a non-tick line reads as a tick");
+        }
+
+        // A stage that stopped for any other reason says why, and no label can
+        // read as a tick either.
+        use crate::workflow::StageStopCause;
+        for (cause, expected) in [
+            (StageStopCause::Cancelled, "patch 1: locking cancelled"),
+            (
+                StageStopCause::OutOfTime,
+                "patch 1: locking stopped: out of time",
+            ),
+            (StageStopCause::CutShort, "patch 1: locking cut short"),
+            (
+                StageStopCause::Interrupted,
+                "patch 1: locking still running when the review stopped",
+            ),
+        ] {
+            let line = progress_line(ProgressEvent::AiReviewStageFailed {
+                patch_index: 1,
+                stage: "locking".to_string(),
+                reason: "a turn of phrase".to_string(),
+                cause,
+            })
+            .unwrap();
             assert_eq!(line, expected);
             assert!(!line.contains(" turn "), "a non-tick line reads as a tick");
         }
@@ -3217,16 +3234,18 @@ mod tests {
                 ProgressWire::StageFinished { stage: stage() },
             ),
             (
+                // A cause other than the default, so the hop cannot pass by
+                // writing `Error` whatever it was given.
                 ProgressEvent::AiReviewStageFailed {
                     patch_index: 3,
                     stage: stage(),
                     reason: "boom".to_string(),
-                    cancelled: false,
+                    cause: crate::workflow::StageStopCause::OutOfTime,
                 },
                 ProgressWire::StageFailed {
                     stage: stage(),
                     reason: "boom".to_string(),
-                    cancelled: false,
+                    cause: crate::workflow::StageStopCause::OutOfTime,
                 },
             ),
             (
@@ -3260,6 +3279,43 @@ mod tests {
             ProgressEvent::ReviewComplete { partial: false },
         ] {
             assert!(to_wire(&event).is_none(), "{event:?}");
+        }
+    }
+
+    /// A stopped stage's cause crosses from the worker's event to the local
+    /// one as it was given, together with the patch it belongs to.
+    #[test]
+    fn test_a_stage_stop_cause_survives_the_worker_hop() {
+        use crate::workflow::StageStopCause;
+        for cause in [
+            StageStopCause::Error,
+            StageStopCause::Cancelled,
+            StageStopCause::OutOfTime,
+            StageStopCause::CutShort,
+            StageStopCause::Interrupted,
+        ] {
+            let event = from_worker_progress(
+                4,
+                crate::worker::WorkerProgressEvent::StageFailed {
+                    stage: "locking".to_string(),
+                    reason: "boom".to_string(),
+                    cause,
+                },
+            );
+            match event {
+                ProgressEvent::AiReviewStageFailed {
+                    patch_index,
+                    stage,
+                    reason,
+                    cause: carried,
+                } => {
+                    assert_eq!(patch_index, 4);
+                    assert_eq!(stage, "locking");
+                    assert_eq!(reason, "boom");
+                    assert_eq!(carried, cause);
+                }
+                other => panic!("a stage failure must stay one, got {other:?}"),
+            }
         }
     }
 

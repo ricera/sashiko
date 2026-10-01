@@ -33,6 +33,7 @@ use std::time::Instant;
 
 use crate::api::ActivityEntry;
 use crate::project::ProjectId;
+use crate::workflow::StageStopCause;
 
 /// Identifies a unit of tracked work.
 ///
@@ -258,7 +259,7 @@ pub enum Phase {
     StageFailed {
         stage: String,
         reason: String,
-        cancelled: bool,
+        cause: StageStopCause,
     },
 }
 
@@ -426,11 +427,11 @@ impl Phase {
             Phase::StageFailed {
                 stage,
                 reason,
-                cancelled,
+                cause,
             } => format!(
                 "stage {} {}: {}",
                 stage,
-                if *cancelled { "cancelled" } else { "failed" },
+                cause.label(),
                 summarize_reason(reason)
             ),
         }
@@ -1157,7 +1158,7 @@ pub enum ProgressWire {
     StageFailed {
         stage: String,
         reason: String,
-        cancelled: bool,
+        cause: StageStopCause,
     },
     /// One message joining the review's conversation, for its live log.
     ///
@@ -1377,14 +1378,14 @@ pub fn progress_update(
         ProgressWire::StageFailed {
             stage,
             reason,
-            cancelled,
+            cause,
         } => match stage_key(stage) {
             Some(key) => ProgressUpdate::Set(
                 key,
                 Phase::StageFailed {
                     stage: stage.clone(),
                     reason: public_reason(reason),
-                    cancelled: *cancelled,
+                    cause: *cause,
                 },
             ),
             None => ProgressUpdate::Touch(patch),
@@ -2554,7 +2555,7 @@ mod tests {
             Phase::StageFailed {
                 stage: "resources".to_string(),
                 reason: "Session exceeded max turns limit (50)".to_string(),
-                cancelled: false,
+                cause: StageStopCause::Error,
             },
         );
         reg.update_stage_wait(key.clone(), "resources".to_string(), StageWait::Model);
@@ -2666,7 +2667,7 @@ mod tests {
             Phase::StageFailed {
                 stage: "implementation".to_string(),
                 reason: "Session exceeded max turns limit (50)".to_string(),
-                cancelled: false,
+                cause: StageStopCause::Error,
             },
         );
 
@@ -2715,7 +2716,7 @@ mod tests {
             Phase::StageFailed {
                 stage: "implementation".to_string(),
                 reason: "boom".to_string(),
-                cancelled: false,
+                cause: StageStopCause::Error,
             },
         );
         let failed_since = {
@@ -2737,11 +2738,52 @@ mod tests {
             Phase::StageFailed {
                 stage: "resources".to_string(),
                 reason: "Session cancelled by supervisor".to_string(),
-                cancelled: true,
+                cause: StageStopCause::Cancelled,
             }
             .describe(),
             "stage resources cancelled: Session cancelled by supervisor"
         );
+    }
+
+    /// The description is what the CLI and the public activity routes show,
+    /// so each cause reads with the label every other view uses for it.
+    #[test]
+    fn test_a_stopped_stage_is_described_by_its_cause() {
+        for (cause, expected) in [
+            (StageStopCause::Error, "stage goal failed: why"),
+            (StageStopCause::Cancelled, "stage goal cancelled: why"),
+            (
+                StageStopCause::OutOfTime,
+                "stage goal stopped: out of time: why",
+            ),
+            (StageStopCause::CutShort, "stage goal cut short: why"),
+            (
+                StageStopCause::Interrupted,
+                "stage goal still running when the review stopped: why",
+            ),
+        ] {
+            let phase = Phase::StageFailed {
+                stage: "goal".to_string(),
+                reason: "why".to_string(),
+                cause,
+            };
+            assert_eq!(phase.describe(), expected);
+        }
+    }
+
+    /// A failed stage's phase is stored and read back after a restart, so the
+    /// cause is written in the spelling the page reads.
+    #[test]
+    fn test_a_stored_stage_failure_names_its_cause() {
+        let phase = Phase::StageFailed {
+            stage: "goal".to_string(),
+            reason: "why".to_string(),
+            cause: StageStopCause::OutOfTime,
+        };
+        let json = serde_json::to_value(&phase).unwrap();
+        assert_eq!(json["cause"], "out_of_time", "{json}");
+        assert!(json.get("cancelled").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<Phase>(json).unwrap(), phase);
     }
 
     #[test]
@@ -2934,7 +2976,7 @@ mod tests {
                 Phase::StageFailed {
                     stage: "goal".into(),
                     reason: "r".into(),
-                    cancelled: false,
+                    cause: StageStopCause::Error,
                 },
                 "stage_failed",
             ),
@@ -3041,7 +3083,7 @@ mod tests {
             ProgressWire::StageFailed {
                 stage: "goal".into(),
                 reason: "Session exceeded max turns limit (20)".into(),
-                cancelled: false,
+                cause: StageStopCause::Error,
             },
         ]
     }
@@ -3167,7 +3209,7 @@ mod tests {
                 {"stage": "no-such-stage", "seconds": 1, "turns": 1},
             ],
             "stage_failures": [
-                {"stage": "goal", "reason": "x", "cancelled": true},
+                {"stage": "goal", "reason": "x", "cause": "error"},
             ],
         });
         annotate_stage_records(&mut review, ProjectId::Linux);
@@ -3297,7 +3339,7 @@ mod tests {
                     ProgressWire::StageFailed {
                         stage: stage.into(),
                         reason: "boom".into(),
-                        cancelled: false,
+                        cause: StageStopCause::Error,
                     },
                 ] {
                     assert_eq!(
@@ -3417,14 +3459,31 @@ mod tests {
                 ProgressWire::StageFailed {
                     stage: "implementation".into(),
                     reason: "Session exceeded max turns limit (50)".into(),
-                    cancelled: false,
+                    cause: StageStopCause::Error,
                 },
                 ProgressUpdate::Set(
                     key("implementation"),
                     Phase::StageFailed {
                         stage: "implementation".into(),
                         reason: "Session exceeded max turns limit (50)".into(),
-                        cancelled: false,
+                        cause: StageStopCause::Error,
+                    },
+                ),
+            ),
+            // The cause crosses the pipe as it was sent, so the row says why
+            // the stage stopped, not only that it did.
+            (
+                ProgressWire::StageFailed {
+                    stage: "security".into(),
+                    reason: "stopped".into(),
+                    cause: StageStopCause::OutOfTime,
+                },
+                ProgressUpdate::Set(
+                    key("security"),
+                    Phase::StageFailed {
+                        stage: "security".into(),
+                        reason: "stopped".into(),
+                        cause: StageStopCause::OutOfTime,
                     },
                 ),
             ),
@@ -3455,7 +3514,7 @@ mod tests {
             let wire = ProgressWire::StageFailed {
                 stage: "security".into(),
                 reason: reason.to_string(),
-                cancelled: false,
+                cause: StageStopCause::Error,
             };
             let Some(ProgressUpdate::Set(_, phase)) =
                 progress_update(ProjectId::Linux, 77, 3, &wire, 1, 4)

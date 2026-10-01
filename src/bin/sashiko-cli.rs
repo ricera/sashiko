@@ -25,6 +25,7 @@ use sashiko::auth::LocalToken;
 use sashiko::project::ProjectId;
 use sashiko::settings::Settings;
 use sashiko::utils::utf8_prefix;
+use sashiko::workflow::StageStopCause;
 use serde_json::{Value, from_str};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -1218,13 +1219,25 @@ fn print_coverage_warning(review: &Value) {
     );
     for f in failures {
         let stage = f["stage"].as_str().unwrap_or("?");
-        let what = if f["cancelled"].as_bool().unwrap_or(false) {
-            "cancelled"
-        } else {
-            "failed"
-        };
         let reason = f["reason"].as_str().unwrap_or("unknown");
-        println!("  Stage {} {}: {}", stage, what, reason);
+        println!("  Stage {} {}: {}", stage, stage_failure_label(f), reason);
+    }
+}
+
+/// What one stored stage failure says about why the stage stopped, in the
+/// label the web page and the activity descriptions use for the same cause.
+///
+/// Rows written before the cause existed carry only `cancelled`. A legacy
+/// `cancelled: true` reads "stopped" rather than "cancelled", because the flag
+/// was set mostly for stages that ran out of time or were still running when
+/// the worker died, and "stopped" is what those rows have always read. A cause
+/// this build does not know also reads "stopped", which claims no fault.
+fn stage_failure_label(failure: &Value) -> &'static str {
+    match failure.get("cause").filter(|c| !c.is_null()) {
+        Some(cause) => serde_json::from_value::<StageStopCause>(cause.clone())
+            .map_or("stopped", StageStopCause::label),
+        None if failure["cancelled"].as_bool().unwrap_or(false) => "stopped",
+        None => "failed",
     }
 }
 
@@ -2904,6 +2917,38 @@ fn format_timestamp(ts: i64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_a_stage_failure_is_labelled_by_its_cause_or_its_legacy_flag() {
+        for (failure, expected) in [
+            (serde_json::json!({"cause": "error"}), "failed"),
+            (serde_json::json!({"cause": "cancelled"}), "cancelled"),
+            (
+                serde_json::json!({"cause": "out_of_time"}),
+                "stopped: out of time",
+            ),
+            (serde_json::json!({"cause": "cut_short"}), "cut short"),
+            (
+                serde_json::json!({"cause": "interrupted"}),
+                "still running when the review stopped",
+            ),
+            // The cause wins over a legacy flag written beside it.
+            (
+                serde_json::json!({"cause": "error", "cancelled": true}),
+                "failed",
+            ),
+            (serde_json::json!({"cause": "no_such_cause"}), "stopped"),
+            (serde_json::json!({"cancelled": true}), "stopped"),
+            (serde_json::json!({"cancelled": false}), "failed"),
+            (
+                serde_json::json!({"cause": null, "cancelled": true}),
+                "stopped",
+            ),
+            (serde_json::json!({}), "failed"),
+        ] {
+            assert_eq!(stage_failure_label(&failure), expected, "{failure}");
+        }
+    }
 
     #[test]
     fn test_format_subject_handles_multibyte_cutoff() {

@@ -3619,10 +3619,36 @@
                 rows.push({
                     stage: f.stage, state: 'stopped',
                     order: f.order, stage_label: f.stage_label,
-                    reason: f.reason || '', cancelled: !!f.cancelled,
+                    reason: f.reason || '', cause: stageStopCause(f),
                 });
             }
             return rows.sort(compareStageRows);
+        }
+
+        // Why a stopped stage stopped, from a stored failure or a live phase.
+        //
+        // Rows written before the cause existed carry only `cancelled`. A legacy
+        // `cancelled: true` becomes 'stopped' rather than 'cancelled': the flag
+        // was set mostly for stages that ran out of time or were still running
+        // when the worker died, and "stopped" is what those rows always read.
+        function stageStopCause(record) {
+            if (record.cause != null) return String(record.cause);
+            return record.cancelled ? 'stopped' : 'error';
+        }
+
+        // The words after a stopped stage's name. The same labels as
+        // StageStopCause::label on the server, so the activity descriptions, the
+        // CLI and this page say the same thing. A cause this page does not know
+        // reads 'stopped', which claims no fault.
+        function stageStopLabel(cause) {
+            switch (cause) {
+                case 'error': return 'failed';
+                case 'cancelled': return 'cancelled';
+                case 'out_of_time': return 'stopped: out of time';
+                case 'cut_short': return 'cut short';
+                case 'interrupted': return 'still running when the review stopped';
+                default: return 'stopped';
+            }
         }
 
         // The same rows, from the activity registry instead of the database.
@@ -3662,7 +3688,7 @@
                 if (phase.kind === 'stage_failed') {
                     return {
                         stage, order, stage_label, state: 'stopped',
-                        reason: phase.reason || '', cancelled: !!phase.cancelled,
+                        reason: phase.reason || '', cause: stageStopCause(phase),
                         age,
                     };
                 }
@@ -3732,9 +3758,11 @@
             // indistinguishable from one that never ran, and the review carries
             // on without it. A recorded stopped stage has no duration -- only its
             // reason was written down, and the elapsed time is inside that text.
+            // Only a stage's own error is coloured as a fault: a cancel or a
+            // deadline says nothing about the stage.
             if (row.state === 'stopped') {
-                const what = row.cancelled ? 'stopped' : 'failed';
-                const colour = row.cancelled ? 'var(--text-muted)' : 'var(--status-failed)';
+                const what = stageStopLabel(row.cause);
+                const colour = row.cause === 'error' ? 'var(--status-failed)' : 'var(--text-muted)';
                 const when = row.age ? `${formatDuration(row.age)} ago` : '—';
                 return `<tr title="${escapeHtml(String(row.reason || ''))}">`
                     + `<td style="${cell}">${label}</td>`

@@ -1888,8 +1888,10 @@ impl Database {
             info!("Applying database migration version 15 (review activity and timing)...");
             let tx = self.conn.transaction().await?;
             const COLUMNS: &[(&str, &str, &str)] = &[
-                // JSON array of {stage, reason, cancelled}: stages that did not
-                // complete while their siblings did.
+                // JSON array of {stage, reason, cause}: stages that did not
+                // complete while their siblings did. Rows written before the
+                // cause was recorded carry a boolean cancelled in its place,
+                // and readers fall back to it.
                 ("reviews", "stage_failures", "TEXT"),
                 // 1-based; which retry of this patch produced this row.
                 ("reviews", "attempt", "INTEGER"),
@@ -8062,7 +8064,8 @@ impl Database {
     }
 
     /// Records which review stages did not complete, as a JSON array of
-    /// `{stage, reason, cancelled}`.
+    /// `{stage, reason, cause}`. Older rows carry a boolean `cancelled` instead
+    /// of `cause`, and readers fall back to it.
     ///
     /// The concurrent review stages run best-effort, so one failing stage does
     /// not abort the review while its siblings succeed. That is only safe if the
@@ -20593,7 +20596,7 @@ mod tests {
         db.set_review_duration(review_id, 321).await.unwrap();
         db.set_review_stage_failures(
             review_id,
-            r#"[{"stage":"security","reason":"boom","cancelled":false}]"#,
+            r#"[{"stage":"security","reason":"boom","cause":"error"}]"#,
         )
         .await
         .unwrap();
