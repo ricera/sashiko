@@ -1985,7 +1985,8 @@ impl Reviewer {
                 }
                 AttemptEnd::TimedOut { timeout } => {
                     error!(
-                        "Review {} of patch {}/{} timed out after {} active seconds",
+                        "Review {} of patch {}/{} timed out after {} active seconds; \
+                         not retrying",
                         review_id, patchset_id, index, timeout.active_seconds
                     );
                     Self::fail_review_row(
@@ -1996,7 +1997,11 @@ impl Reviewer {
                         conversation,
                     )
                     .await;
-                    AttemptVerdict::Retry
+                    // A review that used up its whole deadline has shown it does
+                    // not fit in one, and a retry gets an identical deadline.
+                    // Retrying is how one patch came to spend four deadlines
+                    // and produce nothing; a rerun is one command away.
+                    AttemptVerdict::GiveUp
                 }
                 AttemptEnd::Failed { reason, output } => {
                     error!(
@@ -2005,6 +2010,9 @@ impl Reviewer {
                     );
                     Self::fail_review_row(ctx, review_id, &reason, output.as_ref(), conversation)
                         .await;
+                    // A worker that hits its own deadline also ends here and is
+                    // retried, because its timeout reaches the daemon as an
+                    // untyped error rather than as a ReviewTimedOut.
                     AttemptVerdict::Retry
                 }
             };
@@ -2012,7 +2020,7 @@ impl Reviewer {
             match verdict {
                 AttemptVerdict::Final(result) => return Ok(result),
                 AttemptVerdict::Retry if retries < max_retries => retries += 1,
-                AttemptVerdict::Retry => {
+                AttemptVerdict::Retry | AttemptVerdict::GiveUp => {
                     let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
                     return Ok(PatchResult::ReviewFailed);
                 }
@@ -2711,11 +2719,15 @@ fn missing_review(output: &Value, index: i64, no_ai: bool) -> Option<String> {
     }
 }
 
-/// What follows an attempt: a final result for the patch, or another attempt
-/// while retries remain.
+/// What follows an attempt: a final result for the patch, another attempt
+/// while retries remain, or the patch marked failed with no further attempt.
 enum AttemptVerdict {
     Final(PatchResult),
+    /// The attempt failed in a way another attempt may get past.
     Retry,
+    /// The attempt failed in a way an identical attempt would repeat, so the
+    /// patch fails now whatever retries remain.
+    GiveUp,
 }
 
 /// The conversation review `review_id` streamed, as a final log for a review
@@ -7463,6 +7475,41 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             promoted(&[(Some("security"), "tracing the user copy")]),
             "a killed worker returns no history, so the stream is all there is: {review}"
         );
+        Ok(())
+    }
+
+    /// A review that ran out of time is not tried again, however many retries
+    /// remain: an identical attempt gets an identical deadline. The patch
+    /// fails at once, while any other failure is still retried (see
+    /// `test_an_error_output_records_what_the_attempt_did`).
+    #[tokio::test]
+    async fn test_a_timed_out_review_is_not_retried() -> Result<()> {
+        let script = worker_reporting_then(&stage_reaching("security", 1), "exec sleep 30\n");
+
+        let run = review_patch_with_worker(&script, |s| {
+            s.review.timeout_seconds = 1;
+            s.review.max_retries = 2;
+        })
+        .await?;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1, "one attempt only: {reviews:?}");
+        assert_eq!(reviews[0]["status"], "Failed");
+        assert_eq!(reviews[0]["attempt"], 1, "{}", reviews[0]);
+        let patch_status = run
+            .db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![run.patch_id],
+            )
+            .await?
+            .next()
+            .await?
+            .map(|row| row.get::<String>(0))
+            .transpose()?;
+        assert_eq!(patch_status.as_deref(), Some("Failed"));
         Ok(())
     }
 
