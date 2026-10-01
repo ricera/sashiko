@@ -310,7 +310,13 @@ that carries `tool_calls` is pushed to `history` even though the calls are
 ignored (`session.rs:429-439`). If validation then fails, the next request has
 a `tool_use` without a `tool_result`, which Claude rejects. On the final turn,
 the runner drops `tool_calls` from the copy that goes into `history` and keeps
-them in `log_history`.
+them in `log_history`. An answer that held only tool calls would then have no
+content, and Claude rejects an assistant message with an empty content array
+while Bedrock fails to build it (`bedrock.rs`, "Failed to build assistant
+message"). So when the copy is left with no text, its content becomes
+`IGNORED_TOOL_CALLS_NOTE` ("[Tool calls omitted: no tools are run on the final
+turn, so none were made.]"). The note goes into `history` only; text the model
+did write is kept unchanged.
 
 **Response cache.** `CachingAiProvider::generate_content` does not store a
 response with `truncated == true`. It also treats a stored entry with
@@ -1205,7 +1211,8 @@ salvage_seconds = 1800
   - New: a truncated final turn pushes the budget prompt exactly once.
   - New: a validation retry on the final turn pushes it exactly once.
   - New: a final-turn answer with tool calls followed by a validation retry
-    sends no `tool_use` without a `tool_result`.
+    sends no `tool_use` without a `tool_result`, and an answer left with no
+    text carries `IGNORED_TOOL_CALLS_NOTE` in `history`.
   - New: truncated usage is counted, and the truncated answer appears in the
     log but not in the next request.
   - New: an answer truncated with nothing written gets the reasoning

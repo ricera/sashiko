@@ -185,6 +185,35 @@ impl FinalTurn {
     }
 }
 
+/// Stands in for a final-turn answer that held nothing but ignored tool calls.
+const IGNORED_TOOL_CALLS_NOTE: &str =
+    "[Tool calls omitted: no tools are run on the final turn, so none were made.]";
+
+/// The copy of an assistant answer that is sent back to the model.
+///
+/// Tool calls made on the final turn are ignored, so they never get a result.
+/// Claude rejects a request whose `tool_use` has no matching `tool_result`
+/// (OpenAI does the same), so a validation retry after such an answer failed
+/// on the provider instead of reaching the model. The copy therefore drops the
+/// calls; the conversation log keeps them. An answer left with no text gets a
+/// short note instead, because Claude and Bedrock also reject an assistant
+/// message with no content.
+fn reply_for_history(answer: &AiMessage, final_turn: Option<FinalTurn>) -> AiMessage {
+    let has_tool_calls = answer.tool_calls.as_ref().is_some_and(|c| !c.is_empty());
+    if final_turn.is_none() || !has_tool_calls {
+        return answer.clone();
+    }
+    let content = match answer.content.as_deref() {
+        Some(text) if !text.is_empty() => text.to_string(),
+        _ => IGNORED_TOOL_CALLS_NOTE.to_string(),
+    };
+    AiMessage {
+        content: Some(content),
+        tool_calls: None,
+        ..answer.clone()
+    }
+}
+
 /// Fired around tool execution with the tool names, current turn, and turn cap.
 /// An empty name slice signals the tools finished.
 type ToolsCallback<'a> = dyn Fn(&[String], usize, usize) + Send + Sync + 'a;
@@ -557,7 +586,7 @@ impl<'a> SessionRunner<'a> {
                 tool_calls: resp.tool_calls.clone(),
                 tool_call_id: None,
             };
-            history.push(assistant_msg.clone());
+            history.push(reply_for_history(&assistant_msg, final_turn));
             self.push_log(&mut log_history, assistant_msg);
 
             // Handle Tool Calls
@@ -1172,5 +1201,95 @@ mod tests {
             assert!(req.tools.is_none());
             assert_eq!(budget_prompts(&req.messages), 0);
         }
+    }
+
+    /// The ids of tool calls in `messages` that no later tool message answers.
+    fn unanswered_tool_calls(messages: &[AiMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .enumerate()
+            .flat_map(|(i, m)| {
+                m.tool_calls
+                    .iter()
+                    .flatten()
+                    .map(move |call| (i, call.id.clone()))
+            })
+            .filter(|(i, id)| {
+                !messages[i + 1..]
+                    .iter()
+                    .any(|m| m.role == AiRole::Tool && m.tool_call_id.as_deref() == Some(id))
+            })
+            .map(|(_, id)| id)
+            .collect()
+    }
+
+    /// Tool calls on the final turn are ignored and never answered. Sending
+    /// them back on a validation retry gave the provider a `tool_use` with no
+    /// `tool_result`, which Claude rejects, so the retry never reached the
+    /// model.
+    #[tokio::test]
+    async fn a_final_turn_retry_sends_no_unanswered_tool_calls() {
+        let provider = RecordingProvider::new(vec![
+            tool_answer("call_1"),
+            tool_answer("call_2"),
+            text_answer("verdict"),
+        ]);
+        let runner = SessionRunner::new(&provider).with_max_turns(2);
+
+        let res = runner
+            .run(&mut RejectingToolSession { rejections: 1 })
+            .await
+            .unwrap();
+        assert_eq!(res.output, "verdict");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        for (i, req) in requests.iter().enumerate() {
+            assert!(
+                unanswered_tool_calls(&req.messages).is_empty(),
+                "request {i} carries a tool call with no result"
+            );
+        }
+        let retried = requests[2]
+            .messages
+            .iter()
+            .rfind(|m| m.role == AiRole::Assistant)
+            .unwrap();
+        assert_eq!(
+            retried.content.as_deref(),
+            Some(IGNORED_TOOL_CALLS_NOTE),
+            "an answer left empty must still have content for the provider"
+        );
+        assert_eq!(
+            unanswered_tool_calls(&res.history),
+            vec!["call_2".to_string()],
+            "the log keeps the ignored call"
+        );
+    }
+
+    /// Text that came with ignored final-turn tool calls is what the model
+    /// said, so its copy in the history keeps it; only the calls go.
+    #[test]
+    fn a_final_turn_reply_keeps_its_text_and_drops_its_tool_calls() {
+        let answer = AiMessage {
+            role: AiRole::Assistant,
+            content: Some("partial verdict".to_string()),
+            thought: Some("thinking".to_string()),
+            thought_signature: Some("sig".to_string()),
+            tool_calls: tool_answer("call_1").tool_calls,
+            tool_call_id: None,
+        };
+
+        let copy = reply_for_history(&answer, Some(FinalTurn::TurnBudget));
+        assert_eq!(copy.content.as_deref(), Some("partial verdict"));
+        assert_eq!(copy.tool_calls, None);
+        assert_eq!(copy.thought, answer.thought);
+        assert_eq!(copy.thought_signature, answer.thought_signature);
+
+        assert_eq!(
+            reply_for_history(&answer, None),
+            answer,
+            "before the final turn the calls are run and answered, so they stay"
+        );
     }
 }
