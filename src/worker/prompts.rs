@@ -150,6 +150,58 @@ pub enum WorkerProgressEvent {
         reason: String,
         cancelled: bool,
     },
+    /// One message joining the conversation log, streamed so a running review
+    /// can be read before it finishes. `stage` is `None` only for the system
+    /// message the log opens with, which belongs to no stage.
+    ///
+    /// Carries the message itself rather than a flattened rendering of it. The
+    /// finished log stores `AiMessage`s, so sharing the type is what keeps the
+    /// live view and the finished view from drifting apart -- they drifted
+    /// before precisely because nothing tied the two shapes together.
+    LogEntry {
+        stage: Option<String>,
+        message: AiMessage,
+    },
+}
+
+/// The copy of a message that is streamed to the live log.
+///
+/// The message the finished log will hold, changed only as the finished log
+/// changes it: thought signatures are dropped, as
+/// [`crate::ai::scrub_thought_signatures`] drops them from the stored history,
+/// because they are opaque provider state, not conversation. Nothing else is
+/// reshaped for a reader. The page redraws a running review's log as the
+/// finished one when the review ends, and any difference between the two
+/// copies would show as every changed block changing shape under the reader;
+/// a display transform belongs in the page's one renderer, where both logs get
+/// it. Content is carried whole for the same reason, and costs little: the
+/// daemon proxies every request, so the same tool result already crosses the
+/// pipe as part of the history.
+pub(crate) fn live_log_message(msg: &AiMessage) -> AiMessage {
+    AiMessage {
+        role: msg.role.clone(),
+        content: msg.content.clone(),
+        thought: msg.thought.clone(),
+        thought_signature: None,
+        tool_calls: msg.tool_calls.as_ref().map(|calls| {
+            calls
+                .iter()
+                .map(|c| {
+                    // Scrubbed through the arguments too, as the finished log's
+                    // scrub walks the whole history.
+                    let mut arguments = c.arguments.clone();
+                    crate::ai::scrub_thought_signatures(&mut arguments);
+                    crate::ai::ToolCall {
+                        id: c.id.clone(),
+                        function_name: c.function_name.clone(),
+                        arguments,
+                        thought_signature: None,
+                    }
+                })
+                .collect()
+        }),
+        tool_call_id: msg.tool_call_id.clone(),
+    }
 }
 
 pub struct WorkerResult {
@@ -410,14 +462,23 @@ impl Worker {
                 ProjectId::Sashiko => sashiko_system_prompt(true),
             };
             let rendered_sys = sys_template.render_for_log(&state);
-            self.global_history.push(AiMessage {
+            let system = AiMessage {
                 role: crate::ai::AiRole::System,
                 content: Some(rendered_sys),
                 thought: None,
                 thought_signature: None,
                 tool_calls: None,
                 tool_call_id: None,
-            });
+            };
+            // The finished log opens with this message, so the live one does
+            // too. It belongs to no stage.
+            if let Some(progress_cb) = progress {
+                progress_cb(WorkerProgressEvent::LogEntry {
+                    stage: None,
+                    message: live_log_message(&system),
+                });
+            }
+            self.global_history.push(system);
         }
 
         let workflow = match self.project {
@@ -544,6 +605,21 @@ impl Worker {
                             stage: stage_name.to_string(),
                             reason,
                             cancelled,
+                        });
+                    }
+                    // Every stage, not only the counted ones. The finished
+                    // log holds the pre-screen, planning and consolidation
+                    // conversations too; the is_counted_stage gate above is
+                    // about which stages count on the progress bar, and
+                    // applying it here would make the live log a subset of
+                    // the finished one.
+                    WorkflowEvent::StageMessage {
+                        stage_name,
+                        message,
+                    } => {
+                        progress_cb(WorkerProgressEvent::LogEntry {
+                            stage: Some(stage_name.to_string()),
+                            message: live_log_message(&message),
                         });
                     }
                     _ => {}
@@ -2008,5 +2084,178 @@ mod tests {
                 .unwrap()
                 .contains("wasn't introduced by this patch")
         );
+    }
+
+    /// Every message the finished log will hold is streamed, once, starting
+    /// with the system message, which belongs to no stage.
+    #[tokio::test]
+    async fn test_the_live_log_streams_the_whole_finished_log() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        // No stage fails, so every streamed stage also reaches the history.
+        let provider = std::sync::Arc::new(MockProviderFailsOneStage {
+            failing_stage: "no-such-stage",
+        });
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let config = WorkerConfig {
+            project: ProjectId::Linux,
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: None,
+            baseline_sha: None,
+            custom_prompt: None,
+            stages: Some(vec!["goal".to_string(), "implementation".to_string()]),
+            skip_report: false,
+            report_preexisting: false,
+            effort: None,
+        };
+        let mut worker = Worker::new(
+            provider,
+            std::sync::Arc::new(tools),
+            PromptRegistry::new(prompts_dir),
+            config,
+        );
+        let patchset = serde_json::json!({
+            "id": 1,
+            "patch_index": 1,
+            "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
+        });
+
+        let streamed: std::sync::Mutex<Vec<(Option<String>, AiMessage)>> =
+            std::sync::Mutex::new(Vec::new());
+        let record = |e: WorkerProgressEvent| {
+            if let WorkerProgressEvent::LogEntry { stage, message } = e {
+                streamed.lock().unwrap().push((stage, message));
+            }
+        };
+        let res = worker.run(patchset, Some(&record)).await.unwrap();
+        let streamed = streamed.into_inner().unwrap();
+
+        assert_eq!(streamed[0].0, None);
+        assert_eq!(streamed[0].1.role, crate::ai::AiRole::System);
+        assert_eq!(
+            streamed.iter().filter(|(stage, _)| stage.is_none()).count(),
+            1,
+            "only the system message is outside a stage"
+        );
+        // Stages run concurrently, so the stream interleaves what the finished
+        // log groups by stage. The messages are the same either way.
+        assert_eq!(streamed.len(), res.history.len());
+        for message in &res.history {
+            let live = live_log_message(message);
+            assert!(
+                streamed.iter().any(|(_, m)| *m == live),
+                "not streamed: {message:?}"
+            );
+        }
+        // The consolidation stages run outside the concurrent block and are
+        // streamed like any other.
+        assert!(
+            streamed
+                .iter()
+                .any(|(stage, _)| stage.as_deref() == Some("goal"))
+        );
+    }
+
+    /// A single tool result can be a whole kernel file. Clipping it bought
+    /// little, because the daemon proxies every request and the same result
+    /// already crosses the pipe as part of the history. What it cost was a
+    /// live view that disagreed with the finished one.
+    #[test]
+    fn streamed_log_entries_carry_their_content_whole() {
+        let huge = "x".repeat(4_000_000);
+        let msg = AiMessage {
+            role: crate::ai::AiRole::Tool,
+            content: Some(huge.clone()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let message = live_log_message(&msg);
+        assert_eq!(message.role, crate::ai::AiRole::Tool);
+        assert_eq!(
+            message.content.unwrap_or_default().len(),
+            huge.len(),
+            "the streamed entry must hold what the finished log would hold"
+        );
+    }
+
+    /// The live log must hold what the finished log will hold, so the page's
+    /// redraw at the end changes nothing a reader is looking at. The finished
+    /// log is the history serialised and scrubbed of thought signatures; a
+    /// streamed message read back from the wire must be that message exactly,
+    /// tool-result envelopes and long tool-call arguments included.
+    #[test]
+    fn streamed_messages_are_the_finished_logs_messages() {
+        let call = AiMessage {
+            role: crate::ai::AiRole::Assistant,
+            content: None,
+            thought: Some("thinking".to_string()),
+            thought_signature: Some("opaque".to_string()),
+            tool_calls: Some(vec![crate::ai::ToolCall {
+                id: "c0".to_string(),
+                function_name: "git_show".to_string(),
+                arguments: json!({
+                    "path": "x".repeat(400),
+                    "unset": null,
+                    "nested": [{"thought_signature": "opaque", "y": "z"}],
+                }),
+                thought_signature: Some("opaque".to_string()),
+            }]),
+            tool_call_id: None,
+        };
+        let result = AiMessage {
+            role: crate::ai::AiRole::Tool,
+            content: Some(
+                json!({
+                    "content": "diff --git a/x.c b/x.c\n+\tstrcpy(buf, \"name\");\n",
+                    "truncated": true,
+                })
+                .to_string(),
+            ),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: Some("c0".to_string()),
+        };
+
+        for message in [call, result] {
+            let mut finished = serde_json::to_value(&message).unwrap();
+            crate::ai::scrub_thought_signatures(&mut finished);
+            let finished: AiMessage = serde_json::from_value(finished).unwrap();
+
+            let wire = serde_json::to_string(&live_log_message(&message)).unwrap();
+            let live: AiMessage = serde_json::from_str(&wire).unwrap();
+            assert_eq!(live, finished, "{wire}");
+        }
+    }
+
+    /// Thought signatures are opaque provider state, and the finished log has
+    /// them scrubbed; the live log must not be the one place they show.
+    #[test]
+    fn streamed_messages_carry_no_thought_signature() {
+        let msg = AiMessage {
+            role: crate::ai::AiRole::Assistant,
+            content: Some("x".to_string()),
+            thought: Some("thinking".to_string()),
+            thought_signature: Some("opaque".to_string()),
+            tool_calls: Some(vec![crate::ai::ToolCall {
+                id: "c0".to_string(),
+                function_name: "git_ls".to_string(),
+                arguments: json!({ "path": "." }),
+                thought_signature: Some("opaque".to_string()),
+            }]),
+            tool_call_id: None,
+        };
+        let live = live_log_message(&msg);
+        assert_eq!(live.thought.as_deref(), Some("thinking"));
+        assert_eq!(live.thought_signature, None);
+        assert_eq!(live.tool_calls.unwrap()[0].thought_signature, None);
+        let wire = serde_json::to_string(&live_log_message(&msg)).unwrap();
+        assert!(!wire.contains("opaque"), "{wire}");
     }
 }

@@ -2544,10 +2544,13 @@ async fn handle_review_command(
                     render_progress(&mut s);
                 }
             }
-            // What a turn is waiting on is for the daemon's activity view; the
-            // terminal display counts turns and stages, which these do not move.
+            // What a turn is waiting on is for the daemon's activity view, and
+            // the conversation is for the daemon's live log. The terminal
+            // display counts turns and stages, which these do not move, and it
+            // does not show the conversation.
             ProgressEvent::AiReviewStageTools { .. }
-            | ProgressEvent::AiReviewStageBackoff { .. } => {}
+            | ProgressEvent::AiReviewStageBackoff { .. }
+            | ProgressEvent::AiReviewLogEntry { .. } => {}
             ProgressEvent::AiReviewAttempt {
                 patch_index: _,
                 attempt,

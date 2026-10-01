@@ -166,6 +166,9 @@ type ToolsCallback<'a> = dyn Fn(&[String], usize, usize) + Send + Sync + 'a;
 /// plus the current turn and turn cap.
 type BackoffCallback<'a> = dyn Fn(Option<u64>, usize, usize) + Send + Sync + 'a;
 
+/// Fired with each message as it joins the conversation log.
+type MessageCallback<'a> = dyn Fn(&AiMessage) + Send + Sync + 'a;
+
 /// Orchestrates the execution of an [`LlmSession`].
 pub struct SessionRunner<'a> {
     provider: &'a dyn AiProvider,
@@ -180,6 +183,8 @@ pub struct SessionRunner<'a> {
     /// Called with the backoff duration when the provider asks us to slow down,
     /// and with `None` once the wait is over.
     on_backoff: Option<Box<BackoffCallback<'a>>>,
+    /// Called with every message that joins the logged history, in order.
+    on_message: Option<Box<MessageCallback<'a>>>,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -194,6 +199,7 @@ impl<'a> SessionRunner<'a> {
             on_turn: None,
             on_tools: None,
             on_backoff: None,
+            on_message: None,
         }
     }
 
@@ -250,6 +256,35 @@ impl<'a> SessionRunner<'a> {
         self
     }
 
+    /// Configures a callback fired with each message as it joins the
+    /// conversation log.
+    ///
+    /// The finished log is only stored once the whole review ends, which for a
+    /// long review is hours after the conversation it records. This lets a
+    /// caller stream the same messages while they happen. The callback sees
+    /// exactly what the returned history will hold, in the same order.
+    pub fn with_message_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(&AiMessage) + Send + Sync + 'a,
+    {
+        self.on_message = Some(Box::new(cb));
+        self
+    }
+
+    /// Adds a message to the logged history, reporting it first.
+    ///
+    /// Every push into the log goes through here. A message that reached the
+    /// log without the callback is exactly how the streamed conversation and
+    /// the finished one drifted apart before: the streamed copy skipped the
+    /// initial prompt and the turn-budget prompt, so the two disagreed about
+    /// what the model had been told.
+    fn push_log(&self, log_history: &mut Vec<AiMessage>, msg: AiMessage) {
+        if let Some(ref cb) = self.on_message {
+            cb(&msg);
+        }
+        log_history.push(msg);
+    }
+
     /// Configures a turn callback.
     pub fn with_turn_callback<F>(mut self, cb: F) -> Self
     where
@@ -273,14 +308,18 @@ impl<'a> SessionRunner<'a> {
             tool_call_id: None,
         }];
 
-        let mut log_history = vec![AiMessage {
-            role: AiRole::User,
-            content: Some(session.log_user_prompt()),
-            thought: None,
-            thought_signature: None,
-            tool_calls: None,
-            tool_call_id: None,
-        }];
+        let mut log_history = Vec::new();
+        self.push_log(
+            &mut log_history,
+            AiMessage {
+                role: AiRole::User,
+                content: Some(session.log_user_prompt()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        );
 
         let mut turns: usize = 0;
         let mut validation_attempts = 0;
@@ -340,7 +379,7 @@ impl<'a> SessionRunner<'a> {
                     tool_call_id: None,
                 };
                 history.push(final_prompt.clone());
-                log_history.push(final_prompt);
+                self.push_log(&mut log_history, final_prompt);
             }
 
             let tools = if is_final_turn { None } else { session.tools() };
@@ -421,7 +460,7 @@ impl<'a> SessionRunner<'a> {
                                     tool_call_id: None,
                                 };
                                 history.push(msg.clone());
-                                log_history.push(msg);
+                                self.push_log(&mut log_history, msg);
                                 turns = turns.saturating_sub(1);
                                 continue;
                             }
@@ -477,7 +516,7 @@ impl<'a> SessionRunner<'a> {
                 tool_call_id: None,
             };
             history.push(assistant_msg.clone());
-            log_history.push(assistant_msg);
+            self.push_log(&mut log_history, assistant_msg);
 
             // Handle Tool Calls
             if let Some(tool_calls) = &resp.tool_calls
@@ -527,7 +566,7 @@ impl<'a> SessionRunner<'a> {
                             tool_call_id: Some(call_id),
                         };
                         history.push(tool_msg.clone());
-                        log_history.push(tool_msg);
+                        self.push_log(&mut log_history, tool_msg);
                     }
                     continue; // Loop again to feed tool results back to LLM
                 }
@@ -578,7 +617,7 @@ impl<'a> SessionRunner<'a> {
                         tool_call_id: None,
                     };
                     history.push(msg.clone());
-                    log_history.push(msg);
+                    self.push_log(&mut log_history, msg);
                     turns = turns.saturating_sub(1);
                 }
                 Result::Err(ValidationError::Fatal(err)) => {
@@ -827,5 +866,103 @@ mod tests {
                     .contains("TURN BUDGET EXHAUSTED")
         });
         assert!(exhausted_msg.is_some());
+    }
+
+    /// Logs a prompt that differs from what the model is sent, and rejects its
+    /// first answer, so every kind of logged message turns up once.
+    struct StreamedSession {
+        rejected: bool,
+    }
+
+    #[async_trait]
+    impl LlmSession for StreamedSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "prompt with the whole diff".to_string()
+        }
+
+        fn log_user_prompt(&self) -> String {
+            "prompt as logged".to_string()
+        }
+
+        async fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value> {
+            Ok(serde_json::json!({"content": "file"}))
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            if !self.rejected {
+                self.rejected = true;
+                return Err(ValidationError::FormatViolation("not json".to_string()));
+            }
+            Ok(response.content.clone().unwrap_or_default())
+        }
+    }
+
+    /// The streamed conversation is the finished log, message for message.
+    /// The live view and the finished view drifted apart once because some
+    /// messages reached the log without being streamed.
+    #[tokio::test]
+    async fn every_logged_message_is_streamed_in_order() {
+        let answer = |content: &str| AiResponse {
+            content: Some(content.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            usage: None,
+            truncated: false,
+        };
+        let provider = MockProvider::new(vec![
+            AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "git_grep".to_string(),
+                    arguments: serde_json::json!({"pattern": "x"}),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            },
+            answer("first try"),
+            answer("second try"),
+        ]);
+        let streamed: Mutex<Vec<AiMessage>> = Mutex::new(Vec::new());
+        // Two turns, so the turn-budget prompt is logged as well.
+        let runner = SessionRunner::new(&provider)
+            .with_max_turns(2)
+            .with_message_callback(|m| streamed.lock().unwrap().push(m.clone()));
+
+        let res = runner
+            .run(&mut StreamedSession { rejected: false })
+            .await
+            .unwrap();
+        assert_eq!(res.output, "second try");
+
+        drop(runner);
+        let streamed = streamed.into_inner().unwrap();
+        assert_eq!(streamed, res.history);
+        assert_eq!(
+            streamed[0].content.as_deref(),
+            Some("prompt as logged"),
+            "the stream opens with the logged prompt, as the finished log does"
+        );
+        let roles: Vec<AiRole> = streamed.iter().map(|m| m.role.clone()).collect();
+        assert!(roles.contains(&AiRole::Tool));
+        assert!(streamed.iter().any(|m| {
+            m.content
+                .as_deref()
+                .is_some_and(|c| c.contains("TURN BUDGET EXHAUSTED"))
+        }));
+        assert!(
+            streamed.iter().filter(|m| m.role == AiRole::User).count() >= 3,
+            "the prompt, the budget prompt and the validation feedback"
+        );
     }
 }

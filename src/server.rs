@@ -342,7 +342,10 @@ pub fn build_router(
         // quoted model output removed (`activity::public_reason`) -- and no
         // review text, so they need no capability, embargoed patchsets
         // included. That has to be revisited if live conversation text is ever
-        // added to these payloads.
+        // added to these payloads. The live conversation itself is kept out by
+        // `activity::progress_update`, which discards every `LogEntry`, so it
+        // never reaches the registry these read; it is served as `live_log`
+        // from the review routes above instead.
         .route("/api/activity", get(get_activity))
         .route("/api/patchset/activity", get(get_patchset_activity))
         .route("/api/stats", get(get_stats))
@@ -1068,6 +1071,7 @@ async fn get_patchset(
             )
             .await?;
             redact_embedded_bugs(&state, &principal, &mut details).await?;
+            annotate_review_stages(&state, &mut details);
             Ok(Json(details))
         }
         Ok(None) => {
@@ -1125,6 +1129,11 @@ async fn get_review(
         Ok(Some(mut details)) => {
             enforce_review_embargo(&state, &headers, auth.0.as_ref(), &principal, &details).await?;
             redact_embedded_bugs(&state, &principal, &mut details).await?;
+            crate::activity::annotate_stage_records(
+                &mut details,
+                state.settings.project.kind.unwrap_or_default(),
+            );
+            attach_live_log(&state, &mut details, query.after_seq).await?;
             Ok(Json(details))
         }
         Ok(None) => {
@@ -1178,6 +1187,7 @@ async fn get_patchset_summary(
                 false,
             )
             .await?;
+            annotate_review_stages(&state, &mut details);
             Ok(Json(details))
         }
         Ok(None) => {
@@ -1252,25 +1262,133 @@ async fn get_patchset_activity(
         entries.push(fetch.into());
     }
 
+    // Read whether or not anything is live: it also tells the page when to
+    // stop polling.
+    let status = state
+        .db
+        .get_patchset_status(query.id)
+        .await
+        .map_err(db_error)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let unfinished = UNFINISHED_PATCHSET_STATUSES.contains(&status.as_str());
     let live = !entries.is_empty();
-    if !live {
-        let status = state
+    if !live && unfinished {
+        entries = state
             .db
-            .get_patchset_status(query.id)
+            .get_patchset_activity(query.id)
             .await
-            .map_err(db_error)?
-            .ok_or(StatusCode::NOT_FOUND)?;
-        if UNFINISHED_PATCHSET_STATUSES.contains(&status.as_str()) {
-            entries = state
-                .db
-                .get_patchset_activity(query.id)
-                .await
-                .map_err(db_error)?;
-        }
+            .map_err(db_error)?;
     }
 
     crate::activity::sort_for_display(&mut entries, project);
-    Ok(Json(crate::api::PatchsetActivityResponse { live, entries }))
+    Ok(Json(crate::api::PatchsetActivityResponse {
+        live,
+        entries,
+        finished: !unfinished,
+    }))
+}
+
+/// Gives every review in a patchset payload the stage order and labels the
+/// live entries carry, so recorded and live stage rows sort on one field.
+fn annotate_review_stages(state: &AppState, details: &mut serde_json::Value) {
+    let project = state.settings.project.kind.unwrap_or_default();
+    if let Some(reviews) = details.get_mut("reviews").and_then(|r| r.as_array_mut()) {
+        for review in reviews.iter_mut() {
+            crate::activity::annotate_stage_records(review, project);
+        }
+    }
+}
+
+/// Adds a running review's streamed conversation to its payload as
+/// `live_log`, with `live_log_capped` saying whether streaming stopped at the
+/// cap and `live_log_first_seq` naming the run the entries belong to.
+///
+/// `live_log_first_seq` is the lowest seq stored for the review, whatever
+/// `after_seq` asked for, or null when nothing is stored. A review reset to
+/// Pending by a restart reuses its row and numbers the new run's entries past
+/// the old run's, so this changes when a new run replaces the old one's
+/// entries. A page appending after its cursor would otherwise splice the two
+/// conversations together; it redraws from the start instead.
+///
+/// Only while the review is Pending or In Review and has no final log: once
+/// `logs` is set it is the record, and a review that ended without one has
+/// nothing more coming. Liveness is decided here, once, so the page keeps no
+/// list of statuses: the key's presence is the answer. When present it is
+/// always an array, possibly empty, so a poll can tell "nothing new" from "no
+/// live log".
+///
+/// Access: `live_log` is transcript, the same in kind as `logs`. Of the
+/// transcripts this daemon serves, only bug transcripts are gated so far
+/// (`transcript_bug` refuses the raw bug-transcript routes without global bug
+/// visibility); review transcripts are served by `/api/review`,
+/// `/api/review_log` and `/api/patch` to anyone who can read the review.
+/// `live_log` follows the review-transcript rule: it is served only by
+/// `/api/review` and `/api/review_log`, behind the same extractor as `logs`,
+/// so it is no more exposed than the finished log is. It is deliberately not
+/// added to `/api/patch`, `/api/patchset` or the activity routes. When the
+/// transcript enforcement of DESIGN_PATCHSET_SUBSYSTEM_ACCESS_CONTROL §4.6
+/// lands, `live_log`, `live_log_capped` and `live_log_first_seq` must be
+/// stripped or refused together with `logs`: they belong on its one list of
+/// transcript keys. The design's §5 move of `renderLogView` from
+/// `/api/review` to `/api/review_log` applies to the page's live-log poll
+/// too, which reads `/api/review?id=&after_seq=` today.
+async fn attach_live_log(
+    state: &AppState,
+    details: &mut serde_json::Value,
+    after_seq: Option<i64>,
+) -> Result<(), StatusCode> {
+    let has_final_log = details.get("logs").is_some_and(|l| !l.is_null());
+    let running = details
+        .get("status")
+        .and_then(|s| s.as_str())
+        .and_then(|s| s.parse::<crate::ReviewStatus>().ok())
+        .is_some_and(|s| {
+            matches!(
+                s,
+                crate::ReviewStatus::Pending | crate::ReviewStatus::InReview
+            )
+        });
+    let Some(id) = details.get("id").and_then(|v| v.as_i64()) else {
+        return Ok(());
+    };
+    if has_final_log || !running {
+        return Ok(());
+    }
+    let db_error = |e: anyhow::Error| {
+        info!("Database error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let mut entries = state
+        .db
+        .get_review_log_entries(id, after_seq)
+        .await
+        .map_err(db_error)?;
+    // Labelled here, as activity entries are, because the labels are the
+    // project's and the page keeps no table of them.
+    let project = state.settings.project.kind.unwrap_or_default();
+    for entry in &mut entries {
+        entry.stage_label = entry
+            .stage
+            .as_deref()
+            .and_then(|s| crate::workflows::stage_short_label(project, s))
+            .map(str::to_string);
+    }
+    let span = state.db.review_live_log_span(id).await.map_err(db_error)?;
+    if let Some(obj) = details.as_object_mut() {
+        obj.insert(
+            "live_log".to_string(),
+            serde_json::to_value(entries).map_err(|e| db_error(e.into()))?,
+        );
+        obj.insert(
+            "live_log_capped".to_string(),
+            serde_json::Value::Bool(span.capped),
+        );
+        obj.insert(
+            "live_log_first_seq".to_string(),
+            serde_json::json!(span.first_seq),
+        );
+    }
+    Ok(())
 }
 
 async fn get_review_log(
@@ -1294,6 +1412,11 @@ async fn get_review_log(
         Ok(Some(mut details)) => {
             enforce_review_embargo(&state, &headers, auth.0.as_ref(), &principal, &details).await?;
             redact_embedded_bugs(&state, &principal, &mut details).await?;
+            crate::activity::annotate_stage_records(
+                &mut details,
+                state.settings.project.kind.unwrap_or_default(),
+            );
+            attach_live_log(&state, &mut details, query.after_seq).await?;
             Ok(Json(details))
         }
         Ok(None) => {
@@ -3183,6 +3306,291 @@ mod tests {
         let resp = patchset_activity(addr, id).await;
         assert!(!resp.live);
         assert!(resp.entries.is_empty());
+    }
+
+    /// A patchset with one patch and one review of it, for the review route
+    /// tests. Returns (patchset, patch, review).
+    async fn reviewed(db: &Database, root: &str) -> (i64, i64, i64) {
+        let thread_id = db.create_thread(root, "Subject", 1000).await.unwrap();
+        let msg = format!("{root}_p1");
+        db.create_message(
+            &msg, thread_id, None, "Author", "Subject", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps = db
+            .create_patchset(
+                thread_id, None, root, "Subject", "Author", 1000, 1, 1, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch = db.create_patch(ps, &msg, 1, "diff").await.unwrap();
+        let review = db
+            .create_review(ps, Some(patch), "mock", "mock", None, None)
+            .await
+            .unwrap();
+        (ps, patch, review)
+    }
+
+    async fn get_json(addr: SocketAddr, path: &str) -> serde_json::Value {
+        let resp = reqwest::get(format!("http://{addr}{path}")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        resp.json().await.unwrap()
+    }
+
+    fn message_json(role: &str, content: &str) -> String {
+        serde_json::json!({ "role": role, "content": content }).to_string()
+    }
+
+    /// A running review's conversation is served beside its (absent) final
+    /// log, from both review routes, and only while the review runs.
+    #[tokio::test]
+    async fn test_live_log_is_served_only_while_the_review_runs() {
+        let (addr, db) = serve_activity(crate::activity::ActivityRegistry::new()).await;
+        let (_, _, review) = reviewed(&db, "live").await;
+
+        // Pending with nothing streamed yet: live, and empty rather than absent.
+        let body = get_json(addr, &format!("/api/review?id={review}")).await;
+        assert_eq!(body["live_log"], serde_json::json!([]), "{body}");
+        assert_eq!(body["live_log_capped"], false);
+        assert!(body["live_log_first_seq"].is_null(), "{body}");
+
+        db.update_review_status(review, "In Review", None)
+            .await
+            .unwrap();
+        db.append_review_log_entry(review, 0, None, "system", &message_json("system", "sys"))
+            .await
+            .unwrap();
+        db.append_review_log_entry(review, 1, Some("goal"), "user", &message_json("user", "go"))
+            .await
+            .unwrap();
+
+        let body = get_json(addr, &format!("/api/review?id={review}")).await;
+        let live = body["live_log"].as_array().expect("live_log");
+        assert_eq!(live.len(), 2);
+        assert_eq!(live[1]["role"], "user");
+        assert_eq!(live[1]["content"], "go");
+        assert_eq!(live[1]["seq"], 1);
+        assert_eq!(live[1]["stage"], "goal");
+        assert_eq!(
+            live[1]["stage_label"],
+            serde_json::json!(crate::workflows::stage_short_label(
+                crate::project::ProjectId::default(),
+                "goal"
+            )),
+            "the label comes from the daemon, as for activity entries"
+        );
+        assert!(live[1]["stage_label"].is_string(), "{body}");
+        assert!(live[0]["stage"].is_null());
+        assert!(live[0]["stage_label"].is_null());
+        assert_eq!(body["live_log_first_seq"], 0);
+        assert_eq!(
+            get_json(addr, &format!("/api/review_log?id={review}")).await["live_log"],
+            body["live_log"]
+        );
+
+        // Only the tail after a sequence already held.
+        let tail = get_json(addr, &format!("/api/review?id={review}&after_seq=0")).await;
+        assert_eq!(tail["live_log"].as_array().unwrap().len(), 1);
+        assert_eq!(tail["live_log"][0]["seq"], 1);
+        let none = get_json(addr, &format!("/api/review?id={review}&after_seq=1")).await;
+        assert_eq!(none["live_log"], serde_json::json!([]));
+        assert_eq!(
+            none["live_log_first_seq"], 0,
+            "the run marker does not depend on the cursor"
+        );
+
+        // A rerun of the row clears the old run's entries and continues past
+        // its seqs; the marker moves, so a page holding the old cursor can see
+        // the conversation started over.
+        db.delete_review_log_entries(review).await.unwrap();
+        db.append_review_log_entry(review, 2, None, "system", &message_json("system", "again"))
+            .await
+            .unwrap();
+        let rerun = get_json(addr, &format!("/api/review?id={review}&after_seq=1")).await;
+        assert_eq!(rerun["live_log_first_seq"], 2, "{rerun}");
+        assert_eq!(rerun["live_log"][0]["content"], "again");
+
+        // A review that failed without reaching complete_review keeps its rows
+        // until the startup sweep, but they are no longer served as live.
+        db.update_review_status(review, "Failed", None)
+            .await
+            .unwrap();
+        let body = get_json(addr, &format!("/api/review?id={review}")).await;
+        assert!(body.get("live_log").is_none(), "{body}");
+
+        // The final log landing ends it too, and takes the rows with it.
+        db.update_review_status(review, "In Review", None)
+            .await
+            .unwrap();
+        db.complete_review(review, "Reviewed", "ok", None, None, None, Some("[]"))
+            .await
+            .unwrap();
+        for path in ["/api/review", "/api/review_log"] {
+            let body = get_json(addr, &format!("{path}?id={review}")).await;
+            assert!(body.get("live_log").is_none(), "{body}");
+            assert_eq!(body["logs"], "[]");
+        }
+    }
+
+    /// The live conversation is transcript. It never reaches the activity
+    /// routes, which are public for embargoed patchsets too, nor the patchset
+    /// payloads.
+    #[tokio::test]
+    async fn test_no_conversation_reaches_the_activity_routes() {
+        use crate::activity::{ActivityRegistry, ProgressWire, StageTracker, progress_update};
+
+        let activity = ActivityRegistry::new();
+        let (addr, db) = serve_activity(activity.clone()).await;
+        let (ps, patch, review) = reviewed(&db, "secret").await;
+        db.update_patchset_status(ps, "In Review").await.unwrap();
+        db.update_review_status(review, "In Review", None)
+            .await
+            .unwrap();
+
+        const SECRET: &str = "conversation-text-that-must-stay-put";
+        let message = crate::ai::AiMessage {
+            role: crate::ai::AiRole::Assistant,
+            content: Some(SECRET.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        // What the daemon does with a worker's progress, for a stage start and
+        // for a log entry.
+        let mut tracker = StageTracker::new(activity.clone());
+        for wire in [
+            ProgressWire::StageStarted {
+                stage: "goal".to_string(),
+            },
+            ProgressWire::LogEntry {
+                stage: Some("goal".to_string()),
+                message: message.clone(),
+            },
+        ] {
+            if let Some(update) =
+                progress_update(crate::project::ProjectId::Linux, ps, patch, &wire, 1, 1)
+            {
+                tracker.apply(update);
+            }
+        }
+        db.append_review_log_entry(
+            review,
+            0,
+            Some("goal"),
+            "assistant",
+            &serde_json::to_string(&message).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let activity_body = reqwest::get(format!("http://{addr}/api/patchset/activity?id={ps}"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(activity_body.contains("goal"), "{activity_body}");
+        for path in [
+            format!("/api/patchset/activity?id={ps}"),
+            "/api/activity".to_string(),
+            format!("/api/patchset?id={ps}"),
+            format!("/api/patch?id={ps}"),
+        ] {
+            let body = reqwest::get(format!("http://{addr}{path}"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert!(!body.contains(SECRET), "{path}: {body}");
+            assert!(!body.contains("live_log"), "{path}: {body}");
+        }
+        // Where the finished log is served, the live one is.
+        let body = get_json(addr, &format!("/api/review?id={review}")).await;
+        assert_eq!(body["live_log"][0]["content"], SECRET);
+    }
+
+    /// The page stops polling when the daemon says the patchset is finished,
+    /// rather than keeping a list of statuses of its own.
+    #[tokio::test]
+    async fn test_patchset_activity_says_when_it_is_finished() {
+        let (addr, db) = serve_activity(crate::activity::ActivityRegistry::new()).await;
+        let (ps, _, _) = reviewed(&db, "fin").await;
+        db.update_patchset_status(ps, "In Review").await.unwrap();
+        assert!(!patchset_activity(addr, ps).await.finished);
+        for status in ["Reviewed", "Failed", "Skipped"] {
+            db.update_patchset_status(ps, status).await.unwrap();
+            assert!(patchset_activity(addr, ps).await.finished, "{status}");
+        }
+        db.update_patchset_status(ps, "Pending").await.unwrap();
+        assert!(!patchset_activity(addr, ps).await.finished);
+        // Last: a cancelled patchset never leaves that status.
+        db.update_patchset_status(ps, "Cancelled").await.unwrap();
+        assert!(patchset_activity(addr, ps).await.finished);
+    }
+
+    /// Recorded stage rows carry the order and label live entries carry, from
+    /// every route that serves them.
+    #[tokio::test]
+    async fn test_recorded_stage_rows_carry_order_and_label() {
+        let (addr, db) = serve_activity(crate::activity::ActivityRegistry::new()).await;
+        let (ps, _, review) = reviewed(&db, "rec").await;
+        db.set_review_stage_durations(
+            review,
+            r#"[{"stage":"locking","seconds":5,"turns":1},{"stage":"goal","seconds":9,"turns":2},
+                {"stage":"no-such-stage","seconds":1,"turns":1}]"#,
+        )
+        .await
+        .unwrap();
+        db.set_review_stage_failures(
+            review,
+            r#"[{"stage":"security","reason":"x","cancelled":true}]"#,
+        )
+        .await
+        .unwrap();
+
+        let reviews = |body: serde_json::Value| body["reviews"][0].clone();
+        for (path, r) in [
+            (
+                "review",
+                get_json(addr, &format!("/api/review?id={review}")).await,
+            ),
+            (
+                "review_log",
+                get_json(addr, &format!("/api/review_log?id={review}")).await,
+            ),
+            (
+                "patchset",
+                reviews(get_json(addr, &format!("/api/patchset?id={ps}")).await),
+            ),
+            (
+                "patch",
+                reviews(get_json(addr, &format!("/api/patch?id={ps}")).await),
+            ),
+        ] {
+            let durations = r["stage_durations"].as_array().expect(path);
+            let goal = durations.iter().find(|d| d["stage"] == "goal").expect(path);
+            let locking = durations
+                .iter()
+                .find(|d| d["stage"] == "locking")
+                .expect(path);
+            assert_eq!(goal["stage_label"], "Goal Analysis", "{path}");
+            assert!(
+                goal["order"].as_u64() < locking["order"].as_u64(),
+                "{path}: {r}"
+            );
+            let unknown = durations
+                .iter()
+                .find(|d| d["stage"] == "no-such-stage")
+                .expect(path);
+            assert!(unknown["order"].is_null(), "{path}");
+            assert!(unknown["stage_label"].is_null(), "{path}");
+            assert!(r["stage_failures"][0]["order"].is_u64(), "{path}");
+        }
     }
 
     #[tokio::test]
@@ -5913,6 +6321,7 @@ F:	*
             Query(ReviewQuery {
                 id: Some(review_id),
                 patchset_id: None,
+                after_seq: None,
             }),
         )
         .await
@@ -6096,6 +6505,7 @@ F:	*
                 Query(ReviewQuery {
                     id: Some(review_id),
                     patchset_id: None,
+                    after_seq: None,
                 }),
             )
             .await

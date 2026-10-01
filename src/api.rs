@@ -49,6 +49,37 @@ pub struct PatchQuery {
 pub struct ReviewQuery {
     pub id: Option<i64>,
     pub patchset_id: Option<i64>,
+    /// Only return live log entries after this sequence number, so a poll on
+    /// a long review does not refetch the whole conversation.
+    pub after_seq: Option<i64>,
+}
+
+/// One message of a running review's conversation, as `live_log` serves it.
+///
+/// A superset of a finished-log entry: the message's own fields, flattened,
+/// plus where it sits. One renderer therefore draws both logs, and fields it
+/// does not know about are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveLogEntry {
+    /// Position in the review's conversation. It only grows for one review
+    /// row: a rerun of the row continues past the last run's seqs, so a page
+    /// holding a cursor from one run cannot mistake another run's entries
+    /// for what follows it.
+    pub seq: i64,
+    /// The stage the message belongs to, by name; `None` for the system
+    /// message. Stages run concurrently, so the stream interleaves what the
+    /// finished log groups by stage, and the page marks each live entry with
+    /// its stage so a reader can tell the conversations apart.
+    pub stage: Option<String>,
+    /// The project's short label for `stage`, set by the daemon as it is for
+    /// activity entries; `None` for an unknown stage or no stage. The page
+    /// shows it in place of the name when present.
+    #[serde(default)]
+    pub stage_label: Option<String>,
+    /// Unix time the daemon stored it.
+    pub created_at: i64,
+    #[serde(flatten)]
+    pub message: crate::ai::AiMessage,
 }
 
 #[derive(Deserialize)]
@@ -384,6 +415,12 @@ pub struct PatchsetActivityResponse {
     /// restart, rather than work running now.
     pub live: bool,
     pub entries: Vec<ActivityEntry>,
+    /// True once the patchset has reached a state it will not leave by
+    /// itself, so there is nothing left to poll for. Decided by the daemon,
+    /// which knows the full set of statuses, so a client keeps no list of its
+    /// own. Defaulted so a client can still read an older daemon's answer.
+    #[serde(default)]
+    pub finished: bool,
 }
 
 /// Query for `/api/patchset/activity`.
@@ -417,5 +454,35 @@ mod tests {
         assert_eq!(resp.entries[0].phase, None);
         assert_eq!(resp.entries[0].description, "doing something new");
         assert_eq!(resp.entries[1].phase, Some(crate::activity::Phase::Queued));
+        // An older daemon sends no `finished`; it reads as still running.
+        assert!(!resp.finished);
+    }
+
+    /// The live log entry is the finished-log message with its position added,
+    /// so the page renders both with the same code.
+    #[test]
+    fn test_a_live_log_entry_is_a_message_with_its_position() {
+        let entry = LiveLogEntry {
+            seq: 3,
+            stage: Some("goal".to_string()),
+            stage_label: Some("Goal".to_string()),
+            created_at: 100,
+            message: crate::ai::AiMessage {
+                role: crate::ai::AiRole::Tool,
+                content: Some("out".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: Some("c0".to_string()),
+            },
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["role"], "tool");
+        assert_eq!(value["content"], "out");
+        assert_eq!(value["tool_call_id"], "c0");
+        assert_eq!(value["seq"], 3);
+        assert_eq!(value["stage"], "goal");
+        let back: LiveLogEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(back, entry);
     }
 }

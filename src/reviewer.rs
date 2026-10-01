@@ -283,6 +283,20 @@ impl Reviewer {
             }
         }
 
+        // After the reset, so the streamed conversation of a review that was
+        // interrupted is judged by the status it now has. Those reviews are
+        // Pending again and keep their rows until they restart, which clears
+        // them; everything else is left over from a review that ended without
+        // reaching complete_review.
+        match self.db.sweep_orphan_review_log_entries().await {
+            Ok(count) => {
+                if count > 0 {
+                    info!("Swept {} streamed log entries of finished reviews", count);
+                }
+            }
+            Err(e) => error!("Failed to sweep streamed review log entries: {}", e),
+        }
+
         loop {
             match self.process_pending_patchsets().await {
                 Ok(_) => {}
@@ -2830,6 +2844,32 @@ async fn run_review_tool_with_cmd(
     // Outside the interaction block so its timings outlive it.
     let mut stages = crate::activity::StageTracker::new(activity.clone());
 
+    // The conversation starts over with this worker, and so does its live log.
+    // A review reset to Pending by a restart reuses its row, so the old run's
+    // entries are cleared and this run numbers its own from past the last seq
+    // the old run used rather than from 0. A log page left open across the
+    // restart holds the old run's entries and asks only for what follows the
+    // last of them; restarting at 0 would hide the new run's first entries
+    // behind that cursor and splice the rest onto the old conversation. A seq
+    // that only grows lets the page see the run change, through the first
+    // stored seq it is served, and draw the new conversation from the start.
+    let mut log_seq: i64 = match db.review_live_log_span(review_id).await {
+        Ok(span) => span.next_seq,
+        Err(e) => {
+            warn!(
+                "Failed to read the streamed log of review {}: {}",
+                review_id, e
+            );
+            0
+        }
+    };
+    if let Err(e) = db.delete_review_log_entries(review_id).await {
+        warn!(
+            "Failed to clear the streamed log of review {}: {}",
+            review_id, e
+        );
+    }
+
     let mut spawned_tasks = Vec::new();
     let interaction_result =
         async {
@@ -3137,6 +3177,39 @@ async fn run_review_tool_with_cmd(
                                     // never disturbs the review.
                                     crate::activity::PROGRESS_MESSAGE => {
                                         match crate::activity::parse_progress(&json_msg) {
+                                            // One message of the conversation,
+                                            // for the review's live log. Never
+                                            // activity: it does not reach the
+                                            // stage tracker or the registry.
+                                            // Awaited inline so entries are
+                                            // stored in the order they came.
+                                            Some((idx, crate::activity::ProgressWire::LogEntry { stage, message }))
+                                                if Some(idx) == review_index =>
+                                            {
+                                                let stored = match (
+                                                    serde_json::to_string(&message),
+                                                    serde_json::to_value(&message.role),
+                                                ) {
+                                                    (Ok(text), Ok(serde_json::Value::String(role))) => {
+                                                        db.append_review_log_entry(
+                                                            review_id,
+                                                            log_seq,
+                                                            stage.as_deref(),
+                                                            &role,
+                                                            &text,
+                                                        )
+                                                        .await
+                                                    }
+                                                    _ => Err(anyhow::anyhow!("message does not serialise")),
+                                                };
+                                                if let Err(e) = stored {
+                                                    tracing::debug!(
+                                                        "Failed to store live log entry {} of review {}: {}",
+                                                        log_seq, review_id, e
+                                                    );
+                                                }
+                                                log_seq += 1;
+                                            }
                                             Some((idx, wire)) if Some(idx) == review_index => {
                                                 if let Some(update) = crate::activity::progress_update(
                                                     project,
@@ -4204,6 +4277,19 @@ mod tests {
         timeout_seconds: u64,
         activity: Arc<crate::activity::ActivityRegistry>,
     ) -> Result<MockRun> {
+        run_review_tool_mock_after(mock_script, provider, timeout_seconds, activity, None).await
+    }
+
+    /// As [`run_review_tool_mock_reporting`], with `stale_log` already stored
+    /// as the review's streamed entry 0, as an earlier run of the same review
+    /// row would have left it.
+    async fn run_review_tool_mock_after(
+        mock_script: &str,
+        provider: Arc<dyn AiProvider>,
+        timeout_seconds: u64,
+        activity: Arc<crate::activity::ActivityRegistry>,
+        stale_log: Option<&str>,
+    ) -> Result<MockRun> {
         let temp_dir = tempdir()?;
         let bin_path = temp_dir.path().join("mock_review");
 
@@ -4245,6 +4331,11 @@ mod tests {
         let review_id = db
             .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
             .await?;
+        if let Some(content) = stale_log {
+            let message = json!({"role": "user", "content": content}).to_string();
+            db.append_review_log_entry(review_id, 0, None, "user", &message)
+                .await?;
+        }
 
         let result = run_review_tool_with_cmd(
             Command::new(&bin_path),
@@ -4381,6 +4472,119 @@ mod tests {
         assert_eq!(
             review["stage_durations"],
             json!([{"stage": "goal", "seconds": 0, "turns": 2}])
+        );
+        Ok(())
+    }
+
+    /// The worker's conversation reaches the review's live log, in order,
+    /// with each stage stored as its name -- and never the activity registry.
+    #[tokio::test]
+    async fn test_worker_log_entries_reach_the_live_log_and_nothing_else() -> Result<()> {
+        use crate::activity::{ActivityRegistry, ProgressWire};
+        use crate::ai::{AiMessage, AiRole, ToolCall};
+
+        let message = |role: AiRole, content: &str| AiMessage {
+            role,
+            content: Some(content.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        let mut call = message(AiRole::Assistant, "looking");
+        call.tool_calls = Some(vec![ToolCall {
+            id: "c0".to_string(),
+            function_name: "git_grep".to_string(),
+            arguments: json!({"pattern": "spin_lock"}),
+            thought_signature: None,
+        }]);
+        let lines = vec![
+            progress(
+                1,
+                ProgressWire::LogEntry {
+                    stage: None,
+                    message: message(AiRole::System, "system prompt"),
+                },
+            ),
+            progress(
+                1,
+                ProgressWire::LogEntry {
+                    stage: Some("planning".to_string()),
+                    message: message(AiRole::User, "plan this"),
+                },
+            ),
+            // Another patch's conversation is not this review's.
+            progress(
+                2,
+                ProgressWire::LogEntry {
+                    stage: Some("goal".to_string()),
+                    message: message(AiRole::User, "other patch"),
+                },
+            ),
+            progress(
+                1,
+                ProgressWire::LogEntry {
+                    stage: Some("goal".to_string()),
+                    message: call.clone(),
+                },
+            ),
+            // A numbered stage is not a stage; the line is dropped.
+            r#"{"type":"progress","patch_index":1,"payload":{"kind":"log_entry","stage":3,"message":{"role":"user","content":"numbered"}}}"#
+                .to_string(),
+        ];
+        let activity = ActivityRegistry::new();
+        let run = run_review_tool_mock_after(
+            &worker_printing(&lines),
+            Arc::new(MockProvider),
+            30,
+            activity.clone(),
+            Some("left by an earlier run"),
+        )
+        .await?;
+        run.result.expect("the review completes");
+
+        let entries = run.db.get_review_log_entries(run.review_id, None).await?;
+        let seen: Vec<(i64, Option<&str>, Option<&str>)> = entries
+            .iter()
+            .map(|e| (e.seq, e.stage.as_deref(), e.message.content.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (1, None, Some("system prompt")),
+                (2, Some("planning"), Some("plan this")),
+                (3, Some("goal"), Some("looking")),
+            ],
+            "the earlier run's entry is gone and this run starts past its seq"
+        );
+        assert_eq!(entries[2].message, call, "the message is stored whole");
+        assert_eq!(entries[0].message.role, AiRole::System);
+
+        let mut rows = run
+            .db
+            .conn
+            .query(
+                "SELECT DISTINCT typeof(stage), role FROM review_log_entries
+                 WHERE stage IS NOT NULL ORDER BY role",
+                (),
+            )
+            .await?;
+        let mut kinds = Vec::new();
+        while let Some(row) = rows.next().await? {
+            kinds.push((row.get::<String>(0)?, row.get::<String>(1)?));
+        }
+        assert_eq!(
+            kinds,
+            [
+                ("text".to_string(), "assistant".to_string()),
+                ("text".to_string(), "user".to_string())
+            ],
+            "stages are names and roles are serde's lowercase strings"
+        );
+
+        assert!(
+            activity.patchset_snapshot(run.patchset_id).is_empty(),
+            "conversation is never activity"
         );
         Ok(())
     }
