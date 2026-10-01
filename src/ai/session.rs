@@ -158,6 +158,33 @@ pub trait LlmSession: Send {
     }
 }
 
+/// Why the runner is forcing a tool-less verdict.
+///
+/// Once set it stays set for the rest of the session, because a retry that
+/// gives back its turn re-enters the final turn. Recomputing it from the turn
+/// counter pushed the budget prompt again on every such retry, so the model
+/// saw the same instruction stacked up once per rejected answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalTurn {
+    /// The session used up `max_turns`.
+    TurnBudget,
+}
+
+/// Sent once when a multi-turn session reaches its last turn.
+const TURN_BUDGET_PROMPT: &str = "TURN BUDGET EXHAUSTED: You have reached the maximum allowed investigation turns. Do NOT call any tools. Synthesize your final JSON verdict now based on the evidence gathered so far.";
+
+impl FinalTurn {
+    /// The message that announces this final turn, if any.
+    ///
+    /// A single-turn session is asked its one question without tools from the
+    /// start, so telling it that its budget ran out would only confuse it.
+    fn prompt(self, max_turns: usize) -> Option<&'static str> {
+        match self {
+            Self::TurnBudget => (max_turns > 1).then_some(TURN_BUDGET_PROMPT),
+        }
+    }
+}
+
 /// Fired around tool execution with the tool names, current turn, and turn cap.
 /// An empty name slice signals the tools finished.
 type ToolsCallback<'a> = dyn Fn(&[String], usize, usize) + Send + Sync + 'a;
@@ -285,6 +312,31 @@ impl<'a> SessionRunner<'a> {
         log_history.push(msg);
     }
 
+    /// Tells the model, in both histories, that it is on its final turn.
+    ///
+    /// The caller invokes this only when the session first enters its final
+    /// turn, so the prompt appears once however many retries follow.
+    fn announce_final_turn(
+        &self,
+        final_turn: FinalTurn,
+        history: &mut Vec<AiMessage>,
+        log_history: &mut Vec<AiMessage>,
+    ) {
+        let Some(prompt) = final_turn.prompt(self.max_turns) else {
+            return;
+        };
+        let msg = AiMessage {
+            role: AiRole::User,
+            content: Some(prompt.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: None,
+        };
+        history.push(msg.clone());
+        self.push_log(log_history, msg);
+    }
+
     /// Configures a turn callback.
     pub fn with_turn_callback<F>(mut self, cb: F) -> Self
     where
@@ -331,6 +383,7 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
+        let mut final_turn: Option<FinalTurn> = None;
 
         let make_failure = |message: String,
                             history: Vec<AiMessage>,
@@ -365,22 +418,11 @@ impl<'a> SessionRunner<'a> {
                 cb(turns, self.max_turns);
             }
 
-            let is_final_turn = turns == self.max_turns;
-            if is_final_turn && turns > 1 {
-                let final_prompt = AiMessage {
-                    role: AiRole::User,
-                    content: Some(
-                        "TURN BUDGET EXHAUSTED: You have reached the maximum allowed investigation turns. Do NOT call any tools. Synthesize your final JSON verdict now based on the evidence gathered so far."
-                            .to_string(),
-                    ),
-                    thought: None,
-                    thought_signature: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                };
-                history.push(final_prompt.clone());
-                self.push_log(&mut log_history, final_prompt);
+            if final_turn.is_none() && turns == self.max_turns {
+                final_turn = Some(FinalTurn::TurnBudget);
+                self.announce_final_turn(FinalTurn::TurnBudget, &mut history, &mut log_history);
             }
+            let is_final_turn = final_turn.is_some();
 
             let tools = if is_final_turn { None } else { session.tools() };
 
@@ -964,5 +1006,171 @@ mod tests {
             streamed.iter().filter(|m| m.role == AiRole::User).count() >= 3,
             "the prompt, the budget prompt and the validation feedback"
         );
+    }
+
+    /// Answers from a script and keeps every request it was sent.
+    struct RecordingProvider {
+        responses: Mutex<VecDeque<AiResponse>>,
+        requests: Mutex<Vec<AiRequest>>,
+    }
+
+    impl RecordingProvider {
+        fn new(responses: Vec<AiResponse>) -> Self {
+            Self {
+                responses: Mutex::new(responses.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<AiRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AiProvider for RecordingProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            self.requests.lock().unwrap().push(request);
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("No more mock responses"))
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 4096,
+            }
+        }
+    }
+
+    /// Offers one tool and rejects its first `rejections` answers.
+    struct RejectingToolSession {
+        rejections: usize,
+    }
+
+    #[async_trait]
+    impl LlmSession for RejectingToolSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "initial prompt".to_string()
+        }
+
+        fn tools(&self) -> Option<Vec<AiTool>> {
+            Some(vec![AiTool {
+                name: "git_grep".to_string(),
+                description: "search".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }])
+        }
+
+        async fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value> {
+            Ok(serde_json::json!({"content": "file"}))
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            if self.rejections > 0 {
+                self.rejections -= 1;
+                return Err(ValidationError::FormatViolation("not json".to_string()));
+            }
+            Ok(response.content.clone().unwrap_or_default())
+        }
+    }
+
+    fn text_answer(content: &str) -> AiResponse {
+        AiResponse {
+            content: Some(content.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            usage: None,
+            truncated: false,
+        }
+    }
+
+    fn tool_answer(id: &str) -> AiResponse {
+        AiResponse {
+            content: None,
+            thought: None,
+            thought_signature: None,
+            tool_calls: Some(vec![ToolCall {
+                id: id.to_string(),
+                function_name: "git_grep".to_string(),
+                arguments: serde_json::json!({"pattern": "x"}),
+                thought_signature: None,
+            }]),
+            usage: None,
+            truncated: false,
+        }
+    }
+
+    fn budget_prompts(messages: &[AiMessage]) -> usize {
+        messages
+            .iter()
+            .filter(|m| m.content.as_deref() == Some(TURN_BUDGET_PROMPT))
+            .count()
+    }
+
+    /// A rejected answer on the final turn gives the turn back, which used to
+    /// re-enter the final-turn block and push the budget prompt once more for
+    /// every rejection.
+    #[tokio::test]
+    async fn a_validation_retry_on_the_final_turn_pushes_the_budget_prompt_once() {
+        let provider = RecordingProvider::new(vec![
+            tool_answer("call_1"),
+            text_answer("first try"),
+            text_answer("second try"),
+            text_answer("third try"),
+        ]);
+        let runner = SessionRunner::new(&provider).with_max_turns(2);
+
+        let res = runner
+            .run(&mut RejectingToolSession { rejections: 2 })
+            .await
+            .unwrap();
+        assert_eq!(res.output, "third try");
+        assert_eq!(budget_prompts(&res.history), 1);
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].tools.is_some(), "turn 1 may still call tools");
+        for (i, req) in requests.iter().enumerate().skip(1) {
+            assert!(req.tools.is_none(), "final-turn request {i} offered tools");
+            assert_eq!(
+                budget_prompts(&req.messages),
+                1,
+                "final-turn request {i} must carry the budget prompt exactly once"
+            );
+        }
+    }
+
+    /// A single-turn stage is asked its one question without tools, and is
+    /// never told that a budget it never had has run out.
+    #[tokio::test]
+    async fn a_single_turn_session_gets_no_tools_and_no_budget_prompt() {
+        let provider =
+            RecordingProvider::new(vec![text_answer("rejected"), text_answer("verdict")]);
+        let runner = SessionRunner::new(&provider).with_max_turns(1);
+
+        let res = runner
+            .run(&mut RejectingToolSession { rejections: 1 })
+            .await
+            .unwrap();
+        assert_eq!(res.output, "verdict");
+        assert_eq!(budget_prompts(&res.history), 0);
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        for req in &requests {
+            assert!(req.tools.is_none());
+            assert_eq!(budget_prompts(&req.messages), 0);
+        }
     }
 }

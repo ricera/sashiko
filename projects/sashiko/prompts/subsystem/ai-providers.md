@@ -163,20 +163,28 @@ asymmetry that already exists: validation uses `>=` and the other two use
 `>`, so `max_validation_attempts: 3` permits two feedback retries and the
 others permit their full count.
 
-**Invariant: the final turn is tool-free.** `is_final_turn = turns == max_turns`.
-On it, `tools` is forced to `None` and a `"TURN BUDGET EXHAUSTED: ... Do
-NOT call any tools. Synthesize your final JSON verdict now"` user message
-is appended — but only `if is_final_turn && turns > 1`, so a stage
-configured with `max_turns: 1` gets tools disabled and no explanation.
-If the model emits tool calls anyway they are logged and *ignored*, and
-the response falls through to `validate`. This came from `a15f6cd9e318`;
-before it, hitting max turns was a hard failure. The test is
-`test_session_runner_forces_synthesis_on_max_turns`.
+**Invariant: the final turn is tool-free and sticky.** `final_turn:
+Option<FinalTurn>` is set to `Some(FinalTurn::TurnBudget)` the first time
+`turns == max_turns` and is never cleared for the rest of the session. From
+then on every request, including every validation, transient and
+recitation retry, has `tools` forced to `None`. At the moment `final_turn`
+is first set, `announce_final_turn` appends `TURN_BUDGET_PROMPT` (`"TURN
+BUDGET EXHAUSTED: ... Do NOT call any tools. Synthesize your final JSON
+verdict now"`) to both `history` and `log_history`, but only when
+`FinalTurn::prompt` returns it, i.e. when `max_turns > 1`. A stage
+configured with `max_turns: 1` therefore gets tools disabled and no
+explanation. If the model emits tool calls anyway they are logged and
+*ignored*, and the response falls through to `validate`. This came from
+`a15f6cd9e318`; before it, hitting max turns was a hard failure. The tests
+are `test_session_runner_forces_synthesis_on_max_turns`,
+`a_validation_retry_on_the_final_turn_pushes_the_budget_prompt_once` and
+`a_single_turn_session_gets_no_tools_and_no_budget_prompt`.
 
-A second-order effect worth checking when a diff changes the validation
-path: a validation failure on the final turn decrements `turns`, so the
-next iteration is *also* the final turn and appends a *second* turn-budget
-message. Bounded by `max_validation_attempts`, but the history grows.
+Because every retry gives its turn back, a retry on the final turn
+re-enters it. The prompt must still appear exactly once: a diff that
+recomputes the final-turn state from the turn counter on each pass, or
+that clears `final_turn`, brings back the old bug where each rejected
+answer stacked another copy of the budget prompt into the history.
 
 **Invariant: `truncated` is checked before usage is accumulated.** The
 `bail!` on `resp.truncated` happens above the `total_prompt_tokens +=`

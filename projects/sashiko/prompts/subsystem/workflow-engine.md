@@ -253,11 +253,17 @@ Counters and their exact semantics:
 
 - `turns += 1` at the top of each iteration; `turns > max_turns` bails with
   "Session exceeded max turns limit".
-- `is_final_turn = turns == max_turns`. On the final turn (and only when
-  `turns > 1`) a "TURN BUDGET EXHAUSTED" user message is appended and
-  `tools` is forced to `None` for that request, **overriding `ToolScope`**.
-  If the model emits tool calls anyway they are logged and ignored, and the
-  response goes straight to `validate`.
+- `final_turn: Option<FinalTurn>` is set to `Some(FinalTurn::TurnBudget)`
+  the first time `turns == max_turns` and is never cleared. From then on
+  every request, including every retry, goes out with `tools` forced to
+  `None`, **overriding `ToolScope`**. If the model emits tool calls anyway
+  they are logged and ignored, and the response goes straight to
+  `validate`.
+- The "TURN BUDGET EXHAUSTED" user message (`TURN_BUDGET_PROMPT`) is
+  pushed once, by `announce_final_turn`, at the moment `final_turn` is
+  first set, and only when `max_turns > 1` (`FinalTurn::prompt`). Retries
+  that give their turn back re-enter the final turn but do not push it
+  again.
 - Transient / rate-limit errors sleep and then do
   `turns = turns.saturating_sub(1)` — they do not consume the turn budget.
 - A recitation retry (`ErrorAction::RetryWithFeedback`) also does
@@ -383,9 +389,9 @@ match a `LlmTool::name()` registered on the `ToolBox`, and there is no test
 that will tell you otherwise — ask for one.
 
 **Check in a diff:** granting tools (`ToolScope::All`) to a stage that also
-has `max_turns: 1`. `is_final_turn` is true on turn 1 when `max_turns == 1`,
-but the "TURN BUDGET EXHAUSTED" message is only injected when `turns > 1`, so
-the model gets no tools and no explanation of why.
+has `max_turns: 1`. `final_turn` is set on turn 1 when `max_turns == 1`,
+but `FinalTurn::prompt` returns the "TURN BUDGET EXHAUSTED" message only when
+`max_turns > 1`, so the model gets no tools and no explanation of why.
 
 ## 8. `PromptTemplate`: the Template/Included boundary is a security boundary
 
