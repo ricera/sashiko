@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::ReviewStatus;
+use crate::ai::backoff_provider::{ReviewDeadline, ReviewTimedOut};
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, RemoteAiErrorPayload, classify_ai_error,
@@ -2855,12 +2856,13 @@ async fn run_review_tool_with_cmd(
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
-    use tokio::time::Instant as TokioInstant;
     use tokio::time::{timeout, timeout_at};
 
-    // Perform interaction with timeout
-    let deadline = Arc::new(std::sync::Mutex::new(
-        TokioInstant::now() + Duration::from_secs(settings.review.timeout_seconds),
+    // Perform interaction with timeout. There is no salvage window yet, so
+    // the worker is stopped at the soft limit, which is also the hard one.
+    let deadline = Arc::new(ReviewDeadline::new(
+        Duration::from_secs(settings.review.timeout_seconds),
+        Duration::ZERO,
     ));
 
     // Retry rate-limited and transient failures with the shared limiter rather
@@ -2933,10 +2935,9 @@ async fn run_review_tool_with_cmd(
             cancel_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
-                let current_deadline = {
-                    let d = deadline.lock().unwrap();
-                    *d
-                };
+                // Read on every pass, because a credited quota-gate wait
+                // moves it later while the loop runs.
+                let current_deadline = deadline.soft();
 
                 tokio::select! {
                     Some(err) = abort_rx.recv() => {
@@ -2957,9 +2958,7 @@ async fn run_review_tool_with_cmd(
                         let line_result = match line_res {
                             Ok(res) => res,
                             Err(_) => {
-                                return Err(anyhow::anyhow!(
-                                    "Review tool timed out (active time exceeded)"
-                                ));
+                                return Err(deadline.timed_out().into());
                             }
                         };
 
@@ -3334,10 +3333,8 @@ async fn run_review_tool_with_cmd(
     drop(stdin_writer);
 
     let timed_out = match &interaction_result {
-        Err(e) => e
-            .to_string()
-            .contains("Review tool timed out (active time exceeded)"),
-        Ok(_) => false,
+        Err(e) => e.downcast_ref::<ReviewTimedOut>().copied(),
+        Ok(_) => None,
     };
     let cancelled = match &interaction_result {
         Err(e) => e
@@ -3346,10 +3343,10 @@ async fn run_review_tool_with_cmd(
         Ok(_) => false,
     };
 
-    if timed_out {
+    if let Some(timed_out) = timed_out {
         error!(
             "Review tool timed out after {} active seconds. Killing process.",
-            settings.review.timeout_seconds
+            timed_out.active_seconds
         );
         let _ = child.start_kill();
         let _ = timeout(Duration::from_secs(5), child.wait()).await;
@@ -4811,7 +4808,7 @@ mod tests {
         let (result, db, review_id) =
             run_review_tool_mock(&mock_script, Arc::new(MockProvider), 1).await?;
         let err = result.expect_err("the review must time out");
-        assert!(err.to_string().contains("timed out"), "{err}");
+        assert!(err.downcast_ref::<ReviewTimedOut>().is_some(), "{err}");
 
         let review = db.get_review_details(review_id).await?.unwrap();
         let refs = &review["reference_repos"];
@@ -5124,9 +5121,17 @@ sleep 30
         )
         .await;
 
-        assert!(
-            completed.is_ok(),
-            "run_review_tool should kill/reap a timed-out child promptly"
+        let result =
+            completed.expect("run_review_tool should kill/reap a timed-out child promptly");
+        // The daemon tells a timeout from other failures by its type alone.
+        let err = result.expect_err("the stuck child must time out");
+        assert_eq!(
+            err.downcast_ref::<ReviewTimedOut>(),
+            Some(&ReviewTimedOut {
+                active_seconds: 1,
+                salvage_seconds: 0,
+            }),
+            "{err}"
         );
         Ok(())
     }
