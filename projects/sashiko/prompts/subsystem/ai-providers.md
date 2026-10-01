@@ -36,11 +36,12 @@ fn cache_identity(&self) -> String { self.get_capabilities().model_name }
 ### `AiResponse` field by field — what each consumer does with it
 
 - **`truncated`** — the single most load-bearing field. `SessionRunner::run`
-  bails the whole session the moment it sees `resp.truncated`:
-  `anyhow::bail!("LLM output was truncated by provider ...")`. If a new
-  provider leaves this `false` when the model hit its output cap, the
-  session accepts a half-written JSON verdict and hands it to
-  validation, which either fails opaquely or — worse — parses. The three
+  discards a response with `resp.truncated` set and asks the model again
+  with feedback, a bounded number of times per turn, before failing the
+  stage (see `retry_truncated`). If a new provider leaves this `false`
+  when the model hit its output cap, the session accepts a half-written
+  JSON verdict and hands it to validation, which either fails opaquely
+  or — worse — parses. The three
   HTTP providers derive it from the provider's own stop signal:
   `gemini::translate_ai_response` from `finish_reason == "MAX_TOKENS"`,
   `claude::translate_ai_response` from `stop_reason == "max_tokens"`,

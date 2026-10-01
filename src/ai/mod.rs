@@ -330,6 +330,55 @@ pub(crate) fn truncation_remedy(answer_chars: usize, tool_arg_chars: usize) -> &
     }
 }
 
+/// A response the provider cut off at its output limit.
+///
+/// The request succeeded, so no provider returns this. `SessionRunner` builds
+/// it from the truncated response it received, because only the session can
+/// recover: the remedy is to ask the model for less, which changes the
+/// request. It carries the counts of the log line in `truncation_warning`, so
+/// the recovery decides from them rather than from text, and its message ends
+/// with the same remedy that line gives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "LLM output was truncated by provider (e.g. hit max tokens) after {answer_chars} chars \
+     of answer and {tool_arg_chars} chars of tool arguments.{}",
+    truncation_remedy(*.answer_chars, *.tool_arg_chars)
+)]
+pub struct OutputTruncated {
+    /// Characters of answer text written before the cut.
+    pub answer_chars: usize,
+    /// Characters of tool-call arguments written before the cut.
+    pub tool_arg_chars: usize,
+}
+
+impl OutputTruncated {
+    /// Measures what a truncated response wrote.
+    ///
+    /// Thinking is not counted, for the reason given on `truncation_remedy`.
+    pub fn from_response(response: &AiResponse) -> Self {
+        Self {
+            answer_chars: response
+                .content
+                .as_deref()
+                .map_or(0, |answer| answer.chars().count()),
+            tool_arg_chars: tool_argument_chars(response.tool_calls.as_deref().unwrap_or_default()),
+        }
+    }
+
+    /// Nothing visible was written: the budget went on reasoning.
+    pub fn spent_on_reasoning(&self) -> bool {
+        self.answer_chars == 0 && self.tool_arg_chars == 0
+    }
+}
+
+impl ClassifyAiError for OutputTruncated {
+    /// Resending the same request cannot help, because the limit has not
+    /// moved. Recovery changes the request instead (see `SessionRunner`).
+    fn ai_error_class(&self) -> AiErrorClass {
+        AiErrorClass::Fatal
+    }
+}
+
 /// Classifies a remote AI error using the typed stdio protocol payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "snake_case")]
@@ -444,6 +493,9 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<crate::worker::prompts::ReviewError>() {
+        return e.ai_error_class();
+    }
+    if let Some(e) = error.downcast_ref::<OutputTruncated>() {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<ollama::OllamaError>() {
@@ -1208,6 +1260,46 @@ mod tests {
             "",
             "a half-written tool call is still the answer having started"
         );
+    }
+
+    /// The error a session raises for a cut-off answer measures what was
+    /// written, ignores thinking, and ends with the same remedy as the log
+    /// line, so the two never disagree about what to change.
+    #[test]
+    fn output_truncated_measures_what_was_written() {
+        let response = AiResponse {
+            content: Some("héllo".to_string()),
+            thought: Some("long hidden reasoning".to_string()),
+            thought_signature: None,
+            tool_calls: Some(vec![read_files_call("a", json!({"q": 1}))]),
+            usage: None,
+            truncated: true,
+        };
+        let cut = OutputTruncated::from_response(&response);
+        assert_eq!(
+            cut,
+            OutputTruncated {
+                answer_chars: 5,
+                tool_arg_chars: 7,
+            }
+        );
+        assert!(!cut.spent_on_reasoning());
+        assert!(cut.to_string().ends_with("7 chars of tool arguments."));
+
+        let nothing = OutputTruncated::from_response(&AiResponse {
+            content: None,
+            tool_calls: None,
+            ..response
+        });
+        assert!(nothing.spent_on_reasoning());
+        assert!(
+            nothing.to_string().ends_with(truncation_remedy(0, 0)),
+            "{nothing}"
+        );
+        assert!(matches!(
+            classify_ai_error(&anyhow::Error::new(nothing)),
+            AiErrorClass::Fatal
+        ));
     }
 
     fn read_files_call(id: &str, arguments: serde_json::Value) -> ToolCall {

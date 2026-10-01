@@ -514,9 +514,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_retry_after_a_truncated_answer_reaches_the_model() {
-        // The runner gives up on a truncated answer before validating it.
-        // The answer was still a successful API response, so it is cached,
-        // and a retry must not be handed it again.
+        // The runner asks again after a truncated answer, up to the provider
+        // error retry limit, and then gives up. Nothing it was handed may be
+        // served to the next attempt: each attempt reaches the model as often
+        // as the first did.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("response_cache.db");
         let calls = Arc::new(AtomicU64::new(0));
@@ -534,11 +535,16 @@ mod tests {
             .await
             .unwrap();
             let result = SessionRunner::new(&provider).run(&mut JsonSession).await;
-            assert!(result.is_err(), "a truncated answer ends the session");
+            assert!(
+                result.is_err(),
+                "answers truncated every time end the session"
+            );
             per_attempt.push(calls.load(Ordering::SeqCst) - before);
         }
 
-        assert_eq!(per_attempt, vec![1, 1], "calls per attempt");
+        // The first answer and three more before the default limit of three
+        // truncated answers per turn is exceeded.
+        assert_eq!(per_attempt, vec![4, 4], "calls per attempt");
     }
 
     /// Rejects the first answer of a conversation, then cuts the next one
@@ -572,8 +578,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_giving_up_on_a_truncated_answer_also_forgets_the_rejected_ones() {
-        // A rejected answer, then a truncated one: the stage gives up, and a
-        // retry must be asked both again rather than be served the rejection.
+        // A rejected answer, then truncated ones until the stage gives up: a
+        // retry must be asked all of them again rather than be served the
+        // rejection.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("response_cache.db");
         let calls = Arc::new(AtomicU64::new(0));
@@ -593,12 +600,14 @@ mod tests {
             let result = SessionRunner::new(&provider).run(&mut JsonSession).await;
             assert!(
                 result.is_err(),
-                "the stage gives up on the truncated answer"
+                "the stage gives up on the truncated answers"
             );
             per_attempt.push(calls.load(Ordering::SeqCst) - before);
         }
 
-        assert_eq!(per_attempt, vec![2, 2], "calls per attempt");
+        // The rejected answer, then four truncated ones before the default
+        // limit of three truncated answers per turn is exceeded.
+        assert_eq!(per_attempt, vec![5, 5], "calls per attempt");
     }
 
     #[tokio::test]

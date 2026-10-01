@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use super::{
     AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
-    AiUsage, ReasoningEffort, ToolCall, classify_ai_error,
+    AiUsage, OutputTruncated, ReasoningEffort, ToolCall, classify_ai_error,
 };
 
 /// The unified result of executing an [`LlmSession`].
@@ -182,6 +182,78 @@ impl FinalTurn {
         match self {
             Self::TurnBudget => (max_turns > 1).then_some(TURN_BUDGET_PROMPT),
         }
+    }
+}
+
+/// Sent after an answer the provider cut off part way through.
+///
+/// Asking again unchanged would most likely be cut off again, because the
+/// output limit has not moved. The model has to answer differently, so it is
+/// told why it is asked again and to be shorter.
+const OUTPUT_TRUNCATED_FEEDBACK: &str = "IMPORTANT: Your previous response hit the provider's output limit and was discarded \
+     unread. Answer again, shorter. Do not quote long passages of code -- cite file and \
+     line and describe what is there. Keep reasoning to the conclusions you have reached. \
+     If the work does not fit in one response, do the first part only and continue on the \
+     next turn.";
+
+/// Sent after an answer that used the whole output limit before writing
+/// anything.
+///
+/// Asking for a shorter answer misses the point there, because there was no
+/// answer. The model has to stop deliberating and act on what it has.
+const OUTPUT_TRUNCATED_REASONING_FEEDBACK: &str = "IMPORTANT: Your previous response spent the provider's whole output limit on \
+     reasoning before writing anything, and was discarded unread. Do not deliberate \
+     further. State the conclusions you have already reached and act on them now: call \
+     the next tool, or write the answer.";
+
+/// Truncated answers since the last accepted response.
+///
+/// Counted per turn rather than per session, so a long stage that is cut off
+/// now and then over many turns keeps going: every accepted response starts
+/// the count again. `max_turns` still bounds the total.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TurnTruncations {
+    /// Truncated answers in a row.
+    count: usize,
+    /// Whether one of them already got the reasoning feedback.
+    reasoning_retried: bool,
+}
+
+impl TurnTruncations {
+    /// Counts one more truncated answer that is being asked for again.
+    fn record(&mut self, truncated: &OutputTruncated) {
+        self.count += 1;
+        if truncated.spent_on_reasoning() {
+            self.reasoning_retried = true;
+        }
+    }
+}
+
+/// Decides what to do about a truncated answer, given the turn's earlier ones.
+///
+/// An answer that wrote something is asked for again, shorter. One that wrote
+/// nothing is asked once to stop deliberating; a second such answer in the
+/// same turn fails, because asking again resends the whole history to no
+/// purpose, and the error names the setting to change instead.
+fn truncation_action(truncated: &OutputTruncated, so_far: &TurnTruncations) -> ErrorAction {
+    if !truncated.spent_on_reasoning() {
+        ErrorAction::RetryWithFeedback(OUTPUT_TRUNCATED_FEEDBACK.to_string())
+    } else if !so_far.reasoning_retried {
+        ErrorAction::RetryWithFeedback(OUTPUT_TRUNCATED_REASONING_FEEDBACK.to_string())
+    } else {
+        ErrorAction::Fail
+    }
+}
+
+/// The assistant message that records a response in the conversation.
+fn assistant_message(resp: &AiResponse) -> AiMessage {
+    AiMessage {
+        role: AiRole::Assistant,
+        content: resp.content.clone(),
+        thought: resp.thought.clone(),
+        thought_signature: resp.thought_signature.clone(),
+        tool_calls: resp.tool_calls.clone(),
+        tool_call_id: None,
     }
 }
 
@@ -354,9 +426,22 @@ impl<'a> SessionRunner<'a> {
         let Some(prompt) = final_turn.prompt(self.max_turns) else {
             return;
         };
+        self.push_feedback(history, log_history, prompt.to_string());
+    }
+
+    /// Adds a user message to both the conversation and its log.
+    ///
+    /// Every message the runner adds for the model goes to both, so the log
+    /// says why the model answered the same question again.
+    fn push_feedback(
+        &self,
+        history: &mut Vec<AiMessage>,
+        log_history: &mut Vec<AiMessage>,
+        text: String,
+    ) {
         let msg = AiMessage {
             role: AiRole::User,
-            content: Some(prompt.to_string()),
+            content: Some(text),
             thought: None,
             thought_signature: None,
             tool_calls: None,
@@ -364,6 +449,43 @@ impl<'a> SessionRunner<'a> {
         };
         history.push(msg.clone());
         self.push_log(log_history, msg);
+    }
+
+    /// Handles an answer the provider cut off, returning `Ok` to ask again.
+    ///
+    /// The answer goes to the log only. The log then shows what was cut, and
+    /// the model never sees a half-written tool call, whose arguments may not
+    /// even parse. On `Ok` the feedback is in both histories and the caller
+    /// gives the turn back, because a discarded answer should not spend the
+    /// stage's turn cap.
+    fn retry_truncated(
+        &self,
+        resp: &AiResponse,
+        so_far: &mut TurnTruncations,
+        history: &mut Vec<AiMessage>,
+        log_history: &mut Vec<AiMessage>,
+    ) -> Result<()> {
+        self.push_log(log_history, assistant_message(resp));
+        let truncated = OutputTruncated::from_response(resp);
+        let ErrorAction::RetryWithFeedback(feedback) = truncation_action(&truncated, so_far) else {
+            return Err(truncated.into());
+        };
+        so_far.record(&truncated);
+        if so_far.count > self.max_provider_error_retries {
+            anyhow::bail!(
+                "Session failed after {} truncated answers in one turn. Last error: {}",
+                so_far.count,
+                truncated
+            );
+        }
+        tracing::warn!(
+            "{}; asking again (truncated answer {}/{} this turn)",
+            truncated,
+            so_far.count,
+            self.max_provider_error_retries
+        );
+        self.push_feedback(history, log_history, feedback);
+        Ok(())
     }
 
     /// Configures a turn callback.
@@ -413,6 +535,7 @@ impl<'a> SessionRunner<'a> {
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
         let mut final_turn: Option<FinalTurn> = None;
+        let mut turn_truncations = TurnTruncations::default();
 
         let make_failure = |message: String,
                             history: Vec<AiMessage>,
@@ -522,16 +645,7 @@ impl<'a> SessionRunner<'a> {
                                         total_cached_tokens,
                                     ));
                                 }
-                                let msg = AiMessage {
-                                    role: AiRole::User,
-                                    content: Some(feedback.clone()),
-                                    thought: None,
-                                    thought_signature: None,
-                                    tool_calls: None,
-                                    tool_call_id: None,
-                                };
-                                history.push(msg.clone());
-                                self.push_log(&mut log_history, msg);
+                                self.push_feedback(&mut history, &mut log_history, feedback);
                                 turns = turns.saturating_sub(1);
                                 continue;
                             }
@@ -554,22 +668,8 @@ impl<'a> SessionRunner<'a> {
                 },
             };
 
-            if resp.truncated {
-                // Giving up, as when the answers are rejected below: forget
-                // this cut-off answer and any the stage rejected before it, so
-                // that a retry asks the model again.
-                for request in rejected.iter().chain(std::iter::once(&sent)) {
-                    self.provider.forget(request).await;
-                }
-                return Err(make_failure(
-                    "LLM output was truncated by provider (e.g. hit max tokens)".to_string(),
-                    log_history,
-                    total_prompt_tokens,
-                    total_completion_tokens,
-                    total_cached_tokens,
-                ));
-            }
-
+            // A truncated answer was billed like any other, so its usage counts
+            // even though the answer itself is discarded.
             if let Some(usage) = &resp.usage {
                 total_prompt_tokens = total_prompt_tokens.saturating_add(usage.prompt_tokens);
                 total_completion_tokens =
@@ -578,14 +678,43 @@ impl<'a> SessionRunner<'a> {
                     total_cached_tokens.saturating_add(usage.cached_tokens.unwrap_or(0));
             }
 
-            let assistant_msg = AiMessage {
-                role: AiRole::Assistant,
-                content: resp.content.clone(),
-                thought: resp.thought.clone(),
-                thought_signature: resp.thought_signature.clone(),
-                tool_calls: resp.tool_calls.clone(),
-                tool_call_id: None,
-            };
+            // The request succeeded and the conversation so far is intact, so
+            // a cut-off answer is asked for again instead of ending the stage
+            // and losing every turn it has already paid for.
+            if resp.truncated {
+                if let Err(e) = self.retry_truncated(
+                    &resp,
+                    &mut turn_truncations,
+                    &mut history,
+                    &mut log_history,
+                ) {
+                    // Giving up, as when the answers are rejected below: forget
+                    // this cut-off answer and any the stage rejected before it,
+                    // so that a retry asks the model again. Wrapped rather than
+                    // replaced, so the typed OutputTruncated cause still
+                    // downcasts while the partial history and usage survive.
+                    for request in rejected.iter().chain(std::iter::once(&sent)) {
+                        self.provider.forget(request).await;
+                    }
+                    let message = e.to_string();
+                    return Err(e.context(SessionFailure {
+                        message,
+                        history: log_history,
+                        usage: AiUsage {
+                            prompt_tokens: total_prompt_tokens,
+                            completion_tokens: total_completion_tokens,
+                            total_tokens: total_prompt_tokens
+                                .saturating_add(total_completion_tokens),
+                            cached_tokens: Some(total_cached_tokens),
+                        },
+                    }));
+                }
+                turns = turns.saturating_sub(1);
+                continue;
+            }
+            turn_truncations = TurnTruncations::default();
+
+            let assistant_msg = assistant_message(&resp);
             history.push(reply_for_history(&assistant_msg, final_turn));
             self.push_log(&mut log_history, assistant_msg);
 
@@ -679,16 +808,7 @@ impl<'a> SessionRunner<'a> {
                         ));
                     }
                     let feedback = session.format_validation_feedback(&violation);
-                    let msg = AiMessage {
-                        role: AiRole::User,
-                        content: Some(feedback),
-                        thought: None,
-                        thought_signature: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                    };
-                    history.push(msg.clone());
-                    self.push_log(&mut log_history, msg);
+                    self.push_feedback(&mut history, &mut log_history, feedback);
                     turns = turns.saturating_sub(1);
                 }
                 Result::Err(ValidationError::Fatal(err)) => {
@@ -1290,6 +1410,292 @@ mod tests {
             reply_for_history(&answer, None),
             answer,
             "before the final turn the calls are run and answered, so they stay"
+        );
+    }
+
+    /// A response cut off after writing `content`, billed `completion` tokens.
+    fn truncated_answer(content: Option<&str>, completion: usize) -> AiResponse {
+        AiResponse {
+            content: content.map(str::to_string),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            usage: Some(AiUsage {
+                prompt_tokens: 10,
+                completion_tokens: completion,
+                total_tokens: 10 + completion,
+                cached_tokens: None,
+            }),
+            truncated: true,
+        }
+    }
+
+    fn last_user_text(request: &AiRequest) -> String {
+        request
+            .messages
+            .last()
+            .and_then(|m| m.content.clone())
+            .unwrap_or_default()
+    }
+
+    /// A stage used to die outright when the provider cut its answer short.
+    /// Three stages of one patch were lost that way in a single review, each
+    /// after about an hour of tool calls.
+    #[tokio::test]
+    async fn a_truncated_answer_is_asked_again_rather_than_ending_the_session() {
+        let provider = RecordingProvider::new(vec![
+            truncated_answer(Some("half a"), 50),
+            text_answer("done"),
+        ]);
+
+        let res = SessionRunner::new(&provider)
+            .run(&mut DummySession)
+            .await
+            .expect("a truncated answer must not end the session");
+        assert_eq!(
+            res.output, "done",
+            "the retry's answer is the one that counts"
+        );
+
+        // Asking again unchanged would most likely be cut off again, because
+        // the output limit has not moved, so the request has to change.
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "it has to actually ask again");
+        assert_ne!(requests[0].messages, requests[1].messages);
+        assert_eq!(last_user_text(&requests[1]), OUTPUT_TRUNCATED_FEEDBACK);
+    }
+
+    /// A model that keeps overrunning still has to stop somewhere, and the
+    /// error has to say both which bound ran out and what was cut.
+    #[tokio::test]
+    async fn truncation_retries_are_bounded_and_say_what_ran_out() {
+        let provider = RecordingProvider::new(
+            (0..10)
+                .map(|_| truncated_answer(Some("half a"), 50))
+                .collect(),
+        );
+
+        let err = match SessionRunner::new(&provider)
+            .with_max_provider_error_retries(2)
+            .run(&mut DummySession)
+            .await
+        {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a provider that always truncates cannot succeed"),
+        };
+
+        assert!(
+            err.contains("3 truncated answers in one turn"),
+            "the reason must name the bound that ran out: {err}"
+        );
+        assert!(
+            err.contains("truncated by provider") && err.contains("6 chars of answer"),
+            "the underlying cause must still be reported: {err}"
+        );
+        assert_eq!(provider.requests().len(), 3, "one attempt plus two retries");
+    }
+
+    /// The turn cap pays for answers, and a discarded answer is not one.
+    #[tokio::test]
+    async fn a_discarded_turn_is_not_charged_against_the_turn_cap() {
+        let provider = RecordingProvider::new(vec![
+            truncated_answer(Some("half a"), 50),
+            truncated_answer(Some("half b"), 50),
+            text_answer("done"),
+        ]);
+
+        let res = SessionRunner::new(&provider)
+            .with_max_turns(1)
+            .run(&mut DummySession)
+            .await;
+
+        assert!(
+            res.is_ok(),
+            "two truncated answers must not use up a one-turn budget: {:?}",
+            res.err()
+        );
+        assert_eq!(provider.requests().len(), 3);
+    }
+
+    /// A truncated final turn gives its turn back and re-enters the final
+    /// turn, which must not announce the budget a second time.
+    #[tokio::test]
+    async fn a_truncated_final_turn_pushes_the_budget_prompt_once() {
+        let provider = RecordingProvider::new(vec![
+            tool_answer("call_1"),
+            truncated_answer(Some("half a verdict"), 50),
+            text_answer("verdict"),
+        ]);
+        let runner = SessionRunner::new(&provider).with_max_turns(2);
+
+        let res = runner
+            .run(&mut RejectingToolSession { rejections: 0 })
+            .await
+            .unwrap();
+        assert_eq!(res.output, "verdict");
+        assert_eq!(budget_prompts(&res.history), 1);
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        for (i, req) in requests.iter().enumerate().skip(1) {
+            assert!(req.tools.is_none(), "final-turn request {i} offered tools");
+            assert_eq!(
+                budget_prompts(&req.messages),
+                1,
+                "final-turn request {i} must carry the budget prompt exactly once"
+            );
+        }
+    }
+
+    /// The discarded answer was billed, so its tokens count, and the log
+    /// keeps it so a reader can see what was cut. The model never sees it
+    /// again: a half-written tool call may not even parse.
+    #[tokio::test]
+    async fn a_truncated_answer_is_billed_and_logged_but_not_resent() {
+        let mut cut = truncated_answer(Some("half a"), 4000);
+        cut.tool_calls = tool_answer("call_cut").tool_calls;
+        let mut whole = text_answer("done");
+        whole.usage = Some(AiUsage {
+            prompt_tokens: 20,
+            completion_tokens: 5,
+            total_tokens: 25,
+            cached_tokens: None,
+        });
+        let provider = RecordingProvider::new(vec![cut, whole]);
+
+        let res = SessionRunner::new(&provider)
+            .run(&mut RejectingToolSession { rejections: 0 })
+            .await
+            .unwrap();
+
+        assert_eq!(res.usage.prompt_tokens, 30);
+        assert_eq!(res.usage.completion_tokens, 4005);
+        assert_eq!(res.usage.total_tokens, 4035);
+
+        let logged = res
+            .history
+            .iter()
+            .position(|m| m.content.as_deref() == Some("half a"))
+            .expect("the truncated answer is in the log");
+        assert_eq!(
+            res.history[logged + 1].content.as_deref(),
+            Some(OUTPUT_TRUNCATED_FEEDBACK),
+            "the log says why the question was asked again"
+        );
+
+        let retry = &provider.requests()[1];
+        assert!(
+            retry
+                .messages
+                .iter()
+                .all(|m| m.content.as_deref() != Some("half a") && m.tool_calls.is_none()),
+            "the cut answer must not be sent back to the model"
+        );
+        assert!(unanswered_tool_calls(&retry.messages).is_empty());
+    }
+
+    /// An answer that wrote nothing spent the limit on reasoning. Asking for
+    /// a shorter answer cannot help, so the model is asked once to act on
+    /// what it has, and a second such answer fails with the setting to
+    /// change.
+    #[tokio::test]
+    async fn a_truncation_that_wrote_nothing_is_retried_once_then_names_the_remedy() {
+        let provider = RecordingProvider::new(vec![
+            truncated_answer(None, 4000),
+            truncated_answer(Some(""), 4000),
+            text_answer("never reached"),
+        ]);
+
+        let err = match SessionRunner::new(&provider).run(&mut DummySession).await {
+            Err(e) => e,
+            Ok(_) => panic!("a second reasoning-only truncation must fail"),
+        };
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            last_user_text(&requests[1]),
+            OUTPUT_TRUNCATED_REASONING_FEEDBACK
+        );
+        assert_eq!(
+            err.downcast_ref::<OutputTruncated>(),
+            Some(&OutputTruncated {
+                answer_chars: 0,
+                tool_arg_chars: 0,
+            })
+        );
+        assert!(
+            err.to_string().contains("raise max_tokens or lower effort"),
+            "the error must say what to change: {err}"
+        );
+        assert!(matches!(classify_ai_error(&err), AiErrorClass::Fatal));
+    }
+
+    /// Truncations are counted per turn. An accepted answer starts the count
+    /// again, so a long stage that is cut off now and then keeps going, while
+    /// a run of them in one turn still ends it.
+    #[tokio::test]
+    async fn truncations_are_counted_per_turn() {
+        let cut = || truncated_answer(Some("half"), 50);
+        let mut script: Vec<AiResponse> = (0..3).map(|_| cut()).collect();
+        script.push(tool_answer("call_1"));
+        script.extend((0..3).map(|_| cut()));
+        script.push(text_answer("done"));
+        let provider = RecordingProvider::new(script);
+
+        let res = SessionRunner::new(&provider)
+            .run(&mut RejectingToolSession { rejections: 0 })
+            .await
+            .expect("three in a row, an accepted turn, then three more is allowed");
+        assert_eq!(res.output, "done");
+        assert_eq!(provider.requests().len(), 8);
+
+        let mut script: Vec<AiResponse> = (0..3).map(|_| cut()).collect();
+        script.push(tool_answer("call_1"));
+        script.extend((0..5).map(|_| cut()));
+        let provider = RecordingProvider::new(script);
+        let err = SessionRunner::new(&provider)
+            .run(&mut RejectingToolSession { rejections: 0 })
+            .await
+            .err()
+            .expect("a fourth truncation in a row must fail");
+        assert!(err.to_string().contains("4 truncated answers in one turn"));
+        assert_eq!(provider.requests().len(), 8);
+    }
+
+    #[test]
+    fn truncation_action_follows_what_the_answer_wrote() {
+        let wrote = OutputTruncated {
+            answer_chars: 10,
+            tool_arg_chars: 0,
+        };
+        let nothing = OutputTruncated {
+            answer_chars: 0,
+            tool_arg_chars: 0,
+        };
+        let fresh = TurnTruncations::default();
+        let after_reasoning = TurnTruncations {
+            count: 1,
+            reasoning_retried: true,
+        };
+
+        let retry = |text: &str| ErrorAction::RetryWithFeedback(text.to_string());
+        assert_eq!(
+            truncation_action(&wrote, &fresh),
+            retry(OUTPUT_TRUNCATED_FEEDBACK)
+        );
+        assert_eq!(
+            truncation_action(&wrote, &after_reasoning),
+            retry(OUTPUT_TRUNCATED_FEEDBACK),
+            "an answer that wrote something is always worth asking for again"
+        );
+        assert_eq!(
+            truncation_action(&nothing, &fresh),
+            retry(OUTPUT_TRUNCATED_REASONING_FEEDBACK)
+        );
+        assert_eq!(
+            truncation_action(&nothing, &after_reasoning),
+            ErrorAction::Fail
         );
     }
 }

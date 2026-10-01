@@ -652,12 +652,10 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
 /// translated response, whose answer holds only text blocks, so thinking is
 /// never counted as writing.
 fn truncation_warning(output_tokens: u32, response: &AiResponse) -> String {
-    let answer_chars = response
-        .content
-        .as_deref()
-        .map_or(0, |answer| answer.chars().count());
-    let tool_arg_chars =
-        crate::ai::tool_argument_chars(response.tool_calls.as_deref().unwrap_or_default());
+    let crate::ai::OutputTruncated {
+        answer_chars,
+        tool_arg_chars,
+    } = crate::ai::OutputTruncated::from_response(response);
     format!(
         "Claude response truncated at max_tokens after {output_tokens} output tokens \
          ({answer_chars} chars of answer, {tool_arg_chars} chars of tool arguments).{}",

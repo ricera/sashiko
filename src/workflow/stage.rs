@@ -1416,4 +1416,77 @@ mod tests {
         (stage.reducer)(&mut state, "ok".to_string());
         assert_eq!(state, "plain:ok");
     }
+
+    /// Cuts off its first answer, then answers properly. Records requests so a
+    /// test can see what the model was told on the way back in.
+    struct TruncatingOnceProvider {
+        seen: Mutex<Vec<AiRequest>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for TruncatingOnceProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            let mut seen = self.seen.lock().unwrap();
+            seen.push(request);
+            let first = seen.len() == 1;
+            Ok(AiResponse {
+                content: Some(if first { "half an ans" } else { "done" }.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: first,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "truncating-once".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// The review stages override the provider-error hook for recitation, so
+    /// the recovery has to sit in the runner, where a stage cannot bypass it.
+    /// This runs it through a real stage rather than a bare session.
+    #[tokio::test]
+    async fn test_a_stage_survives_a_truncated_answer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(TruncatingOnceProvider {
+            seen: Mutex::new(Vec::new()),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("truncated")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let (outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, None)
+            .await
+            .expect("a truncated answer must not end the stage");
+
+        assert!(
+            outcome.history.iter().any(|m| m
+                .content
+                .as_deref()
+                .is_some_and(|c| c.contains("output limit"))),
+            "the log has to say why the model was asked again"
+        );
+        let seen = provider.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "the stage has to ask again");
+        assert_ne!(
+            seen[0].messages.len(),
+            seen[1].messages.len(),
+            "an unchanged request would be cut off again at the same limit"
+        );
+    }
 }
