@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::ReviewStatus;
 use crate::ai::backoff_provider::{ReviewDeadline, ReviewTimedOut};
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
@@ -28,6 +27,7 @@ use crate::prerequisites::{PrerequisitePatch, resolve_prerequisites_from_lore};
 use crate::settings::Settings;
 use crate::utils::redact_secret;
 use crate::worker::prompts::ReviewError;
+use crate::{PatchOutcome, ReviewStatus};
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -981,7 +981,11 @@ impl Reviewer {
                 }
 
                 if should_skip {
-                    if let Err(e) = ctx.db.update_patch_status(*patch_id, "Skipped").await {
+                    if let Err(e) = ctx
+                        .db
+                        .update_patch_status(*patch_id, PatchOutcome::Skipped)
+                        .await
+                    {
                         warn!(
                             "Failed to mark patch {} as Skipped for patchset {}: {}",
                             patch_id, patchset_id, e
@@ -1787,16 +1791,12 @@ impl Reviewer {
             return Ok(PatchResult::Success);
         }
 
-        if ctx
-            .db
-            .has_failed_review(patchset_id, patch_id, baseline_id)
-            .await?
-        {
+        if let Some(outcome) = ctx.db.prior_final_outcome(patchset_id, patch_id).await? {
             info!(
-                "Patch {}/{} (ID: {}) already has a failed review. Skipping to keep it visible.",
-                patchset_id, index, patch_id
+                "Patch {}/{} (ID: {}) already ended {} in an earlier run. Skipping to keep it visible.",
+                patchset_id, index, patch_id, outcome
             );
-            let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+            let _ = ctx.db.update_patch_status(patch_id, outcome).await;
             return Ok(PatchResult::ReviewFailed);
         }
 
@@ -1970,7 +1970,10 @@ impl Reviewer {
                 AttemptVerdict::Final(result) => return Ok(result),
                 AttemptVerdict::Retry if retries < max_retries => retries += 1,
                 AttemptVerdict::Retry | AttemptVerdict::GiveUp => {
-                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
+                    let _ = ctx
+                        .db
+                        .update_patch_status(patch_id, PatchOutcome::Failed)
+                        .await;
                     return Ok(PatchResult::ReviewFailed);
                 }
             }
@@ -2105,7 +2108,7 @@ impl Reviewer {
         }
         if let Err(e) = ctx
             .db
-            .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
+            .update_patch_status(patch_id, PatchOutcome::Cancelled)
             .await
         {
             warn!("Failed to mark patch {} as Cancelled: {}", patch_id, e);
@@ -2353,7 +2356,10 @@ impl Reviewer {
                     logs.as_deref(),
                 )
                 .await;
-            let _ = ctx.db.update_patch_status(patch.patch_id, "Skipped").await;
+            let _ = ctx
+                .db
+                .update_patch_status(patch.patch_id, PatchOutcome::Skipped)
+                .await;
             return Ok(AttemptVerdict::Final(PatchResult::Success));
         };
 
@@ -2382,7 +2388,10 @@ impl Reviewer {
             .await
         {
             error!("Failed to save review completion: {}", e);
-            let _ = ctx.db.update_patch_status(patch.patch_id, "Failed").await;
+            let _ = ctx
+                .db
+                .update_patch_status(patch.patch_id, PatchOutcome::Failed)
+                .await;
             return Ok(AttemptVerdict::Final(PatchResult::ReviewFailed));
         }
 
@@ -2392,7 +2401,10 @@ impl Reviewer {
         }
         // Failing the patchset over a notification would strand it:
         // get_pending_patchsets() selects only Pending rows.
-        let _ = ctx.db.update_patch_status(patch.patch_id, "Reviewed").await;
+        let _ = ctx
+            .db
+            .update_patch_status(patch.patch_id, PatchOutcome::Reviewed)
+            .await;
         Ok(AttemptVerdict::Final(PatchResult::Success))
     }
 
