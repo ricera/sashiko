@@ -47,6 +47,12 @@ const KERNEL_REFERENCE_DESCRIPTION: &str = "The Linux kernel tree the code under
 /// not exist there. Only a kernel reference implies that, so a configuration
 /// with only a userspace tree such as rdma-core must not claim it: telling an
 /// in-tree review that Fixes: tags do not apply would suppress real findings.
+///
+/// Only the references attached to this patch reach here; those left dormant
+/// by their `applies_to` are not passed in. So a kernel entry scoped away from
+/// a patch gives that patch neither its list entry nor the out-of-tree
+/// caveats, and the patch is framed as in-tree. That is why the kernel entry of
+/// an out-of-tree module should not be scoped.
 fn reference_context_block(references: &[ReferenceRepo]) -> String {
     if references.is_empty() {
         return String::new();
@@ -3630,6 +3636,7 @@ mod tests {
             commit: "1a2b3c4d5e6f7a8b9c0d1a2b3c4d5e6f7a8b9c0d".to_string(),
             description: (kind == ReferenceKind::Source)
                 .then(|| "Userspace RDMA stack.\nproviders/ionic is libionic.".to_string()),
+            applies_to: None,
         }
     }
 
@@ -3728,6 +3735,78 @@ mod tests {
         );
         assert!(!caveats.contains("rdma-core"), "{caveats}");
         assert!(!caveats.contains("ionic-rdma-v59"), "{caveats}");
+    }
+
+    /// A kernel entry scoped away from a patch is not attached to it, so that
+    /// patch gets neither the kernel's list entry nor the out-of-tree caveats;
+    /// a patch it does apply to gets both.
+    #[test]
+    fn a_dormant_kernel_reference_renders_no_out_of_tree_caveats() {
+        let mut kernel = reference("kernel", ReferenceKind::Kernel, "v6.18");
+        kernel.applies_to = Some(
+            crate::references::AppliesTo::new("kernel", &["rdma/drv/**".to_string()]).unwrap(),
+        );
+        let refs = vec![
+            kernel,
+            reference("rdma-core", ReferenceKind::Source, "ionic-rdma-v59"),
+        ];
+
+        let eth =
+            crate::references::attach_for_patch(&refs, &["eth/ionic/ionic_lif.c".to_string()]);
+        let prompt = render_with(eth.attached);
+        assert!(
+            prompt.contains("Read-only Reference Repositories"),
+            "{prompt}"
+        );
+        assert!(prompt.contains(r#"repo="rdma-core""#), "{prompt}");
+        for absent in ["Out-of-Tree Module", "Fixes:", r#"repo="kernel""#] {
+            assert!(!prompt.contains(absent), "unexpected {absent}: {prompt}");
+        }
+
+        let rdma =
+            crate::references::attach_for_patch(&refs, &["rdma/drv/ionic/ionic_fw.h".to_string()]);
+        let prompt = render_with(rdma.attached);
+        let caveats = &prompt[prompt
+            .find("=== Out-of-Tree Module ===")
+            .expect("an attached kernel entry brings the caveats")..];
+        assert!(
+            caveats.contains(r#"repo="kernel", pinned at v6.18"#),
+            "{caveats}"
+        );
+    }
+
+    /// The RDMA guide is one the pre-screen may pick -- a plain name that no
+    /// stage claims for itself -- and, once picked, it loads from the bundle
+    /// into the system prompt. Its wording is conditional on a userspace
+    /// reference rather than naming one.
+    #[tokio::test]
+    async fn the_rdma_guide_is_selectable_and_loads() {
+        assert!(crate::workflows::guard::sanitize_guide_name("rdma.md"));
+        assert!(!is_stage_exclusive_guide("rdma.md"));
+
+        let prompt = linux_system_prompt(true)
+            .render_for_model(
+                &LinuxPatchReviewState {
+                    selected_guides: vec!["rdma.md".into()],
+                    ..Default::default()
+                },
+                &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("third_party/prompts/kernel"),
+            )
+            .await
+            .unwrap();
+        assert!(prompt.contains("# subsystem/rdma.md"), "{prompt}");
+        assert!(
+            prompt.contains("RDMA/InfiniBand Subsystem Details"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Read-only Reference Repositories"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("rdma-core"),
+            "the guide must not hard-code a reference name"
+        );
     }
 
     #[test]

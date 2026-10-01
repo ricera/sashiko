@@ -48,6 +48,10 @@ pub struct SashikoToolContext {
     /// Fixed for the ToolBox's lifetime, so an index into it is a stable
     /// identity for a cache key.
     pub references: Vec<ReferenceRepo>,
+    /// Configured references left out of this patch by their `applies_to`.
+    /// Never read and never offered; kept only so that naming one is answered
+    /// with why it is missing rather than with "unknown".
+    pub dormant: Vec<DormantReference>,
     pub(crate) cache: Arc<RwLock<std::collections::HashMap<String, Value>>>,
 }
 
@@ -73,6 +77,19 @@ pub struct ReferenceRepo {
     /// What the tree is for, as configured. Shown to the model in the prompt;
     /// a kernel entry without one gets built-in text.
     pub description: Option<String>,
+    /// Which patches the reference is attached to; `None` means every patch.
+    /// Decided before the ToolBox is built, which only ever holds the
+    /// references attached to its patch.
+    pub applies_to: Option<crate::references::AppliesTo>,
+}
+
+/// A configured reference that is not attached to the patch under review,
+/// because the patch touches none of the files it applies to.
+#[derive(Debug, Clone)]
+pub struct DormantReference {
+    pub name: String,
+    /// The `applies_to` patterns as configured, quoted back in the error.
+    pub applies_to: Vec<String>,
 }
 
 /// Which repository a tool call reads from.
@@ -173,6 +190,25 @@ impl SashikoToolContext {
         };
         if let Some(index) = self.references.iter().position(|r| r.name == name) {
             return Ok(RepoTarget::Reference(index));
+        }
+        // The model can know a dormant name from elsewhere -- an earlier patch
+        // of the series, the description of another tree. "Unknown" would read
+        // as a misconfiguration, so say it exists, why it is not here, and what
+        // is.
+        if let Some(dormant) = self.dormant.iter().find(|d| d.name == name) {
+            let valid: Vec<String> =
+                std::iter::once(format!("\"{REPO_ARG_REVIEW}\" (the code under review)"))
+                    .chain(self.references.iter().map(|r| format!("\"{}\"", r.name)))
+                    .collect();
+            return Err(anyhow::anyhow!(
+                "{} \"{}\" is configured but not attached to this review: it applies only \
+                 to changes matching {}, and this patch touches none of them. Valid values \
+                 here: {}.",
+                REPO_ARG,
+                name,
+                dormant.applies_to.join(", "),
+                valid.join(", ")
+            ));
         }
         if self.references.is_empty() {
             return Err(anyhow::anyhow!(
@@ -376,6 +412,7 @@ impl ToolBox {
             active_patch_files: RwLock::new(Vec::new()),
             virtual_head: RwLock::new(None),
             references: Vec::new(),
+            dormant: Vec::new(),
             cache: cache.clone(),
         };
 
@@ -436,6 +473,24 @@ impl ToolBox {
         references.into_iter().fold(self, Self::with_reference)
     }
 
+    /// Records the configured references this patch is reviewed without, so
+    /// that naming one gets a specific error. See [`DormantReference`].
+    pub fn with_dormant_references(
+        mut self,
+        dormant: impl IntoIterator<Item = DormantReference>,
+    ) -> Self {
+        self.context.dormant.extend(dormant);
+        debug_assert!(
+            !self.context.dormant.iter().any(|d| self
+                .context
+                .references
+                .iter()
+                .any(|r| r.name == d.name)),
+            "a reference is both attached and dormant"
+        );
+        self
+    }
+
     /// Sets the virtual head commit SHA for the current review session.
     pub fn set_virtual_head(&mut self, sha: String) {
         let mut vhead = self.context.virtual_head.write().unwrap();
@@ -472,6 +527,11 @@ impl ToolBox {
     /// from every schema. Advertising a value that always errors would spend a
     /// turn per attempt to teach the model something the declaration could have
     /// said for free. With references, it lists exactly the attached names.
+    ///
+    /// Dormant references are excluded by construction: they are never in
+    /// the attached list this is built from. A patch whose references are all
+    /// dormant therefore sees no `repo` argument, exactly like a
+    /// configuration with none.
     pub fn get_declarations_generic(&self) -> Vec<AiTool> {
         let references = &self.context.references;
         let repo_schema = (!references.is_empty()).then(|| repo_arg_schema_for(references));

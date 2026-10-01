@@ -1191,6 +1191,7 @@ mod tests {
                 commit: "0".repeat(40),
                 description: (kind == ReferenceKind::Source)
                     .then(|| "Userspace RDMA stack.".to_string()),
+                applies_to: None,
             }
         }
 

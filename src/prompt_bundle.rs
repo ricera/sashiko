@@ -205,6 +205,25 @@ mod tests {
         assert_index_guides_bundled("kernel");
     }
 
+    /// The RDMA guide is carried on top of the vendored tree, so its row in the
+    /// kernel index must survive each sync; the index test above only checks
+    /// that the rows present name bundled files.
+    #[test]
+    fn test_kernel_rdma_guide_is_indexed() {
+        let index = PROMPT_BUNDLE_FILES
+            .iter()
+            .find(|(p, _)| *p == "kernel/subsystem/subsystem.md")
+            .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
+            .expect("kernel/subsystem/subsystem.md must be bundled and valid UTF-8");
+        let row = index
+            .lines()
+            .find(|l| l.trim_end().ends_with("| rdma.md |"))
+            .expect("the RDMA row");
+        for trigger in ["drivers/infiniband/", "uverbs", "rdma/drv/"] {
+            assert!(row.contains(trigger), "missing {trigger}: {row}");
+        }
+    }
+
     /// Asserts every guide named in `<project>/subsystem/subsystem.md` is in
     /// the bundle, under subsystem/ or patterns/.
     fn assert_index_guides_bundled(project: &str) {
@@ -240,7 +259,7 @@ mod tests {
 
         assert!(
             !referenced_guides.is_empty(),
-            "should parse referenced guides from subsystem.md"
+            "should parse referenced guides from {index_path}"
         );
 
         for guide in referenced_guides {

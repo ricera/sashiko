@@ -250,6 +250,7 @@ repository_path = "third_party/linux"
 # name = "rdma-core"
 # path = "/srv/sashiko/rdma-core"
 # revision = "origin/ionic-rdma"
+# applies_to = ["rdma/drv/**", "eth/ionic/ionic_aux*", "include/uapi/rdma/**"]  # optional: attach only to patches touching these (globs over the reviewed repo). Absent: every patch.
 # description = "Userspace RDMA stack; required for kind \"source\"."
 
 [review]
