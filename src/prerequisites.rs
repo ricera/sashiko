@@ -387,6 +387,7 @@ mod tests {
                     part_index INTEGER,
                     diff TEXT
                 );
+                CREATE TABLE reviews (id INTEGER PRIMARY KEY);
                 PRAGMA user_version = 11;",
             )
             .await?;
@@ -413,7 +414,7 @@ mod tests {
 
         let mut version = db.conn.query("PRAGMA user_version", ()).await?;
         let version: u32 = version.next().await?.expect("user version row").get(0)?;
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         Ok(())
     }
 

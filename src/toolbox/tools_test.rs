@@ -1474,6 +1474,61 @@ mod tests {
         }
     }
 
+    /// Every call that names an attached reference counts against it --
+    /// cache hits and calls git refuses included -- and nothing else does.
+    #[test]
+    fn reference_reads_are_counted_per_reference() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let (_kernel_dir, kernel_path) = setup_reference_repo();
+        let (_rdma_dir, rdma_path) = setup_rdma_reference_repo();
+        let prompts_dir = tempfile::tempdir().unwrap();
+        std::fs::write(prompts_dir.path().join("a.md"), "prompt").unwrap();
+        let toolbox = ToolBox::new(review_path, Some(prompts_dir.path().to_path_buf()))
+            .with_references([pinned_reference(kernel_path), pinned_rdma(rdma_path)])
+            .with_dormant_references([dormant("iproute2", &["ip/**"])]);
+        assert_eq!(toolbox.reference_reads(), [0, 0]);
+
+        let rt = Runtime::new().unwrap();
+        let call = |name: &str, args: serde_json::Value| rt.block_on(toolbox.call(name, args));
+        let kernel_grep = json!({ "repo": "kernel", "revision": "HEAD", "pattern": "ndo_open" });
+
+        call("git_grep", kernel_grep.clone()).unwrap();
+        let first = toolbox.cache.read().unwrap().len();
+        call("git_grep", kernel_grep).unwrap();
+        assert_eq!(
+            toolbox.cache.read().unwrap().len(),
+            first,
+            "the second grep must be a cache hit"
+        );
+        call(
+            "git_grep",
+            json!({ "repo": "rdma-core", "revision": "HEAD", "pattern": "ionic_ctx_resp" }),
+        )
+        .unwrap();
+        call("git_grep", json!({ "revision": "HEAD", "pattern": "x" })).unwrap();
+        call(
+            "git_grep",
+            json!({ "repo": "iproute2", "revision": "HEAD", "pattern": "x" }),
+        )
+        .unwrap_err();
+        call(
+            "git_grep",
+            json!({ "repo": "nosuch", "revision": "HEAD", "pattern": "x" }),
+        )
+        .unwrap_err();
+        // read_prompt does not read a repository, so a stray repo means
+        // nothing to it.
+        let _ = call("read_prompt", json!({ "name": "a.md", "repo": "kernel" }));
+        let refused = call(
+            "git_grep",
+            json!({ "repo": "kernel", "revision": "no-such-tag", "pattern": "x" }),
+        )
+        .unwrap();
+        assert!(refused.get("error").is_some(), "{refused}");
+
+        assert_eq!(toolbox.reference_reads(), [3, 1]);
+    }
+
     /// Naming a dormant reference says it exists, why it is not attached, and
     /// what is; a name that is not configured at all is still unknown.
     #[test]

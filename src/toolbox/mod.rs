@@ -17,6 +17,7 @@ use crate::toolbox::framework::ToolRegistry;
 use anyhow::Result;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 pub mod command;
@@ -399,6 +400,11 @@ pub struct ToolBox {
     /// Thread-safe cache of tool invocation results.
     /// Shared with the execution context so that tools can access it internally.
     pub(crate) cache: Arc<RwLock<std::collections::HashMap<String, Value>>>,
+    /// How many tool calls named each attached reference, parallel to
+    /// `context.references`. Recorded on the review row so a reader can tell
+    /// whether the model used a tree it was offered; the deployment's logs do
+    /// not live long enough to answer that later.
+    reference_reads: Vec<AtomicU64>,
 }
 
 impl ToolBox {
@@ -434,6 +440,7 @@ impl ToolBox {
             context,
             registry,
             cache,
+            reference_reads: Vec::new(),
         }
     }
 
@@ -464,6 +471,7 @@ impl ToolBox {
             reference.name
         );
         self.context.references.push(reference);
+        self.reference_reads.push(AtomicU64::new(0));
         self
     }
 
@@ -519,6 +527,19 @@ impl ToolBox {
     /// and to decide whether this is an out-of-tree review at all.
     pub fn references(&self) -> &[ReferenceRepo] {
         &self.context.references
+    }
+
+    /// How many tool calls have named each attached reference so far,
+    /// parallel to [`ToolBox::references`].
+    ///
+    /// Every call that named the reference counts, including cache hits and
+    /// calls git then refused: the number answers "did the model use this
+    /// tree", not "how many reads succeeded".
+    pub fn reference_reads(&self) -> Vec<u64> {
+        self.reference_reads
+            .iter()
+            .map(|n| n.load(Ordering::Relaxed))
+            .collect()
     }
 
     /// Generates LLM-facing declarations for all registered tools.
@@ -599,6 +620,21 @@ impl ToolBox {
             obj.insert(REPO_ARG.to_string(), Value::from(REPO_ARG_REVIEW));
         }
 
+        // Resolved before the cache lookup, so a bad `repo` fails without
+        // running the tool, a call that did run is never turned into an error
+        // after the fact, and a cache hit is counted against its reference:
+        // counting after the early return would undercount exactly the reads
+        // the model repeated. Unknown and dormant names were never cached, so
+        // checking them first changes no answer.
+        let target = if takes_repo {
+            Some(self.context.repo_target(&normalized_args)?)
+        } else {
+            None
+        };
+        if let Some(RepoTarget::Reference(index)) = target {
+            self.reference_reads[index].fetch_add(1, Ordering::Relaxed);
+        }
+
         let key = if should_cache {
             let k = format!(
                 "{}:{}",
@@ -616,12 +652,7 @@ impl ToolBox {
             None
         };
 
-        // Resolved before the call, so a bad `repo` fails without running the
-        // tool, and a call that did run is never turned into an error after
-        // the fact.
-        let served = if takes_repo
-            && let RepoTarget::Reference(index) = self.context.repo_target(&normalized_args)?
-        {
+        let served = if let Some(RepoTarget::Reference(index)) = target {
             Some((
                 self.context.served_revision(&normalized_args)?,
                 self.context.references[index].name.clone(),

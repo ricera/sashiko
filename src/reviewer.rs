@@ -2714,6 +2714,35 @@ async fn run_review_tool_with_cmd(
                                         });
                                         spawned_tasks.push(handle);
                                     }
+                                    // Stored as soon as it arrives, not with the
+                                    // final result: a review that times out, fails
+                                    // or is cancelled is killed before it writes
+                                    // one, and its row must still say which
+                                    // reference trees it had. Awaited inline so the
+                                    // write lands before the final line is handled.
+                                    // A bad hand-off never stops the review.
+                                    crate::references::REFERENCE_REPOS_MESSAGE => {
+                                        match crate::references::parse_handoff(&json_msg) {
+                                            Some((idx, rec)) if Some(idx) == review_index => {
+                                                let stored = match serde_json::to_string(&rec) {
+                                                    Ok(text) => db.set_review_reference_repos(review_id, &text).await,
+                                                    Err(e) => Err(e.into()),
+                                                };
+                                                if let Err(e) = stored {
+                                                    warn!("Failed to store reference repositories for review {}: {}", review_id, e);
+                                                }
+                                            }
+                                            Some((idx, _)) => {
+                                                warn!(
+                                                    "Ignoring reference repositories for patch {} from the worker of review {} (patch {:?})",
+                                                    idx, review_id, review_index
+                                                );
+                                            }
+                                            None => {
+                                                warn!("Ignoring a malformed reference repositories message from the worker of review {}", review_id);
+                                            }
+                                        }
+                                    }
                                     _ => {
                                         // Unknown type. Assume it's result if it matches result structure.
                                         if json_msg.get("patchset_id").is_some() {
@@ -2835,11 +2864,51 @@ async fn run_review_tool_with_cmd(
                     }
                 }
             }
+            store_final_reference_repos(&db, review_id, review_index, &json).await;
             Ok(json)
         }
         Err(e) => Err(e),
     }
 }
+
+/// Replaces the review's early reference record with the worker's final one,
+/// which adds how many reads each reference served.
+///
+/// Without a final record the early one is kept, read counts and all missing,
+/// which the UI shows as not reported rather than as zero.
+async fn store_final_reference_repos(
+    db: &Database,
+    review_id: i64,
+    review_index: Option<i64>,
+    json: &Value,
+) {
+    let Some(raw) = json["patches"].as_array().and_then(|patches| {
+        patches
+            .iter()
+            .find(|p| review_index.is_some() && p["index"].as_i64() == review_index)
+            .and_then(|p| p.get("reference_repos"))
+    }) else {
+        return;
+    };
+    let Some(rec) = crate::references::parse_record(raw) else {
+        warn!(
+            "Ignoring malformed reference repositories in the result of review {}",
+            review_id
+        );
+        return;
+    };
+    let stored = match serde_json::to_string(&rec) {
+        Ok(text) => db.set_review_reference_repos(review_id, &text).await,
+        Err(e) => Err(e.into()),
+    };
+    if let Err(e) = stored {
+        warn!(
+            "Failed to store reference repositories for review {}: {}",
+            review_id, e
+        );
+    }
+}
+
 impl Reviewer {
     #[allow(clippy::too_many_arguments)]
     async fn queue_notifications(
@@ -3577,6 +3646,18 @@ mod tests {
         mock_script: &str,
         provider: Arc<dyn AiProvider>,
     ) -> Result<Value> {
+        run_review_tool_mock(mock_script, provider, 5).await?.0
+    }
+
+    /// Runs `run_review_tool_with_cmd` against a mock worker script for patch
+    /// 1 of a fresh patchset, returning its result along with the database
+    /// and the review row, so a test can look at what was stored even when
+    /// the review failed.
+    async fn run_review_tool_mock(
+        mock_script: &str,
+        provider: Arc<dyn AiProvider>,
+        timeout_seconds: u64,
+    ) -> Result<(Result<Value>, Arc<Database>, i64)> {
         let temp_dir = tempdir()?;
         let bin_path = temp_dir.path().join("mock_review");
 
@@ -3585,7 +3666,7 @@ mod tests {
 
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
-        settings.review.timeout_seconds = 5;
+        settings.review.timeout_seconds = timeout_seconds;
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
@@ -3620,12 +3701,12 @@ mod tests {
             .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
             .await?;
 
-        run_review_tool_with_cmd(
+        let result = run_review_tool_with_cmd(
             Command::new(&bin_path),
             ps_id,
             &json!({}),
             &settings,
-            db,
+            db.clone(),
             "HEAD",
             Some(1),
             None,
@@ -3635,7 +3716,95 @@ mod tests {
             provider,
             Arc::new(Semaphore::new(56)),
         )
-        .await
+        .await;
+        Ok((result, db, review_id))
+    }
+
+    /// The early reference hand-off as a worker would print it for patch
+    /// `index`, with no read counts yet.
+    fn kernel_handoff(index: i64) -> String {
+        crate::references::handoff_line(
+            index,
+            &serde_json::from_value(json!({
+                "attached": [{
+                    "name": "kernel",
+                    "kind": "kernel",
+                    "revision": "v6.18",
+                    "commit": "1a2b3c4d5e6f".repeat(3) + "1a2b",
+                    "why": "always",
+                }],
+                "dormant": [{"name": "rdma-core", "applies_to": ["rdma/drv/**"]}],
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// A worker that is killed for running out of time never writes a final
+    /// result, so the references it reported early are all its row will say.
+    #[tokio::test]
+    async fn test_reference_repos_handoff_survives_a_timeout() -> Result<()> {
+        let mock_script = format!(
+            "#!/bin/bash\nread -r input\necho '{}'\nsleep 30\n",
+            kernel_handoff(1)
+        );
+        let (result, db, review_id) =
+            run_review_tool_mock(&mock_script, Arc::new(MockProvider), 1).await?;
+        let err = result.expect_err("the review must time out");
+        assert!(err.to_string().contains("timed out"), "{err}");
+
+        let review = db.get_review_details(review_id).await?.unwrap();
+        let refs = &review["reference_repos"];
+        assert_eq!(refs["attached"][0]["name"], "kernel");
+        assert!(
+            refs["attached"][0].get("reads").is_none(),
+            "an unfinished review has no read count: {refs}"
+        );
+        assert_eq!(refs["dormant"][0]["name"], "rdma-core");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_final_output_fills_in_reference_reads() -> Result<()> {
+        let mut final_refs: Value =
+            serde_json::from_str::<Value>(&kernel_handoff(1))?["payload"].clone();
+        final_refs["attached"][0]["reads"] = json!(5);
+        let final_line = json!({
+            "patchset_id": 1,
+            "patches": [{"index": 1, "status": "applied", "reference_repos": final_refs}],
+        });
+        let mock_script = format!(
+            "#!/bin/bash\nread -r input\necho '{}'\necho '{}'\n",
+            kernel_handoff(1),
+            final_line
+        );
+        let (result, db, review_id) =
+            run_review_tool_mock(&mock_script, Arc::new(MockProvider), 5).await?;
+        result?;
+        let review = db.get_review_details(review_id).await?.unwrap();
+        assert_eq!(review["reference_repos"]["attached"][0]["reads"], 5);
+        assert_eq!(review["reference_repos"]["dormant"][0]["name"], "rdma-core");
+        Ok(())
+    }
+
+    /// A hand-off the daemon cannot trust, or one about another patch, is
+    /// dropped without failing the review.
+    #[tokio::test]
+    async fn test_malformed_reference_handoff_is_ignored() -> Result<()> {
+        let mut unknown: Value = serde_json::from_str(&kernel_handoff(1))?;
+        unknown["payload"]["attached"][0]["extra"] = json!(true);
+        let mock_script = format!(
+            "#!/bin/bash\nread -r input\necho '{}'\necho '{}'\n\
+             echo '{{\"patchset_id\":1,\"patches\":[{{\"index\":1,\"status\":\"applied\"}}]}}'\n",
+            unknown,
+            kernel_handoff(2)
+        );
+        let (result, db, review_id) =
+            run_review_tool_mock(&mock_script, Arc::new(MockProvider), 5).await?;
+        result?;
+        let review = db.get_review_details(review_id).await?.unwrap();
+        assert!(review["reference_repos"].is_null(), "{review}");
+        Ok(())
     }
 
     #[tokio::test]

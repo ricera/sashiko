@@ -3951,6 +3951,54 @@
             `;
         }
 
+        // One line naming the reference repositories a review had: which tree,
+        // at which configured revision and commit, and how many tool calls named
+        // it. The reason it was attached goes in the hover text, and configured
+        // references the patch left dormant follow in muted text, so a reader can
+        // tell "not offered" from "offered and unused". Everything shown comes
+        // from the review row, and the matched file name from the patch itself,
+        // so every value is escaped. Returns '' for a review with no record, so
+        // such a card renders exactly as before.
+        function renderReviewReferences(refs) {
+            try {
+                if (typeof refs === 'string') refs = JSON.parse(refs);
+                if (!refs || typeof refs !== 'object') return '';
+                const attached = Array.isArray(refs.attached) ? refs.attached : [];
+                const dormant = Array.isArray(refs.dormant) ? refs.dormant : [];
+                if (attached.length === 0 && dormant.length === 0) return '';
+
+                const entries = attached.map(a => {
+                    const commit = String(a.commit || '');
+                    let text = `${escapeHtml(a.name)} @ ${escapeHtml(a.revision)} (${escapeHtml(commit.slice(0, 12))})`;
+                    const hasReads = typeof a.reads === 'number';
+                    if (hasReads) text += `, ${a.reads} read${a.reads === 1 ? '' : 's'}`;
+                    // Stored JSON is untyped, so a reason is only spelled out
+                    // when the fields it names are actually there.
+                    const why = a.why === 'match' && typeof a.file === 'string' && typeof a.glob === 'string'
+                        ? `attached because ${a.file} matches ${a.glob}`
+                        : a.why === 'always' ? 'attached to every patch' : 'attached';
+                    const title = [why, `kind ${a.kind}`, `commit ${commit}`,
+                        hasReads ? 'reads count tool calls that named it, cache hits and refused calls included'
+                                 : 'read count not reported: the review did not finish'].join('; ');
+                    return `<span title="${escapeHtml(title)}">${text}</span>`;
+                });
+
+                let html = `<strong>References:</strong> ${entries.length ? entries.join('; ') : 'none attached'}`;
+                if (dormant.length) {
+                    const notes = dormant.map(d => {
+                        const globs = Array.isArray(d.applies_to) ? d.applies_to : [];
+                        return globs.length
+                            ? `${escapeHtml(d.name)} (applies only to ${globs.map(g => escapeHtml(g)).join(', ')})`
+                            : escapeHtml(d.name);
+                    });
+                    html += ` <span style="color:var(--text-dim)">Not attached: ${notes.join('; ')}</span>`;
+                }
+                return `<div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; margin-top: 6px;">${html}</div>`;
+            } catch (e) {
+                return '';
+            }
+        }
+
         function renderReviewCard(r, emailHtml = '') {
             const uniqueId = Math.random().toString(36).substr(2, 9);
 
@@ -4097,6 +4145,9 @@
             const statusRaw = r.status || 'Finished';
             const s = statusRaw.toLowerCase();
             const showDetails = s === 'reviewed' || s === 'finished' || s === 'failed' || s === 'skipped';
+            // Outside the details block: a review still running, or one that was
+            // cancelled, already has the record its worker sent early.
+            const referencesHtml = renderReviewReferences(r.reference_repos);
 
             return `
                 <div class="review-card">
@@ -4111,7 +4162,7 @@
                         <div class="review-meta-label">Status:</div>
                         <div><span class="status-badge status-${(statusRaw || '').replace(/ /g, '')}">${statusRaw}</span></div>
                         `}
-                    </div>
+                    </div>${referencesHtml}
                     ${showDetails ? `
                     ${summaryHtml}
                     ${inlineHtml}
