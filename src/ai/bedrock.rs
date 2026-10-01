@@ -227,11 +227,15 @@ fn translate_request(
 
     let mut messages: Vec<Message> = Vec::new();
 
-    // We need to merge consecutive Tool messages into a single User message
-    // because Bedrock requires alternating user/assistant turns.
-    let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
+    // Bedrock Converse rejects a conversation whose user and assistant turns
+    // do not alternate. Tool results and user text that follow one another are
+    // therefore gathered into a single user message. The session runner sends
+    // user text right after tool results or after another user message, for
+    // example the final-turn prompt that follows tool results, or the feedback
+    // that asks again after a discarded answer.
+    let mut pending_user_blocks: Vec<ContentBlock> = Vec::new();
 
-    let flush_tool_results =
+    let flush_user_blocks =
         |pending: &mut Vec<ContentBlock>, messages: &mut Vec<Message>| -> Result<()> {
             if pending.is_empty() {
                 return Ok(());
@@ -240,11 +244,7 @@ fn translate_request(
             for block in pending.drain(..) {
                 builder = builder.content(block);
             }
-            messages.push(
-                builder
-                    .build()
-                    .context("Failed to build tool result message")?,
-            );
+            messages.push(builder.build().context("Failed to build user message")?);
             Ok(())
         };
 
@@ -252,18 +252,11 @@ fn translate_request(
         match msg.role {
             AiRole::System => {} // handled above
             AiRole::User => {
-                flush_tool_results(&mut pending_tool_results, &mut messages)?;
                 let text = msg.content.clone().unwrap_or_default();
-                messages.push(
-                    Message::builder()
-                        .role(ConversationRole::User)
-                        .content(ContentBlock::Text(text))
-                        .build()
-                        .context("Failed to build user message")?,
-                );
+                pending_user_blocks.push(ContentBlock::Text(text));
             }
             AiRole::Assistant => {
-                flush_tool_results(&mut pending_tool_results, &mut messages)?;
+                flush_user_blocks(&mut pending_user_blocks, &mut messages)?;
                 let mut builder = Message::builder().role(ConversationRole::Assistant);
                 if let Some(text) = &msg.content {
                     builder = builder.content(ContentBlock::Text(text.clone()));
@@ -293,7 +286,7 @@ fn translate_request(
                     .as_ref()
                     .context("Tool message missing tool_call_id")?;
                 let result_text = msg.content.clone().unwrap_or_else(|| "{}".to_string());
-                pending_tool_results.push(ContentBlock::ToolResult(
+                pending_user_blocks.push(ContentBlock::ToolResult(
                     ToolResultBlock::builder()
                         .tool_use_id(tool_call_id)
                         .content(ToolResultContentBlock::Text(result_text))
@@ -303,7 +296,7 @@ fn translate_request(
             }
         }
     }
-    flush_tool_results(&mut pending_tool_results, &mut messages)?;
+    flush_user_blocks(&mut pending_user_blocks, &mut messages)?;
 
     if enable_caching && let Some(last) = messages.last_mut() {
         let role = last.role().clone();
@@ -676,6 +669,73 @@ mod tests {
             panic!("Expected ToolResult block");
         }
 
+        Ok(())
+    }
+
+    fn message(role: AiRole, content: &str, tool_call_id: Option<&str>) -> AiMessage {
+        AiMessage {
+            role,
+            content: Some(content.to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: tool_call_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_consecutive_user_messages_become_one_turn() -> Result<()> {
+        let req = make_request(vec![
+            message(AiRole::User, "prompt", None),
+            message(AiRole::User, "feedback", None),
+        ]);
+
+        let params = translate_request(&req, false, 4096, None, None)?;
+        assert_eq!(
+            params.messages.len(),
+            1,
+            "Converse rejects two user turns in a row"
+        );
+        let texts: Vec<&str> = params.messages[0]
+            .content()
+            .iter()
+            .filter_map(|b| b.as_text().ok().map(String::as_str))
+            .collect();
+        assert_eq!(texts, ["prompt", "feedback"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_user_text_after_tool_results_joins_their_turn() -> Result<()> {
+        let req = make_request(vec![
+            message(AiRole::User, "prompt", None),
+            AiMessage {
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    function_name: "git_log".to_string(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                }]),
+                ..message(AiRole::Assistant, "looking", None)
+            },
+            message(AiRole::Tool, "commit abc123", Some("call_1")),
+            message(AiRole::User, "feedback", None),
+        ]);
+
+        let params = translate_request(&req, false, 4096, None, None)?;
+        let roles: Vec<&ConversationRole> = params.messages.iter().map(|m| m.role()).collect();
+        assert_eq!(
+            roles,
+            [
+                &ConversationRole::User,
+                &ConversationRole::Assistant,
+                &ConversationRole::User
+            ]
+        );
+        let last = params.messages[2].content();
+        assert_eq!(last.len(), 2);
+        assert!(last[0].is_tool_result(), "tool results come first");
+        assert_eq!(last[1].as_text().map(String::as_str), Ok("feedback"));
         Ok(())
     }
 
