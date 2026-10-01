@@ -305,3 +305,96 @@ pub struct CreateApiTokenRequest {
     pub max_bug_access: Option<String>,
     pub expires_in_days: Option<u64>,
 }
+
+/// One entry of live or last-known activity, as served by `/api/activity` and
+/// `/api/patchset/activity` and read back by `sashiko-cli`.
+///
+/// One shape for both sources, so a reader never has to tell them apart by
+/// which fields happen to be present: live entries carry `age_seconds` and
+/// `idle_seconds`, persisted ones carry `updated_at` instead.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ActivityEntry {
+    /// The rendered `ActivityKey`. An identifier, not something to parse: the
+    /// patch and stage it names are given below.
+    pub key: String,
+    /// What the work is doing. `None` for a phase this build cannot read --
+    /// a persisted row from another build, or a newer daemon answering an
+    /// older client -- in which case `description` still says it. Read
+    /// leniently for the same reason: one unfamiliar entry must not make the
+    /// whole response unreadable.
+    #[serde(default, deserialize_with = "lenient_phase")]
+    pub phase: Option<crate::activity::Phase>,
+    pub description: String,
+    pub patch_id: Option<i64>,
+    /// The stage's name, for stage-level entries.
+    pub stage: Option<String>,
+    /// The stage's short label in the daemon's project.
+    pub stage_label: Option<String>,
+    /// The stage's rank in the daemon's pipeline; `None` for entries that are
+    /// not stages and for names the pipeline does not know. Sort `None` last.
+    pub order: Option<u32>,
+    /// Seconds since this activity began. Live entries only.
+    pub age_seconds: Option<u64>,
+    /// Seconds since it last advanced. Live entries only.
+    pub idle_seconds: Option<u64>,
+    /// Unix time the row was last written. Persisted entries only.
+    pub updated_at: Option<i64>,
+}
+
+fn lenient_phase<'de, D>(deserializer: D) -> Result<Option<crate::activity::Phase>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
+/// Everything in flight across the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityResponse {
+    pub count: usize,
+    pub entries: Vec<ActivityEntry>,
+}
+
+/// What one patchset is doing, or was doing when the daemon last stopped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchsetActivityResponse {
+    /// False when the entries are the last known state persisted before a
+    /// restart, rather than work running now.
+    pub live: bool,
+    pub entries: Vec<ActivityEntry>,
+}
+
+/// Query for `/api/patchset/activity`.
+#[derive(Debug, Deserialize)]
+pub struct PatchsetActivityQuery {
+    pub id: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A newer daemon may report a phase this client has never heard of; the
+    /// entry still reads, by its description, and so does the rest.
+    #[test]
+    fn test_an_unknown_phase_does_not_spoil_the_response() {
+        let body = serde_json::json!({
+            "live": true,
+            "entries": [
+                {"key": "patchset:1", "phase": {"kind": "from_the_future"},
+                 "description": "doing something new", "patch_id": null, "stage": null,
+                 "stage_label": null, "order": null, "age_seconds": 3, "idle_seconds": 1,
+                 "updated_at": null},
+                {"key": "patchset:1/patch:2", "phase": {"kind": "queued"},
+                 "description": "queued", "patch_id": 2, "stage": null,
+                 "stage_label": null, "order": null, "age_seconds": 3, "idle_seconds": 1,
+                 "updated_at": null},
+            ],
+        });
+        let resp: PatchsetActivityResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(resp.entries[0].phase, None);
+        assert_eq!(resp.entries[0].description, "doing something new");
+        assert_eq!(resp.entries[1].phase, Some(crate::activity::Phase::Queued));
+    }
+}

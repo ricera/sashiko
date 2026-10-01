@@ -233,6 +233,11 @@ pub struct ServerOptions {
     /// Absent when the token could not be written, in which case local tools
     /// authenticate the same way anyone else does.
     pub local_token: Option<crate::auth::LocalToken>,
+    /// What running fetches and reviews are doing, shared with the reviewer
+    /// and the fetcher that report into it. The default is an empty registry
+    /// with nothing reporting, which is what a router built without a daemon
+    /// behind it should serve.
+    pub activity: Arc<crate::activity::ActivityRegistry>,
 }
 
 pub struct AppState {
@@ -246,6 +251,7 @@ pub struct AppState {
     pub smtp_enabled: bool,
     pub dry_run: bool,
     pub local_token: Option<crate::auth::LocalToken>,
+    pub activity: Arc<crate::activity::ActivityRegistry>,
     pub sign_in_link_rate_limiter: SignInLinkRateLimiter,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
@@ -298,6 +304,7 @@ pub fn build_router(
         smtp_enabled: options.smtp_enabled,
         dry_run: options.dry_run,
         local_token: options.local_token,
+        activity: options.activity,
         sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -320,6 +327,15 @@ pub fn build_router(
         .route("/api/message", get(get_message))
         .route("/api/review", get(get_review))
         .route("/api/review_log", get(get_review_log))
+        // Read-only and public, like the patchset and review routes beside
+        // them. They carry progress metadata only -- stage and tool names, turn
+        // counts, redacted remote URLs, one-line failure reasons with any
+        // quoted model output removed (`activity::public_reason`) -- and no
+        // review text, so they need no capability, embargoed patchsets
+        // included. That has to be revisited if live conversation text is ever
+        // added to these payloads.
+        .route("/api/activity", get(get_activity))
+        .route("/api/patchset/activity", get(get_patchset_activity))
         .route("/api/stats", get(get_stats))
         .route("/api/stats/timeline", get(stats_timeline))
         .route("/api/stats/reviews", get(stats_reviews))
@@ -922,6 +938,91 @@ async fn get_patchset_summary(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+/// Everything in flight across the daemon, least idle first.
+async fn get_activity(State(state): State<Arc<AppState>>) -> Json<crate::api::ActivityResponse> {
+    let mut entries: Vec<crate::api::ActivityEntry> = state
+        .activity
+        .snapshot()
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    crate::activity::annotate(
+        &mut entries,
+        state.settings.project.kind.unwrap_or_default(),
+    );
+    Json(crate::api::ActivityResponse {
+        count: entries.len(),
+        entries,
+    })
+}
+
+/// Statuses in which a patchset still has work outstanding. Persisted activity
+/// is only an explanation for a patchset in one of these: one that has
+/// finished has nothing left to explain, whatever rows outlived it.
+///
+/// Status alone is enough only while nothing moves a stranded patchset to a
+/// terminal status at startup. The fork's stranded-fetch sweep (not ported)
+/// marks such a patchset `Failed` and deliberately keeps its row so the reason
+/// can read "stopped while: fetching ..." (its
+/// `test_sweep_preserves_the_last_activity_for_context`). If that sweep is
+/// ported, a patchset it failed must still be served its preserved row, so this
+/// test has to look at more than the status.
+const UNFINISHED_PATCHSET_STATUSES: &[&str] = &["Fetching", "Pending", "Incomplete", "In Review"];
+
+/// What one patchset is doing now, or failing that what it was doing when the
+/// daemon last stopped.
+async fn get_patchset_activity(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<crate::api::PatchsetActivityQuery>,
+) -> Result<Json<crate::api::PatchsetActivityResponse>, StatusCode> {
+    let db_error = |e: anyhow::Error| {
+        info!("Database error: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let project = state.settings.project.kind.unwrap_or_default();
+
+    let mut entries: Vec<crate::api::ActivityEntry> = state
+        .activity
+        .patchset_snapshot(query.id)
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    // A fetch is keyed by what it fetches, not by patchset, so it has to be
+    // looked up through the placeholder the patchset was created with.
+    // Without this a patchset that is fetching right now read as stopped.
+    if let Some(commit) = state
+        .db
+        .get_patchset_fetch_commit(query.id)
+        .await
+        .map_err(db_error)?
+        && let Some(fetch) = state
+            .activity
+            .get(&crate::activity::ActivityKey::Commit(commit))
+    {
+        entries.push(fetch.into());
+    }
+
+    let live = !entries.is_empty();
+    if !live {
+        let status = state
+            .db
+            .get_patchset_status(query.id)
+            .await
+            .map_err(db_error)?
+            .ok_or(StatusCode::NOT_FOUND)?;
+        if UNFINISHED_PATCHSET_STATUSES.contains(&status.as_str()) {
+            entries = state
+                .db
+                .get_patchset_activity(query.id)
+                .await
+                .map_err(db_error)?;
+        }
+    }
+
+    crate::activity::sort_for_display(&mut entries, project);
+    Ok(Json(crate::api::PatchsetActivityResponse { live, entries }))
 }
 
 async fn get_review_log(
@@ -2283,6 +2384,197 @@ mod tests {
         assert!(id.ends_with("@sashiko.local"));
     }
 
+    /// Serves a router with `activity` behind it, read-only so that nothing
+    /// mutating could be what lets a request through.
+    async fn serve_activity(
+        activity: Arc<crate::activity::ActivityRegistry>,
+    ) -> (SocketAddr, Arc<Database>) {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.server.testing_mode = false;
+        settings.server.read_only = true;
+        let (event_tx, _event_rx) = mpsc::channel(10);
+        let (fetch_tx, _fetch_rx) = mpsc::channel(10);
+        let app = build_router(
+            Arc::new(settings),
+            db.clone(),
+            event_tx,
+            fetch_tx,
+            ServerOptions {
+                activity,
+                ..Default::default()
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        (addr, db)
+    }
+
+    async fn patchset_activity(addr: SocketAddr, id: i64) -> crate::api::PatchsetActivityResponse {
+        let resp = reqwest::get(format!("http://{addr}/api/patchset/activity?id={id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.json().await.unwrap()
+    }
+
+    /// Both activity routes are public reads, like the patchset pages they sit
+    /// beside, and answer without credentials even on a read-only server.
+    #[tokio::test]
+    async fn test_activity_routes_answer_without_credentials() {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase};
+
+        let activity = ActivityRegistry::new();
+        activity.update(
+            ActivityKey::Patchset(3),
+            Phase::ReviewingPatches { patches: 2 },
+        );
+        let (addr, _db) = serve_activity(activity).await;
+
+        let resp = reqwest::get(format!("http://{addr}/api/activity"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let all: crate::api::ActivityResponse = resp.json().await.unwrap();
+        assert_eq!(all.count, 1);
+        assert_eq!(all.entries[0].description, "reviewing 2 patches");
+        assert!(all.entries[0].idle_seconds.is_some());
+
+        // A patchset the database has never heard of, with nothing live.
+        let resp = reqwest::get(format!("http://{addr}/api/patchset/activity?id=999"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A fetch is keyed by what it fetches, so the patchset has to be bridged to
+    /// it. Without that a patchset fetching right now read as stopped.
+    #[tokio::test]
+    async fn test_a_fetch_in_progress_reads_as_live() {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase};
+
+        let activity = ActivityRegistry::new();
+        let (addr, db) = serve_activity(activity.clone()).await;
+        let id = db
+            .create_fetching_patchset(
+                "mr-4-aaa..bbb@sashiko.local",
+                "Fetching PR",
+                None,
+                None,
+                None,
+                Some("Title"),
+                Some(4),
+                None,
+            )
+            .await
+            .unwrap();
+        activity.update(
+            ActivityKey::Commit("aaa..bbb".to_string()),
+            Phase::Fetching {
+                remote: "https://example.org/repo".to_string(),
+                commits: 2,
+            },
+        );
+
+        let resp = patchset_activity(addr, id).await;
+        assert!(resp.live, "a fetch running now is live");
+        assert_eq!(resp.entries.len(), 1);
+        assert_eq!(resp.entries[0].key, "commit:aaa..bbb");
+        assert!(resp.entries[0].age_seconds.is_some());
+    }
+
+    /// Persisted activity explains a patchset the daemon stopped in the middle
+    /// of. It is shown only for one still unfinished, and in the same order the
+    /// live entries would be.
+    #[tokio::test]
+    async fn test_last_known_activity_is_shown_only_for_unfinished_work() {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase};
+
+        let (addr, db) = serve_activity(ActivityRegistry::new()).await;
+        let thread_id = db.create_thread("act", "Subject", 1000).await.unwrap();
+        let id = db
+            .create_patchset(
+                thread_id, None, "act", "Subject", "Author", 1000, 1, 1, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.update_patchset_status(id, "In Review").await.unwrap();
+
+        // What a registry would have written, newest first, as a restart would
+        // find it.
+        let rows = [
+            (
+                ActivityKey::PatchsetStage {
+                    patchset_id: id,
+                    patch_id: 8,
+                    stage: "report".to_string(),
+                },
+                Phase::Queued,
+            ),
+            (
+                ActivityKey::PatchsetStage {
+                    patchset_id: id,
+                    patch_id: 8,
+                    stage: "goal".to_string(),
+                },
+                Phase::Queued,
+            ),
+            (
+                ActivityKey::Patchset(id),
+                Phase::ReviewingPatches { patches: 1 },
+            ),
+        ];
+        for (key, phase) in rows {
+            db.upsert_activity(
+                &key.to_string(),
+                key.patchset_id(),
+                &serde_json::to_string(&phase).unwrap(),
+                &phase.describe(),
+                1000,
+            )
+            .await
+            .unwrap();
+        }
+
+        let resp = patchset_activity(addr, id).await;
+        assert!(!resp.live);
+        let keys: Vec<&str> = resp.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                format!("patchset:{id}"),
+                format!("patchset:{id}/patch:8/stage:goal"),
+                format!("patchset:{id}/patch:8/stage:report"),
+            ]
+        );
+        assert!(resp.entries[1].order < resp.entries[2].order);
+        assert_eq!(
+            resp.entries[1].stage_label.as_deref(),
+            Some("Goal Analysis")
+        );
+
+        // Finished, the same rows explain nothing.
+        db.update_patchset_status(id, "Reviewed").await.unwrap();
+        let resp = patchset_activity(addr, id).await;
+        assert!(!resp.live);
+        assert!(resp.entries.is_empty());
+    }
+
     #[tokio::test]
     async fn test_api_token_endpoint_minting_and_attenuation() {
         let db_settings = crate::settings::DatabaseSettings {
@@ -3376,6 +3668,7 @@ mod tests {
             smtp_enabled: false,
             dry_run: true,
             local_token: None,
+            activity: Default::default(),
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
             stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3769,6 +4062,7 @@ mod tests {
                 smtp_enabled: false,
                 dry_run: true,
                 local_token: None,
+                activity: Default::default(),
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
                 stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3835,6 +4129,7 @@ mod tests {
                 smtp_enabled: false,
                 dry_run: true,
                 local_token,
+                activity: Default::default(),
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
                 stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -3977,6 +4272,7 @@ mod tests {
             messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
             local_token: None,
+            activity: Default::default(),
         });
         let index = crate::maintainers::MaintainersIndex::from_reader(
             b"Maintainers List\n================\n\nSECTION A\nM:\tAlice <a@example.org>\nF:\ta/\n\nSECTION B\nM:\tBob <b@example.org>\nF:\tb/\n".as_slice()

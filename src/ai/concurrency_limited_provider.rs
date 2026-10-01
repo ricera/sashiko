@@ -46,29 +46,76 @@ pub fn llm_permits(concurrency: usize) -> usize {
     if concurrency < 2 { 1 } else { concurrency * 3 }
 }
 
+/// Notified when a request has to wait before it can reach the model, and
+/// again once it is on its way.
+///
+/// The wait is otherwise invisible. A stage queued behind its siblings, or
+/// backing off after a rate limit, looks exactly like a stage waiting on a slow
+/// model, and the three call for different responses: raise the concurrency,
+/// check the quota, or be patient. Only the layers that impose the waits know
+/// which of them is happening.
+pub trait SlotObserver: Send + Sync {
+    /// The request is blocked because every permit is taken.
+    fn queued(&self, request: &AiRequest);
+    /// The wait is over, so the time from here really is the model's.
+    fn running(&self, request: &AiRequest);
+    /// The request is backing off after a rate limit or a transient error, and
+    /// will retry in `retry_in`. Reported by
+    /// [`crate::ai::backoff_provider::BackoffProvider`]; ignored by default.
+    fn backing_off(&self, _request: &AiRequest, _retry_in: std::time::Duration) {}
+}
+
 /// Limits concurrent model calls to the permits of a shared semaphore. All
 /// other behaviour is delegated unchanged to the inner provider.
 pub struct ConcurrencyLimitedProvider {
     inner: Arc<dyn AiProvider>,
     semaphore: Arc<Semaphore>,
+    observer: Option<Arc<dyn SlotObserver>>,
 }
 
 impl ConcurrencyLimitedProvider {
     /// The semaphore is shared, so every provider built from it draws on the
     /// same pool of permits.
     pub fn new(inner: Arc<dyn AiProvider>, semaphore: Arc<Semaphore>) -> Self {
-        Self { inner, semaphore }
+        Self {
+            inner,
+            semaphore,
+            observer: None,
+        }
+    }
+
+    /// Reports slot waits to `observer`. Without one the limiter is silent, as
+    /// it is for a local review that has nowhere to report to.
+    pub fn with_observer(mut self, observer: Arc<dyn SlotObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 }
 
 #[async_trait]
 impl AiProvider for ConcurrencyLimitedProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
+        // Tried without blocking first, so the common case of a free slot costs
+        // no report at all. Only a request that genuinely waits is worth saying
+        // anything about, and only that request needs telling when the wait
+        // ends.
+        let _permit = match self.semaphore.try_acquire() {
+            Ok(permit) => permit,
+            Err(_) => {
+                if let Some(observer) = &self.observer {
+                    observer.queued(&request);
+                }
+                let permit = self
+                    .semaphore
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
+                if let Some(observer) = &self.observer {
+                    observer.running(&request);
+                }
+                permit
+            }
+        };
         self.inner.generate_content(request).await
     }
 
@@ -95,5 +142,127 @@ mod tests {
         // Above that, calls are allowed to run wider than the worktrees are.
         assert_eq!(llm_permits(2), 6);
         assert_eq!(llm_permits(16), 48);
+    }
+
+    /// Answers each call only once the test releases it, so a second caller is
+    /// provably still queued. A semaphore rather than a `Notify`, so a release
+    /// that happens before a call starts waiting is not lost.
+    struct GatedProvider {
+        gate: Arc<Semaphore>,
+    }
+
+    #[async_trait]
+    impl AiProvider for GatedProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            self.gate.acquire().await?.forget();
+            Ok(AiResponse {
+                content: Some("ok".into()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "gated".into(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl SlotObserver for RecordingObserver {
+        fn queued(&self, _request: &AiRequest) {
+            self.events.lock().unwrap().push("queued");
+        }
+        fn running(&self, _request: &AiRequest) {
+            self.events.lock().unwrap().push("running");
+        }
+    }
+
+    fn request() -> AiRequest {
+        AiRequest {
+            system: None,
+            messages: Vec::new(),
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        }
+    }
+
+    /// A request that waits for a slot says so, and says when the wait is over.
+    ///
+    /// Without this a stage queued behind its siblings reports "awaiting model",
+    /// which is what a slow model reports -- and the two call for opposite
+    /// responses.
+    #[tokio::test]
+    async fn test_a_queued_request_is_reported_as_queued() {
+        let gate = Arc::new(Semaphore::new(0));
+        let observer = Arc::new(RecordingObserver::default());
+        // One permit, so the second caller cannot proceed until the first ends.
+        let limiter = Arc::new(
+            ConcurrencyLimitedProvider::new(
+                Arc::new(GatedProvider { gate: gate.clone() }),
+                Arc::new(Semaphore::new(1)),
+            )
+            .with_observer(observer.clone()),
+        );
+
+        let first = tokio::spawn({
+            let limiter = limiter.clone();
+            async move { limiter.generate_content(request()).await }
+        });
+        // Let the first call take the only permit and block on the gate.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let second = tokio::spawn({
+            let limiter = limiter.clone();
+            async move { limiter.generate_content(request()).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(
+            observer.events.lock().unwrap().as_slice(),
+            ["queued"],
+            "the second call is waiting for a slot and nothing has told anyone"
+        );
+
+        gate.add_permits(2);
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(
+            observer.events.lock().unwrap().as_slice(),
+            ["queued", "running"],
+            "the wait has to be cleared, or the stage reads as queued forever"
+        );
+    }
+
+    /// The common case costs nothing: a free slot is not worth reporting, and
+    /// reporting it would churn the activity clock on every single request.
+    #[tokio::test]
+    async fn test_an_unqueued_request_is_not_reported() {
+        let gate = Arc::new(Semaphore::new(1));
+        let observer = Arc::new(RecordingObserver::default());
+        let limiter = ConcurrencyLimitedProvider::new(
+            Arc::new(GatedProvider { gate }),
+            Arc::new(Semaphore::new(4)),
+        )
+        .with_observer(observer.clone());
+
+        limiter.generate_content(request()).await.unwrap();
+
+        assert!(
+            observer.events.lock().unwrap().is_empty(),
+            "a request that never waited has nothing to report"
+        );
     }
 }

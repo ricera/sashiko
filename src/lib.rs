@@ -15,6 +15,7 @@ pub mod metrics;
 
 #[cfg(feature = "server")]
 pub mod access;
+pub mod activity;
 pub mod ai;
 pub mod api;
 pub mod auth;

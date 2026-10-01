@@ -119,6 +119,35 @@ pub enum WorkerProgressEvent {
         turn: usize,
         max_turns: usize,
     },
+    /// A stage started running tools, or finished (empty `tools`).
+    ///
+    /// Splits a turn's elapsed time into waiting on the model versus running
+    /// git, which are indistinguishable from outside without this.
+    StageTools {
+        stage: String,
+        tools: Vec<String>,
+        turn: usize,
+        max_turns: usize,
+    },
+    /// A stage is backing off after the provider asked us to slow down.
+    /// `retry_in_seconds` is `None` once the wait is over.
+    StageBackoff {
+        stage: String,
+        retry_in_seconds: Option<u64>,
+        turn: usize,
+        max_turns: usize,
+    },
+    /// A stage stopped without finishing.
+    ///
+    /// The counterpart to [`WorkerProgressEvent::StageFinished`], which is only
+    /// reached on the success path. Without this, a stage that failed kept its
+    /// last reported turn on display -- claiming to still be running -- for as
+    /// long as the rest of the review took.
+    StageFailed {
+        stage: String,
+        reason: String,
+        cancelled: bool,
+    },
 }
 
 pub struct WorkerResult {
@@ -437,6 +466,43 @@ impl Worker {
                             max_turns,
                         });
                     }
+                    WorkflowEvent::StageTools {
+                        stage_name,
+                        tools,
+                        turn,
+                        max_turns,
+                    } if crate::workflows::is_counted_stage(project, stage_name) => {
+                        progress_cb(WorkerProgressEvent::StageTools {
+                            stage: stage_name.to_string(),
+                            tools,
+                            turn,
+                            max_turns,
+                        });
+                    }
+                    WorkflowEvent::StageBackoff {
+                        stage_name,
+                        retry_in_seconds,
+                        turn,
+                        max_turns,
+                    } if crate::workflows::is_counted_stage(project, stage_name) => {
+                        progress_cb(WorkerProgressEvent::StageBackoff {
+                            stage: stage_name.to_string(),
+                            retry_in_seconds,
+                            turn,
+                            max_turns,
+                        });
+                    }
+                    WorkflowEvent::StageFailed {
+                        stage_name,
+                        reason,
+                        cancelled,
+                    } if crate::workflows::is_counted_stage(project, stage_name) => {
+                        progress_cb(WorkerProgressEvent::StageFailed {
+                            stage: stage_name.to_string(),
+                            reason,
+                            cancelled,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -459,6 +525,34 @@ impl Worker {
             state.review_inline
         };
 
+        // Stages that did not complete while their siblings did, so the caller
+        // can report which parts of the review are missing instead of
+        // presenting partial coverage as full. A batch where every stage failed
+        // never gets here: the engine turns that into an error.
+        let stage_failures: Vec<Value> = outcome
+            .stage_failures
+            .iter()
+            .map(|f| {
+                json!({
+                    "stage": f.stage_name,
+                    "reason": f.reason,
+                    "cancelled": f.cancelled,
+                })
+            })
+            .collect();
+
+        if !stage_failures.is_empty() {
+            tracing::warn!(
+                "{} review stages did not complete: {:?}",
+                stage_failures.len(),
+                outcome
+                    .stage_failures
+                    .iter()
+                    .map(|f| f.stage_name)
+                    .collect::<Vec<_>>()
+            );
+        }
+
         let final_output = json!({
             "summary": state.summary,
             "findings": state.findings,
@@ -467,6 +561,7 @@ impl Worker {
             "review_inline": review_inline,
             "fixes": state.fixes,
             "concerns_count": concerns_count,
+            "stage_failures": stage_failures,
             "dismissed_concerns_count": dismissed_concerns_count,
         });
 
@@ -1159,6 +1254,112 @@ mod tests {
                 "unexpected error: {e}"
             ),
         }
+    }
+
+    /// Fails every request from one named stage and answers the rest with an
+    /// empty concern list, so a batch can partly fail. The stage is read from
+    /// the `[s:NAME]` context tag, the same place the daemon reads it from.
+    struct MockProviderFailsOneStage {
+        failing_stage: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for MockProviderFailsOneStage {
+        async fn generate_content(
+            &self,
+            request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            let stage = request
+                .context_tag
+                .as_deref()
+                .and_then(crate::activity::stage_from_context_tag);
+            if stage.as_deref() == Some(self.failing_stage) {
+                anyhow::bail!("mock: simulated failure in {}", self.failing_stage)
+            }
+            Ok(crate::ai::AiResponse {
+                content: Some(r#"{"concerns": [], "dismissed_concerns": []}"#.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    /// The concurrent analysis stages run under `BestEffort`, so one failing
+    /// stage does not abort the review while a sibling succeeds. That is only
+    /// acceptable because the failure is reported: partial coverage presented
+    /// as full coverage would be worse than an outright failure. (A batch where
+    /// every stage fails is still an error; see the test above.)
+    #[tokio::test]
+    async fn test_stage_failure_is_reported_not_swallowed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let prompts_dir = temp_dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).unwrap();
+
+        let provider = std::sync::Arc::new(MockProviderFailsOneStage {
+            failing_stage: "goal",
+        });
+        let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+        let prompts = PromptRegistry::new(prompts_dir);
+        let config = WorkerConfig {
+            project: ProjectId::Linux,
+            max_input_tokens: 10000,
+            max_interactions: 3,
+            temperature: 0.0,
+            series_range: None,
+            baseline_sha: None,
+            custom_prompt: None,
+            // Named explicitly so the pre-screen and planning stages skip and
+            // the run reaches the concurrent analysis stages, which are the
+            // ones the best-effort policy covers.
+            stages: Some(vec!["goal".to_string(), "implementation".to_string()]),
+            skip_report: false,
+        };
+        let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
+
+        let patchset = serde_json::json!({
+            "id": 1,
+            "patch_index": 1,
+            "patches": [{"diff": "diff --git a/foo.c b/foo.c\n+int x;"}]
+        });
+
+        let failed: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let record = |e: WorkerProgressEvent| {
+            if let WorkerProgressEvent::StageFailed { stage, .. } = e {
+                failed.lock().unwrap().push(stage);
+            }
+        };
+
+        let res = worker
+            .run(patchset, Some(&record))
+            .await
+            .expect("a partly failed batch is still a review");
+        let output = res.output.expect("output");
+        let failures = output["stage_failures"].as_array().expect("array");
+        assert_eq!(failures.len(), 1, "{output}");
+        assert_eq!(failures[0]["stage"], "goal");
+        assert_eq!(failures[0]["cancelled"], false);
+        assert!(
+            failures[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("simulated failure in goal"),
+            "{output}"
+        );
+        assert_eq!(
+            *failed.lock().unwrap(),
+            ["goal"],
+            "the failing stage must also report itself live"
+        );
     }
 
     // ReviewError tests

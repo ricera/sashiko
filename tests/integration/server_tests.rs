@@ -67,6 +67,8 @@ struct TestServer {
     db: Arc<Database>,
     /// Event receiver — tests can drain submitted events from the channel.
     event_rx: mpsc::Receiver<Event>,
+    /// Shared activity registry — tests can publish live phases directly.
+    activity: Arc<sashiko::activity::ActivityRegistry>,
 }
 
 /// Spawn a real axum server on a random port with an in-memory database.
@@ -86,6 +88,7 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
     let (fetch_tx, _fetch_rx) = mpsc::channel::<FetchRequest>(100);
 
     let settings = Arc::new(test_settings(read_only));
+    let activity = sashiko::activity::ActivityRegistry::new();
     let app = build_router(
         settings,
         Arc::clone(&db),
@@ -94,6 +97,7 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
         ServerOptions {
             allow_all_submit: true,
             dry_run: true,
+            activity: Arc::clone(&activity),
             ..Default::default()
         },
     );
@@ -115,10 +119,167 @@ async fn spawn_test_server(read_only: bool) -> TestServer {
         base_url,
         db,
         event_rx,
+        activity,
     }
 }
 
 // ── Smoke Tests ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn test_activity_endpoint_reports_live_work() {
+    use sashiko::activity::{ActivityKey, Phase, StageWait};
+
+    let server = spawn_test_server(false).await;
+
+    // Nothing running yet.
+    let resp = reqwest::get(format!("{}/api/activity", server.base_url))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["count"], 0);
+
+    // Publish what a mid-review patchset with two concurrent stages and an
+    // in-flight fetch look like.
+    server.activity.update(
+        ActivityKey::Patchset(42),
+        Phase::Reviewing {
+            attempt: 1,
+            max_attempts: 1,
+        },
+    );
+    for (stage, turn) in [("locking", 9), ("security", 2)] {
+        server.activity.update(
+            ActivityKey::PatchsetStage {
+                patchset_id: 42,
+                patch_id: 1,
+                stage: stage.to_string(),
+            },
+            Phase::Stage {
+                stage: stage.to_string(),
+                turn,
+                max_turns: 100,
+                waiting: StageWait::Model,
+            },
+        );
+    }
+    server.activity.update(
+        ActivityKey::Commit("deadbeef".to_string()),
+        Phase::Fetching {
+            remote: "https://example.com/linux.git".to_string(),
+            commits: 2,
+        },
+    );
+
+    let body: serde_json::Value = reqwest::get(format!("{}/api/activity", server.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    assert_eq!(body["count"], 4);
+    let entries = body["entries"].as_array().unwrap();
+
+    let locking_stage = entries
+        .iter()
+        .find(|e| e["key"] == "patchset:42/patch:1/stage:locking")
+        .expect("per-stage activity should be reported");
+    assert_eq!(locking_stage["phase"]["kind"], "stage");
+    assert_eq!(locking_stage["phase"]["turn"], 9);
+    assert_eq!(locking_stage["stage"], "locking");
+    assert_eq!(
+        locking_stage["description"],
+        "stage locking, turn 9/100 (awaiting model)"
+    );
+
+    // Both clocks must reach the client — idle is what distinguishes a slow
+    // stage from a wedged one.
+    assert!(locking_stage["age_seconds"].is_number());
+    assert!(locking_stage["idle_seconds"].is_number());
+
+    // Concurrent stages are tracked separately rather than overwriting each other.
+    let security_stage = entries
+        .iter()
+        .find(|e| e["key"] == "patchset:42/patch:1/stage:security")
+        .expect("a second concurrent stage should have its own entry");
+    assert_eq!(security_stage["phase"]["turn"], 2);
+
+    let fetch = entries
+        .iter()
+        .find(|e| e["key"] == "commit:deadbeef")
+        .expect("fetch activity should be reported");
+    assert_eq!(fetch["phase"]["kind"], "fetching");
+
+    // Finishing one stage leaves its siblings alone.
+    server.activity.clear(&ActivityKey::PatchsetStage {
+        patchset_id: 42,
+        patch_id: 1,
+        stage: "locking".to_string(),
+    });
+    let body: serde_json::Value = reqwest::get(format!("{}/api/activity", server.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["count"], 3);
+
+    // Ending the review clears the patchset entry and every stage under it.
+    server.activity.clear_patchset(42);
+    let body: serde_json::Value = reqwest::get(format!("{}/api/activity", server.base_url))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["count"], 1, "only the unrelated fetch should remain");
+}
+
+/// A fetch is keyed by the commit it fetches, not by patchset, so the
+/// patchset's activity has to be bridged to it through the placeholder it was
+/// created with. Without the bridge a fetch running right now was reported as
+/// the last state of a daemon that had stopped.
+#[tokio::test]
+#[ignore]
+async fn test_patchset_activity_reports_live_fetch_as_live() {
+    use sashiko::activity::{ActivityKey, Phase};
+
+    let server = spawn_test_server(false).await;
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let id = server
+        .db
+        .create_fetching_patchset(
+            &format!("{sha}@sashiko.local"),
+            "Fetching...",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    server.activity.update(
+        ActivityKey::Commit(sha.to_string()),
+        Phase::GitOp {
+            op: "git rev-parse (checking commit presence)".to_string(),
+        },
+    );
+
+    let body: serde_json::Value =
+        reqwest::get(format!("{}/api/patchset/activity?id={id}", server.base_url))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(body["live"], true, "{body}");
+    assert_eq!(body["entries"][0]["key"], format!("commit:{sha}"));
+    assert_eq!(body["entries"][0]["phase"]["kind"], "git_op");
+}
 
 #[tokio::test]
 #[ignore]
