@@ -1115,15 +1115,9 @@ async fn attach_live_log(
         .get_review_log_entries(id, after_seq)
         .await
         .map_err(db_error)?;
-    // Labelled here, as activity entries are, because the labels are the
-    // project's and the page keeps no table of them.
     let project = state.settings.project.kind.unwrap_or_default();
     for entry in &mut entries {
-        entry.stage_label = entry
-            .stage
-            .as_deref()
-            .and_then(|s| crate::workflows::stage_short_label(project, s))
-            .map(str::to_string);
+        entry.label_stage(project);
     }
     let span = state.db.review_live_log_span(id).await.map_err(db_error)?;
     if let Some(obj) = details.as_object_mut() {

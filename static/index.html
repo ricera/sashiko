@@ -5710,10 +5710,12 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 else rowClass += ' role-system';
 
                 let label = (role === 'model' || role === 'assistant') ? 'LLM' : (role === 'tool' || role === 'function') ? 'TOOL' : role.toUpperCase();
-                // A live entry names its stage. Stages run concurrently, so the
-                // live stream interleaves conversations the finished log keeps
-                // apart, and without this a reader cannot tell which a message
-                // belongs to. Finished entries carry no stage and are drawn as
+                // A live entry names its stage, and so does each entry of the
+                // streamed conversation a review that did not finish keeps as
+                // its log. Stages run concurrently, so the stream interleaves
+                // conversations a worker's finished log keeps apart, and
+                // without this a reader cannot tell which a message belongs
+                // to. A worker's finished log carries no stage and is drawn as
                 // before. Both the label and the name are worker data: escaped.
                 if (entry.stage != null && entry.stage !== '') {
                     const stageName = String(entry.stage);

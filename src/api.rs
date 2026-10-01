@@ -58,7 +58,9 @@ pub struct ReviewQuery {
 ///
 /// A superset of a finished-log entry: the message's own fields, flattened,
 /// plus where it sits. One renderer therefore draws both logs, and fields it
-/// does not know about are ignored.
+/// does not know about are ignored. A review that did not finish keeps these
+/// entries, under a header saying so, as its final log, because its worker
+/// returned no history of its own.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LiveLogEntry {
     /// Position in the review's conversation. It only grows for one review
@@ -80,6 +82,20 @@ pub struct LiveLogEntry {
     pub created_at: i64,
     #[serde(flatten)]
     pub message: crate::ai::AiMessage,
+}
+
+impl LiveLogEntry {
+    /// Sets `stage_label` to the project's short label for `stage`.
+    ///
+    /// Done by the daemon, as it is for activity entries, because the labels
+    /// are the project's and the page keeps no table of them.
+    pub fn label_stage(&mut self, project: crate::project::ProjectId) {
+        self.stage_label = self
+            .stage
+            .as_deref()
+            .and_then(|s| crate::workflows::stage_short_label(project, s))
+            .map(str::to_string);
+    }
 }
 
 #[derive(Deserialize)]
