@@ -266,20 +266,40 @@ violations and the 3rd violation is fatal — **two retries, not three**. A
 patch that sets `max_validation_attempts: 1` disables retry entirely: the
 first violation bails and `format_validation_feedback` is never called.
 
-`resp.truncated` is fatal immediately, before validation, with "LLM output was
-truncated by provider". There is no retry path for truncation.
+`resp.truncated` is not fatal by itself. The runner counts the response's
+usage, logs the cut answer to `log_history` only, and asks again with
+feedback, refunding the turn (`retry_truncated`, `truncation_action`).
+Truncations are counted per turn (`TurnTruncations`, reset by every response
+that is not truncated) and bounded by `max_provider_error_retries` in a row;
+an answer that wrote nothing gets the reasoning feedback once, and a second
+one in the same turn fails with the typed `ai::OutputTruncated`, whose
+message names the remedy. Recitation keeps its own session-wide counter.
 
-`SessionResult.history` is `log_history`, not `history`. The two differ only
-in their first message: `history` starts with `session.initial_user_prompt()`
-(files expanded) and `log_history` with `session.log_user_prompt()`
-(`render_for_log`, directives left as `@path` tokens). Every subsequent
-message — assistant, tool result, validation feedback, recitation reminder —
-is pushed to both. That is what keeps expanded guide files out of the stored
-interaction log while keeping the log faithful about everything else.
+`SessionResult.history` is `log_history`, not `history`. The two start
+differently: `history` begins with `session.initial_user_prompt()` (files
+expanded) and `log_history` with `session.log_user_prompt()` (`render_for_log`,
+directives left as `@path` tokens). That is what keeps expanded guide files out
+of the stored interaction log. After the first message, every message —
+assistant, tool result, validation feedback, recitation reminder, truncation
+feedback, final-turn prompt — is pushed to both, with two deliberate
+differences:
+
+- **A truncated answer is logged only.** `retry_truncated` pushes the cut
+  answer to `log_history` alone, so the record shows what the model wrote and
+  the model never sees a half-written tool call.
+- **A final-turn answer is copied without its tool calls.**
+  `reply_for_history` gives `history` a copy with the tool calls dropped (or,
+  when no text is left, replaced by `IGNORED_TOOL_CALLS_NOTE`), because no
+  tool runs on the final turn and providers reject a `tool_use` with no
+  `tool_result`. `log_history` keeps the answer as the model wrote it.
 
 **Check in a diff:** a new message pushed to `history` but not `log_history`
-(or vice versa). GEMINI.md's observability rule requires every input and
-output be recorded; a one-sided push silently drops it from the record.
+(or vice versa), or one pushed to both in different forms, other than the two
+exceptions above. GEMINI.md's observability rule requires every input and
+output be recorded; a one-sided push silently drops it from the record. A
+one-sided push in `retry_truncated` of the truncated answer to `log_history`,
+or the `reply_for_history` copy for a final-turn answer, is intended and is
+not a finding.
 
 **Check in a diff:** a new `LlmSession` impl that does not override
 `call_tools`. See §6.

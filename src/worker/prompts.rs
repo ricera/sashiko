@@ -31,9 +31,6 @@ pub enum ReviewError {
     /// violated constraint rather than repeating the identical request.
     #[error("Format validation failed: {0}")]
     FormatRejection(String),
-    /// The AI response was truncated by the provider (e.g., hit max tokens).
-    #[error("AI response truncated by provider limit")]
-    OutputTruncated,
     /// The review was cancelled (e.g., superseded by a newer patchset version).
     #[error("Review cancelled")]
     Cancelled,
@@ -45,7 +42,6 @@ impl ClassifyAiError for ReviewError {
             ReviewError::LimitExceeded => AiErrorClass::Fatal,
             ReviewError::BudgetExceeded(_) => AiErrorClass::Fatal,
             ReviewError::FormatRejection(_) => AiErrorClass::Fatal,
-            ReviewError::OutputTruncated => AiErrorClass::Fatal,
             ReviewError::Cancelled => AiErrorClass::Fatal,
         }
     }
