@@ -47,6 +47,7 @@ impl ClassifyAiError for ReviewError {
     }
 }
 
+use crate::activity::StageFailureRecord;
 use crate::project::ProjectId;
 use crate::workflow::{StageFailure, StageStopCause, WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use crate::workflows::linux_patch_review::{
@@ -290,17 +291,15 @@ fn worker_progress_event(
 /// The `stage_failures` array of the worker's output, which the caller stores
 /// as `reviews.stage_failures`.
 ///
-/// Each entry is `{stage, reason, cause}`, with the cause in its stored snake
-/// case spelling.
-fn stage_failures_json(failures: &[StageFailure]) -> Vec<Value> {
+/// Built from [`StageFailureRecord`], the shape the daemon writes for an
+/// attempt that ended without a review, so both writers agree.
+fn stage_failures_json(failures: &[StageFailure]) -> Vec<StageFailureRecord> {
     failures
         .iter()
-        .map(|f| {
-            json!({
-                "stage": f.stage_name,
-                "reason": f.reason,
-                "cause": f.cause,
-            })
+        .map(|f| StageFailureRecord {
+            stage: f.stage_name.to_string(),
+            reason: f.reason.clone(),
+            cause: f.cause,
         })
         .collect()
 }
@@ -1491,7 +1490,8 @@ mod tests {
                 cause,
             })
             .collect();
-        let json = stage_failures_json(&failures);
+        let json = serde_json::to_value(stage_failures_json(&failures)).expect("serialises");
+        let json = json.as_array().expect("an array");
         let spellings: Vec<&str> = json
             .iter()
             .map(|f| f["cause"].as_str().expect("cause is a string"))
@@ -1506,7 +1506,7 @@ mod tests {
                 "interrupted"
             ]
         );
-        for f in &json {
+        for f in json {
             assert_eq!(f["stage"], "goal");
             assert_eq!(f["reason"], "stopped");
             assert!(f.get("cancelled").is_none(), "{f}");

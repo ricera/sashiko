@@ -57,6 +57,10 @@ struct ReviewContext {
     target_review_count: usize,
     provider: Arc<dyn AiProvider>,
     activity: Arc<crate::activity::ActivityRegistry>,
+    /// The program run as the review worker. `None` runs the daemon's own
+    /// binary; tests set a script that plays the worker's side of the
+    /// protocol.
+    worker_program: Option<PathBuf>,
 }
 
 enum PatchResult {
@@ -340,6 +344,7 @@ impl Reviewer {
                 target_review_count,
                 provider: self.provider.clone(),
                 activity: self.activity.clone(),
+                worker_program: None,
             };
 
             tokio::spawn(async move {
@@ -382,6 +387,7 @@ impl Reviewer {
                 target_review_count: 1,
                 provider: self.provider.clone(),
                 activity: self.activity.clone(),
+                worker_program: None,
             };
 
             if let Err(e) = Self::release_patchset_results(&context, &patchset).await {
@@ -1781,6 +1787,16 @@ impl Reviewer {
             return Ok(PatchResult::Success);
         }
 
+        let patch = PatchUnderReview {
+            patchset_id,
+            patch_id,
+            index,
+            baseline_ref,
+            commit_sha: commit_sha.as_deref(),
+            worktree_path,
+            input_payload,
+            embargo_until,
+        };
         let mut retries = 0;
         let max_retries = ctx.settings.review.max_retries;
 
@@ -1795,42 +1811,13 @@ impl Reviewer {
             .await?;
 
         loop {
-            if ctx
-                .db
-                .get_patchset_status(patchset_id)
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some(ReviewStatus::Cancelled.as_str())
-            {
+            if Self::patchset_cancelled(ctx, patchset_id).await {
                 info!(
                     "Patchset {} was cancelled before reviewing patch {}/{}",
                     patchset_id, patchset_id, index
                 );
-                if let Some(rid) = existing_pending_review_id.take()
-                    && let Err(e) = ctx
-                        .db
-                        .complete_review(
-                            rid,
-                            ReviewStatus::Cancelled.as_str(),
-                            "Cancelled because patchset was superseded or cancelled",
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await
-                {
-                    warn!("Failed to mark review {} as Cancelled: {}", rid, e);
-                }
-                if let Err(e) = ctx
-                    .db
-                    .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
-                    .await
-                {
-                    warn!("Failed to mark patch {} as Cancelled: {}", patch_id, e);
-                }
+                Self::mark_attempt_cancelled(ctx, existing_pending_review_id.take(), patch_id)
+                    .await;
                 return Ok(PatchResult::Cancelled);
             }
 
@@ -1864,7 +1851,11 @@ impl Reviewer {
             // reaches a terminal state still records which attempt it was.
             let _ = ctx.db.set_review_attempt(review_id, retries + 1).await;
 
+            // Owned here rather than by the run, so what it saw of the stages
+            // outlives a run that ended in an error.
+            let mut stages = crate::activity::StageTracker::new(ctx.activity.clone());
             let result = run_review_tool(
+                ctx.worker_program.as_deref(),
                 patchset_id,
                 input_payload,
                 &ctx.settings,
@@ -1883,6 +1874,7 @@ impl Reviewer {
                     attempt: retries + 1,
                     max_attempts: max_retries + 1,
                 },
+                &mut stages,
             )
             .await;
 
@@ -1895,558 +1887,686 @@ impl Reviewer {
                 .set_review_duration(review_id, review_started.elapsed().as_secs())
                 .await;
 
-            if ctx
-                .db
-                .get_patchset_status(patchset_id)
-                .await
-                .ok()
-                .flatten()
-                .as_deref()
-                == Some(ReviewStatus::Cancelled.as_str())
-            {
-                info!(
-                    "Patchset {} was cancelled while reviewing patch {}/{}",
-                    patchset_id, patchset_id, index
-                );
-                if let Err(e) = ctx
-                    .db
-                    .complete_review(
+            // A cancel decides the end whatever the run returned: the patchset
+            // is no longer wanted, so neither is its result.
+            let end = if Self::patchset_cancelled(ctx, patchset_id).await {
+                AttemptEnd::Cancelled
+            } else {
+                AttemptEnd::classify(result, index, ctx.settings.ai.no_ai)
+            };
+            Self::settle_attempt(ctx, review_id, &mut stages, &end).await;
+
+            let verdict = match end {
+                AttemptEnd::Finished { output } => {
+                    Self::store_finished_attempt(ctx, &patch, review_id, &output).await?
+                }
+                AttemptEnd::Cancelled => {
+                    info!(
+                        "Review {} of patch {}/{} was cancelled",
+                        review_id, patchset_id, index
+                    );
+                    Self::mark_attempt_cancelled(ctx, Some(review_id), patch_id).await;
+                    AttemptVerdict::Final(PatchResult::Cancelled)
+                }
+                AttemptEnd::TimedOut { timeout } => {
+                    error!(
+                        "Review {} of patch {}/{} timed out after {} active seconds",
+                        review_id, patchset_id, index, timeout.active_seconds
+                    );
+                    Self::fail_review_row(
+                        ctx,
                         review_id,
-                        ReviewStatus::Cancelled.as_str(),
-                        "Cancelled because patchset was superseded or cancelled",
-                        None,
-                        None,
-                        None,
+                        &format!("Tool error: {}", timeout),
                         None,
                     )
-                    .await
-                {
-                    warn!("Failed to mark review {} as Cancelled: {}", review_id, e);
+                    .await;
+                    AttemptVerdict::Retry
                 }
-                if let Err(e) = ctx
-                    .db
-                    .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
-                    .await
-                {
-                    warn!("Failed to mark patch {} as Cancelled: {}", patch_id, e);
+                AttemptEnd::Failed { reason, output } => {
+                    error!(
+                        "Review {} of patch {}/{} failed: {}",
+                        review_id, patchset_id, index, reason
+                    );
+                    Self::fail_review_row(ctx, review_id, &reason, output.as_ref()).await;
+                    AttemptVerdict::Retry
                 }
-                return Ok(PatchResult::Cancelled);
-            }
+            };
 
-            match result {
-                Ok(json_output) => {
-                    let patches_status = json_output["patches"].as_array();
-                    let target_applied = patches_status
-                        .and_then(|arr| arr.iter().find(|p| p["index"] == index))
-                        .map(|p| p["status"] == "applied")
-                        .unwrap_or(false);
-
-                    // Record incomplete coverage before anything else touches the
-                    // review row, so a partial review can never be presented as a
-                    // complete one.
-                    if let Some(failures) = json_output
-                        .get("review")
-                        .and_then(|r| r.get("stage_failures"))
-                        .or_else(|| json_output.get("stage_failures"))
-                        .and_then(|f| f.as_array())
-                        .filter(|f| !f.is_empty())
-                    {
-                        let stages: Vec<&str> = failures
-                            .iter()
-                            .filter_map(|f| f["stage"].as_str())
-                            .collect();
-                        warn!(
-                            "Review {} completed with {} incomplete stage(s): {:?}",
-                            review_id,
-                            failures.len(),
-                            stages
-                        );
-                        let _ = ctx
-                            .db
-                            .set_review_stage_failures(
-                                review_id,
-                                &serde_json::Value::Array(failures.clone()).to_string(),
-                            )
-                            .await;
-                    }
-
-                    let history = json_output.get("history");
-                    let logs_str = if let Some(h) = history {
-                        let mut scrubbed = h.clone();
-                        crate::ai::scrub_thought_signatures(&mut scrubbed);
-                        serde_json::to_string_pretty(&scrubbed).ok()
-                    } else {
-                        None
-                    };
-
-                    let interaction_id = if let Some(tokens_in) = json_output["tokens_in"].as_u64()
-                    {
-                        let i_id = generate_interaction_id();
-                        let input_ctx = json_output["input_context"].as_str().unwrap_or("");
-                        let output_raw = if let Some(r) = json_output.get("review") {
-                            r.to_string()
-                        } else if let Some(e) = json_output.get("error") {
-                            e.to_string()
-                        } else {
-                            String::new()
-                        };
-
-                        let _ = ctx
-                            .db
-                            .create_ai_interaction(AiInteractionParams {
-                                id: &i_id,
-                                parent_id: None,
-                                workflow_id: None,
-                                provider: &ctx.settings.ai.provider,
-                                model: &ctx.settings.ai.model,
-                                input: input_ctx,
-                                output: &output_raw,
-                                tokens_in: tokens_in as u32,
-                                tokens_out: json_output["tokens_out"].as_u64().unwrap_or(0) as u32,
-                                tokens_cached: json_output["tokens_cached"].as_u64().unwrap_or(0)
-                                    as u32,
-                            })
-                            .await;
-                        Some(i_id)
-                    } else {
-                        None
-                    };
-
-                    if target_applied {
-                        if let Some(error_msg) = json_output["error"].as_str() {
-                            error!(
-                                "Review tool returned error for ps={} idx={}: {}",
-                                patchset_id, index, error_msg
-                            );
-                            let _ = ctx
-                                .db
-                                .complete_review(
-                                    review_id,
-                                    ReviewStatus::Failed.as_str(),
-                                    error_msg,
-                                    None,
-                                    interaction_id.as_deref(),
-                                    None,
-                                    logs_str.as_deref(),
-                                )
-                                .await;
-
-                            if retries < max_retries {
-                                retries += 1;
-                                continue;
-                            } else {
-                                let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
-                                return Ok(PatchResult::ReviewFailed);
-                            }
-                        } else if let Some(review_content) = json_output.get("review") {
-                            if !review_content.is_null() {
-                                if let Some(findings_arr) =
-                                    review_content.get("findings").and_then(|f| f.as_array())
-                                {
-                                    for f in findings_arr {
-                                        let severity_str = f["severity"].as_str().unwrap_or("Low");
-                                        let severity = Severity::from_str(severity_str);
-
-                                        let problem =
-                                            f["problem"].as_str().unwrap_or("").to_string();
-                                        let severity_explanation = f["severity_explanation"]
-                                            .as_str()
-                                            .map(|s| s.to_string());
-                                        let preexisting = f["preexisting"].as_bool();
-                                        if preexisting == Some(true)
-                                            && !ctx.settings.linux_bug.enabled
-                                        {
-                                            continue;
-                                        }
-                                        let locations = f.get("locations").cloned();
-
-                                        ctx.db
-                                            .create_finding(Finding {
-                                                review_id,
-                                                severity,
-                                                severity_explanation,
-                                                problem,
-                                                preexisting,
-                                                locations,
-                                            })
-                                            .await?;
-                                    }
-                                }
-
-                                if ctx.settings.linux_bug.enabled
-                                    && let Some(arr) =
-                                        review_content.get("concerns").and_then(|f| f.as_array())
-                                {
-                                    for concern in arr {
-                                        let problem = concern
-                                            .get("description")
-                                            .or_else(|| concern.get("type"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        if problem.is_empty() {
-                                            continue;
-                                        }
-                                        let reasoning = concern
-                                            .get("reasoning")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let locations = concern.get("locations").cloned();
-                                        let mut source_files = Vec::new();
-                                        if let Some(locs) =
-                                            locations.as_ref().and_then(|v| v.as_array())
-                                        {
-                                            for loc in locs {
-                                                if let Some(f) =
-                                                    loc.get("file").and_then(|v| v.as_str())
-                                                {
-                                                    source_files.push(f.to_string());
-                                                }
-                                            }
-                                        }
-                                        let project = ctx.settings.project.kind.unwrap_or_default();
-                                        let matched_subsystems: Vec<_> = if project
-                                            .uses_maintainers()
-                                        {
-                                            let names = if let Some(mindex) =
-                                                crate::maintainers::get_global_maintainers()
-                                            {
-                                                mindex.match_files(&source_files)
-                                            } else if let Ok(mindex) =
-                                                crate::maintainers::MaintainersIndex::from_top_of_trunk(
-                                                    &ctx.settings.git.repository_path,
-                                                )
-                                            {
-                                                mindex.match_files(&source_files)
-                                            } else {
-                                                Vec::new()
-                                            };
-                                            names
-                                                .into_iter()
-                                                .map(
-                                                    crate::db::AttributedSubsystem::from_maintainers,
-                                                )
-                                                .collect()
-                                        } else {
-                                            crate::workflows::linux_bug::extract_directory_subsystems_for_project(
-                                                &source_files,
-                                                project,
-                                            )
-                                            .into_iter()
-                                            .map(
-                                                crate::db::AttributedSubsystem::from_path_prefix,
-                                            )
-                                            .collect()
-                                        };
-
-                                        let input = crate::api::BugInput {
-                                            problem,
-                                            reasoning,
-                                            locations,
-                                            subsystems: matched_subsystems,
-                                            source_files,
-                                            commit_sha: commit_sha.clone(),
-                                            patchset_id: Some(patchset_id),
-                                            patch_id: Some(patch_id),
-                                            baseline_sha: Some(baseline_ref.to_string()),
-                                            review_id: Some(review_id),
-                                        };
-                                        let repo_path = std::path::PathBuf::from(
-                                            &ctx.settings.git.repository_path,
-                                        );
-                                        let mainline_remote =
-                                            ctx.baseline_registry.mainline_remote_name();
-                                        let candidate_refs = [
-                                            format!("{}/master", mainline_remote),
-                                            format!("{}/main", mainline_remote),
-                                            "origin/master".to_string(),
-                                            "origin/main".to_string(),
-                                            "master".to_string(),
-                                            "main".to_string(),
-                                            "HEAD".to_string(),
-                                        ];
-                                        let mut mainline_sha = None;
-                                        for candidate_ref in &candidate_refs {
-                                            if let Ok(sha) =
-                                                get_commit_hash(&repo_path, candidate_ref).await
-                                            {
-                                                mainline_sha = Some(sha);
-                                                break;
-                                            }
-                                        }
-
-                                        let mut toolbox = None;
-                                        let base_path = if repo_path.exists() {
-                                            Some(repo_path.clone())
-                                        } else {
-                                            worktree_path.map(|wt| wt.to_path_buf())
-                                        };
-                                        if let Some(target_dir) = base_path {
-                                            let mut tb =
-                                                crate::toolbox::ToolBox::new(target_dir, None);
-                                            if let Some(m_sha) = mainline_sha {
-                                                tb.set_virtual_head(m_sha);
-                                            }
-                                            toolbox = Some(Arc::new(tb));
-                                        }
-                                        let review_tool = match project {
-                                            crate::project::ProjectId::Linux => {
-                                                "sashiko:linux_patch_review"
-                                            }
-                                            crate::project::ProjectId::Sashiko => {
-                                                "sashiko:sashiko_patch_review"
-                                            }
-                                        };
-                                        let discovery_db = ctx.db.with_bug_actor(
-                                            ctx.settings.project.attribution(),
-                                            review_tool,
-                                            Some(ctx.provider.get_capabilities().model_name),
-                                        );
-                                        if let Err(e) =
-                                            crate::workflows::linux_bug::process_issue_for_project(
-                                                ctx.provider.as_ref(),
-                                                toolbox,
-                                                &discovery_db,
-                                                input,
-                                                Some("bug"),
-                                                project,
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                "Failed to queue candidate pre-existing bug: {}",
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-
-                                let summary =
-                                    review_content["summary"].as_str().unwrap_or("").to_string();
-                                let result_desc = "Review completed successfully.";
-
-                                let inline_review = json_output["inline_review"].as_str();
-
-                                let mut db_success = true;
-
-                                if let Err(e) = ctx
-                                    .db
-                                    .complete_review(
-                                        review_id,
-                                        ReviewStatus::Reviewed.as_str(),
-                                        result_desc,
-                                        Some(&summary),
-                                        interaction_id.as_deref(),
-                                        inline_review,
-                                        logs_str.as_deref(),
-                                    )
-                                    .await
-                                {
-                                    error!("Failed to save review completion: {}", e);
-                                    db_success = false;
-                                }
-
-                                let now = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_secs() as i64;
-
-                                if db_success {
-                                    let inline_opt = inline_review;
-                                    if let Some(inline) = inline_opt {
-                                        let mut skip_notify = false;
-                                        if let Some(until) = embargo_until.filter(|&u| u > now) {
-                                            info!(
-                                                "Review completed but embargoed until {} for patch {}/{}",
-                                                until, patchset_id, index
-                                            );
-                                            skip_notify = true;
-                                        }
-
-                                        if !skip_notify {
-                                            let patch_msg_id = input_payload["patches"]
-                                                .as_array()
-                                                .and_then(|arr| {
-                                                    arr.iter().find(|p| p["index"] == index)
-                                                })
-                                                .and_then(|p| p["message_id"].as_str())
-                                                .unwrap_or("");
-
-                                            let patchset_msg_id = input_payload["message_id"]
-                                                .as_str()
-                                                .unwrap_or(patch_msg_id);
-
-                                            if let Err(e) = Self::queue_notifications(
-                                                ctx,
-                                                patchset_id,
-                                                Some(review_id),
-                                                patch_id,
-                                                patch_msg_id,
-                                                patchset_msg_id,
-                                                index,
-                                                inline,
-                                                review_content["findings"].as_array(),
-                                                &summary,
-                                            )
-                                            .await
-                                            {
-                                                error!(
-                                                    "Failed to queue email for patch {}/{} (ID: {}): {}",
-                                                    patchset_id, index, patch_id, e
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                if !db_success {
-                                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
-                                    return Ok(PatchResult::ReviewFailed);
-                                }
-                                // Failing the patchset over a notification
-                                // would strand it: get_pending_patchsets()
-                                // selects only Pending rows.
-                                let _ = ctx.db.update_patch_status(patch_id, "Reviewed").await;
-                                return Ok(PatchResult::Success);
-                            } else if ctx.settings.ai.no_ai {
-                                info!(
-                                    "Review skipped as requested for ps={} idx={}",
-                                    patchset_id, index
-                                );
-                                let _ = ctx
-                                    .db
-                                    .complete_review(
-                                        review_id,
-                                        ReviewStatus::Skipped.as_str(),
-                                        "Skipped AI review via --no-ai",
-                                        None,
-                                        interaction_id.as_deref(),
-                                        None,
-                                        logs_str.as_deref(),
-                                    )
-                                    .await;
-                                let _ = ctx.db.update_patch_status(patch_id, "Skipped").await;
-                                return Ok(PatchResult::Success);
-                            } else {
-                                let _ = ctx
-                                    .db
-                                    .complete_review(
-                                        review_id,
-                                        ReviewStatus::Failed.as_str(),
-                                        "AI returned null response",
-                                        None,
-                                        interaction_id.as_deref(),
-                                        None,
-                                        logs_str.as_deref(),
-                                    )
-                                    .await;
-                                if retries < max_retries {
-                                    retries += 1;
-                                    continue;
-                                } else {
-                                    let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
-                                    return Ok(PatchResult::ReviewFailed);
-                                }
-                            }
-                        } else {
-                            let error_msg = json_output["error"]
-                                .as_str()
-                                .unwrap_or("Missing review content");
-                            let _ = ctx
-                                .db
-                                .complete_review(
-                                    review_id,
-                                    ReviewStatus::Failed.as_str(),
-                                    error_msg,
-                                    None,
-                                    interaction_id.as_deref(),
-                                    None,
-                                    logs_str.as_deref(),
-                                )
-                                .await;
-                            let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
-                            return Ok(PatchResult::ReviewFailed);
-                        }
-                    } else {
-                        // Tool failed to process or missing patches array
-                        let error_msg = json_output["error"]
-                            .as_str()
-                            .unwrap_or("Tool failed to return patch status");
-                        let _ = ctx
-                            .db
-                            .complete_review(
-                                review_id,
-                                ReviewStatus::Failed.as_str(),
-                                error_msg,
-                                None,
-                                interaction_id.as_deref(),
-                                None,
-                                logs_str.as_deref(),
-                            )
-                            .await;
-                        if retries < max_retries {
-                            retries += 1;
-                            continue;
-                        }
-                        let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
-                        return Ok(PatchResult::ReviewFailed);
-                    }
-                }
-                Err(e) => {
-                    if e.downcast_ref::<ReviewError>()
-                        .is_some_and(|re| matches!(re, ReviewError::Cancelled))
-                    {
-                        info!(
-                            "Review cancelled for patchset {} patch {}",
-                            patchset_id, index
-                        );
-                        if let Err(err) = ctx
-                            .db
-                            .complete_review(
-                                review_id,
-                                ReviewStatus::Cancelled.as_str(),
-                                "Cancelled because patchset was superseded or cancelled",
-                                None,
-                                None,
-                                None,
-                                None,
-                            )
-                            .await
-                        {
-                            warn!("Failed to mark review {} as Cancelled: {}", review_id, err);
-                        }
-                        if let Err(err) = ctx
-                            .db
-                            .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
-                            .await
-                        {
-                            warn!("Failed to mark patch {} as Cancelled: {}", patch_id, err);
-                        }
-                        return Ok(PatchResult::Cancelled);
-                    }
-                    error!("Review execution failed for {}: {}", patchset_id, e);
-                    let _ = ctx
-                        .db
-                        .complete_review(
-                            review_id,
-                            ReviewStatus::Failed.as_str(),
-                            &format!("Tool error: {}", e),
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                        .await;
-                    if retries < max_retries {
-                        retries += 1;
-                        continue;
-                    }
+            match verdict {
+                AttemptVerdict::Final(result) => return Ok(result),
+                AttemptVerdict::Retry if retries < max_retries => retries += 1,
+                AttemptVerdict::Retry => {
                     let _ = ctx.db.update_patch_status(patch_id, "Failed").await;
                     return Ok(PatchResult::ReviewFailed);
                 }
             }
         }
     }
+
+    /// Whether the patchset has been cancelled. A status that cannot be read
+    /// counts as not cancelled, so a passing database error does not end a
+    /// review that is still wanted.
+    async fn patchset_cancelled(ctx: &ReviewContext, patchset_id: i64) -> bool {
+        ctx.db
+            .get_patchset_status(patchset_id)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(ReviewStatus::Cancelled.as_str())
+    }
+
+    /// Marks the attempt's review row, when it has one, and the patch as
+    /// cancelled.
+    async fn mark_attempt_cancelled(ctx: &ReviewContext, review_id: Option<i64>, patch_id: i64) {
+        if let Some(rid) = review_id
+            && let Err(e) = ctx
+                .db
+                .complete_review(
+                    rid,
+                    ReviewStatus::Cancelled.as_str(),
+                    "Cancelled because patchset was superseded or cancelled",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+        {
+            warn!("Failed to mark review {} as Cancelled: {}", rid, e);
+        }
+        if let Err(e) = ctx
+            .db
+            .update_patch_status(patch_id, ReviewStatus::Cancelled.as_str())
+            .await
+        {
+            warn!("Failed to mark patch {} as Cancelled: {}", patch_id, e);
+        }
+    }
+
+    /// Settles the stages still running when the worker stopped, and writes
+    /// the daemon's record of an attempt that ended without a review from the
+    /// worker.
+    ///
+    /// Settling always runs, because it is also what stops a killed worker's
+    /// stage rows claiming to be mid-turn. When the worker returned a review,
+    /// its own list of stage failures is the record, and nothing is still
+    /// running in practice.
+    async fn settle_attempt(
+        ctx: &ReviewContext,
+        review_id: i64,
+        stages: &mut crate::activity::StageTracker,
+        end: &AttemptEnd,
+    ) {
+        let settled = stages.settle(end.settle_cause());
+        if !settled.is_empty() {
+            info!(
+                "Review {} stopped with {} stage(s) still running: {:?}",
+                review_id,
+                settled.len(),
+                settled.iter().map(|s| s.stage.as_str()).collect::<Vec<_>>()
+            );
+        }
+        if !end.has_worker_review() {
+            Self::record_unfinished_attempt(ctx, review_id, stages).await;
+        }
+    }
+
+    /// Writes which stages of an attempt with no review from the worker did
+    /// not run to completion, and why.
+    ///
+    /// Taken from the stage tracker, which saw every stage failure the worker
+    /// reported as well as the stages settled when it stopped. The worker's
+    /// own output carries no list for a patch whose review failed, so without
+    /// this a failed or timed-out row could not say which stage was stuck.
+    async fn record_unfinished_attempt(
+        ctx: &ReviewContext,
+        review_id: i64,
+        stages: &crate::activity::StageTracker,
+    ) {
+        let project = ctx.settings.project.kind.unwrap_or_default();
+        let mut failures = stages.stopped();
+        if failures.is_empty() {
+            return;
+        }
+        failures.sort_by_cached_key(|f| pipeline_position(project, &f.stage));
+        let stored = match serde_json::to_string(&failures) {
+            Ok(json) => ctx.db.set_review_stage_failures(review_id, &json).await,
+            Err(e) => Err(e.into()),
+        };
+        if let Err(e) = stored {
+            warn!(
+                "Failed to record the unfinished stages of review {}: {}",
+                review_id, e
+            );
+        }
+    }
+
+    /// Marks an attempt's review row Failed with `reason`. `output` is the
+    /// worker's output when it returned one; its token counts and history are
+    /// kept with the row.
+    async fn fail_review_row(
+        ctx: &ReviewContext,
+        review_id: i64,
+        reason: &str,
+        output: Option<&Value>,
+    ) {
+        let (interaction_id, logs) = match output {
+            Some(output) => Self::record_worker_output(ctx, output).await,
+            None => (None, None),
+        };
+        if let Err(e) = ctx
+            .db
+            .complete_review(
+                review_id,
+                ReviewStatus::Failed.as_str(),
+                reason,
+                None,
+                interaction_id.as_deref(),
+                None,
+                logs.as_deref(),
+            )
+            .await
+        {
+            warn!("Failed to mark review {} as Failed: {}", review_id, e);
+        }
+    }
+
+    /// Stores the worker output's token counts as an AI interaction, and
+    /// renders its history as the review's log. Returns the interaction's id,
+    /// when the output had token counts, and the log.
+    async fn record_worker_output(
+        ctx: &ReviewContext,
+        output: &Value,
+    ) -> (Option<String>, Option<String>) {
+        let logs = output.get("history").and_then(|h| {
+            let mut scrubbed = h.clone();
+            crate::ai::scrub_thought_signatures(&mut scrubbed);
+            serde_json::to_string_pretty(&scrubbed).ok()
+        });
+
+        let Some(tokens_in) = output["tokens_in"].as_u64() else {
+            return (None, logs);
+        };
+        let id = generate_interaction_id();
+        let input_ctx = output["input_context"].as_str().unwrap_or("");
+        let output_raw = if let Some(r) = output.get("review") {
+            r.to_string()
+        } else if let Some(e) = output.get("error") {
+            e.to_string()
+        } else {
+            String::new()
+        };
+        let _ = ctx
+            .db
+            .create_ai_interaction(AiInteractionParams {
+                id: &id,
+                parent_id: None,
+                workflow_id: None,
+                provider: &ctx.settings.ai.provider,
+                model: &ctx.settings.ai.model,
+                input: input_ctx,
+                output: &output_raw,
+                tokens_in: tokens_in as u32,
+                tokens_out: output["tokens_out"].as_u64().unwrap_or(0) as u32,
+                tokens_cached: output["tokens_cached"].as_u64().unwrap_or(0) as u32,
+            })
+            .await;
+        (Some(id), logs)
+    }
+
+    /// Records incomplete coverage the worker reported for a review it
+    /// returned. Written before anything else touches the review row, so a
+    /// partial review can never be presented as a complete one.
+    async fn store_worker_stage_failures(ctx: &ReviewContext, review_id: i64, output: &Value) {
+        let Some(failures) = output
+            .get("review")
+            .and_then(|r| r.get("stage_failures"))
+            .or_else(|| output.get("stage_failures"))
+            .and_then(|f| f.as_array())
+            .filter(|f| !f.is_empty())
+        else {
+            return;
+        };
+        let stages: Vec<&str> = failures
+            .iter()
+            .filter_map(|f| f["stage"].as_str())
+            .collect();
+        warn!(
+            "Review {} completed with {} incomplete stage(s): {:?}",
+            review_id,
+            failures.len(),
+            stages
+        );
+        let _ = ctx
+            .db
+            .set_review_stage_failures(
+                review_id,
+                &serde_json::Value::Array(failures.clone()).to_string(),
+            )
+            .await;
+    }
+
+    /// Stores an attempt in which the worker returned a review for the patch,
+    /// or skipped the review as it was asked to.
+    async fn store_finished_attempt(
+        ctx: &ReviewContext,
+        patch: &PatchUnderReview<'_>,
+        review_id: i64,
+        output: &Value,
+    ) -> Result<AttemptVerdict> {
+        Self::store_worker_stage_failures(ctx, review_id, output).await;
+        let (interaction_id, logs) = Self::record_worker_output(ctx, output).await;
+
+        // `AttemptEnd::classify` lets a null review through only when the AI
+        // review was turned off.
+        let Some(review_content) = output.get("review").filter(|r| !r.is_null()) else {
+            info!(
+                "Review skipped as requested for ps={} idx={}",
+                patch.patchset_id, patch.index
+            );
+            let _ = ctx
+                .db
+                .complete_review(
+                    review_id,
+                    ReviewStatus::Skipped.as_str(),
+                    "Skipped AI review via --no-ai",
+                    None,
+                    interaction_id.as_deref(),
+                    None,
+                    logs.as_deref(),
+                )
+                .await;
+            let _ = ctx.db.update_patch_status(patch.patch_id, "Skipped").await;
+            return Ok(AttemptVerdict::Final(PatchResult::Success));
+        };
+
+        Self::store_review_findings(ctx, review_id, review_content).await?;
+        if ctx.settings.linux_bug.enabled
+            && let Some(concerns) = review_content.get("concerns").and_then(|f| f.as_array())
+        {
+            for concern in concerns {
+                Self::hand_off_concern(ctx, patch, review_id, concern).await;
+            }
+        }
+
+        let summary = review_content["summary"].as_str().unwrap_or("");
+        let inline_review = output["inline_review"].as_str();
+        if let Err(e) = ctx
+            .db
+            .complete_review(
+                review_id,
+                ReviewStatus::Reviewed.as_str(),
+                "Review completed successfully.",
+                Some(summary),
+                interaction_id.as_deref(),
+                inline_review,
+                logs.as_deref(),
+            )
+            .await
+        {
+            error!("Failed to save review completion: {}", e);
+            let _ = ctx.db.update_patch_status(patch.patch_id, "Failed").await;
+            return Ok(AttemptVerdict::Final(PatchResult::ReviewFailed));
+        }
+
+        if let Some(inline) = inline_review {
+            Self::notify_reviewed_patch(ctx, patch, review_id, inline, review_content, summary)
+                .await;
+        }
+        // Failing the patchset over a notification would strand it:
+        // get_pending_patchsets() selects only Pending rows.
+        let _ = ctx.db.update_patch_status(patch.patch_id, "Reviewed").await;
+        Ok(AttemptVerdict::Final(PatchResult::Success))
+    }
+
+    /// Stores the findings of a review the worker returned.
+    async fn store_review_findings(
+        ctx: &ReviewContext,
+        review_id: i64,
+        review_content: &Value,
+    ) -> Result<()> {
+        let Some(findings) = review_content.get("findings").and_then(|f| f.as_array()) else {
+            return Ok(());
+        };
+        for f in findings {
+            let preexisting = f["preexisting"].as_bool();
+            if preexisting == Some(true) && !ctx.settings.linux_bug.enabled {
+                continue;
+            }
+            ctx.db
+                .create_finding(Finding {
+                    review_id,
+                    severity: Severity::from_str(f["severity"].as_str().unwrap_or("Low")),
+                    severity_explanation: f["severity_explanation"].as_str().map(|s| s.to_string()),
+                    problem: f["problem"].as_str().unwrap_or("").to_string(),
+                    preexisting,
+                    locations: f.get("locations").cloned(),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Queues the patch's notifications for a review just stored, unless the
+    /// patchset is still embargoed.
+    async fn notify_reviewed_patch(
+        ctx: &ReviewContext,
+        patch: &PatchUnderReview<'_>,
+        review_id: i64,
+        inline: &str,
+        review_content: &Value,
+        summary: &str,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if let Some(until) = patch.embargo_until.filter(|&u| u > now) {
+            info!(
+                "Review completed but embargoed until {} for patch {}/{}",
+                until, patch.patchset_id, patch.index
+            );
+            return;
+        }
+
+        let patch_msg_id = patch.input_payload["patches"]
+            .as_array()
+            .and_then(|arr| arr.iter().find(|p| p["index"] == patch.index))
+            .and_then(|p| p["message_id"].as_str())
+            .unwrap_or("");
+        let patchset_msg_id = patch.input_payload["message_id"]
+            .as_str()
+            .unwrap_or(patch_msg_id);
+
+        if let Err(e) = Self::queue_notifications(
+            ctx,
+            patch.patchset_id,
+            Some(review_id),
+            patch.patch_id,
+            patch_msg_id,
+            patchset_msg_id,
+            patch.index,
+            inline,
+            review_content["findings"].as_array(),
+            summary,
+        )
+        .await
+        {
+            error!(
+                "Failed to queue email for patch {}/{} (ID: {}): {}",
+                patch.patchset_id, patch.index, patch.patch_id, e
+            );
+        }
+    }
+
+    /// Hands one concern of a stored review to the bug discovery pipeline.
+    /// A concern with no description is skipped, and a failure is logged:
+    /// neither affects the review.
+    async fn hand_off_concern(
+        ctx: &ReviewContext,
+        patch: &PatchUnderReview<'_>,
+        review_id: i64,
+        concern: &Value,
+    ) {
+        let problem = concern
+            .get("description")
+            .or_else(|| concern.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if problem.is_empty() {
+            return;
+        }
+        let reasoning = concern
+            .get("reasoning")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let locations = concern.get("locations").cloned();
+        let source_files: Vec<String> = locations
+            .as_ref()
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|loc| loc.get("file").and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .collect();
+        let project = ctx.settings.project.kind.unwrap_or_default();
+        let input = crate::api::BugInput {
+            problem,
+            reasoning,
+            locations,
+            subsystems: Self::concern_subsystems(ctx, project, &source_files),
+            source_files,
+            commit_sha: patch.commit_sha.map(str::to_string),
+            patchset_id: Some(patch.patchset_id),
+            patch_id: Some(patch.patch_id),
+            baseline_sha: Some(patch.baseline_ref.to_string()),
+            review_id: Some(review_id),
+        };
+        let toolbox = Self::mainline_toolbox(ctx, patch.worktree_path).await;
+        let review_tool = match project {
+            crate::project::ProjectId::Linux => "sashiko:linux_patch_review",
+            crate::project::ProjectId::Sashiko => "sashiko:sashiko_patch_review",
+        };
+        let discovery_db = ctx.db.with_bug_actor(
+            ctx.settings.project.attribution(),
+            review_tool,
+            Some(ctx.provider.get_capabilities().model_name),
+        );
+        if let Err(e) = crate::workflows::linux_bug::process_issue_for_project(
+            ctx.provider.as_ref(),
+            toolbox,
+            &discovery_db,
+            input,
+            Some("bug"),
+            project,
+        )
+        .await
+        {
+            warn!("Failed to queue candidate pre-existing bug: {}", e);
+        }
+    }
+
+    /// The subsystems a concern touching `source_files` is attributed to.
+    fn concern_subsystems(
+        ctx: &ReviewContext,
+        project: crate::project::ProjectId,
+        source_files: &[String],
+    ) -> Vec<crate::db::AttributedSubsystem> {
+        if !project.uses_maintainers() {
+            return crate::workflows::linux_bug::extract_directory_subsystems_for_project(
+                source_files,
+                project,
+            )
+            .into_iter()
+            .map(crate::db::AttributedSubsystem::from_path_prefix)
+            .collect();
+        }
+        let names = if let Some(mindex) = crate::maintainers::get_global_maintainers() {
+            mindex.match_files(source_files)
+        } else if let Ok(mindex) = crate::maintainers::MaintainersIndex::from_top_of_trunk(
+            &ctx.settings.git.repository_path,
+        ) {
+            mindex.match_files(source_files)
+        } else {
+            Vec::new()
+        };
+        names
+            .into_iter()
+            .map(crate::db::AttributedSubsystem::from_maintainers)
+            .collect()
+    }
+
+    /// A toolbox over the repository, or else the review's worktree, whose
+    /// head is the mainline tip when one can be found.
+    async fn mainline_toolbox(
+        ctx: &ReviewContext,
+        worktree_path: Option<&Path>,
+    ) -> Option<Arc<crate::toolbox::ToolBox>> {
+        let repo_path = std::path::PathBuf::from(&ctx.settings.git.repository_path);
+        let mainline_remote = ctx.baseline_registry.mainline_remote_name();
+        let candidate_refs = [
+            format!("{}/master", mainline_remote),
+            format!("{}/main", mainline_remote),
+            "origin/master".to_string(),
+            "origin/main".to_string(),
+            "master".to_string(),
+            "main".to_string(),
+            "HEAD".to_string(),
+        ];
+        let mut mainline_sha = None;
+        for candidate_ref in &candidate_refs {
+            if let Ok(sha) = get_commit_hash(&repo_path, candidate_ref).await {
+                mainline_sha = Some(sha);
+                break;
+            }
+        }
+
+        let target_dir = if repo_path.exists() {
+            repo_path
+        } else {
+            worktree_path?.to_path_buf()
+        };
+        let mut tb = crate::toolbox::ToolBox::new(target_dir, None);
+        if let Some(m_sha) = mainline_sha {
+            tb.set_virtual_head(m_sha);
+        }
+        Some(Arc::new(tb))
+    }
+}
+
+/// The patch one call of `process_patch_review` reviews, and what its review
+/// runs against. Grouped because the helpers that store an attempt need most
+/// of it.
+struct PatchUnderReview<'a> {
+    patchset_id: i64,
+    patch_id: i64,
+    index: i64,
+    baseline_ref: &'a str,
+    commit_sha: Option<&'a str>,
+    worktree_path: Option<&'a Path>,
+    input_payload: &'a Value,
+    embargo_until: Option<i64>,
+}
+
+/// How one worker run for a patch ended.
+///
+/// Decided once, right after the run, so that what is recorded and whether
+/// the patch is tried again follow from one value. Whether the I/O loop
+/// returned `Err` does not decide it: a worker whose review failed reports
+/// that in an `Ok` output, while a killed one comes back as an `Err`.
+#[derive(Debug)]
+enum AttemptEnd {
+    /// The worker returned a review for the patch, or skipped the review as
+    /// it was asked to.
+    Finished { output: Value },
+    /// The review's deadline passed and the worker was killed.
+    TimedOut { timeout: ReviewTimedOut },
+    /// The patchset was cancelled while the patch was reviewed.
+    Cancelled,
+    /// Any other end with no review for the patch. `output` is the worker's
+    /// output when it returned one, kept for its token counts and history.
+    Failed {
+        reason: String,
+        output: Option<Value>,
+    },
+}
+
+impl AttemptEnd {
+    /// Classifies what a run of the worker for patch `index` returned.
+    /// `no_ai` is whether the AI review was turned off, which makes a null
+    /// review the expected answer rather than a failure.
+    fn classify(result: Result<Value>, index: i64, no_ai: bool) -> Self {
+        let output = match result {
+            Ok(output) => output,
+            Err(e) => return Self::from_error(e),
+        };
+        match missing_review(&output, index, no_ai) {
+            None => Self::Finished { output },
+            Some(reason) => Self::Failed {
+                reason,
+                output: Some(output),
+            },
+        }
+    }
+
+    fn from_error(e: anyhow::Error) -> Self {
+        if let Some(timeout) = e.downcast_ref::<ReviewTimedOut>() {
+            return Self::TimedOut { timeout: *timeout };
+        }
+        if matches!(
+            e.downcast_ref::<ReviewError>(),
+            Some(ReviewError::Cancelled)
+        ) {
+            return Self::Cancelled;
+        }
+        Self::Failed {
+            reason: format!("Tool error: {}", e),
+            output: None,
+        }
+    }
+
+    /// Why the stages still running when the worker stopped are stopped.
+    fn settle_cause(&self) -> crate::workflow::StageStopCause {
+        use crate::workflow::StageStopCause;
+        match self {
+            Self::TimedOut { .. } => StageStopCause::OutOfTime,
+            Self::Cancelled => StageStopCause::Cancelled,
+            Self::Finished { .. } | Self::Failed { .. } => StageStopCause::Interrupted,
+        }
+    }
+
+    /// Whether the worker returned a review for the patch. Every other end
+    /// gets the daemon's record of what the attempt did.
+    fn has_worker_review(&self) -> bool {
+        matches!(self, Self::Finished { .. })
+    }
+}
+
+/// Why the worker's `output` holds no review for patch `index`, or `None`
+/// when it holds one. `no_ai` makes a null review count as one: the review
+/// was skipped as asked.
+fn missing_review(output: &Value, index: i64, no_ai: bool) -> Option<String> {
+    let applied = output["patches"]
+        .as_array()
+        .and_then(|arr| arr.iter().find(|p| p["index"] == index))
+        .is_some_and(|p| p["status"] == "applied");
+    let error = output["error"].as_str();
+    if !applied {
+        return Some(
+            error
+                .unwrap_or("Tool failed to return patch status")
+                .to_string(),
+        );
+    }
+    if let Some(error) = error {
+        return Some(error.to_string());
+    }
+    match output.get("review") {
+        None => Some("Missing review content".to_string()),
+        Some(review) if review.is_null() && !no_ai => Some("AI returned null response".to_string()),
+        Some(_) => None,
+    }
+}
+
+/// What follows an attempt: a final result for the patch, or another attempt
+/// while retries remain.
+enum AttemptVerdict {
+    Final(PatchResult),
+    Retry,
+}
+
+/// Where `stage` sits in the project's pipeline, as a sort key: stages the
+/// project does not know go last, by name. Stored stage lists are written in
+/// this order because their readers cannot recover it: they do not know which
+/// project's pipeline ran.
+fn pipeline_position(project: crate::project::ProjectId, stage: &str) -> (u32, String) {
+    (
+        crate::workflows::stage_order(project, stage).unwrap_or(u32::MAX),
+        stage.to_string(),
+    )
 }
 
 /// Where one patch's review reports what it is doing, and which attempt it is.
@@ -2544,6 +2664,7 @@ impl crate::ai::concurrency_limited_provider::SlotObserver for StageSlotObserver
 
 #[allow(clippy::too_many_arguments)]
 async fn run_review_tool(
+    worker_program: Option<&Path>,
     patchset_id: i64,
     input_payload: &serde_json::Value,
     settings: &Settings,
@@ -2557,8 +2678,12 @@ async fn run_review_tool(
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
     patch: PatchActivity,
+    stages: &mut crate::activity::StageTracker,
 ) -> Result<serde_json::Value> {
-    let cmd = default_worker_command()?;
+    let cmd = match worker_program {
+        Some(program) => Command::new(program),
+        None => default_worker_command()?,
+    };
     run_review_tool_with_cmd(
         cmd,
         patchset_id,
@@ -2574,6 +2699,7 @@ async fn run_review_tool(
         provider,
         llm_semaphore,
         patch,
+        stages,
     )
     .await
 }
@@ -2657,6 +2783,7 @@ async fn run_review_tool_with_cmd(
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
     patch: PatchActivity,
+    stages: &mut crate::activity::StageTracker,
 ) -> Result<serde_json::Value> {
     let project = settings.project.kind.unwrap_or_default();
     let activity = patch.registry.clone();
@@ -2808,10 +2935,6 @@ async fn run_review_tool_with_cmd(
         )
         .with_observer(slot_observer),
     );
-
-    // Applies the worker's progress to the registry and times each stage.
-    // Outside the interaction block so its timings outlive it.
-    let mut stages = crate::activity::StageTracker::new(activity.clone());
 
     // The conversation starts over with this worker, and so does its live log.
     // A review reset to Pending by a restart reuses its row, so the old run's
@@ -3208,20 +3331,12 @@ async fn run_review_tool_with_cmd(
         }
         .await;
 
-    // Recorded for a completed attempt only. A failed one is retried with its
-    // stages run again, and the breakdown of a run that did not finish would
-    // describe work the review does not rest on.
-    if interaction_result.is_ok() && !stages.timings().is_empty() {
-        // Stored in pipeline order rather than the order the stages happened to
-        // finish in, because readers cannot recover it: they do not know which
-        // project's pipeline ran.
-        let mut timings = stages.timings().to_vec();
-        timings.sort_by_cached_key(|t| {
-            (
-                crate::workflows::stage_order(project, &t.stage).unwrap_or(u32::MAX),
-                t.stage.clone(),
-            )
-        });
+    // Recorded for every attempt however it ended. Each attempt has its own
+    // review row, so the timings of attempts never mix, and on a row that
+    // failed or timed out they show which stage used up the time.
+    let mut timings = stages.timings();
+    if !timings.is_empty() {
+        timings.sort_by_cached_key(|t| pipeline_position(project, &t.stage));
         match serde_json::to_string(&timings) {
             Ok(json) => {
                 let _ = db.set_review_stage_durations(review_id, &json).await;
@@ -3928,6 +4043,7 @@ mod tests {
             target_review_count: 1,
             provider: Arc::new(MockProvider),
             activity: crate::activity::ActivityRegistry::new(),
+            worker_program: None,
         };
         let candidate = BaselineResolution::Commit(CommitId::parse(&base_sha).unwrap());
         let diffs = vec![(
@@ -4027,6 +4143,7 @@ mod tests {
             target_review_count: 1,
             provider: Arc::new(MockProvider),
             activity: crate::activity::ActivityRegistry::new(),
+            worker_program: None,
         };
 
         // A decoy tree that is unreachable, and one that shares the local
@@ -4143,6 +4260,8 @@ mod tests {
         review_id: i64,
         patchset_id: i64,
         patch_id: i64,
+        /// What the daemon saw of the worker's stages.
+        stages: crate::activity::StageTracker,
     }
 
     /// As [`run_review_tool_mock`], reporting into `activity`.
@@ -4213,6 +4332,7 @@ mod tests {
                 .await?;
         }
 
+        let mut stages = crate::activity::StageTracker::new(activity.clone());
         let result = run_review_tool_with_cmd(
             Command::new(&bin_path),
             ps_id,
@@ -4233,6 +4353,7 @@ mod tests {
                 attempt: 1,
                 max_attempts: 1,
             },
+            &mut stages,
         )
         .await;
         Ok(MockRun {
@@ -4241,6 +4362,7 @@ mod tests {
             review_id,
             patchset_id: ps_id,
             patch_id: p_id,
+            stages,
         })
     }
 
@@ -4519,6 +4641,16 @@ mod tests {
         // Nothing finished, so there is no breakdown to record.
         let review = run.db.get_review_details(run.review_id).await?.unwrap();
         assert!(review["stage_durations"].is_null(), "{review}");
+
+        // The daemon knows the stage stopped, should the worker stop later.
+        assert_eq!(
+            run.stages.stopped(),
+            [crate::activity::StageFailureRecord {
+                stage: stage(),
+                reason: "Failed to generate valid response".to_string(),
+                cause: crate::workflow::StageStopCause::Error,
+            }]
+        );
         Ok(())
     }
 
@@ -4900,6 +5032,7 @@ sleep 30
                 provider,
                 Arc::new(Semaphore::new(56)),
                 PatchActivity::untracked(p_id),
+                &mut crate::activity::StageTracker::new(crate::activity::ActivityRegistry::new()),
             ),
         )
         .await;
@@ -5013,6 +5146,7 @@ fi
             target_review_count: 1,
             provider: Arc::new(MockProvider),
             activity: crate::activity::ActivityRegistry::new(),
+            worker_program: None,
         })
     }
 
@@ -5149,6 +5283,7 @@ fi
             target_review_count: 1,
             provider,
             activity: crate::activity::ActivityRegistry::new(),
+            worker_program: None,
         };
 
         // Create dummy patchset and patch in DB
@@ -5427,6 +5562,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             provider,
             Arc::new(Semaphore::new(56)),
             PatchActivity::untracked(p_id),
+            &mut crate::activity::StageTracker::new(crate::activity::ActivityRegistry::new()),
         )
         .await
         .map(|_| ())
@@ -5548,6 +5684,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             target_review_count: 1,
             provider: Arc::new(MockProvider),
             activity: crate::activity::ActivityRegistry::new(),
+            worker_program: None,
         };
 
         // Scenario 1: Mixed findings
@@ -5875,6 +6012,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             target_review_count: 1,
             provider: Arc::new(MockProvider),
             activity: crate::activity::ActivityRegistry::new(),
+            worker_program: None,
         };
 
         Reviewer::queue_notifications(
@@ -6028,6 +6166,414 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         resp.truncated = false;
         record_tool_calls(&db, review_id, "prov", "model", &resp).await;
         assert_eq!(tool_usage_rows(&db, review_id).await?, 1);
+        Ok(())
+    }
+
+    /// What a run of the worker returned decides how the attempt ended,
+    /// whichever arm of the I/O loop's `Result` it came back in.
+    #[test]
+    fn an_attempt_end_is_classified_from_what_the_run_returned() {
+        use crate::workflow::StageStopCause;
+
+        let applied = |extra: Value| {
+            let mut output = json!({
+                "patchset_id": 1,
+                "patches": [{"index": 1, "status": "applied"}],
+            });
+            if let (Some(fields), Some(more)) = (output.as_object_mut(), extra.as_object()) {
+                fields.extend(more.clone());
+            }
+            output
+        };
+        let failed = |end: AttemptEnd| match end {
+            AttemptEnd::Failed { reason, output } => (reason, output.is_some()),
+            other => panic!("expected Failed, got {other:?}"),
+        };
+
+        let timeout = ReviewTimedOut {
+            active_seconds: 60,
+            salvage_seconds: 0,
+        };
+        let end = AttemptEnd::classify(
+            Err(anyhow::Error::new(timeout).context("while reading the worker")),
+            1,
+            false,
+        );
+        assert!(
+            matches!(end, AttemptEnd::TimedOut { timeout: t } if t == timeout),
+            "a timeout behind further context is still a timeout: {end:?}"
+        );
+        assert_eq!(end.settle_cause(), StageStopCause::OutOfTime);
+        assert!(!end.has_worker_review());
+
+        let end = AttemptEnd::classify(Err(ReviewError::Cancelled.into()), 1, false);
+        assert!(matches!(end, AttemptEnd::Cancelled), "{end:?}");
+        assert_eq!(end.settle_cause(), StageStopCause::Cancelled);
+
+        let end = AttemptEnd::classify(Err(anyhow!("worker exited")), 1, false);
+        assert_eq!(end.settle_cause(), StageStopCause::Interrupted);
+        assert_eq!(
+            failed(end),
+            ("Tool error: worker exited".to_string(), false)
+        );
+
+        // An error output is a failure with the worker's own reason, and keeps
+        // the output for its token counts.
+        let end = AttemptEnd::classify(
+            Ok(applied(
+                json!({"review": {"findings": []}, "error": "boom"}),
+            )),
+            1,
+            false,
+        );
+        assert_eq!(end.settle_cause(), StageStopCause::Interrupted);
+        assert!(!end.has_worker_review());
+        assert_eq!(failed(end), ("boom".to_string(), true));
+
+        let not_applied = json!({"patchset_id": 1, "patches": [{"index": 1, "status": "error"}]});
+        assert_eq!(
+            failed(AttemptEnd::classify(Ok(not_applied), 1, false)).0,
+            "Tool failed to return patch status"
+        );
+        let other_patch = applied(json!({"review": {"findings": []}}));
+        assert_eq!(
+            failed(AttemptEnd::classify(Ok(other_patch), 2, false)).0,
+            "Tool failed to return patch status",
+            "a result for another patch is no result for this one"
+        );
+        assert_eq!(
+            failed(AttemptEnd::classify(Ok(applied(json!({}))), 1, false)).0,
+            "Missing review content"
+        );
+        assert_eq!(
+            failed(AttemptEnd::classify(
+                Ok(applied(json!({"review": null}))),
+                1,
+                false
+            ))
+            .0,
+            "AI returned null response"
+        );
+
+        // A null review is the answer when the AI review was turned off.
+        for (output, no_ai) in [
+            (applied(json!({"review": null})), true),
+            (applied(json!({"review": {"findings": []}})), false),
+        ] {
+            let end = AttemptEnd::classify(Ok(output), 1, no_ai);
+            assert!(end.has_worker_review(), "{end:?}");
+            assert_eq!(end.settle_cause(), StageStopCause::Interrupted);
+        }
+    }
+
+    /// A mock worker that reports `lines` and then runs `then`: the shell
+    /// that ends its run.
+    fn worker_reporting_then(lines: &[String], then: &str) -> String {
+        let mut script = String::from("#!/bin/sh\nread -r _payload\n");
+        for line in lines {
+            script.push_str(&format!("echo '{}'\n", line));
+        }
+        script.push_str(then);
+        script
+    }
+
+    /// Progress for a stage that starts and reaches `turn`.
+    fn stage_reaching(stage: &str, turn: usize) -> Vec<String> {
+        use crate::activity::ProgressWire;
+        vec![
+            progress(
+                1,
+                ProgressWire::StageStarted {
+                    stage: stage.to_string(),
+                },
+            ),
+            progress(
+                1,
+                ProgressWire::StageTurn {
+                    stage: stage.to_string(),
+                    turn,
+                    max_turns: 50,
+                },
+            ),
+        ]
+    }
+
+    /// One patch reviewed by `process_patch_review` with `script` as its
+    /// worker.
+    struct WorkerReview {
+        result: PatchResult,
+        db: Arc<Database>,
+        activity: Arc<crate::activity::ActivityRegistry>,
+        patchset_id: i64,
+        patch_id: i64,
+    }
+
+    async fn review_patch_with_worker(
+        script: &str,
+        configure: impl FnOnce(&mut Settings),
+    ) -> Result<WorkerReview> {
+        let temp_dir = tempdir()?;
+        let bin_path = temp_dir.path().join("mock_worker");
+        std::fs::write(&bin_path, script)?;
+        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        configure(&mut settings);
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let activity = crate::activity::ActivityRegistry::new();
+        let ctx = ReviewContext {
+            semaphore: Arc::new(Semaphore::new(1)),
+            llm_semaphore: Arc::new(Semaphore::new(56)),
+            db: db.clone(),
+            settings,
+            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None)?),
+            quota_manager: Arc::new(QuotaManager::new()),
+            target_review_count: 1,
+            provider: Arc::new(MockProvider),
+            activity: activity.clone(),
+            worker_program: Some(bin_path),
+        };
+
+        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+        db.create_message(
+            "msg_id_p1",
+            thread_id,
+            None,
+            "Author",
+            "Subject",
+            1000,
+            "Body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let patchset_id = db
+            .create_patchset(
+                thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                None, false, None, None,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("patchset was not created"))?;
+        let diff = "diff --git a/foo.c b/foo.c\n+int x;";
+        let patch_id = db.create_patch(patchset_id, "msg_id_p1", 1, diff).await?;
+
+        let result = Reviewer::process_patch_review(
+            &ctx,
+            patchset_id,
+            patch_id,
+            1,
+            "HEAD",
+            None,
+            &json!({}),
+            None,
+            None,
+            None,
+            diff,
+            None,
+        )
+        .await?;
+        Ok(WorkerReview {
+            result,
+            db,
+            activity,
+            patchset_id,
+            patch_id,
+        })
+    }
+
+    /// Every review row of the patch, oldest first, with its status, result
+    /// and recorded stage lists.
+    async fn review_rows(db: &Database, patch_id: i64) -> Result<Vec<Value>> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT id FROM reviews WHERE patch_id = ? ORDER BY id",
+                libsql::params![patch_id],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get::<i64>(0)?);
+        }
+        let mut reviews = Vec::new();
+        for id in ids {
+            reviews.push(
+                db.get_review_details(id)
+                    .await?
+                    .ok_or_else(|| anyhow!("review {id} vanished"))?,
+            );
+        }
+        Ok(reviews)
+    }
+
+    /// The stage failures a review row records, as (stage, cause, reason).
+    fn recorded_failures(review: &Value) -> Vec<(String, String, String)> {
+        review["stage_failures"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|f| {
+                (
+                    f["stage"].as_str().unwrap_or_default().to_string(),
+                    f["cause"].as_str().unwrap_or_default().to_string(),
+                    f["reason"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The stored stage timings as (stage, turns) pairs. The seconds are left
+    /// out because they are wall-clock time spent around a real subprocess,
+    /// which a loaded machine can push past a whole second.
+    fn recorded_timings(review: &Value) -> Vec<(String, u64)> {
+        review["stage_durations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|t| {
+                (
+                    t["stage"].as_str().unwrap_or_default().to_string(),
+                    t["turns"].as_u64().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    /// A worker whose review fails reports it in an output, not an error, and
+    /// that output carries no stage list. The row must still say which stages
+    /// stopped and how far each got, and the attempt is retried as before.
+    #[tokio::test]
+    async fn test_an_error_output_records_what_the_attempt_did() -> Result<()> {
+        use crate::activity::{ActivityKey, Phase, ProgressWire};
+
+        let mut lines = stage_reaching("goal", 2);
+        lines.push(progress(
+            1,
+            ProgressWire::StageFinished {
+                stage: "goal".into(),
+            },
+        ));
+        lines.extend(stage_reaching("security", 1));
+        lines.push(progress(
+            1,
+            ProgressWire::StageFailed {
+                stage: "security".into(),
+                reason: "provider unavailable".into(),
+                cause: crate::workflow::StageStopCause::Error,
+            },
+        ));
+        lines.extend(stage_reaching("locking", 3));
+        let error_output = r#"{"patchset_id": 1, "patches": [{"index": 1, "status": "applied", "review_status": "incomplete", "review_error": "boom"}], "review": {"findings": []}, "error": "boom", "history": []}"#;
+        let script = worker_reporting_then(&lines, &format!("echo '{error_output}'\n"));
+
+        let run = review_patch_with_worker(&script, |s| s.review.max_retries = 1).await?;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 2, "an error output is retried as before");
+        for review in &reviews {
+            assert_eq!(review["status"], "Failed", "{review}");
+            assert_eq!(review["result"], "boom", "{review}");
+            let failures = recorded_failures(review);
+            let causes: Vec<(&str, &str)> = failures
+                .iter()
+                .map(|(stage, cause, _)| (stage.as_str(), cause.as_str()))
+                .collect();
+            assert_eq!(causes.len(), 2, "{failures:?}");
+            assert!(causes.contains(&("security", "error")), "{failures:?}");
+            assert!(causes.contains(&("locking", "interrupted")), "{failures:?}");
+            let locking = failures
+                .iter()
+                .find(|(stage, ..)| stage == "locking")
+                .map(|(.., reason)| reason.as_str());
+            // The elapsed time in the middle is wall-clock time around a real
+            // subprocess, so only the parts that do not depend on it are checked.
+            assert!(
+                locking.is_some_and(|reason| reason
+                    .starts_with("still running when the review stopped, after ")
+                    && reason.ends_with(" and 3 turns")),
+                "{failures:?}"
+            );
+            assert_eq!(
+                recorded_timings(review),
+                vec![("goal".to_string(), 2)],
+                "a failed attempt keeps its timings: {review}"
+            );
+        }
+
+        // The stage left running no longer claims to be mid-turn.
+        let locking = run
+            .activity
+            .get(&ActivityKey::PatchsetStage {
+                patchset_id: run.patchset_id,
+                patch_id: run.patch_id,
+                stage: "locking".into(),
+            })
+            .expect("the stage keeps its row");
+        assert!(
+            matches!(
+                locking.phase,
+                Phase::StageFailed {
+                    cause: crate::workflow::StageStopCause::Interrupted,
+                    ..
+                }
+            ),
+            "{locking:?}"
+        );
+        Ok(())
+    }
+
+    /// A worker killed at its deadline leaves the stages it was running in,
+    /// and they are recorded as stopped by the deadline, next to the timings
+    /// of the stages that finished.
+    #[tokio::test]
+    async fn test_a_timed_out_attempt_records_what_it_was_running() -> Result<()> {
+        use crate::activity::ProgressWire;
+
+        let mut lines = stage_reaching("goal", 1);
+        lines.push(progress(
+            1,
+            ProgressWire::StageFinished {
+                stage: "goal".into(),
+            },
+        ));
+        lines.extend(stage_reaching("security", 4));
+        let script = worker_reporting_then(&lines, "exec sleep 30\n");
+
+        let run = review_patch_with_worker(&script, |s| {
+            s.review.timeout_seconds = 1;
+            s.review.max_retries = 0;
+        })
+        .await?;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1);
+        let review = &reviews[0];
+        assert_eq!(review["status"], "Failed");
+        assert_eq!(
+            review["result"],
+            "Tool error: Review tool timed out (active time exceeded)"
+        );
+        let failures = recorded_failures(review);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            (failures[0].0.as_str(), failures[0].1.as_str()),
+            ("security", "out_of_time")
+        );
+        assert!(
+            failures[0].2.ends_with("and 4 turns"),
+            "the reason says how far the stage got: {failures:?}"
+        );
+        assert_eq!(
+            recorded_timings(review),
+            vec![("goal".to_string(), 1)],
+            "{review}"
+        );
         Ok(())
     }
 }
