@@ -416,9 +416,11 @@ is invited to wander into it, while an `rdma/drv/` patch gets both.
   counts. A read is any tool call that named the reference, cache hits and
   calls git refused included. The review card shows it on one
   line, e.g. `References: kernel @ v6.18 (1a2b3c4d5e6f), 34 reads; rdma-core @
-  origin/ionic-rdma (9f8e7d6c5b4a), 12 reads`, with dormant references in muted
-  text and the reason each was attached on hover. Reviews from before this was
-  added, and deployments with no references, show no line. `sashiko review`
+  origin/ionic-rdma (9f8e7d6c5b4a), 12 reads`, with the reason each was
+  attached on hover. Dormant references are kept in the record and the API but
+  not shown on the card, where they would be named on every patch outside their
+  area. Reviews from before this was added, deployments with no references, and
+  patches whose references were all dormant show no line. `sashiko review`
   and `sashiko-cli local` have no review row; their worker JSON carries the
   same object under `patches[].reference_repos`, with reads summed over the
   worker's in-process attempts.

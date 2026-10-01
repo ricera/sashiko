@@ -4536,9 +4536,12 @@
             try {
                 if (typeof refs === 'string') refs = JSON.parse(refs);
                 if (!refs || typeof refs !== 'object') return '';
+                // Only what the review could read. A reference left out
+                // because the patch is outside its area says nothing about
+                // this patch, and named on every such patch it is just noise;
+                // the record keeps it (`dormant`) for anyone asking why.
                 const attached = Array.isArray(refs.attached) ? refs.attached : [];
-                const dormant = Array.isArray(refs.dormant) ? refs.dormant : [];
-                if (attached.length === 0 && dormant.length === 0) return '';
+                if (attached.length === 0) return '';
 
                 const entries = attached.map(a => {
                     const commit = String(a.commit || '');
@@ -4556,16 +4559,7 @@
                     return `<span title="${escapeHtml(title)}">${text}</span>`;
                 });
 
-                let html = `<strong>References:</strong> ${entries.length ? entries.join('; ') : 'none attached'}`;
-                if (dormant.length) {
-                    const notes = dormant.map(d => {
-                        const globs = Array.isArray(d.applies_to) ? d.applies_to : [];
-                        return globs.length
-                            ? `${escapeHtml(d.name)} (applies only to ${globs.map(g => escapeHtml(g)).join(', ')})`
-                            : escapeHtml(d.name);
-                    });
-                    html += ` <span style="color:var(--text-dim)">Not attached: ${notes.join('; ')}</span>`;
-                }
+                const html = `<strong>References:</strong> ${entries.join('; ')}`;
                 return `<div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; margin-top: 6px;">${html}</div>`;
             } catch (e) {
                 return '';
