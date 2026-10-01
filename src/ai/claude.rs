@@ -593,14 +593,7 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         .map(|r| r == "max_tokens")
         .unwrap_or(false);
 
-    if truncated {
-        tracing::warn!(
-            "{}Claude response truncated due to max_tokens.",
-            crate::ai::get_log_prefix()
-        );
-    }
-
-    Ok(AiResponse {
+    let response = AiResponse {
         content: if content.is_empty() {
             None
         } else {
@@ -623,7 +616,39 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
         },
         usage: Some(usage),
         truncated,
-    })
+    };
+
+    if truncated {
+        tracing::warn!(
+            "{}{}",
+            crate::ai::get_log_prefix(),
+            truncation_warning(resp.usage.output_tokens, &response)
+        );
+    }
+
+    Ok(response)
+}
+
+/// Describes a truncated response for the log.
+///
+/// The output count says how much of the budget was used, which tells whether
+/// the configured max_tokens was the limit reached: a gateway in front of the
+/// API can lower it. The character counts say where that budget went, which
+/// decides the remedy (see truncation_remedy). They are taken from the
+/// translated response, whose answer holds only text blocks, so thinking is
+/// never counted as writing.
+fn truncation_warning(output_tokens: u32, response: &AiResponse) -> String {
+    let answer_chars = response
+        .content
+        .as_deref()
+        .map_or(0, |answer| answer.chars().count());
+    let tool_arg_chars =
+        crate::ai::tool_argument_chars(response.tool_calls.as_deref().unwrap_or_default());
+    format!(
+        "Claude response truncated at max_tokens after {output_tokens} output tokens \
+         ({answer_chars} chars of answer, {tool_arg_chars} chars of tool arguments).{}",
+        crate::ai::truncation_remedy(answer_chars, tool_arg_chars)
+    )
 }
 
 // --- AiProvider Implementation ---
@@ -1153,6 +1178,73 @@ mod tests {
         assert_eq!(ai_resp.thought.as_deref(), Some("Let me think..."));
         assert_eq!(ai_resp.thought_signature.as_deref(), Some("sig_abc"));
 
+        Ok(())
+    }
+
+    fn truncated_response(content: Vec<ClaudeContent>) -> ClaudeResponse {
+        ClaudeResponse {
+            id: "msg_truncated".to_string(),
+            content,
+            stop_reason: Some("max_tokens".to_string()),
+            usage: ClaudeUsage {
+                input_tokens: 30,
+                output_tokens: 32000,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: None,
+            },
+        }
+    }
+
+    /// Thinking is billed but is not writing, so a truncated response that
+    /// only reasoned reports nothing written and points at the budget, however
+    /// long its thinking text is.
+    #[test]
+    fn a_truncation_that_only_reasoned_reports_nothing_written() -> Result<()> {
+        let resp = truncated_response(vec![ClaudeContent::Thinking {
+            thinking: "Let me weigh every caller of this function...".to_string(),
+            signature: "sig".to_string(),
+            cache_control: None,
+        }]);
+        let ai_resp = translate_ai_response(&resp)?;
+        assert!(ai_resp.truncated);
+        let warning = truncation_warning(resp.usage.output_tokens, &ai_resp);
+        assert!(
+            warning.contains(
+                "after 32000 output tokens (0 chars of answer, 0 chars of tool arguments)."
+            ),
+            "{warning}"
+        );
+        assert!(warning.contains("went on reasoning"), "{warning}");
+        Ok(())
+    }
+
+    /// A truncated response that had started its answer reports what it wrote
+    /// and offers no budget remedy, because its length is the thing to act on.
+    #[test]
+    fn a_truncation_that_wrote_an_answer_reports_its_length() -> Result<()> {
+        let resp = truncated_response(vec![
+            ClaudeContent::Thinking {
+                thinking: "Reasoning.".to_string(),
+                signature: "sig".to_string(),
+                cache_control: None,
+            },
+            ClaudeContent::Text {
+                text: "The lock".to_string(),
+                cache_control: None,
+            },
+            ClaudeContent::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "read_files".to_string(),
+                input: json!({"p": "a"}),
+            },
+        ]);
+        let ai_resp = translate_ai_response(&resp)?;
+        let warning = truncation_warning(resp.usage.output_tokens, &ai_resp);
+        assert_eq!(
+            warning,
+            "Claude response truncated at max_tokens after 32000 output tokens \
+             (8 chars of answer, 9 chars of tool arguments)."
+        );
         Ok(())
     }
 
