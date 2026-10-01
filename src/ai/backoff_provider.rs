@@ -62,17 +62,98 @@ pub trait RetryBudget: Send + Sync {
     fn check(&self) -> Result<()>;
 }
 
-/// A [`RetryBudget`] backed by a wall-clock deadline shared with the caller.
+/// The review's deadline passed before it finished.
+///
+/// Typed so the daemon tells a timeout from any other failure by downcasting
+/// rather than by matching text. The message is the one failed review rows
+/// have always stored, so rows written before and after read the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Review tool timed out (active time exceeded)")]
+pub struct ReviewTimedOut {
+    /// The active time the review was given, in seconds. Time parked at the
+    /// quota gate is credited back and is not part of it.
+    pub active_seconds: u64,
+    /// The further time it was given after that to salvage its findings, in
+    /// seconds; 0 when salvage is disabled.
+    pub salvage_seconds: u64,
+}
+
+/// The wall-clock limits of one review run, shared by whoever enforces them.
+///
+/// The review is asked to wind down at the soft limit and is stopped at the
+/// hard limit, `salvage` later. Both move together when time spent waiting
+/// at the quota gate is credited back, because that wait is not active time
+/// in either phase.
+#[derive(Debug)]
+pub struct ReviewDeadline {
+    /// The active time granted, kept to say how long the review ran when it
+    /// times out.
+    timeout: Duration,
+    /// The extra time granted after the soft limit. It never changes, so it
+    /// is kept outside the lock.
+    salvage: Duration,
+    /// When the review is asked to wind down. Moved later by credited waits.
+    soft: std::sync::Mutex<tokio::time::Instant>,
+}
+
+impl ReviewDeadline {
+    /// Starts the clock now: the soft limit is `timeout` away and the hard
+    /// limit a further `salvage`.
+    pub fn new(timeout: Duration, salvage: Duration) -> Self {
+        Self {
+            timeout,
+            salvage,
+            soft: std::sync::Mutex::new(tokio::time::Instant::now() + timeout),
+        }
+    }
+
+    /// When the review is asked to wind down.
+    pub fn soft(&self) -> tokio::time::Instant {
+        *self.lock_soft()
+    }
+
+    /// When the review is stopped: `salvage` after the soft limit, and equal
+    /// to it when salvage is disabled.
+    pub fn hard(&self) -> tokio::time::Instant {
+        self.soft() + self.salvage
+    }
+
+    /// Credits a wait at the quota gate by moving both limits later.
+    pub fn credit(&self, waited: Duration) {
+        *self.lock_soft() += waited;
+    }
+
+    /// The error that reports this deadline passing.
+    pub fn timed_out(&self) -> ReviewTimedOut {
+        ReviewTimedOut {
+            active_seconds: self.timeout.as_secs(),
+            salvage_seconds: self.salvage.as_secs(),
+        }
+    }
+
+    /// The guard holds a plain instant that every writer leaves valid, so a
+    /// lock poisoned by a panic elsewhere still guards a usable value and is
+    /// taken as it is rather than spreading the panic.
+    fn lock_soft(&self) -> std::sync::MutexGuard<'_, tokio::time::Instant> {
+        self.soft
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A [`RetryBudget`] backed by a [`ReviewDeadline`] shared with the caller.
 ///
 /// Time spent parked on the quota gate is credited back, so waiting out a rate
-/// limit does not consume the caller's budget.
+/// limit does not consume the caller's budget. Retries stop only at the hard
+/// limit, so a request made while the review winds down is not abandoned
+/// when the soft limit passes.
 pub struct DeadlineBudget {
-    deadline: Arc<std::sync::Mutex<tokio::time::Instant>>,
+    deadline: Arc<ReviewDeadline>,
     last_credit_end: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
 impl DeadlineBudget {
-    pub fn new(deadline: Arc<std::sync::Mutex<tokio::time::Instant>>) -> Self {
+    pub fn new(deadline: Arc<ReviewDeadline>) -> Self {
         Self {
             deadline,
             last_credit_end: std::sync::Mutex::new(None),
@@ -87,7 +168,12 @@ impl RetryBudget for DeadlineBudget {
         }
         let now = tokio::time::Instant::now();
         let sleep_start = now.checked_sub(slept).unwrap_or(now);
-        let mut last_end = self.last_credit_end.lock().unwrap();
+        // The guard holds only the end of the last credited wait, which every
+        // writer leaves valid, so a poisoned lock is taken as it is.
+        let mut last_end = self
+            .last_credit_end
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let effective_start = match *last_end {
             Some(end) if end > sleep_start => end,
             _ => sleep_start,
@@ -97,19 +183,15 @@ impl RetryBudget for DeadlineBudget {
             // Filter out sub-millisecond thread scheduling jitter between
             // concurrent tasks waking from the same rate-limit window.
             if uncredited >= Duration::from_millis(1) {
-                let mut d = self.deadline.lock().unwrap();
-                *d += uncredited;
+                self.deadline.credit(uncredited);
                 *last_end = Some(now);
             }
         }
     }
 
     fn check(&self) -> Result<()> {
-        let current = { *self.deadline.lock().unwrap() };
-        if tokio::time::Instant::now() > current {
-            return Err(anyhow::anyhow!(
-                "Review tool timed out (active time exceeded)"
-            ));
+        if tokio::time::Instant::now() > self.deadline.hard() {
+            return Err(self.deadline.timed_out().into());
         }
         Ok(())
     }
@@ -474,25 +556,77 @@ mod tests {
         assert!(observer.events.lock().unwrap().is_empty());
     }
 
-    #[tokio::test]
+    /// Paused, so the clock moves only when the test says and the credited
+    /// amounts are exact rather than within scheduling jitter.
+    #[tokio::test(start_paused = true)]
     async fn deadline_budget_credit_wait_deduplicates_overlapping_sleeps() {
-        let deadline = Arc::new(std::sync::Mutex::new(
-            tokio::time::Instant::now() + Duration::from_secs(60),
-        ));
+        let deadline = Arc::new(ReviewDeadline::new(Duration::from_secs(60), Duration::ZERO));
+        let start = deadline.soft();
         let budget = DeadlineBudget::new(deadline.clone());
 
-        // First sleep of 10s credits approximately 10s.
+        // A 10s wait that has just ended credits all 10s.
+        tokio::time::advance(Duration::from_secs(10)).await;
         budget.credit_wait(Duration::from_secs(10));
-        let d1 = *deadline.lock().unwrap();
+        let d1 = deadline.soft();
+        assert_eq!(d1, start + Duration::from_secs(10));
 
-        // An immediately following call reporting the same 10s sleep should not add another 10s.
+        // A second task reporting the same wait adds nothing.
         budget.credit_wait(Duration::from_secs(10));
-        let d2 = *deadline.lock().unwrap();
-        assert_eq!(d1, d2);
+        assert_eq!(deadline.soft(), d1);
 
-        // Zero sleep should not affect deadline.
+        // A zero wait does not touch the deadline.
         budget.credit_wait(Duration::ZERO);
-        let d3 = *deadline.lock().unwrap();
-        assert_eq!(d2, d3);
+        assert_eq!(deadline.soft(), d1);
+    }
+
+    /// A credited wait is not active time in either phase, so it moves the
+    /// hard limit with the soft one and the salvage window keeps its length.
+    #[tokio::test(start_paused = true)]
+    async fn a_credit_moves_both_limits() {
+        let deadline = ReviewDeadline::new(Duration::from_secs(60), Duration::from_secs(30));
+        let (soft, hard) = (deadline.soft(), deadline.hard());
+        assert_eq!(hard - soft, Duration::from_secs(30));
+
+        deadline.credit(Duration::from_secs(5));
+        assert_eq!(deadline.soft(), soft + Duration::from_secs(5));
+        assert_eq!(deadline.hard(), hard + Duration::from_secs(5));
+    }
+
+    /// With salvage disabled the review is stopped the moment it is due to
+    /// wind down.
+    #[tokio::test(start_paused = true)]
+    async fn without_salvage_the_hard_limit_is_the_soft_one() {
+        let deadline = ReviewDeadline::new(Duration::from_secs(60), Duration::ZERO);
+        assert_eq!(deadline.hard(), deadline.soft());
+    }
+
+    /// Retries keep going through the salvage window, so a consolidation
+    /// request in backoff is not abandoned at the soft limit, and stop with
+    /// the typed timeout once the hard limit has passed.
+    #[tokio::test(start_paused = true)]
+    async fn the_budget_runs_out_at_the_hard_limit_not_the_soft_one() {
+        let deadline = Arc::new(ReviewDeadline::new(
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        ));
+        let budget = DeadlineBudget::new(deadline);
+        assert!(budget.check().is_ok());
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        assert!(budget.check().is_ok(), "between soft and hard");
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let err = budget.check().expect_err("past the hard limit");
+        assert_eq!(
+            err.downcast_ref::<ReviewTimedOut>(),
+            Some(&ReviewTimedOut {
+                active_seconds: 60,
+                salvage_seconds: 30,
+            })
+        );
+        assert_eq!(
+            err.to_string(),
+            "Review tool timed out (active time exceeded)"
+        );
     }
 }

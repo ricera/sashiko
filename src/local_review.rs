@@ -1091,8 +1091,14 @@ async fn review_single_patch(
 ) -> (Result<Value>, Option<ReviewReferences>) {
     let retry_budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>> =
         (timeout_seconds > 0).then(|| {
-            let deadline = Arc::new(std::sync::Mutex::new(
-                tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds),
+            // Salvage is zero because no review is given a salvage window
+            // yet. This budget also governs the worker the daemon spawns, so
+            // once the daemon grants salvage_seconds this deadline must be
+            // given the same value. Otherwise the worker's own retries stop
+            // at the soft limit while the daemon still waits for it.
+            let deadline = Arc::new(crate::ai::backoff_provider::ReviewDeadline::new(
+                std::time::Duration::from_secs(timeout_seconds),
+                std::time::Duration::ZERO,
             ));
             Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(deadline))
                 as Arc<dyn crate::ai::backoff_provider::RetryBudget>
