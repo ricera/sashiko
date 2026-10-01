@@ -23,7 +23,8 @@
 //! via the `generateContent` endpoint.
 
 use crate::ai::claude::{
-    self, ClaudeError, ClaudeMessage, ClaudeResponse, ClaudeTool, SystemBlock, ThinkingConfig,
+    self, ClaudeError, ClaudeMessage, ClaudeRequest, ClaudeResponse, ClaudeTool, OutputConfig,
+    SystemBlock, ThinkingConfig,
 };
 use crate::ai::gemini::{self, GenerateContentRequest, GenerateContentResponse};
 use crate::ai::{AiProvider, AiRequest, AiResponse, ProviderCapabilities};
@@ -76,6 +77,28 @@ struct VertexClaudeRequest {
     tools: Option<Vec<ClaudeTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<ThinkingConfig>,
+    /// Carries `effort`. Vertex forwards the body to the Messages API, which
+    /// reads `effort` here and ignores it inside `thinking`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
+}
+
+impl From<ClaudeRequest> for VertexClaudeRequest {
+    /// Rewraps a direct-API request for `rawPredict`: drops `model`, adds
+    /// `anthropic_version`, and copies every other field. The production path
+    /// and the tests both go through this conversion, so the tests see the
+    /// body that is actually sent.
+    fn from(claude_req: ClaudeRequest) -> Self {
+        Self {
+            anthropic_version: "vertex-2023-10-16".to_string(),
+            messages: claude_req.messages,
+            max_tokens: claude_req.max_tokens,
+            system: claude_req.system,
+            tools: claude_req.tools,
+            thinking: claude_req.thinking,
+            output_config: claude_req.output_config,
+        }
+    }
 }
 
 // --- Endpoint construction ---
@@ -257,15 +280,7 @@ impl VertexClient {
             self.effort.clone(),
         )?;
 
-        let vertex_req = VertexClaudeRequest {
-            anthropic_version: "vertex-2023-10-16".to_string(),
-            messages: claude_req.messages,
-            max_tokens: claude_req.max_tokens,
-            system: claude_req.system,
-            tools: claude_req.tools,
-            thinking: claude_req.thinking,
-        };
-
+        let vertex_req = VertexClaudeRequest::from(claude_req);
         let response = self.post_claude_request(&vertex_req).await?;
         claude::translate_ai_response(&response)
     }
@@ -436,6 +451,7 @@ mod tests {
             system: None,
             tools: None,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_value(&req).unwrap();
@@ -452,6 +468,7 @@ mod tests {
             system: None,
             tools: None,
             thinking: None,
+            output_config: None,
         };
 
         let json = serde_json::to_value(&req).unwrap();
@@ -479,15 +496,7 @@ mod tests {
         };
 
         let claude_req = claude::translate_ai_request(&ai_req, false, 4096, None, None).unwrap();
-
-        let vertex_req = VertexClaudeRequest {
-            anthropic_version: "vertex-2023-10-16".to_string(),
-            messages: claude_req.messages,
-            max_tokens: claude_req.max_tokens,
-            system: claude_req.system,
-            tools: claude_req.tools,
-            thinking: claude_req.thinking,
-        };
+        let vertex_req = VertexClaudeRequest::from(claude_req);
 
         let json = serde_json::to_value(&vertex_req).unwrap();
         assert_eq!(json["anthropic_version"], "vertex-2023-10-16");
@@ -495,8 +504,48 @@ mod tests {
         assert!(json["system"].is_array());
         assert!(json["messages"].is_array());
         assert_eq!(json["max_tokens"], 4096);
-        // thinking should be absent (both None)
+        // Neither thinking nor effort is configured, so neither key is sent.
         assert!(!json.as_object().unwrap().contains_key("thinking"));
+        assert!(!json.as_object().unwrap().contains_key("output_config"));
+    }
+
+    /// Vertex Claude reuses the direct API's request translation, so it had
+    /// the same defect: `effort` nested inside `thinking`, where the Messages
+    /// API behind `rawPredict` does not read it.
+    #[test]
+    fn vertex_sends_effort_as_output_config_not_inside_thinking() {
+        let ai_req = AiRequest {
+            system: None,
+            messages: vec![crate::ai::AiMessage {
+                role: crate::ai::AiRole::User,
+                content: Some("hi".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let claude_req = claude::translate_ai_request(
+            &ai_req,
+            false,
+            4096,
+            Some("adaptive".to_string()),
+            Some("high".to_string()),
+        )
+        .unwrap();
+        let json = serde_json::to_value(VertexClaudeRequest::from(claude_req)).unwrap();
+
+        assert_eq!(json["thinking"]["type"], "adaptive");
+        assert_eq!(json["output_config"]["effort"], "high");
+        assert!(
+            json["thinking"].get("effort").is_none(),
+            "effort must not be nested inside thinking: {json}"
+        );
     }
 
     // --- Context window detection ---

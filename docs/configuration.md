@@ -115,7 +115,7 @@ Settings specific to the Claude API provider (`provider = "claude"`).
 | `max_tokens` | integer | `4096` | Max output tokens per response. |
 | `base_url` | string | -- | Override the API base URL (optional, for proxies like Portkey). |
 | `thinking` | string | -- | Extended thinking mode: `"enabled"` or `"adaptive"` (Sonnet 4.6+). |
-| `effort` | string | -- | Thinking effort: `"low"`, `"medium"`, `"high"`. |
+| `effort` | string | -- | Thinking effort: `"low"`, `"medium"`, `"high"`. Sent as `output_config.effort`, beside `thinking` rather than inside it. Vertex Claude models read their own `[ai.vertex]` `effort` instead of this key and send it the same way. |
 
 #### `[ai.claude_cli]`
 
