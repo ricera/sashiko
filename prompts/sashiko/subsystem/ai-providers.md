@@ -180,6 +180,19 @@ are `test_session_runner_forces_synthesis_on_max_turns`,
 `a_validation_retry_on_the_final_turn_pushes_the_budget_prompt_once` and
 `a_single_turn_session_gets_no_tools_and_no_budget_prompt`.
 
+**Invariant: an ignored tool call never goes back to the model.** On the
+final turn, `reply_for_history` strips `tool_calls` from the copy of the
+answer pushed to `history` and keeps them in `log_history` only. An answer
+left with no text gets `IGNORED_TOOL_CALLS_NOTE` as its content. Both halves
+matter: a `tool_use` with no `tool_result` makes Claude (and OpenAI) reject
+the next request, and an assistant message with no content is rejected by
+Claude and fails to build in Bedrock, so either mistake turns a validation
+retry on the final turn into a provider error. A diff that pushes the raw
+answer into `history` on the final turn, or that lets the copy's content be
+`None` or empty, brings that back. The tests are
+`a_final_turn_retry_sends_no_unanswered_tool_calls` and
+`a_final_turn_reply_keeps_its_text_and_drops_its_tool_calls`.
+
 Because every retry gives its turn back, a retry on the final turn
 re-enters it. The prompt must still appear exactly once: a diff that
 recomputes the final-turn state from the turn counter on each pass, or

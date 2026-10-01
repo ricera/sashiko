@@ -234,7 +234,9 @@ Counters and their exact semantics:
   every request, including every retry, goes out with `tools` forced to
   `None`, **overriding `ToolScope`**. If the model emits tool calls anyway
   they are logged and ignored, and the response goes straight to
-  `validate`.
+  `validate`. The copy of that answer pushed to `history` has its
+  `tool_calls` removed (`reply_for_history`), so a validation retry never
+  sends the provider a tool call without a result.
 - The "TURN BUDGET EXHAUSTED" user message (`TURN_BUDGET_PROMPT`) is
   pushed once, by `announce_final_turn`, at the moment `final_turn` is
   first set, and only when `max_turns > 1` (`FinalTurn::prompt`). Retries
