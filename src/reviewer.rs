@@ -15,7 +15,7 @@
 use crate::ReviewStatus;
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, RemoteAiErrorPayload, classify_ai_error,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, RemoteAiErrorPayload, classify_ai_error,
     create_provider_cached,
 };
 use crate::baseline::{BaselineRegistry, BaselineResolution, CommitId, extract_files_from_diff};
@@ -2665,6 +2665,44 @@ fn default_worker_command() -> Result<Command> {
     Ok(c)
 }
 
+/// Records the tool calls in a provider response that the worker will run.
+///
+/// The worker never runs the calls in a truncated response: it discards the
+/// response unread and either asks the model again or ends the session. A row
+/// for one of those calls would stay at zero output length and count as a call
+/// in the tool usage statistics. When a retried answer repeats the same call,
+/// its result fills in the newest matching row and the phantom row is left
+/// behind.
+async fn record_tool_calls(
+    db: &Database,
+    review_id: i64,
+    provider: &str,
+    model: &str,
+    resp: &AiResponse,
+) {
+    if resp.truncated {
+        return;
+    }
+    for call in resp.tool_calls.iter().flatten() {
+        let usage = crate::db::ToolUsage {
+            review_id,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            tool_name: call.function_name.clone(),
+            arguments: Some(call.arguments.to_string()),
+            output_length: 0,
+        };
+        // Tool usage rows are statistics only; failing to write one must not
+        // fail the review.
+        if let Err(e) = db.create_tool_usage(usage).await {
+            warn!(
+                "Failed to record tool usage for review {}: {}",
+                review_id, e
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_review_tool_with_cmd(
     mut cmd: Command,
@@ -3066,22 +3104,14 @@ async fn run_review_tool_with_cmd(
                                                         }
                                                     }
 
-                                                    if let Some(tool_calls) = &p.tool_calls {
-                                                        for call in tool_calls {
-                                                            let _ = db_clone
-                                                                .create_tool_usage(crate::db::ToolUsage {
-                                                                    review_id,
-                                                                    provider: settings_clone.ai.provider.clone(),
-                                                                    model: settings_clone.ai.model.clone(),
-                                                                    tool_name: call.function_name.clone(),
-                                                                    arguments: Some(
-                                                                        call.arguments.to_string(),
-                                                                    ),
-                                                                    output_length: 0,
-                                                                })
-                                                                .await;
-                                                        }
-                                                    }
+                                                    record_tool_calls(
+                                                        &db_clone,
+                                                        review_id,
+                                                        &settings_clone.ai.provider,
+                                                        &settings_clone.ai.model,
+                                                        &p,
+                                                    )
+                                                    .await;
 
                                                     Some(json!({
                                                         "type": "ai_response",
@@ -6516,6 +6546,70 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             Some(ReviewStatus::Failed.as_str())
         );
 
+        Ok(())
+    }
+
+    /// Counts the tool usage rows recorded for a review.
+    async fn tool_usage_rows(db: &Database, review_id: i64) -> Result<i64> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT count(*) FROM tool_usages WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("count(*) returned no row"))?;
+        Ok(row.get(0)?)
+    }
+
+    #[tokio::test]
+    async fn tool_calls_in_a_truncated_response_are_not_recorded() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        let db = Database::new(&settings.database).await?;
+        db.migrate().await?;
+        let thread_id = db.create_thread("root", "Tool usage", 1000).await?;
+        db.create_message(
+            "msg1", thread_id, None, "Author", "Subject", 1000, "", "", "", None, None,
+        )
+        .await?;
+        let patchset_id = db
+            .create_patchset(
+                thread_id, None, "msg1", "Subject", "Author", 1000, 1, 1, "", "", None, 1, None,
+                true, None, None,
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("patchset was not created"))?;
+        let review_id = db
+            .create_review(patchset_id, None, "prov", "model", None, None)
+            .await?;
+
+        let mut resp = AiResponse {
+            content: None,
+            thought: None,
+            thought_signature: None,
+            tool_calls: Some(vec![crate::ai::ToolCall {
+                id: "call_1".to_string(),
+                function_name: "git_grep".to_string(),
+                arguments: json!({"pattern": "foo"}),
+                thought_signature: None,
+            }]),
+            usage: None,
+            truncated: true,
+        };
+        record_tool_calls(&db, review_id, "prov", "model", &resp).await;
+        assert_eq!(
+            tool_usage_rows(&db, review_id).await?,
+            0,
+            "the worker never runs a call from a truncated response"
+        );
+
+        resp.truncated = false;
+        record_tool_calls(&db, review_id, "prov", "model", &resp).await;
+        assert_eq!(tool_usage_rows(&db, review_id).await?, 1);
         Ok(())
     }
 }
