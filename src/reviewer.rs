@@ -1901,58 +1901,7 @@ impl Reviewer {
             );
             let conversation = Self::settle_attempt(ctx, review_id, &mut stages, &end).await;
 
-            let verdict = match end {
-                AttemptEnd::Finished { output } => {
-                    Self::store_finished_attempt(ctx, &patch, review_id, &output).await?
-                }
-                AttemptEnd::Cancelled { output } => {
-                    info!(
-                        "Review {} of patch {}/{} was cancelled",
-                        review_id, patchset_id, index
-                    );
-                    Self::mark_attempt_cancelled(
-                        ctx,
-                        Some(review_id),
-                        patch_id,
-                        output.as_ref(),
-                        conversation,
-                    )
-                    .await;
-                    AttemptVerdict::Final(PatchResult::Cancelled)
-                }
-                AttemptEnd::TimedOut { timeout } => {
-                    error!(
-                        "Review {} of patch {}/{} timed out after {} active seconds; \
-                         not retrying",
-                        review_id, patchset_id, index, timeout.active_seconds
-                    );
-                    Self::fail_review_row(
-                        ctx,
-                        review_id,
-                        &format!("Tool error: {}", timeout),
-                        None,
-                        conversation,
-                    )
-                    .await;
-                    // A review that used up its whole deadline has shown it does
-                    // not fit in one, and a retry gets an identical deadline.
-                    // Retrying is how one patch came to spend four deadlines
-                    // and produce nothing; a rerun is one command away.
-                    AttemptVerdict::GiveUp
-                }
-                AttemptEnd::Failed { reason, output } => {
-                    error!(
-                        "Review {} of patch {}/{} failed: {}",
-                        review_id, patchset_id, index, reason
-                    );
-                    Self::fail_review_row(ctx, review_id, &reason, output.as_ref(), conversation)
-                        .await;
-                    // A worker that hits its own deadline also ends here and is
-                    // retried, because its timeout reaches the daemon as an
-                    // untyped error rather than as a ReviewTimedOut.
-                    AttemptVerdict::Retry
-                }
-            };
+            let verdict = Self::conclude_attempt(ctx, &patch, review_id, end, conversation).await?;
 
             match verdict {
                 AttemptVerdict::Final(result) => return Ok(result),
@@ -1963,6 +1912,90 @@ impl Reviewer {
                 }
             }
         }
+    }
+
+    /// Records how an attempt ended on its review row, and decides what
+    /// follows it. `conversation` is what the attempt streamed, given for an
+    /// attempt with no review from the worker; see [`Self::settle_attempt`].
+    async fn conclude_attempt(
+        ctx: &ReviewContext,
+        patch: &PatchUnderReview<'_>,
+        review_id: i64,
+        end: AttemptEnd,
+        conversation: Option<String>,
+    ) -> Result<AttemptVerdict> {
+        let (patchset_id, index) = (patch.patchset_id, patch.index);
+        let verdict = match end {
+            AttemptEnd::Finished { output } => {
+                Self::store_finished_attempt(ctx, patch, review_id, &output).await?
+            }
+            AttemptEnd::Cancelled { output } => {
+                info!(
+                    "Review {} of patch {}/{} was cancelled",
+                    review_id, patchset_id, index
+                );
+                Self::mark_attempt_cancelled(
+                    ctx,
+                    Some(review_id),
+                    patch.patch_id,
+                    output.as_ref(),
+                    conversation,
+                )
+                .await;
+                AttemptVerdict::Final(PatchResult::Cancelled)
+            }
+            AttemptEnd::TimedOut { timeout } => {
+                error!(
+                    "Review {} of patch {}/{} timed out after {} active seconds; \
+                     not retrying",
+                    review_id, patchset_id, index, timeout.active_seconds
+                );
+                Self::fail_review_row(
+                    ctx,
+                    review_id,
+                    &format!("Tool error: {}", timeout),
+                    None,
+                    conversation,
+                )
+                .await;
+                // A review that used up its whole deadline has shown it does
+                // not fit in one, and a retry gets an identical deadline.
+                // Retrying is how one patch came to spend four deadlines and
+                // produce nothing; a rerun is one command away.
+                AttemptVerdict::GiveUp
+            }
+            AttemptEnd::BudgetExceeded { error } => {
+                error!(
+                    "Review {} of patch {}/{} exceeded its token budget: {}; not retrying",
+                    review_id, patchset_id, index, error
+                );
+                Self::fail_review_row(
+                    ctx,
+                    review_id,
+                    &format!("Tool error: {}", error),
+                    None,
+                    conversation,
+                )
+                .await;
+                // The budget caps what one review of a patch may cost. Each
+                // attempt starts with fresh token counts, so retrying would
+                // multiply the cap by the number of attempts, and an identical
+                // attempt has no reason to need fewer tokens.
+                AttemptVerdict::GiveUp
+            }
+            AttemptEnd::Failed { reason, output } => {
+                error!(
+                    "Review {} of patch {}/{} failed: {}",
+                    review_id, patchset_id, index, reason
+                );
+                Self::fail_review_row(ctx, review_id, &reason, output.as_ref(), conversation).await;
+                // A worker that hits its own deadline also ends here and is
+                // retried, because its timeout reaches the daemon as an
+                // untyped error rather than as a ReviewTimedOut.
+                AttemptVerdict::Retry
+            }
+        };
+        Ok(verdict)
     }
 
     /// Whether the patchset has been cancelled. A status that cannot be read
@@ -2544,6 +2577,11 @@ enum AttemptEnd {
     Finished { output: Value },
     /// The review's deadline passed and the worker was killed.
     TimedOut { timeout: ReviewTimedOut },
+    /// The daemon stopped the worker because the review used more tokens
+    /// than `max_total_tokens` or `max_total_output_tokens` allow. `error` is
+    /// the `ReviewError::BudgetExceeded` the I/O loop returned, kept whole so
+    /// the row's reason reads as it did when this was an ordinary failure.
+    BudgetExceeded { error: anyhow::Error },
     /// The patchset was cancelled while the patch was reviewed. `output` is
     /// the worker's output when it returned a review before the cancel was
     /// seen: the review is no longer wanted, but the worker's history is
@@ -2572,7 +2610,9 @@ impl AttemptEnd {
                 output: Some(output),
             },
             Self::Cancelled { output } => Self::Cancelled { output },
-            Self::TimedOut { .. } | Self::Failed { .. } => Self::Cancelled { output: None },
+            Self::TimedOut { .. } | Self::BudgetExceeded { .. } | Self::Failed { .. } => {
+                Self::Cancelled { output: None }
+            }
         }
     }
 
@@ -2597,11 +2637,10 @@ impl AttemptEnd {
         if let Some(timeout) = e.downcast_ref::<ReviewTimedOut>() {
             return Self::TimedOut { timeout: *timeout };
         }
-        if matches!(
-            e.downcast_ref::<ReviewError>(),
-            Some(ReviewError::Cancelled)
-        ) {
-            return Self::Cancelled { output: None };
+        match e.downcast_ref::<ReviewError>() {
+            Some(ReviewError::Cancelled) => return Self::Cancelled { output: None },
+            Some(ReviewError::BudgetExceeded(_)) => return Self::BudgetExceeded { error: e },
+            _ => {}
         }
         Self::Failed {
             reason: format!("Tool error: {}", e),
@@ -2615,7 +2654,9 @@ impl AttemptEnd {
         match self {
             Self::TimedOut { .. } => StageStopCause::OutOfTime,
             Self::Cancelled { .. } => StageStopCause::Cancelled,
-            Self::Finished { .. } | Self::Failed { .. } => StageStopCause::Interrupted,
+            Self::Finished { .. } | Self::BudgetExceeded { .. } | Self::Failed { .. } => {
+                StageStopCause::Interrupted
+            }
         }
     }
 
@@ -6375,6 +6416,20 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         );
         assert_eq!(end.settle_cause(), StageStopCause::Cancelled);
 
+        let budget = ReviewError::BudgetExceeded("1800 tokens used > 1000 limit".into());
+        let end = AttemptEnd::classify(
+            Err(anyhow::Error::new(budget).context("while reading the worker")),
+            1,
+            false,
+        );
+        assert!(
+            matches!(&end, AttemptEnd::BudgetExceeded { error } if error.to_string() == "while reading the worker"),
+            "a budget stop behind further context is still a budget stop, \
+             and keeps the error it came as: {end:?}"
+        );
+        assert_eq!(end.settle_cause(), StageStopCause::Interrupted);
+        assert!(!end.has_worker_review());
+
         let end = AttemptEnd::classify(Err(anyhow!("worker exited")), 1, false);
         assert_eq!(end.settle_cause(), StageStopCause::Interrupted);
         assert_eq!(
@@ -6462,6 +6517,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             Ok(no_review),
             Err(anyhow::Error::new(timeout)),
             Err(ReviewError::Cancelled.into()),
+            Err(ReviewError::BudgetExceeded("over".into()).into()),
             Err(anyhow!("worker exited")),
         ] {
             let end = AttemptEnd::decide(result, 1, false, true);
@@ -6519,14 +6575,25 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         script: &str,
         configure: impl FnOnce(&mut Settings),
     ) -> Result<WorkerReview> {
-        review_patch_with_worker_while(script, configure, |_, _| async { Ok(()) }).await
+        review_patch_with_provider(script, Arc::new(MockProvider), configure).await
     }
 
-    /// As [`review_patch_with_worker`], running `during` alongside the review
-    /// with the database and the patchset's id, to act on the review while
-    /// its worker runs.
+    /// As [`review_patch_with_worker`], with `provider` answering the
+    /// worker's AI requests.
+    async fn review_patch_with_provider(
+        script: &str,
+        provider: Arc<dyn AiProvider>,
+        configure: impl FnOnce(&mut Settings),
+    ) -> Result<WorkerReview> {
+        review_patch_with_worker_while(script, provider, configure, |_, _| async { Ok(()) }).await
+    }
+
+    /// As [`review_patch_with_provider`], running `during` alongside the
+    /// review with the database and the patchset's id, to act on the review
+    /// while its worker runs.
     async fn review_patch_with_worker_while<F, Fut>(
         script: &str,
+        provider: Arc<dyn AiProvider>,
         configure: impl FnOnce(&mut Settings),
         during: F,
     ) -> Result<WorkerReview>
@@ -6553,7 +6620,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None)?),
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
-            provider: Arc::new(MockProvider),
+            provider,
             activity: activity.clone(),
             worker_program: Some(bin_path),
         };
@@ -6633,6 +6700,22 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             );
         }
         Ok(reviews)
+    }
+
+    /// The status the patch's row holds, or `None` when it has none.
+    async fn patch_status(db: &Database, patch_id: i64) -> Result<Option<String>> {
+        db.conn
+            .query(
+                "SELECT status FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?
+            .next()
+            .await?
+            .map(|row| row.get::<Option<String>>(0))
+            .transpose()
+            .map(Option::flatten)
+            .map_err(Into::into)
     }
 
     /// The stage failures a review row records, as (stage, cause, reason).
@@ -6906,19 +6989,67 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert_eq!(reviews.len(), 1, "one attempt only: {reviews:?}");
         assert_eq!(reviews[0]["status"], "Failed");
         assert_eq!(reviews[0]["attempt"], 1, "{}", reviews[0]);
-        let patch_status = run
-            .db
-            .conn
-            .query(
-                "SELECT status FROM patches WHERE id = ?",
-                libsql::params![run.patch_id],
-            )
-            .await?
-            .next()
-            .await?
-            .map(|row| row.get::<String>(0))
-            .transpose()?;
-        assert_eq!(patch_status.as_deref(), Some("Failed"));
+        assert_eq!(
+            patch_status(&run.db, run.patch_id).await?.as_deref(),
+            Some("Failed")
+        );
+        Ok(())
+    }
+
+    /// A review stopped at its token budget is not tried again, however many
+    /// retries remain: each attempt starts with fresh token counts, so a
+    /// retry would spend the budget again. The row gets the daemon's record
+    /// of what the attempt did, as any review without a worker's own does.
+    #[tokio::test]
+    async fn test_a_review_over_its_token_budget_is_not_retried() -> Result<()> {
+        let mut lines = stage_reaching("security", 1);
+        lines.push(streamed(Some("security"), "reading the copy loop"));
+        lines.push(
+            json!({"type": "ai_request", "payload": {"messages": [{"role": "user", "content": "go on"}]}})
+                .to_string(),
+        );
+        // The worker reads the daemon's error reply, then waits for its input
+        // to close, which happens once the daemon has stopped the attempt.
+        let script = worker_reporting_then(&lines, "read -r _reply\nread -r _eof\nexit 1\n");
+        let provider = Arc::new(MockProviderWithUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 100,
+            cached_tokens: 0,
+        });
+
+        let run = review_patch_with_provider(&script, provider, |s| {
+            s.review.max_total_tokens = 500;
+            s.review.max_retries = 2;
+        })
+        .await?;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1, "one attempt only: {reviews:?}");
+        let review = &reviews[0];
+        assert_eq!(review["status"], "Failed");
+        assert_eq!(review["attempt"], 1, "{review}");
+        assert!(
+            review["result"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("Tool error: Token budget exceeded")),
+            "the reason reads as before: {review}"
+        );
+        let failures = recorded_failures(review);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            (failures[0].0.as_str(), failures[0].1.as_str()),
+            ("security", "interrupted")
+        );
+        assert_eq!(
+            recorded_log(review),
+            promoted(&[(Some("security"), "reading the copy loop")]),
+            "{review}"
+        );
+        assert_eq!(
+            patch_status(&run.db, run.patch_id).await?.as_deref(),
+            Some("Failed")
+        );
         Ok(())
     }
 
@@ -6932,6 +7063,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         let run = review_patch_with_worker_while(
             &script,
+            Arc::new(MockProvider),
             |s| s.review.max_retries = 0,
             cancel_once_streamed,
         )
@@ -7009,6 +7141,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         };
         let run = review_patch_with_worker_while(
             &script,
+            Arc::new(MockProvider),
             |s| s.review.max_retries = 0,
             cancel_then_finish,
         )
