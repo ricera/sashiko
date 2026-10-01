@@ -3548,7 +3548,7 @@ mod tests {
         .unwrap();
         db.set_review_stage_failures(
             review,
-            r#"[{"stage":"security","reason":"x","cancelled":true}]"#,
+            r#"[{"stage":"security","reason":"x","cause":"out_of_time"}]"#,
         )
         .await
         .unwrap();

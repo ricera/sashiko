@@ -49,7 +49,8 @@ function grabLet(name) {
 const LETS = ['activityPoll', 'viewGeneration', 'logView', 'logTimer'];
 const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'renderReviewCard',
                'formatDuration', 'describeStageWait', 'summarizeReason', 'compareStageRows',
-               'stageTableLabel', 'stageRowsFromRecord', 'stageRowsFromActivity',
+               'stageTableLabel', 'stageRowsFromRecord', 'stageStopCause', 'stageStopLabel',
+               'stageRowsFromActivity',
                'renderStageRow', 'stageTableParts', 'hostForPatch', 'paintStageProgress',
                'refreshActivity', 'startActivityPolling', 'stopActivityPolling',
                'renderInteractionLogEntries', 'formatJsonExpandable', 'formatFuncCallExpandable',
@@ -336,12 +337,12 @@ payload = { live: true, entries: [
       description: 'stage execution-flow, turn 7/50 (awaiting model)', age_seconds: 300, idle_seconds: 12 },
     { key: 'patchset:7/patch:10/stage:implementation', patch_id: 10, stage: 'implementation',
       order: ORDER.implementation,
-      phase: { kind: 'stage_failed', stage: 'implementation', cancelled: false,
+      phase: { kind: 'stage_failed', stage: 'implementation', cause: 'error',
                reason: 'Session exceeded max turns limit (50)\n\nCaused by:\n    nothing' },
       description: 'stage implementation failed: Session exceeded max turns limit (50)',
       age_seconds: 90, idle_seconds: 90 },
     { key: 'patchset:7/patch:10/stage:security', patch_id: 10, stage: 'security', order: ORDER.security,
-      phase: { kind: 'stage_failed', stage: 'security', cancelled: true,
+      phase: { kind: 'stage_failed', stage: 'security', cause: 'cancelled',
                reason: 'Session cancelled by supervisor' },
       description: 'stage security cancelled: Session cancelled by supervisor',
       age_seconds: 30, idle_seconds: 30 },
@@ -363,7 +364,8 @@ console.log('case 5: failed stages');
     check('a still-running sibling keeps its turn counter',
         /turn 7\/50/.test(visibleText(rowFor(body5, 'Stage execution-flow'))));
     check('cancelled is not called a failure',
-        visibleText(rowFor(body5, 'Stage security')).includes('stopped: Session cancelled by supervisor'));
+        visibleText(rowFor(body5, 'Stage security')).includes('cancelled: Session cancelled by supervisor')
+            && !visibleText(rowFor(body5, 'Stage security')).includes('failed'));
     check('summary separates running from stopped',
         h10.querySelector('summary').textContent === 'Stages (1 running, 2 stopped)',
         h10.querySelector('summary').textContent);
@@ -460,7 +462,7 @@ console.log('case 9: completed stages');
 // and would pass a sorted fixture.
 payload = { live: true, entries: [
     { key: 'patchset:7/patch:10/stage:resources', patch_id: 10, stage: 'resources', order: ORDER.resources,
-      phase: { kind: 'stage_failed', stage: 'resources', cancelled: false, reason: 'boom' },
+      phase: { kind: 'stage_failed', stage: 'resources', cause: 'error', reason: 'boom' },
       description: 'stage resources failed: boom', age_seconds: 10, idle_seconds: 10 },
     { key: 'patchset:7/patch:10/stage:execution-flow', patch_id: 10, stage: 'execution-flow',
       order: ORDER['execution-flow'],
@@ -699,7 +701,7 @@ function stageChecks(fns) {
         guard(() => fns.renderStageRow({ stage: evil, state: 'running', description: evil,
             waiting: { on: 'tools', names: [evil] }, max_turns: 3, turn: 1 })),
         guard(() => fns.renderStageRow({ stage: evil, stage_label: evil, state: 'stopped',
-            reason: evil, cancelled: false })),
+            reason: evil, cause: evil })),
         guard(() => fns.renderStageRow({ stage: evil, state: 'persisted', description: evil })),
         guard(() => fns.renderStageRow({ stage: null, state: 'patch', description: evil })),
         guard(() => fns.renderStageRow({ stage: evil, state: 'done', seconds: 1, turns: 1 })),
@@ -713,6 +715,53 @@ console.log('stage order, labels and escaping');
 {
     const stageFailures = stageChecks(ctx);
     check('every stage check passes', stageFailures.length === 0, stageFailures.join(', '));
+}
+
+// ---- why a stage stopped ----------------------------------------------------
+// Each cause has its own words, the same ones the activity descriptions and
+// the CLI use, and only a stage's own error is coloured as a fault. A row
+// written before the cause existed reads as it always did.
+function causeChecks(fns) {
+    const failed = [];
+    const expect = (name, cond) => { if (!cond) failed.push(name); };
+    const guard = f => { try { return f(); } catch (e) { return `THREW ${e}`; } };
+    const recorded = f => {
+        const rows = guard(() => fns.stageRowsFromRecord([], [{ stage: 'goal', order: 0, reason: 'why', ...f }]));
+        return Array.isArray(rows) ? String(guard(() => fns.renderStageRow(rows[0]))) : String(rows);
+    };
+    const live = phase => {
+        const rows = guard(() => fns.stageRowsFromActivity([{ patch_id: 1, stage: 'goal', order: 0,
+            phase: { kind: 'stage_failed', stage: 'goal', reason: 'why', ...phase } }], true));
+        return Array.isArray(rows) ? String(guard(() => fns.renderStageRow(rows[0]))) : String(rows);
+    };
+    const shows = (html, words) => visibleText(html).includes(`${words}: why`);
+    const red = html => html.includes('var(--status-failed)');
+
+    for (const [cause, words] of [
+        ['error', 'failed'], ['cancelled', 'cancelled'], ['out_of_time', 'stopped: out of time'],
+        ['cut_short', 'cut short'], ['interrupted', 'still running when the review stopped'],
+    ]) {
+        const fromRecord = recorded({ cause });
+        expect(`cause: a recorded ${cause} reads "${words}"`, shows(fromRecord, words));
+        expect(`cause: a live ${cause} reads "${words}"`, shows(live({ cause }), words));
+        expect(`cause: a recorded and a live ${cause} render alike`, fromRecord === live({ cause }));
+        expect(`cause: only an error is coloured as a fault (${cause})`, red(fromRecord) === (cause === 'error'));
+    }
+    expect('cause: a cause wins over a legacy flag beside it',
+        shows(recorded({ cause: 'error', cancelled: true }), 'failed'));
+    expect('legacy: cancelled reads "stopped", not "cancelled"',
+        shows(recorded({ cancelled: true }), 'stopped') && !red(recorded({ cancelled: true })));
+    expect('legacy: not cancelled reads "failed"',
+        shows(recorded({ cancelled: false }), 'failed') && red(recorded({ cancelled: false })));
+    expect('legacy: no flag at all reads "failed"', shows(recorded({}), 'failed'));
+    expect('cause: an unknown cause reads "stopped" and claims no fault',
+        shows(recorded({ cause: 'constructor' }), 'stopped') && !red(recorded({ cause: 'constructor' })));
+    return failed;
+}
+console.log('stage stop causes');
+{
+    const causeFailures = causeChecks(ctx);
+    check('every cause check passes', causeFailures.length === 0, causeFailures.join(', '));
 }
 
 // ---- polling hygiene -------------------------------------------------------
@@ -1129,6 +1178,11 @@ const mutate = (name, from, to) => {
     const rowUnescaped = load({ ...sources,
         renderStageRow: sources.renderStageRow.replaceAll('escapeHtml(', 'String(') });
     check('a stage row that does not escape is caught', stageChecks(rowUnescaped).length > 0);
+    const oneLabel = load({ ...sources, stageStopLabel: replaceBody('stageStopLabel', " return 'failed';") });
+    check('a label that ignores the cause is caught', causeChecks(oneLabel).length > 0);
+    const noLegacy = load({ ...sources, stageStopCause: replaceBody('stageStopCause',
+        " return record.cause != null ? String(record.cause) : 'error';") });
+    check('a reader that ignores the legacy flag is caught', causeChecks(noLegacy).length > 0);
     const byName = load({ ...sources,
         compareStageRows: replaceBody('compareStageRows', ' return (a.stage || 0) - (b.stage || 0);') });
     check('a comparator subtracting stage names is caught', stageChecks(byName).length > 0);

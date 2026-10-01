@@ -26,6 +26,7 @@ use crate::ai::{
 };
 use crate::toolbox::ToolBox;
 
+use super::engine::StageStopCause;
 use super::events::WorkflowEvent;
 use super::output::OutputFormat;
 use super::policy::{RecitationPolicy, StagePolicy, ToolScope};
@@ -553,7 +554,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                     cb(WorkflowEvent::StageFailed {
                         stage_name: self.name,
                         reason: format!("{:#}", e),
-                        cancelled: false,
+                        cause: StageStopCause::Error,
                     });
                 }
                 return Err(e);
@@ -633,10 +634,9 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             // nothing leaves its last turn frozen on display, indistinguishable
             // from one still waiting on the model.
             //
-            // `cancelled` is always false for now. Upstream cancellation kills
-            // the worker outright, so a stage never observes it; telling a
-            // cancelled stage apart from a failed one arrives with the
-            // cooperative cancel token.
+            // The cause is always `Error` for now. Upstream cancellation kills
+            // the worker outright, so a stage never observes a cancel, and no
+            // session stops for the deadline until the wind-down exists.
             match runner.run(&mut session).await {
                 Ok(result) => result,
                 Err(e) => {
@@ -644,7 +644,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                         cb(WorkflowEvent::StageFailed {
                             stage_name,
                             reason: format!("{:#}", e),
-                            cancelled: false,
+                            cause: StageStopCause::Error,
                         });
                     }
                     return Err(e);
@@ -1050,7 +1050,7 @@ mod tests {
             Some(WorkflowEvent::StageFailed {
                 stage_name,
                 reason,
-                cancelled,
+                cause,
             }) => {
                 assert_eq!(*stage_name, "turn-cap");
                 assert_eq!(
@@ -1059,7 +1059,11 @@ mod tests {
                     "the reason is the error itself"
                 );
                 assert!(reason.contains("valid response"), "{reason}");
-                assert!(!cancelled, "running out of turns is not a cancellation");
+                assert_eq!(
+                    *cause,
+                    StageStopCause::Error,
+                    "running out of turns is the stage's own failure"
+                );
             }
             other => panic!("the last word on a failed stage must be its failure, got {other:?}"),
         }
@@ -1110,11 +1114,11 @@ mod tests {
             Some(WorkflowEvent::StageFailed {
                 stage_name,
                 reason,
-                cancelled,
+                cause,
             }) => {
                 assert_eq!(*stage_name, "unrenderable");
                 assert_eq!(*reason, format!("{:#}", err));
-                assert!(!cancelled);
+                assert_eq!(*cause, StageStopCause::Error);
             }
             other => panic!("a started stage must end with its failure, got {other:?}"),
         }

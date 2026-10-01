@@ -16,6 +16,8 @@
 
 use crate::ai::AiMessage;
 
+use super::engine::StageStopCause;
+
 /// Lifecycle events emitted by the workflow engine.
 #[derive(Debug, Clone)]
 pub enum WorkflowEvent {
@@ -65,7 +67,7 @@ pub enum WorkflowEvent {
     StageFailed {
         stage_name: &'static str,
         reason: String,
-        cancelled: bool,
+        cause: StageStopCause,
     },
     /// A stage has finished executing.
     StageFinished {

@@ -4640,7 +4640,7 @@ mod tests {
                 ProgressWire::StageFailed {
                     stage: stage(),
                     reason: "Failed to generate valid response".to_string(),
-                    cancelled: false,
+                    cause: crate::workflow::StageStopCause::Error,
                 },
             ),
         ];
