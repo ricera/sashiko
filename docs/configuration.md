@@ -478,7 +478,7 @@ pass.
 | `concurrency` | integer | -- | Number of concurrent reviews. |
 | `worktree_dir` | string | -- | Directory for git worktrees used during review. |
 | `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). |
-| `max_retries` | integer | `3` | Retry count on transient failures. |
+| `max_retries` | integer | `3` | Retry count on transient failures. A review the daemon stops at `timeout_seconds` is not retried. |
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |
 | `max_files_touched` | integer | `200` | Skip patches touching more files than this. |
 | `ignore_files` | list | `[]` | File patterns to skip during review (e.g. `MAINTAINERS`). |
