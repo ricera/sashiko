@@ -504,6 +504,16 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                             max_turns,
                         });
                     }
+                })
+                // Each message as it joins the history the outcome will carry,
+                // so a running review can be read before it finishes.
+                .with_message_callback(move |message| {
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::StageMessage {
+                            stage_name,
+                            message: message.clone(),
+                        });
+                    }
                 });
 
             // Reported here rather than by the caller: a failed stage that says
@@ -772,6 +782,66 @@ mod tests {
             })
             .collect();
         assert_eq!(tools, [vec!["concurrency_probe".to_string()], vec![]]);
+    }
+
+    /// The live conversation log is the stage's history, streamed: the same
+    /// messages, in the same order, starting with the prompt the finished log
+    /// opens with.
+    #[tokio::test]
+    async fn test_streamed_messages_are_the_stage_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::probing(1));
+        let mut toolbox = ToolBox::new(tmp.path().to_path_buf(), None);
+        toolbox.register_tool(ConcurrencyProbe {
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(toolbox),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("goal")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let events: Mutex<Vec<WorkflowEvent>> = Mutex::new(Vec::new());
+        let record = |e: WorkflowEvent| events.lock().unwrap().push(e);
+        let (outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, Some(&record))
+            .await
+            .expect("the stage completes");
+
+        let streamed: Vec<crate::ai::AiMessage> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::StageMessage {
+                    stage_name,
+                    message,
+                } => {
+                    assert_eq!(*stage_name, "goal");
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(streamed, outcome.history);
+        let roles: Vec<AiRole> = streamed.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(
+            roles,
+            [
+                AiRole::User,
+                AiRole::Assistant,
+                AiRole::Tool,
+                AiRole::Assistant
+            ]
+        );
+        assert_eq!(streamed[0].content.as_deref(), Some("go"));
     }
 
     fn recorded_turn_reached(events: &[WorkflowEvent], turn: usize) -> bool {

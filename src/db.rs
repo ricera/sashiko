@@ -31,6 +31,28 @@ use std::sync::Arc;
 #[cfg(feature = "server")]
 use tracing::{info, warn};
 
+/// Most messages of one review's conversation stored for its live log.
+///
+/// A review that runs long enough to reach this keeps streaming nothing more
+/// until its final log lands; the page says the live view was capped.
+#[cfg(feature = "server")]
+const MAX_LIVE_LOG_ENTRIES: i64 = 2000;
+
+/// Where a review's streamed conversation stands.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveLogSpan {
+    /// The lowest stored seq, or `None` when nothing is stored. It marks the
+    /// run the entries belong to: a later run of the same review row starts
+    /// past every seq an earlier run used, so a reader holding entries from
+    /// one run sees this change when another starts.
+    pub first_seq: Option<i64>,
+    /// The seq a run starting now should use first: past every seq stored.
+    pub next_seq: i64,
+    /// Whether streaming stopped at [`MAX_LIVE_LOG_ENTRIES`].
+    pub capped: bool,
+}
+
 /// The SQL form of [`Database::is_closed_to_new_parts`], for the statements
 /// that have to ask the question of a row they are updating. The two must
 /// answer alike, which a test below checks.
@@ -1905,7 +1927,38 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 15.");
+        // An earlier build of the live log created review_log_entries at
+        // runtime with `stage INTEGER` and a `content` column. Its rows are
+        // scratch for reviews that were in flight, so a table of that shape is
+        // dropped rather than converted; the reviews it served are reset to
+        // Pending at startup and stream their conversation again.
+        if current_version < 16 {
+            info!("Applying database migration version 16 (review log entries)...");
+            let tx = self.conn.transaction().await?;
+            let (exists, has_message, stage_is_text) = {
+                let mut columns = tx
+                    .query("PRAGMA table_info(review_log_entries)", ())
+                    .await?;
+                let (mut exists, mut has_message, mut stage_is_text) = (false, false, false);
+                while let Some(row) = columns.next().await? {
+                    exists = true;
+                    let name: String = row.get(1)?;
+                    let kind: String = row.get::<Option<String>>(2)?.unwrap_or_default();
+                    has_message |= name == "message";
+                    stage_is_text |= name == "stage" && kind.eq_ignore_ascii_case("TEXT");
+                }
+                (exists, has_message, stage_is_text)
+            };
+            if exists && !(has_message && stage_is_text) {
+                tx.execute("DROP TABLE review_log_entries", ()).await?;
+            }
+            tx.execute_batch(include_str!("migrations/016_review_log_entries.sql"))
+                .await?;
+            tx.execute("PRAGMA user_version = 16", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 16.");
 
         Ok(())
     }
@@ -2160,7 +2213,152 @@ impl Database {
                 libsql::params![status, result, summary, interaction_id, inline_review.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), logs.map(crate::compression::compress_string_if_needed).unwrap_or(libsql::Value::Null), review_id],
             )
             .await?;
+        // Every terminal transition lands its final log here, so the streamed
+        // copy goes in the same call: a reader sees the live log or the final
+        // one, never neither, and nothing is left behind to sweep. Anything
+        // that wants to keep the streamed entries -- promoting them to the
+        // final log, say -- must read them before calling this.
+        self.delete_review_log_entries(review_id).await?;
         Ok(())
+    }
+
+    /// Appends one streamed message of a running review's conversation.
+    ///
+    /// `message_json` is a serialised [`crate::ai::AiMessage`], the type the
+    /// finished log stores, so the live log and the finished log cannot drift
+    /// into two shapes. Compressed as `reviews.logs` is, because a tool result
+    /// can be a whole file. Once the review holds [`MAX_LIVE_LOG_ENTRIES`]
+    /// rows, writes are dropped without error: a runaway review degrades its
+    /// own live view rather than flooding the table, and
+    /// [`review_live_log_span`](Self::review_live_log_span) says so. The cap
+    /// counts rows rather than reading `seq`, because a run that follows an
+    /// earlier one on the same review row does not start at 0.
+    pub async fn append_review_log_entry(
+        &self,
+        review_id: i64,
+        seq: i64,
+        stage: Option<&str>,
+        role: &str,
+        message_json: &str,
+    ) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn
+            .execute(
+                "INSERT INTO review_log_entries (review_id, seq, stage, role, message, created_at)
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6
+                 WHERE (SELECT COUNT(*) FROM review_log_entries WHERE review_id = ?1) < ?7",
+                libsql::params![
+                    review_id,
+                    seq,
+                    stage,
+                    role,
+                    crate::compression::compress_string_if_needed(message_json),
+                    now,
+                    MAX_LIVE_LOG_ENTRIES
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// A running review's streamed conversation, in order.
+    ///
+    /// `after_seq` returns only what follows a sequence the caller already
+    /// holds. A row whose message does not parse is skipped rather than shown
+    /// as something it is not.
+    pub async fn get_review_log_entries(
+        &self,
+        review_id: i64,
+        after_seq: Option<i64>,
+    ) -> Result<Vec<crate::api::LiveLogEntry>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT seq, stage, message, created_at FROM review_log_entries
+                 WHERE review_id = ? AND seq > ? ORDER BY seq",
+                libsql::params![review_id, after_seq.unwrap_or(-1)],
+            )
+            .await?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let Some(message) = crate::compression::get_compressed_string_opt(&row, 2)
+                .ok()
+                .flatten()
+                .and_then(|m| serde_json::from_str::<crate::ai::AiMessage>(&m).ok())
+            else {
+                continue;
+            };
+            out.push(crate::api::LiveLogEntry {
+                seq: row.get::<i64>(0)?,
+                stage: row.get::<Option<String>>(1)?,
+                // The project is the daemon's setting, not the database's;
+                // the route that serves the entries adds the label.
+                stage_label: None,
+                created_at: row.get::<i64>(3)?,
+                message,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Where a review's streamed conversation stands: which run it belongs
+    /// to, where the next run should start, and whether it reached the cap,
+    /// after which nothing more is stored until the final log lands.
+    pub async fn review_live_log_span(&self, review_id: i64) -> Result<LiveLogSpan> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT MIN(seq), MAX(seq), COUNT(*) FROM review_log_entries WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let (first, last, count) = match rows.next().await? {
+            Some(row) => (
+                row.get::<Option<i64>>(0)?,
+                row.get::<Option<i64>>(1)?,
+                row.get::<i64>(2)?,
+            ),
+            None => (None, None, 0),
+        };
+        Ok(LiveLogSpan {
+            first_seq: first,
+            next_seq: last.map_or(0, |l| l + 1),
+            capped: count >= MAX_LIVE_LOG_ENTRIES,
+        })
+    }
+
+    /// Drops a review's streamed conversation.
+    pub async fn delete_review_log_entries(&self, review_id: i64) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM review_log_entries WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Removes streamed entries of every review that is not running.
+    ///
+    /// A daemon killed mid-review never completes it, so its rows would
+    /// otherwise linger. Written as "not one of the running reviews" rather
+    /// than "one of the finished reviews", so rows whose review row is gone
+    /// altogether go too.
+    pub async fn sweep_orphan_review_log_entries(&self) -> Result<u64> {
+        let count = self
+            .conn
+            .execute(
+                "DELETE FROM review_log_entries WHERE review_id NOT IN (
+                     SELECT id FROM reviews WHERE status IN ('Pending', 'In Review')
+                 )",
+                (),
+            )
+            .await?;
+        Ok(count)
     }
 
     pub async fn create_ai_interaction(&self, params: AiInteractionParams<'_>) -> Result<()> {
@@ -16980,7 +17178,7 @@ mod tests {
     #[tokio::test]
     async fn test_migration_adds_review_reference_repos() {
         let db = memory_db().await;
-        assert_eq!(user_version(&db).await, 15);
+        assert_eq!(user_version(&db).await, 16);
         assert!(reviews_have_reference_repos(&db).await);
 
         // An existing database at version 13: a review row, no column.
@@ -16996,14 +17194,14 @@ mod tests {
         assert!(!reviews_have_reference_repos(&db).await);
 
         db.migrate().await.unwrap();
-        assert_eq!(user_version(&db).await, 15);
+        assert_eq!(user_version(&db).await, 16);
         assert!(reviews_have_reference_repos(&db).await);
         let review = db.get_review_details(review_id).await.unwrap().unwrap();
         assert!(review["reference_repos"].is_null(), "{review}");
 
         // Up to date: running again changes nothing and does not fail.
         db.migrate().await.unwrap();
-        assert_eq!(user_version(&db).await, 15);
+        assert_eq!(user_version(&db).await, 16);
 
         // Set back with the column still there, the migration does not try to
         // add it twice, and what was stored survives.
@@ -17015,7 +17213,7 @@ mod tests {
             .await
             .unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(user_version(&db).await, 15);
+        assert_eq!(user_version(&db).await, 16);
         let review = db.get_review_details(review_id).await.unwrap().unwrap();
         assert_eq!(
             review["reference_repos"],
@@ -20811,7 +21009,7 @@ mod tests {
     #[tokio::test]
     async fn test_migration_adds_activity_and_timing() {
         let db = memory_db().await;
-        assert_eq!(user_version(&db).await, 15);
+        assert_eq!(user_version(&db).await, 16);
         assert!(has_activity_table(&db).await);
         let reviews = column_names(&db, "reviews").await;
         for column in [
@@ -20846,7 +21044,7 @@ mod tests {
         assert!(!has_activity_table(&db).await);
 
         db.migrate().await.unwrap();
-        assert_eq!(user_version(&db).await, 15);
+        assert_eq!(user_version(&db).await, 16);
         assert!(has_activity_table(&db).await);
         let review = db.get_review_details(review_id).await.unwrap().unwrap();
         assert!(review["stage_durations"].is_null(), "{review}");
@@ -20863,7 +21061,7 @@ mod tests {
             .await
             .unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(user_version(&db).await, 15);
+        assert_eq!(user_version(&db).await, 16);
         let review = db.get_review_details(review_id).await.unwrap().unwrap();
         assert_eq!(review["attempt"], 2, "existing data survives");
         assert!(
@@ -20871,6 +21069,318 @@ mod tests {
                 .await
                 .iter()
                 .any(|c| c == "stage_durations")
+        );
+    }
+
+    fn live_message(role: &str, content: &str) -> String {
+        serde_json::json!({ "role": role, "content": content }).to_string()
+    }
+
+    #[tokio::test]
+    async fn test_review_log_entries_round_trip_in_order() {
+        let db = setup_db().await;
+        let (_, _, review_id) = reviewed_patchset(&db, "log1").await;
+
+        // Inserted out of order to prove the read is ordered by seq, not rowid.
+        db.append_review_log_entry(
+            review_id,
+            2,
+            Some("execution-flow"),
+            "tool",
+            &live_message("tool", "tool output"),
+        )
+        .await
+        .unwrap();
+        db.append_review_log_entry(review_id, 0, None, "system", &live_message("system", "sys"))
+            .await
+            .unwrap();
+        // Carries the calls as data, exactly as the finished log stores them.
+        db.append_review_log_entry(
+            review_id,
+            1,
+            Some("execution-flow"),
+            "assistant",
+            &serde_json::json!({
+                "role": "assistant",
+                "content": "thinking",
+                "tool_calls": [{"id": "c0", "function_name": "git_grep",
+                                "arguments": {"pattern": "x"}}],
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let entries = db.get_review_log_entries(review_id, None).await.unwrap();
+        let seqs: Vec<i64> = entries.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [0, 1, 2]);
+        assert_eq!(entries[0].message.role, crate::ai::AiRole::System);
+        assert_eq!(entries[0].stage, None);
+        assert_eq!(entries[2].stage.as_deref(), Some("execution-flow"));
+        assert_eq!(entries[2].message.content.as_deref(), Some("tool output"));
+        let calls = entries[1]
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("calls survive");
+        assert_eq!(calls[0].function_name, "git_grep");
+        assert_eq!(calls[0].arguments["pattern"], "x");
+
+        // Only what follows a sequence already held.
+        let tail = db.get_review_log_entries(review_id, Some(0)).await.unwrap();
+        assert_eq!(tail.iter().map(|e| e.seq).collect::<Vec<_>>(), [1, 2]);
+        assert!(
+            db.get_review_log_entries(review_id, Some(2))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A tool result can be a whole file; it is stored compressed, as the
+    /// finished log is, and reads back whole.
+    #[tokio::test]
+    async fn test_a_large_review_log_entry_is_stored_compressed_and_read_whole() {
+        let db = setup_db().await;
+        let (_, _, review_id) = reviewed_patchset(&db, "logbig").await;
+        let big = "line of a large file\n".repeat(20_000);
+        db.append_review_log_entry(
+            review_id,
+            0,
+            Some("goal"),
+            "tool",
+            &live_message("tool", &big),
+        )
+        .await
+        .unwrap();
+        let mut rows = db
+            .conn
+            .query("SELECT typeof(message) FROM review_log_entries", ())
+            .await
+            .unwrap();
+        let kind: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(kind, "blob");
+        let entries = db.get_review_log_entries(review_id, None).await.unwrap();
+        assert_eq!(entries[0].message.content.as_deref(), Some(big.as_str()));
+    }
+
+    /// Writes past the cap are dropped rather than erroring, and the cap is
+    /// reported so the page can say why the live log stopped.
+    #[tokio::test]
+    async fn test_review_log_entries_are_capped() {
+        let db = setup_db().await;
+        let (_, _, review_id) = reviewed_patchset(&db, "log3").await;
+
+        let span = db.review_live_log_span(review_id).await.unwrap();
+        assert_eq!(
+            span,
+            LiveLogSpan {
+                first_seq: None,
+                next_seq: 0,
+                capped: false
+            }
+        );
+        // Started past an earlier run's seqs, as a restarted review is: the
+        // cap counts rows, so it is not reached early by a high first seq.
+        let start = MAX_LIVE_LOG_ENTRIES + 10;
+        for seq in start..start + MAX_LIVE_LOG_ENTRIES - 1 {
+            db.append_review_log_entry(review_id, seq, None, "user", &live_message("user", "x"))
+                .await
+                .unwrap();
+        }
+        assert!(!db.review_live_log_span(review_id).await.unwrap().capped);
+        let last = start + MAX_LIVE_LOG_ENTRIES - 1;
+        for seq in [last, last + 1, last + 50] {
+            db.append_review_log_entry(review_id, seq, None, "user", &live_message("user", "x"))
+                .await
+                .unwrap();
+        }
+        let entries = db.get_review_log_entries(review_id, None).await.unwrap();
+        assert_eq!(
+            entries.len() as i64,
+            MAX_LIVE_LOG_ENTRIES,
+            "only in-cap entries are stored"
+        );
+        assert_eq!(entries.last().map(|e| e.seq), Some(last));
+        let span = db.review_live_log_span(review_id).await.unwrap();
+        assert!(span.capped);
+        assert_eq!(span.first_seq, Some(start));
+        assert_eq!(span.next_seq, last + 1);
+    }
+
+    /// The final log replaces the streamed one in the same call, so a reader
+    /// sees one or the other.
+    #[tokio::test]
+    async fn test_complete_review_clears_its_streamed_log() {
+        let db = setup_db().await;
+        let (_, _, review_id) = reviewed_patchset(&db, "log2").await;
+        let (_, _, other) = reviewed_patchset(&db, "log2b").await;
+        for seq in 0..5 {
+            db.append_review_log_entry(
+                review_id,
+                seq,
+                Some("goal"),
+                "user",
+                &live_message("user", "u"),
+            )
+            .await
+            .unwrap();
+        }
+        db.append_review_log_entry(other, 0, Some("goal"), "user", &live_message("user", "u"))
+            .await
+            .unwrap();
+
+        db.complete_review(review_id, "Reviewed", "ok", None, None, None, Some("[]"))
+            .await
+            .unwrap();
+        assert!(
+            db.get_review_log_entries(review_id, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_review_log_entries(other, None).await.unwrap().len(),
+            1,
+            "another review's entries are untouched"
+        );
+    }
+
+    /// A daemon killed mid-review never completes it. The sweep keeps what a
+    /// running review streamed and drops the rest, including rows whose review
+    /// row is gone altogether.
+    #[tokio::test]
+    async fn test_orphan_sweep_spares_running_reviews() {
+        let db = setup_db().await;
+        let (_, _, finished) = reviewed_patchset(&db, "log4").await;
+        let (_, _, running) = reviewed_patchset(&db, "log5").await;
+        let (_, _, pending) = reviewed_patchset(&db, "log6").await;
+        let vanished = 999_999;
+
+        for review in [finished, running, pending, vanished] {
+            db.append_review_log_entry(review, 0, None, "user", &live_message("user", "x"))
+                .await
+                .unwrap();
+        }
+        // Set directly: complete_review would clear the rows itself.
+        db.update_review_status(finished, "Failed", None)
+            .await
+            .unwrap();
+        db.update_review_status(running, "In Review", None)
+            .await
+            .unwrap();
+
+        let swept = db.sweep_orphan_review_log_entries().await.unwrap();
+        assert_eq!(swept, 2);
+        for (review, kept) in [(finished, 0), (vanished, 0), (running, 1), (pending, 1)] {
+            assert_eq!(
+                db.get_review_log_entries(review, None).await.unwrap().len(),
+                kept,
+                "review {review}"
+            );
+        }
+    }
+
+    /// A review reset to Pending by a restart reuses its row. Its entries are
+    /// deleted when it starts again, and the new run must not collide with
+    /// the old one's seqs; the reviewer starts it at `next_seq`.
+    #[tokio::test]
+    async fn test_a_restarted_review_streams_past_the_old_run() {
+        let db = setup_db().await;
+        let (_, _, review_id) = reviewed_patchset(&db, "log7").await;
+        db.append_review_log_entry(review_id, 0, None, "user", &live_message("user", "old"))
+            .await
+            .unwrap();
+        assert!(
+            db.append_review_log_entry(review_id, 0, None, "user", &live_message("user", "dup"))
+                .await
+                .is_err(),
+            "the unique index refuses a duplicate rather than storing it twice"
+        );
+        let next = db.review_live_log_span(review_id).await.unwrap().next_seq;
+        assert_eq!(next, 1);
+        db.delete_review_log_entries(review_id).await.unwrap();
+        db.append_review_log_entry(review_id, next, None, "user", &live_message("user", "new"))
+            .await
+            .unwrap();
+        let entries = db.get_review_log_entries(review_id, None).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[0].message.content.as_deref(), Some("new"));
+        assert_eq!(
+            db.review_live_log_span(review_id).await.unwrap().first_seq,
+            Some(1),
+            "the new run is told apart from the old by where it starts"
+        );
+    }
+
+    /// A database built by an earlier build of this feature has the table
+    /// with `stage INTEGER` and a `content` column. Migration 16 replaces it,
+    /// and a stage name is then stored as text, not coerced by integer
+    /// affinity.
+    #[tokio::test]
+    async fn test_migration_16_replaces_an_earlier_log_table() {
+        let db = setup_db().await;
+        db.conn
+            .execute_batch(
+                "DROP TABLE review_log_entries;
+                 CREATE TABLE review_log_entries (
+                     id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL,
+                     seq INTEGER NOT NULL, stage INTEGER, role TEXT NOT NULL,
+                     content TEXT NOT NULL, created_at INTEGER NOT NULL);
+                 INSERT INTO review_log_entries (review_id, seq, stage, role, content, created_at)
+                     VALUES (1, 0, 3, 'user', 'old', 0);
+                 PRAGMA user_version = 15;",
+            )
+            .await
+            .unwrap();
+
+        db.migrate().await.unwrap();
+
+        let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
+        let version: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(version, 16);
+
+        let (_, _, review_id) = reviewed_patchset(&db, "log8").await;
+        db.append_review_log_entry(
+            review_id,
+            0,
+            Some("goal"),
+            "user",
+            &live_message("user", "u"),
+        )
+        .await
+        .unwrap();
+        // A numeric-looking name is the case INTEGER affinity would coerce.
+        db.append_review_log_entry(review_id, 1, Some("42"), "user", &live_message("user", "u"))
+            .await
+            .unwrap();
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT typeof(stage) FROM review_log_entries ORDER BY seq",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut kinds = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            kinds.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(
+            kinds,
+            ["text", "text"],
+            "the earlier build's row is gone too"
+        );
+
+        // Running it again at 16 changes nothing.
+        db.migrate().await.unwrap();
+        assert_eq!(
+            db.get_review_log_entries(review_id, None)
+                .await
+                .unwrap()
+                .len(),
+            2
         );
     }
 }

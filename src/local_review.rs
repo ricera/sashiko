@@ -197,6 +197,14 @@ pub enum ProgressEvent {
         reason: String,
         cancelled: bool,
     },
+    /// One message joining a stage's conversation log, so a daemon can show
+    /// a running review's conversation before it finishes. `stage` is `None`
+    /// for the system message, which belongs to no stage.
+    AiReviewLogEntry {
+        patch_index: i64,
+        stage: Option<String>,
+        message: crate::ai::AiMessage,
+    },
     AiReviewAttempt {
         patch_index: i64,
         attempt: usize,
@@ -723,6 +731,13 @@ fn to_wire(event: &ProgressEvent) -> Option<(i64, crate::activity::ProgressWire)
                 cancelled,
             },
         ),
+        // Forwarded only on this path, which runs only for a daemon-spawned
+        // worker: the daemon stores it for the review's live log.
+        ProgressEvent::AiReviewLogEntry {
+            patch_index,
+            stage,
+            message,
+        } => (patch_index, ProgressWire::LogEntry { stage, message }),
         _ => return None,
     };
     Some((patch_index, wire))
@@ -1318,6 +1333,13 @@ async fn review_patch_attempts(
                         stage,
                         reason,
                         cancelled,
+                    });
+                }
+                crate::worker::WorkerProgressEvent::LogEntry { stage, message } => {
+                    cb(ProgressEvent::AiReviewLogEntry {
+                        patch_index: p_index,
+                        stage,
+                        message,
                     });
                 }
             }
@@ -1932,6 +1954,11 @@ pub fn progress_line(event: ProgressEvent) -> Option<String> {
         } if attempt > 1 => format!("patch {patch_index}: retry {attempt}/{max_attempts}"),
         ProgressEvent::AiReviewFinished { patch_index } => format!("patch {patch_index}: done"),
         ProgressEvent::AiReviewFailed { patch_index } => format!("patch {patch_index}: incomplete"),
+        // Never a line. These feed `sashiko-cli local`, which treats any line
+        // containing " turn " as a turn tick, and a conversation is full of
+        // such words; it is also transcript text, which has no business in a
+        // progress stream.
+        ProgressEvent::AiReviewLogEntry { .. } => return None,
         _ => return None,
     };
     Some(line)
@@ -3078,6 +3105,24 @@ mod tests {
             })
             .is_none()
         );
+
+        // The conversation never reaches this channel: it is transcript text,
+        // and "the next turn " in a model's answer would read as a tick.
+        assert!(
+            progress_line(ProgressEvent::AiReviewLogEntry {
+                patch_index: 1,
+                stage: Some("locking".to_string()),
+                message: crate::ai::AiMessage {
+                    role: crate::ai::AiRole::Assistant,
+                    content: Some("on the next turn I will grep".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            })
+            .is_none()
+        );
     }
 
     /// Every review progress event reaches the daemon, through the same encode
@@ -3088,6 +3133,14 @@ mod tests {
         use crate::activity::{ProgressWire, parse_progress, progress_line as wire_line};
 
         let stage = || "locking".to_string();
+        let log_message = || crate::ai::AiMessage {
+            role: crate::ai::AiRole::Tool,
+            content: Some("git_grep output".to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: Some("c0".to_string()),
+        };
         let forwarded = [
             (
                 ProgressEvent::AiReviewPreScreenStarted { patch_index: 3 },
@@ -3174,6 +3227,17 @@ mod tests {
                     stage: stage(),
                     reason: "boom".to_string(),
                     cancelled: false,
+                },
+            ),
+            (
+                ProgressEvent::AiReviewLogEntry {
+                    patch_index: 3,
+                    stage: Some(stage()),
+                    message: log_message(),
+                },
+                ProgressWire::LogEntry {
+                    stage: Some(stage()),
+                    message: log_message(),
                 },
             ),
         ];

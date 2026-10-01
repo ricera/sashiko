@@ -1034,6 +1034,40 @@ pub fn annotate(entries: &mut [ActivityEntry], project: ProjectId) {
     }
 }
 
+/// Gives a review's recorded stage rows the same two fields [`annotate`] gives
+/// live entries: `order`, the stage's rank in the pipeline (`null` for a name
+/// the project does not know, never a sentinel), and `stage_label`.
+///
+/// Applied to `stage_durations` and `stage_failures` on their way out of the
+/// API, so the page draws recorded and live rows from the same fields and
+/// sorts both on the server's order rather than on a table of its own. Fields
+/// that are absent or not arrays are left alone, as is any element that is not
+/// an object with a string `stage`.
+pub fn annotate_stage_records(review: &mut serde_json::Value, project: ProjectId) {
+    for field in ["stage_durations", "stage_failures"] {
+        let Some(rows) = review.get_mut(field).and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        for row in rows.iter_mut() {
+            let Some(obj) = row.as_object_mut() else {
+                continue;
+            };
+            let stage = obj
+                .get("stage")
+                .and_then(|s| s.as_str())
+                .map(str::to_string);
+            let order = stage
+                .as_deref()
+                .and_then(|s| crate::workflows::stage_order(project, s));
+            let label = stage
+                .as_deref()
+                .and_then(|s| crate::workflows::stage_short_label(project, s));
+            obj.insert("order".to_string(), serde_json::json!(order));
+            obj.insert("stage_label".to_string(), serde_json::json!(label));
+        }
+    }
+}
+
 /// Puts entries in the order a reader expects, for live and persisted entries
 /// alike: the patchset's own entry first, then each patch's entry ahead of its
 /// stages, stages in pipeline order (unknown names after the known ones, by
@@ -1079,7 +1113,10 @@ pub const PROGRESS_MESSAGE: &str = "progress";
 /// A single serde enum on both ends, so a stage is a name (`String`) at every
 /// step. A payload carrying a stage of any other type fails to decode and is
 /// dropped, rather than being read as some other stage.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialEq` only: a log entry carries an [`crate::ai::AiMessage`], whose
+/// tool-call arguments are a JSON value with no `Eq`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ProgressWire {
     /// The patch's pre-screen began.
@@ -1121,6 +1158,17 @@ pub enum ProgressWire {
         stage: String,
         reason: String,
         cancelled: bool,
+    },
+    /// One message joining the review's conversation, for its live log.
+    ///
+    /// The message is the type the finished log stores, so the live log and
+    /// the finished one cannot drift into two shapes. `stage` is a stage name,
+    /// or `None` for the system message the log opens with. It is never
+    /// activity: [`progress_update`] discards it.
+    LogEntry {
+        #[serde(default)]
+        stage: Option<String>,
+        message: crate::ai::AiMessage,
     },
 }
 
@@ -1341,6 +1389,12 @@ pub fn progress_update(
             ),
             None => ProgressUpdate::Touch(patch),
         },
+        // Conversation text never enters the registry. /api/activity and
+        // /api/patchset/activity read from it, and both are public and served
+        // for embargoed patchsets too, while the conversation is transcript:
+        // it goes to the review's live log, which is served only where the
+        // finished log already is.
+        ProgressWire::LogEntry { .. } => return None,
     };
     Some(update)
 }
@@ -2892,6 +2946,8 @@ mod tests {
             assert_eq!(kind(phase), expected);
         }
 
+        // The page's describeStageWait switches on exactly these four strings,
+        // and the UI verifier feeds it exactly these; a rename here must fail.
         let on = |w: StageWait| serde_json::to_value(stage(w)).unwrap()["waiting"]["on"].clone();
         assert_eq!(on(StageWait::Model), "model");
         assert_eq!(on(StageWait::Queued), "queued");
@@ -3028,6 +3084,156 @@ mod tests {
                 "stage_failed",
             ]
         );
+    }
+
+    fn log_message() -> crate::ai::AiMessage {
+        crate::ai::AiMessage {
+            role: crate::ai::AiRole::Assistant,
+            content: Some("I will look at the locking".to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: Some(vec![crate::ai::ToolCall {
+                id: "c0".to_string(),
+                function_name: "git_grep".to_string(),
+                arguments: serde_json::json!({"pattern": "spin_lock"}),
+                thought_signature: None,
+            }]),
+            tool_call_id: None,
+        }
+    }
+
+    /// A log entry crosses the same wire as progress, as kind `log_entry`, and
+    /// comes back whole. It is never activity: the activity routes are public,
+    /// and a conversation is transcript.
+    #[test]
+    fn test_a_log_entry_survives_the_wire_and_never_becomes_activity() {
+        for stage in [Some("locking".to_string()), None] {
+            let wire = ProgressWire::LogEntry {
+                stage: stage.clone(),
+                message: log_message(),
+            };
+            let line = progress_line(2, &wire).expect("encodes");
+            let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(msg["payload"]["kind"], "log_entry");
+            assert_eq!(msg["payload"]["message"]["role"], "assistant");
+            assert_eq!(
+                msg["payload"]["message"]["tool_calls"][0]["function_name"],
+                "git_grep"
+            );
+            assert_eq!(parse_progress(&msg), Some((2, wire.clone())), "{line}");
+            assert_eq!(
+                progress_update(ProjectId::Linux, 7, 70, &wire, 1, 4),
+                None,
+                "conversation text must not reach the registry"
+            );
+        }
+
+        // A system message has no stage, and may say so by leaving it out.
+        let no_stage = serde_json::json!({
+            "type": "progress",
+            "patch_index": 1,
+            "payload": {"kind": "log_entry", "message": {"role": "system", "content": "s"}},
+        });
+        assert!(matches!(
+            parse_progress(&no_stage),
+            Some((1, ProgressWire::LogEntry { stage: None, .. }))
+        ));
+    }
+
+    /// A stage is a name on this wire too, and a message is an `AiMessage`;
+    /// anything else is dropped rather than stored as something it is not.
+    #[test]
+    fn test_a_malformed_log_entry_is_dropped() {
+        let message = serde_json::json!({"role": "user", "content": "hi"});
+        for payload in [
+            serde_json::json!({"kind": "log_entry", "stage": 5, "message": message}),
+            serde_json::json!({"kind": "log_entry", "stage": "goal",
+                "message": {"role": "narrator", "content": "hi"}}),
+            serde_json::json!({"kind": "log_entry", "stage": "goal"}),
+            serde_json::json!({"kind": "log_entry", "stage": "goal", "message": "hi"}),
+        ] {
+            let msg = serde_json::json!({"type": "progress", "patch_index": 1, "payload": payload});
+            assert_eq!(parse_progress(&msg), None, "{msg}");
+        }
+    }
+
+    /// Recorded stage rows carry the same order and label live entries do, so
+    /// the page sorts both on one field from one source.
+    #[test]
+    fn test_recorded_stage_rows_are_annotated_like_live_ones() {
+        let mut review = serde_json::json!({
+            "stage_durations": [
+                {"stage": "locking", "seconds": 10, "turns": 2},
+                {"stage": "no-such-stage", "seconds": 1, "turns": 1},
+            ],
+            "stage_failures": [
+                {"stage": "goal", "reason": "x", "cancelled": true},
+            ],
+        });
+        annotate_stage_records(&mut review, ProjectId::Linux);
+
+        let locking = &review["stage_durations"][0];
+        let expected = crate::workflows::stage_order(ProjectId::Linux, "locking");
+        assert!(expected.is_some());
+        assert_eq!(locking["order"], serde_json::json!(expected));
+        assert_eq!(
+            locking["stage_label"],
+            serde_json::json!(crate::workflows::stage_short_label(
+                ProjectId::Linux,
+                "locking"
+            ))
+        );
+        assert!(locking["stage_label"].is_string());
+        // The rest of the row is untouched.
+        assert_eq!(locking["seconds"], 10);
+
+        let unknown = &review["stage_durations"][1];
+        assert!(unknown["order"].is_null(), "never a sentinel: {unknown}");
+        assert!(unknown["stage_label"].is_null());
+        assert!(review["stage_failures"][0]["order"].is_number());
+
+        // The same order annotate() gives a live entry for the same name.
+        let mut live = vec![ActivityEntry {
+            key: "patchset:1/patch:2/stage:locking".to_string(),
+            phase: None,
+            description: String::new(),
+            patch_id: Some(2),
+            stage: Some("locking".to_string()),
+            stage_label: None,
+            order: None,
+            age_seconds: None,
+            idle_seconds: None,
+            updated_at: None,
+        }];
+        annotate(&mut live, ProjectId::Linux);
+        assert_eq!(locking["order"], serde_json::json!(live[0].order));
+        assert_eq!(
+            locking["stage_label"],
+            serde_json::json!(live[0].stage_label)
+        );
+
+        // Absent, null or non-array fields are left as they are.
+        for mut other in [
+            serde_json::json!({}),
+            serde_json::json!({"stage_durations": null, "stage_failures": "[]"}),
+            serde_json::json!({"stage_durations": [1, "x", {"seconds": 3}]}),
+        ] {
+            let before = other.clone();
+            annotate_stage_records(&mut other, ProjectId::Linux);
+            if before
+                .get("stage_durations")
+                .and_then(|v| v.as_array())
+                .is_some()
+            {
+                // An object without a stage gets null fields; anything else
+                // is untouched.
+                assert_eq!(other["stage_durations"][0], 1);
+                assert_eq!(other["stage_durations"][1], "x");
+                assert!(other["stage_durations"][2]["order"].is_null());
+            } else {
+                assert_eq!(other, before);
+            }
+        }
     }
 
     /// A stage is a name on the wire. A number where the name belongs is not

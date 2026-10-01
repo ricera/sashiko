@@ -37,7 +37,7 @@ pub enum AiRole {
 }
 
 /// A single message in an AI conversation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AiMessage {
     /// The role of the message sender.
     pub role: AiRole,

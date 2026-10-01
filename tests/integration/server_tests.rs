@@ -845,3 +845,191 @@ async fn test_review_endpoints_include_reference_repos() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["reference_repos"], record);
 }
+
+/// Inserts patchset 1, patch 1 and review 1 with the given review status and
+/// logs (NULL for none).
+async fn insert_review(server: &TestServer, status: &str, logs: Option<&str>) {
+    let logs = logs.map_or("NULL".to_string(), |l| format!("'{l}'"));
+    for sql in [
+        "INSERT INTO patchsets (id, status, subject, author, date) \
+         VALUES (1, 'In Review', '[PATCH] test patch', 'Author <a@b.com>', 1234567890)"
+            .to_string(),
+        "INSERT INTO messages (message_id, subject, author, date) \
+         VALUES ('<live-1@example.com>', '[PATCH] test patch', 'Author <a@b.com>', 1234567890)"
+            .to_string(),
+        "INSERT INTO patches (id, patchset_id, message_id, part_index) \
+         VALUES (1, 1, '<live-1@example.com>', 1)"
+            .to_string(),
+        format!(
+            "INSERT INTO reviews (id, patchset_id, patch_id, status, logs, created_at) \
+             VALUES (1, 1, 1, '{status}', {logs}, 1234567890)"
+        ),
+    ] {
+        server.db.conn.execute(&sql, ()).await.unwrap();
+    }
+}
+
+fn live_message(role: &str, content: &str) -> String {
+    serde_json::json!({"role": role, "content": content}).to_string()
+}
+
+async fn get_json(server: &TestServer, path: &str) -> serde_json::Value {
+    let resp = reqwest::get(format!("{}{path}", server.base_url))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{path}");
+    resp.json().await.unwrap()
+}
+
+/// A running review's conversation is served as `live_log` from both review
+/// routes, as messages in the finished log's shape with their position added.
+#[tokio::test]
+#[ignore]
+async fn test_review_endpoint_serves_live_log_while_running() {
+    let server = spawn_test_server(false).await;
+    insert_review(&server, "In Review", None).await;
+    server
+        .db
+        .append_review_log_entry(1, 0, None, "system", &live_message("system", "sys"))
+        .await
+        .unwrap();
+    server
+        .db
+        .append_review_log_entry(1, 1, Some("goal"), "user", &live_message("user", "go"))
+        .await
+        .unwrap();
+
+    let body = get_json(&server, "/api/review?id=1").await;
+    let live = body["live_log"].as_array().expect("live_log");
+    assert_eq!(live.len(), 2);
+    assert_eq!(live[1]["role"], "user");
+    assert_eq!(live[1]["content"], "go");
+    assert_eq!(live[1]["seq"], 1);
+    assert_eq!(live[1]["stage"], "goal");
+    assert!(body["logs"].is_null());
+
+    let tail = get_json(&server, "/api/review?id=1&after_seq=0").await;
+    assert_eq!(tail["live_log"].as_array().unwrap().len(), 1);
+
+    let via_log = get_json(&server, "/api/review_log?id=1").await;
+    assert_eq!(via_log["live_log"], body["live_log"]);
+}
+
+/// Once the final log lands, or the review ends without one, there is no
+/// live log to serve.
+#[tokio::test]
+#[ignore]
+async fn test_live_log_is_not_served_for_a_finished_review() {
+    let server = spawn_test_server(false).await;
+    insert_review(&server, "Reviewed", Some("[]")).await;
+    server
+        .db
+        .append_review_log_entry(1, 0, None, "user", &live_message("user", "x"))
+        .await
+        .unwrap();
+    let body = get_json(&server, "/api/review?id=1").await;
+    assert!(body.get("live_log").is_none(), "{body}");
+
+    // Failed, with rows left behind by a review that never completed.
+    server
+        .db
+        .conn
+        .execute(
+            "UPDATE reviews SET status = 'Failed', logs = NULL WHERE id = 1",
+            (),
+        )
+        .await
+        .unwrap();
+    for path in ["/api/review?id=1", "/api/review_log?id=1"] {
+        let body = get_json(&server, path).await;
+        assert!(body.get("live_log").is_none(), "{path}: {body}");
+    }
+}
+
+/// The activity routes are public, embargoed patchsets included, so the
+/// conversation must never reach them.
+#[tokio::test]
+#[ignore]
+async fn test_patchset_activity_carries_no_conversation() {
+    use sashiko::activity::{ActivityKey, Phase, StageWait};
+
+    let server = spawn_test_server(false).await;
+    insert_review(&server, "In Review", None).await;
+    server.activity.update(
+        ActivityKey::PatchsetStage {
+            patchset_id: 1,
+            patch_id: 1,
+            stage: "goal".to_string(),
+        },
+        Phase::Stage {
+            stage: "goal".to_string(),
+            turn: 1,
+            max_turns: 10,
+            waiting: StageWait::Model,
+        },
+    );
+    const SECRET: &str = "a-distinctive-line-of-model-conversation";
+    server
+        .db
+        .append_review_log_entry(
+            1,
+            0,
+            Some("goal"),
+            "assistant",
+            &live_message("assistant", SECRET),
+        )
+        .await
+        .unwrap();
+
+    for path in [
+        "/api/activity",
+        "/api/patchset/activity?id=1",
+        "/api/patchset?id=1",
+        "/api/patch?id=1",
+    ] {
+        let body = reqwest::get(format!("{}{path}", server.base_url))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        if path.contains("activity") {
+            assert!(body.contains("goal"), "{path}: {body}");
+        }
+        assert!(!body.contains(SECRET), "{path}: {body}");
+        assert!(!body.contains("live_log"), "{path}: {body}");
+    }
+    let activity = get_json(&server, "/api/patchset/activity?id=1").await;
+    assert_eq!(activity["finished"], false);
+}
+
+/// A finished review's recorded stage rows carry the same order and label as
+/// the live entries, so the page sorts both on the server's order.
+#[tokio::test]
+#[ignore]
+async fn test_recorded_stage_rows_carry_order_and_label() {
+    let server = spawn_test_server(false).await;
+    insert_review(&server, "Reviewed", Some("[]")).await;
+    server
+        .db
+        .set_review_stage_durations(
+            1,
+            r#"[{"stage":"report","seconds":4,"turns":1},{"stage":"goal","seconds":9,"turns":2},{"stage":"mystery","seconds":1,"turns":1}]"#,
+        )
+        .await
+        .unwrap();
+
+    let single = get_json(&server, "/api/review?id=1").await;
+    let patchset = get_json(&server, "/api/patchset?id=1").await;
+    for (label, review) in [("review", &single), ("patchset", &patchset["reviews"][0])] {
+        let rows = review["stage_durations"].as_array().expect(label);
+        let find = |name: &str| rows.iter().find(|r| r["stage"] == name).unwrap().clone();
+        assert!(
+            find("goal")["order"].as_u64().unwrap() < find("report")["order"].as_u64().unwrap(),
+            "{label}: {review}"
+        );
+        assert_eq!(find("goal")["stage_label"], "Goal Analysis", "{label}");
+        assert!(find("mystery")["order"].is_null(), "{label}");
+        assert!(find("mystery")["stage_label"].is_null(), "{label}");
+    }
+}

@@ -14,6 +14,8 @@
 
 //! Structured lifecycle telemetry events emitted during workflow execution.
 
+use crate::ai::AiMessage;
+
 /// Lifecycle events emitted by the workflow engine.
 #[derive(Debug, Clone)]
 pub enum WorkflowEvent {
@@ -44,6 +46,16 @@ pub enum WorkflowEvent {
         retry_in_seconds: Option<u64>,
         turn: usize,
         max_turns: usize,
+    },
+    /// A message joined a stage's conversation log.
+    ///
+    /// Emitted per message rather than per turn, so the newest messages are not
+    /// held back until the turn that produced them ends: a turn spent running
+    /// a tree-wide grep would otherwise hide the call that started it. The
+    /// messages are the ones the stage's finished history will hold, in order.
+    StageMessage {
+        stage_name: &'static str,
+        message: AiMessage,
     },
     /// A stage ended in an error rather than completing.
     ///
