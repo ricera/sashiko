@@ -23,13 +23,22 @@
 //! name is what the model passes as `repo`, and what every error and log line
 //! uses, so it has to be short, unique and safe to show.
 //!
+//! A reference can be scoped with `applies_to`, globs over the repository
+//! under review. It is then attached only to the patches that touch a matching
+//! file and is dormant for the rest: an Ethernet patch to a driver whose RDMA
+//! half needs rdma-core should neither pay the tokens for that tree in every
+//! tool schema and the prompt, nor be invited to wander into it. The decision
+//! is per patch, because a series is reviewed one patch at a time and its
+//! patches can touch different halves of the driver.
+//!
 //! This module is not gated on the server feature: the worker validates the
 //! list on every path into a review, including builds without the daemon.
 
 use crate::project::ProjectId;
 use crate::settings::{ReferenceKind, ReferenceSettings};
-use crate::toolbox::{REPO_ARG_REVIEW, ReferenceRepo};
+use crate::toolbox::{DormantReference, REPO_ARG_REVIEW, ReferenceRepo};
 use anyhow::{Result, anyhow, bail};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::warn;
@@ -69,6 +78,97 @@ fn valid_name(name: &str) -> bool {
     name.len() <= 32
         && (first.is_ascii_lowercase() || first.is_ascii_digit())
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-".contains(c))
+}
+
+/// The compiled `applies_to` of one reference: which patches it is attached
+/// to.
+#[derive(Debug, Clone)]
+pub struct AppliesTo {
+    /// As configured, for the prompt-free places that explain a decision: the
+    /// per-patch log line and the error for a dormant reference.
+    patterns: Vec<String>,
+    set: GlobSet,
+}
+
+impl AppliesTo {
+    /// Checks and compiles the patterns of the entry labelled `at`.
+    ///
+    /// Each refusal names the entry and the pattern's index, because the
+    /// pattern alone may appear in several entries. The shapes refused are
+    /// those that compile but can never match a path in a patch, which would
+    /// otherwise leave the reference silently dormant for every review.
+    pub fn new(at: &str, patterns: &[String]) -> Result<Self> {
+        if patterns.is_empty() {
+            bail!(
+                "{at}.applies_to is empty; remove the key to attach the reference to every \
+                 patch, or list at least one pattern"
+            );
+        }
+        let mut builder = GlobSetBuilder::new();
+        for (i, p) in patterns.iter().enumerate() {
+            if p.is_empty() {
+                bail!("{at}.applies_to[{i}] is empty");
+            }
+            if p.starts_with('/') {
+                bail!(
+                    "{at}.applies_to[{i}] '{p}' is absolute; patterns are relative to the \
+                     root of the repository under review"
+                );
+            }
+            if p.split('/').any(|c| c == "..") {
+                bail!(
+                    "{at}.applies_to[{i}] '{p}' must not contain '..'; patterns are \
+                     relative to the root of the repository under review"
+                );
+            }
+            if p.split('/').any(|c| c == ".") {
+                bail!(
+                    "{at}.applies_to[{i}] '{p}' contains a '.' component; paths in a patch \
+                     never do, so it would never match"
+                );
+            }
+            if p.ends_with('/') {
+                bail!(
+                    "{at}.applies_to[{i}] '{p}' ends in '/', which matches no file; use \
+                     '{p}**' to match everything under it"
+                );
+            }
+            // Without literal_separator, `*` crosses '/', so
+            // `eth/ionic/ionic_aux*` would also match files in directories
+            // below eth/ionic, and `rdma/*.c` every C file under rdma/. Keeping
+            // `*` inside one component, and leaving `**` to cross them, is what
+            // an operator used to .gitignore-style patterns expects them to
+            // mean.
+            let glob = GlobBuilder::new(p)
+                .literal_separator(true)
+                .build()
+                .map_err(|e| anyhow!("{at}.applies_to[{i}] '{p}': {e}"))?;
+            builder.add(glob);
+        }
+        let set = builder
+            .build()
+            .map_err(|e| anyhow!("{at}.applies_to: {e}"))?;
+        Ok(Self {
+            patterns: patterns.to_vec(),
+            set,
+        })
+    }
+
+    /// The patterns as configured.
+    pub fn patterns(&self) -> &[String] {
+        &self.patterns
+    }
+
+    /// The first file that matches, with the first pattern it matches, or
+    /// `None` when no file matches any pattern.
+    pub fn first_match<'a>(&'a self, files: &'a [String]) -> Option<(&'a str, &'a str)> {
+        files.iter().find_map(|file| {
+            self.set
+                .matches(file)
+                .first()
+                .map(|&i| (file.as_str(), self.patterns[i].as_str()))
+        })
+    }
 }
 
 /// Checks the rules that span the whole reference list, without touching git.
@@ -140,6 +240,11 @@ pub fn validate_reference_list(refs: &[ReferenceSettings]) -> Result<()> {
             && revision.starts_with('-')
         {
             bail!("{at}.revision '{revision}' is not a valid revision name");
+        }
+        // A kernel entry may be scoped too; docs/configuration.md explains
+        // what that costs the patches it leaves it dormant for.
+        if let Some(patterns) = entry.applies_to.as_deref() {
+            AppliesTo::new(&at, patterns)?;
         }
     }
     Ok(())
@@ -245,8 +350,9 @@ pub fn merge_references(
     for r in refs {
         match merged.iter_mut().find(|e| e.name == r.name) {
             // A new path drops the configured pin: a revision chosen for one
-            // clone means nothing in another. Kind, description and position
-            // stay, since they describe what the tree is for, not where it is.
+            // clone means nothing in another. Kind, description, applies_to and
+            // position stay, since they describe what the tree is for, not
+            // where it is.
             Some(entry) => {
                 entry.path = r.path.clone();
                 entry.revision = r.revision.clone();
@@ -263,6 +369,9 @@ pub fn merge_references(
                 path: r.path.clone(),
                 revision: r.revision.clone(),
                 description: None,
+                // A flag cannot say which patches a tree is for; scope it in
+                // Settings.toml.
+                applies_to: None,
             }),
         }
     }
@@ -343,7 +452,7 @@ pub async fn resolve_references(refs: &[ReferenceSettings]) -> Result<Vec<Refere
     validate_reference_list(refs)?;
 
     let mut resolved: Vec<ReferenceRepo> = Vec::with_capacity(refs.len());
-    for entry in refs {
+    for (index, entry) in refs.iter().enumerate() {
         let path = PathBuf::from(&entry.path);
         let commit = crate::git_ops::validate_reference_repository(
             &entry.name,
@@ -379,9 +488,102 @@ pub async fn resolve_references(refs: &[ReferenceSettings]) -> Result<Vec<Refere
             revision: entry.revision.clone().unwrap_or_else(|| "HEAD".to_string()),
             commit,
             description: entry.description.clone(),
+            applies_to: entry
+                .applies_to
+                .as_deref()
+                .map(|p| AppliesTo::new(&label(index, entry), p))
+                .transpose()?,
         });
     }
     Ok(resolved)
+}
+
+/// The references one patch is reviewed with, and those it is not.
+#[derive(Debug, Clone, Default)]
+pub struct PatchReferences {
+    /// Offered to the model for this patch, in configured order.
+    pub attached: Vec<ReferenceRepo>,
+    /// Configured but not attached to this patch, in configured order. Kept
+    /// only so that naming one gets a specific error.
+    pub dormant: Vec<DormantReference>,
+    /// Why each attached reference is attached, parallel to `attached`.
+    reasons: Vec<String>,
+}
+
+/// Decides which references a patch is reviewed with, from the files it
+/// touches.
+///
+/// An unscoped reference is attached to every patch. A scoped one is attached
+/// when any touched file matches any of its patterns, and is dormant otherwise.
+/// `touched` should carry both sides of a rename, so a file moving out of the
+/// tree a reference is scoped to still brings the reference along.
+pub fn attach_for_patch(refs: &[ReferenceRepo], touched: &[String]) -> PatchReferences {
+    let mut out = PatchReferences::default();
+    for r in refs {
+        let reason = match &r.applies_to {
+            None => Some("every patch".to_string()),
+            Some(scope) => scope
+                .first_match(touched)
+                .map(|(file, pattern)| format!("{file} matches {pattern}")),
+        };
+        match reason {
+            Some(reason) => {
+                out.attached.push(r.clone());
+                out.reasons.push(reason);
+            }
+            None => out.dormant.push(DormantReference {
+                name: r.name.clone(),
+                applies_to: r
+                    .applies_to
+                    .as_ref()
+                    .map(|a| a.patterns().to_vec())
+                    .unwrap_or_default(),
+            }),
+        }
+    }
+    out
+}
+
+impl PatchReferences {
+    /// One log line saying which references the patch was reviewed with and
+    /// why, and which it was not and why, or `None` with none configured.
+    ///
+    /// This is the record an operator reads to learn why a review did or did
+    /// not consult a tree: the prompt shows only what was attached.
+    pub fn summary(&self, patch_index: i64) -> Option<String> {
+        if self.attached.is_empty() && self.dormant.is_empty() {
+            return None;
+        }
+        let attached = if self.attached.is_empty() {
+            "none".to_string()
+        } else {
+            self.attached
+                .iter()
+                .zip(&self.reasons)
+                .map(|(r, why)| format!("{} ({why})", r.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let dormant = if self.dormant.is_empty() {
+            "none".to_string()
+        } else {
+            self.dormant
+                .iter()
+                .map(|d| {
+                    format!(
+                        "{} (applies only to changes matching {}; this patch touches none \
+                         of them)",
+                        d.name,
+                        d.applies_to.join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        Some(format!(
+            "Patch {patch_index} references: attached {attached}; dormant {dormant}"
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -395,6 +597,7 @@ mod tests {
             path: format!("/srv/{name}"),
             revision: None,
             description: description.map(str::to_string),
+            applies_to: None,
         }
     }
 
@@ -574,6 +777,7 @@ mod tests {
         k.revision = Some("v6.12".to_string());
         let mut r = source("rdma-core");
         r.revision = Some("ionic-rdma-v59".to_string());
+        r.applies_to = Some(vec!["rdma/drv/**".to_string()]);
         vec![k, r]
     }
 
@@ -614,6 +818,11 @@ mod tests {
             merged[1].description,
             configured()[1].description,
             "the description describes the tree, not the path"
+        );
+        assert_eq!(
+            merged[1].applies_to,
+            configured()[1].applies_to,
+            "which patches the tree is for does not depend on where it is"
         );
 
         let merged = merge_references(configured(), &[], &[rev_flag("kernel", "v6.13")]).unwrap();
@@ -679,6 +888,7 @@ mod tests {
         .unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].kind, ReferenceKind::Kernel);
+        assert_eq!(merged[0].applies_to, None, "a flag-added entry is unscoped");
         validate_reference_list(&merged).unwrap();
 
         let merged =
@@ -719,6 +929,170 @@ mod tests {
         }
     }
 
+    fn scoped(name: &str, patterns: &[&str]) -> ReferenceSettings {
+        let mut e = source(name);
+        e.applies_to = Some(patterns.iter().map(|p| p.to_string()).collect());
+        e
+    }
+
+    #[test]
+    fn applies_to_patterns_are_validated() {
+        let err = list_err(&[scoped("rdma-core", &["rdma/drv/**", "rdma/[drv"])]);
+        assert!(
+            err.contains("git.references[rdma-core].applies_to[1]"),
+            "{err}"
+        );
+        assert!(err.contains("rdma/[drv"), "{err}");
+
+        for (bad, why) in [
+            ("/rdma/**", "absolute"),
+            ("rdma/../eth/**", "'..'"),
+            ("../x", "'..'"),
+            ("./rdma/**", "'.' component"),
+            ("rdma/drv/", "'rdma/drv/**'"),
+            ("", "is empty"),
+        ] {
+            let err = list_err(&[scoped("rdma-core", &["rdma/**", bad])]);
+            assert!(
+                err.contains("git.references[rdma-core].applies_to[1]"),
+                "{bad}: {err}"
+            );
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+
+        let err = list_err(&[scoped("rdma-core", &[])]);
+        assert!(
+            err.contains("git.references[rdma-core].applies_to is empty"),
+            "{err}"
+        );
+
+        validate_reference_list(&[source("rdma-core")]).unwrap();
+        validate_reference_list(&[scoped("rdma-core", &["rdma/drv/**", "include/uapi/rdma/*"])])
+            .unwrap();
+        let mut k = kernel();
+        k.applies_to = Some(vec!["rdma/drv/**".to_string()]);
+        validate_reference_list(&[k]).unwrap();
+    }
+
+    fn matches(pattern: &str, file: &str) -> bool {
+        AppliesTo::new("t", &[pattern.to_string()])
+            .unwrap()
+            .first_match(&[file.to_string()])
+            .is_some()
+    }
+
+    #[test]
+    fn applies_to_globs_do_not_cross_directories_with_a_single_star() {
+        assert!(matches("eth/ionic/ionic_aux*", "eth/ionic/ionic_aux.c"));
+        assert!(!matches("eth/ionic/ionic_aux*", "eth/ionic/ionic_aux/x.c"));
+        assert!(!matches("rdma/*.c", "rdma/drv/a.c"));
+        assert!(matches("rdma/drv/**", "rdma/drv/ionic/ionic_fw.h"));
+        assert!(!matches("*.h", "include/x.h"));
+        assert!(matches(
+            "**/ionic-abi.h",
+            "rdma/drv/ionic/uapi/rdma/ionic-abi.h"
+        ));
+    }
+
+    /// A resolved reference without touching git: what attach_for_patch sees.
+    fn repo(name: &str, kind: ReferenceKind, patterns: Option<&[&str]>) -> ReferenceRepo {
+        ReferenceRepo {
+            name: name.to_string(),
+            kind,
+            path: PathBuf::from(format!("/srv/{name}")),
+            revision: "HEAD".to_string(),
+            commit: "0".repeat(40),
+            description: Some("A tree.".to_string()),
+            applies_to: patterns.map(|p| {
+                AppliesTo::new(name, &p.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+            }),
+        }
+    }
+
+    fn driver_a() -> Vec<ReferenceRepo> {
+        vec![
+            repo("kernel", ReferenceKind::Kernel, None),
+            repo(
+                "rdma-core",
+                ReferenceKind::Source,
+                Some(&[
+                    "rdma/drv/**",
+                    "eth/ionic/ionic_aux*",
+                    "include/uapi/rdma/**",
+                ]),
+            ),
+        ]
+    }
+
+    fn touched(files: &[&str]) -> Vec<String> {
+        files.iter().map(|f| f.to_string()).collect()
+    }
+
+    fn attached_names(p: &PatchReferences) -> Vec<&str> {
+        p.attached.iter().map(|r| r.name.as_str()).collect()
+    }
+
+    #[test]
+    fn an_ethernet_patch_attaches_only_the_kernel() {
+        let p = attach_for_patch(&driver_a(), &touched(&["eth/ionic/ionic_lif.c"]));
+        assert_eq!(attached_names(&p), ["kernel"]);
+        assert_eq!(p.dormant.len(), 1);
+        assert_eq!(p.dormant[0].name, "rdma-core");
+        assert_eq!(
+            p.dormant[0].applies_to,
+            [
+                "rdma/drv/**",
+                "eth/ionic/ionic_aux*",
+                "include/uapi/rdma/**"
+            ]
+        );
+        let line = p.summary(2).unwrap();
+        assert!(line.starts_with("Patch 2 references: "), "{line}");
+        assert!(line.contains("attached kernel (every patch)"), "{line}");
+        assert!(
+            line.contains(
+                "dormant rdma-core (applies only to changes matching rdma/drv/**, \
+                 eth/ionic/ionic_aux*, include/uapi/rdma/**"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn an_rdma_patch_attaches_kernel_and_rdma_core() {
+        let p = attach_for_patch(&driver_a(), &touched(&["rdma/drv/ionic/ionic_fw.h"]));
+        assert_eq!(attached_names(&p), ["kernel", "rdma-core"]);
+        assert!(p.dormant.is_empty());
+        let line = p.summary(1).unwrap();
+        assert!(
+            line.contains("rdma-core (rdma/drv/ionic/ionic_fw.h matches rdma/drv/**)"),
+            "{line}"
+        );
+        assert!(line.ends_with("dormant none"), "{line}");
+
+        assert!(
+            attach_for_patch(&[], &touched(&["a.c"]))
+                .summary(1)
+                .is_none()
+        );
+
+        // Everything dormant still earns a line, so the operator sees why.
+        let only_rdma = &driver_a()[1..];
+        let line = attach_for_patch(only_rdma, &touched(&["eth/a.c"]))
+            .summary(3)
+            .unwrap();
+        assert!(line.contains("attached none; dormant rdma-core"), "{line}");
+    }
+
+    #[test]
+    fn a_rename_out_of_a_matching_path_attaches() {
+        let p = attach_for_patch(
+            &driver_a(),
+            &touched(&["eth/ionic/x.c", "rdma/drv/ionic/x.c"]),
+        );
+        assert_eq!(attached_names(&p), ["kernel", "rdma-core"]);
+    }
+
     async fn git(dir: &std::path::Path, args: &[&str]) {
         let status = crate::git_cmd::in_dir_async(dir)
             .args(args)
@@ -749,6 +1123,7 @@ mod tests {
             path: repo.to_string_lossy().into_owned(),
             revision: revision.map(str::to_string),
             description: Some("A tree.".to_string()),
+            applies_to: None,
         };
 
         let resolved = resolve_references(&[
@@ -762,6 +1137,19 @@ mod tests {
         assert_eq!(resolved[0].name, "net");
         assert_eq!(resolved[0].revision, "v1");
         assert!(resolved[0].path.is_absolute());
+        assert!(resolved[0].applies_to.is_none());
+
+        // A scoped entry carries its compiled patterns into the review.
+        let mut scoped = at("net-next", ReferenceKind::Source, Some("v2"));
+        scoped.applies_to = Some(vec!["rdma/drv/**".to_string(), "include/**".to_string()]);
+        let resolved = resolve_references(&[scoped]).await.unwrap();
+        let scope = resolved[0].applies_to.as_ref().expect("scope is carried");
+        assert_eq!(scope.patterns(), ["rdma/drv/**", "include/**"]);
+        let touched = vec!["include/x.h".to_string()];
+        assert_eq!(
+            scope.first_match(&touched),
+            Some(("include/x.h", "include/**"))
+        );
 
         // v2 and HEAD are the same commit.
         let err = resolve_references(&[

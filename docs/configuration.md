@@ -228,9 +228,11 @@ the code under review. Each entry is one table:
 | `path` | string | -- | Required. The top of a git work tree, or the git directory of a bare clone. Use an absolute path: a relative one is resolved against the working directory of whichever process reads it. |
 | `revision` | string | `HEAD` | Revision to read the tree at: a tag, SHA or branch. Must not start with `-`. |
 | `description` | string | -- | What the tree is and what to use it for, shown to the model. Required for `kind = "source"`; optional for `kind = "kernel"`, which has built-in text. |
+| `applies_to` | list of strings | absent (every patch) | Globs, relative to the root of the repository under review, naming the files a patch must touch for this reference to be attached to its review. See [Scoping a reference](#scoping-a-reference-to-part-of-the-tree). |
 
 At most 8 entries are allowed. Each adds a `repo` value to every git tool and an
-entry to every review's prompt, so configure only trees the reviews need.
+entry to the prompt of every review it is attached to, so configure only trees
+the reviews need.
 
 #### Reviewing out-of-tree modules
 
@@ -254,11 +256,14 @@ name = "kernel"
 kind = "kernel"
 path = "/srv/sashiko/linux"
 revision = "v6.18"
+# No applies_to: the kernel is attached to every patch. See the kernel rule
+# under "Scoping a reference to part of the tree".
 
 [[git.references]]
 name = "rdma-core"
 path = "/srv/sashiko/rdma-core"      # a clone of example-org/rdma-core
 revision = "origin/ionic-rdma"       # a release branch; see the notes on pins
+applies_to = ["rdma/drv/**", "eth/ionic/ionic_aux*", "include/uapi/rdma/**"]
 description = """Userspace RDMA stack (example-org/rdma-core). \
 kernel-headers/rdma/ionic-abi.h mirrors the kernel uapi; providers/ionic is \
 libionic, whose ionic_fw.h hand-mirrors the driver's WQE/CQE/doorbell formats. \
@@ -295,9 +300,11 @@ This does several things:
   that looks normal and is ungrounded. Errors name the entry, e.g.
   `git.references[rdma-core].revision 'v59' does not resolve in ...`.
 - Each worker logs one line per reference when it starts, at INFO: its name,
-  kind, path, and configured revision with the commit it resolved to, e.g.
+  kind, path, configured revision with the commit it resolved to, and which
+  patches it applies to, e.g.
   `Reference repository rdma-core: kind source, path /srv/sashiko/rdma-core,
-  revision origin/ionic-rdma -> 9f8e7d6c...`.
+  revision origin/ionic-rdma -> 9f8e7d6c..., applies to rdma/drv/**,
+  eth/ionic/ionic_aux*, include/uapi/rdma/**` (or `applies to every patch`).
 
 Notes:
 
@@ -332,7 +339,8 @@ Notes:
   worker ignores the list with a warning; both name the entries.
 - An empty list reproduces single-repository behaviour exactly: no `repo`
   argument is advertised to the model, and neither block is added to the
-  prompt.
+  prompt. So does a patch for which every configured reference is dormant
+  (see below).
 - The list is read only where the full `Settings.toml` is loaded: the daemon
   and the review workers it spawns. `sashiko review` and `sashiko-cli local`
   load the local review settings, which have no `[git]` section, and have no
@@ -343,8 +351,10 @@ Notes:
   `[git]` in the named file is ignored.
   - `--reference NAME=PATH[@REV]` replaces the path of entry `NAME` and drops
     its configured revision, which was chosen for a different clone; `@REV`
-    pins the new one. A `NAME` that is not configured is added only as
-    `kernel`, because any other reference needs a description, which only
+    pins the new one. Its `applies_to` is kept, since which patches a tree is
+    for does not depend on where the clone lives. A `NAME` that is not
+    configured is added only as `kernel`, and unscoped, because any other
+    reference needs a description, and any scope an `applies_to`, which only
     `Settings.toml` can give. `PATH@REV` splits at the last `@`, so a
     revision containing `@` must be given with `--reference-revision`, and a
     path containing `@` must be followed by `@REV` (`@HEAD` pins the clone's
@@ -352,6 +362,52 @@ Notes:
     the revision.
   - `--reference-revision NAME=REV` re-pins entry `NAME`, and wins over an
     `@REV` for the same name. An unknown `NAME` is an error.
+
+#### Scoping a reference to part of the tree
+
+A reference with `applies_to` is attached only to the reviews of patches that
+touch a matching file; for every other patch it is *dormant*. In the driver-a
+example above, an `eth/ionic/` patch is reviewed with the kernel alone, and
+neither pays the tokens for rdma-core in every tool schema and the prompt nor
+is invited to wander into it, while an `rdma/drv/` patch gets both.
+
+- **Patterns** are globs relative to the root of the repository under review
+  (not of the reference). `*` and `?` never match `/`, so they stay within one
+  path component; only `**` crosses directories. The alternatives of `{a,b}`
+  may themselves contain `/`, which is useful (`{rdma/drv,eth/ionic}/**`), and a
+  character class such as `[!x]` is not guaranteed to exclude `/`, so do not
+  rely on one to stop at a directory boundary. Matching is case-sensitive. A pattern
+  without a `/` matches only top-level files, so write `**/ionic-abi.h` to match
+  that name anywhere.
+- **Refused patterns** stop the daemon and every worker at startup: an
+  absolute pattern, one with a `..` or `.` component, one ending in `/` (write
+  `dir/**`), one that does not compile, and an empty list (remove the key to
+  attach the reference to every patch). Errors name the entry and the pattern's
+  index, e.g. `git.references[rdma-core].applies_to[1] 'rdma/[drv': ...`.
+- **Matching is per patch**, including within a series: each patch of a series
+  is reviewed on its own and attaches its own references. Every file the patch
+  touches counts, including both the old and the new path of a rename, so a
+  file moving out of `rdma/drv/` still attaches rdma-core.
+- **A dormant reference is invisible to the model**: it is not a `repo` value,
+  not in the prompt's reference list and not in any tool description. If the
+  model names it anyway, it is told the reference is configured but not
+  attached to this review, which patterns it applies to, and which `repo`
+  values are valid here. A name that is not configured at all gets the usual
+  unknown-repo error.
+- **Each patch logs one INFO line** with what it attached and why, and what it
+  left dormant and why. On the deployment host this lives only in the daemon's
+  log, so check it soon after the review:
+
+  ```
+  Patch 1 references: attached kernel (every patch); dormant rdma-core (applies only to changes matching rdma/drv/**, eth/ionic/ionic_aux*, include/uapi/rdma/**; this patch touches none of them)
+  Patch 2 references: attached kernel (every patch), rdma-core (rdma/drv/ionic/ionic_fw.h matches rdma/drv/**); dormant none
+  ```
+
+- **The kernel rule.** The out-of-tree caveats appear only when a
+  `kind = "kernel"` reference is attached to that patch. A kernel entry may be
+  scoped, but a patch it is dormant for is framed as an in-tree review --
+  `Fixes:` tags, lore and mainline paths are expected again -- and reads no
+  kernel tree. Do not scope the kernel entry of an out-of-tree module.
 
 #### `[[git.custom_remotes]]`
 

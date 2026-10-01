@@ -713,6 +713,7 @@ mod tests {
             commit,
             description: (kind == crate::settings::ReferenceKind::Source)
                 .then(|| "A userspace tree.".to_string()),
+            applies_to: None,
         }
     }
 
@@ -749,6 +750,7 @@ mod tests {
             revision: revision.to_string(),
             commit: "0".repeat(40),
             description: None,
+            applies_to: None,
         }
     }
 
@@ -1415,6 +1417,107 @@ mod tests {
             }
         }
         assert_eq!(seen, 8, "every git tool takes repo");
+    }
+
+    /// A configured reference left out of this patch by its `applies_to`.
+    fn dormant(name: &str, globs: &[&str]) -> crate::toolbox::DormantReference {
+        crate::toolbox::DormantReference {
+            name: name.to_string(),
+            applies_to: globs.iter().map(|g| g.to_string()).collect(),
+        }
+    }
+
+    /// A dormant reference is offered nowhere: not in the repo enum, not in
+    /// any description, and with nothing attached, not as a repo argument or
+    /// a pin note at all.
+    #[test]
+    fn dormant_references_are_not_offered() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let toolbox = ToolBox::new(review_path.clone(), None)
+            .with_references([unread_reference("v6.18")])
+            .with_dormant_references([dormant("rdma-core", &["rdma/drv/**"])]);
+        let mut seen = 0;
+        for tool in toolbox.get_declarations_generic() {
+            let props = tool.parameters["properties"].as_object().unwrap();
+            if let Some(repo) = props.get("repo") {
+                seen += 1;
+                assert_eq!(repo["enum"], json!(["review", "kernel"]), "{}", tool.name);
+            }
+            for (key, arg) in props {
+                let desc = arg["description"].as_str().unwrap_or_default();
+                assert!(
+                    !desc.contains("rdma-core"),
+                    "{}.{key} offers a dormant reference: {desc}",
+                    tool.name
+                );
+            }
+        }
+        assert_eq!(seen, 8, "every git tool takes repo");
+
+        let toolbox = ToolBox::new(review_path, None)
+            .with_dormant_references([dormant("rdma-core", &["rdma/drv/**"])]);
+        for tool in toolbox.get_declarations_generic() {
+            let props = tool.parameters["properties"].as_object().unwrap();
+            assert!(
+                !props.contains_key("repo"),
+                "{} offers repo with every reference dormant",
+                tool.name
+            );
+            for (key, arg) in props {
+                let desc = arg["description"].as_str().unwrap_or_default();
+                assert!(
+                    !desc.contains("reads that repo's pin") && !desc.contains("rdma-core"),
+                    "{}.{key} describes a reference that is not attached: {desc}",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    /// Naming a dormant reference says it exists, why it is not attached, and
+    /// what is; a name that is not configured at all is still unknown.
+    #[test]
+    fn a_dormant_reference_names_why_it_is_not_attached() {
+        let (_review_dir, review_path) = setup_test_repo();
+        let rt = Runtime::new().unwrap();
+        let grep = |toolbox: &ToolBox, repo: &str| {
+            rt.block_on(toolbox.call(
+                "git_grep",
+                json!({ "repo": repo, "revision": "HEAD", "pattern": "x" }),
+            ))
+            .expect_err("a reference that is not attached must not be served")
+            .to_string()
+        };
+
+        let toolbox = ToolBox::new(review_path.clone(), None)
+            .with_references([unread_reference("v6.18")])
+            .with_dormant_references([dormant(
+                "rdma-core",
+                &["rdma/drv/**", "include/uapi/rdma/**"],
+            )]);
+        let err = grep(&toolbox, "rdma-core");
+        for needle in [
+            "\"rdma-core\"",
+            "configured but not attached",
+            "rdma/drv/**, include/uapi/rdma/**",
+            "\"review\"",
+            "\"kernel\"",
+        ] {
+            assert!(err.contains(needle), "missing {needle}: {err}");
+        }
+        let valid = err.split("Valid values here:").nth(1).unwrap();
+        assert!(!valid.contains("rdma-core"), "{err}");
+
+        let err = grep(&toolbox, "iproute2");
+        assert!(err.contains("Unknown repo 'iproute2'"), "{err}");
+        assert!(!err.contains("configured but not attached"), "{err}");
+
+        let only_dormant = ToolBox::new(review_path, None)
+            .with_dormant_references([dormant("rdma-core", &["rdma/drv/**"])]);
+        let err = grep(&only_dormant, "rdma-core");
+        assert!(err.contains("configured but not attached"), "{err}");
+        let valid = err.split("Valid values here:").nth(1).unwrap();
+        assert_eq!(valid.trim(), "\"review\" (the code under review).", "{err}");
     }
 
     /// An unknown name is refused with every valid one, so the retry can be

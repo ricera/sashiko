@@ -822,6 +822,18 @@ pub struct ReferenceSettings {
     /// for kind "source"; a kind "kernel" entry has built-in text.
     #[serde(default)]
     pub description: Option<String>,
+    /// Which patches the reference is attached to: globs over the repository
+    /// under review (not over the reference), matched against every file a
+    /// patch touches, both sides of a rename included. A patch that touches
+    /// none of them reviews without the reference, which keeps an Ethernet
+    /// patch from paying for, or wandering into, a userspace RDMA tree.
+    ///
+    /// `*` and `?` stay within one path component and `**` crosses them.
+    /// Absent means every patch. An empty list is refused by validation rather
+    /// than read as "no patch", which is what removing the reference says; it
+    /// stays an `Option` so the two can be told apart.
+    #[serde(default)]
+    pub applies_to: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1231,6 +1243,7 @@ mod tests {
                  [[git.references]]\n\
                  name = \"rdma-core\"\n\
                  path = \"/srv/rdma-core\"\n\
+                 applies_to = [\"rdma/drv/**\", \"include/uapi/rdma/**\"]\n\
                  description = \"\"\"Userspace RDMA stack.\n\
                  providers/ionic is libionic.\"\"\"\n"
             ),
@@ -1249,6 +1262,17 @@ mod tests {
             settings.git.references[1].description.as_deref(),
             Some("Userspace RDMA stack.\nproviders/ionic is libionic.")
         );
+        assert_eq!(
+            settings.git.references[1].applies_to.as_deref(),
+            Some(
+                &[
+                    "rdma/drv/**".to_string(),
+                    "include/uapi/rdma/**".to_string()
+                ][..]
+            ),
+            "applies_to survives the loader, in order"
+        );
+        assert_eq!(settings.git.references[0].applies_to, None);
 
         let stale = dir.path().join("Stale.toml");
         std::fs::write(
@@ -1267,12 +1291,12 @@ mod tests {
         );
     }
 
-    /// Path scoping is not implemented yet, so a config that asks for it must
-    /// fail rather than attach the reference to every patch unannounced. Any
-    /// other unknown key on an entry is refused the same way.
+    /// A key this build does not implement fails the load rather than being
+    /// silently ignored, so a configuration written for a later version is not
+    /// read as if it said less than it does.
     #[test]
-    fn git_settings_reject_applies_to_until_supported() {
-        for extra in ["applies_to = [\"rdma/**\"]", "mirrors = \"x\""] {
+    fn git_settings_reject_unknown_reference_keys() {
+        for extra in ["mirrors = \"x\"", "revision_policy = \"x\""] {
             let err = toml::from_str::<GitSettings>(&format!(
                 "repository_path = \"linux\"\n\
                  [[references]]\n\
@@ -1285,6 +1309,35 @@ mod tests {
             let key = extra.split(' ').next().unwrap();
             assert!(err.to_string().contains(key), "{err}");
         }
+    }
+
+    /// `applies_to` loads as given. An empty list loads too: it is refused by
+    /// validation, which can name the entry, not by serde.
+    #[test]
+    fn git_settings_accept_applies_to() {
+        let load = |extra: &str| {
+            toml::from_str::<GitSettings>(&format!(
+                "repository_path = \"linux\"\n\
+                 [[references]]\n\
+                 name = \"rdma-core\"\n\
+                 path = \"/srv/rdma-core\"\n\
+                 description = \"d\"\n\
+                 {extra}\n"
+            ))
+            .expect("applies_to must load")
+            .references
+            .remove(0)
+            .applies_to
+        };
+        assert_eq!(
+            load("applies_to = [\"rdma/drv/**\", \"eth/ionic/ionic_aux*\"]"),
+            Some(vec![
+                "rdma/drv/**".to_string(),
+                "eth/ionic/ionic_aux*".to_string()
+            ])
+        );
+        assert_eq!(load(""), None);
+        assert_eq!(load("applies_to = []"), Some(vec![]));
     }
 
     #[test]

@@ -173,11 +173,41 @@ mod tests {
             );
         }
 
-        let subsystem_index = PROMPT_BUNDLE_FILES
+        assert_indexed_guides_bundled("sashiko");
+    }
+
+    /// The kernel index is what the Linux pre-screen picks guides from, and a
+    /// row naming a file the bundle lacks is skipped without a word when the
+    /// guide is included. The RDMA row is checked by name because its guide is
+    /// carried on top of the vendored tree and must survive each sync.
+    #[test]
+    fn test_kernel_prompt_bundle_integrity() {
+        let guides = assert_indexed_guides_bundled("kernel");
+        assert!(guides.contains(&"rdma.md"), "{guides:?}");
+        let index = bundled_text("kernel/subsystem/subsystem.md");
+        let row = index
+            .lines()
+            .find(|l| l.trim_end().ends_with("| rdma.md |"))
+            .expect("the RDMA row");
+        for trigger in ["drivers/infiniband/", "uverbs", "rdma/drv/"] {
+            assert!(row.contains(trigger), "missing {trigger}: {row}");
+        }
+    }
+
+    fn bundled_text(path: &str) -> &'static str {
+        PROMPT_BUNDLE_FILES
             .iter()
-            .find(|(p, _)| *p == "sashiko/subsystem/subsystem.md")
+            .find(|(p, _)| *p == path)
             .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
-            .expect("sashiko/subsystem/subsystem.md must be valid UTF-8");
+            .unwrap_or_else(|| panic!("{path} must be bundled and valid UTF-8"))
+    }
+
+    /// Parses `{dir}/subsystem/subsystem.md` and checks every guide it names is
+    /// in the bundle under `{dir}/subsystem/` or `{dir}/patterns/`, returning
+    /// the names.
+    fn assert_indexed_guides_bundled(dir: &str) -> Vec<&'static str> {
+        let index_path = format!("{dir}/subsystem/subsystem.md");
+        let subsystem_index = bundled_text(&index_path);
 
         let mut referenced_guides = Vec::new();
         for line in subsystem_index.lines() {
@@ -196,19 +226,20 @@ mod tests {
 
         assert!(
             !referenced_guides.is_empty(),
-            "should parse referenced guides from subsystem.md"
+            "should parse referenced guides from {index_path}"
         );
 
-        for guide in referenced_guides {
-            let in_subsystem = format!("sashiko/subsystem/{guide}");
-            let in_patterns = format!("sashiko/patterns/{guide}");
+        for guide in &referenced_guides {
+            let in_subsystem = format!("{dir}/subsystem/{guide}");
+            let in_patterns = format!("{dir}/patterns/{guide}");
             let found = PROMPT_BUNDLE_FILES
                 .iter()
                 .any(|(p, _)| *p == in_subsystem || *p == in_patterns);
             assert!(
                 found,
-                "guide {guide} referenced in sashiko/subsystem/subsystem.md not found in bundle under subsystem/ or patterns/"
+                "guide {guide} referenced in {index_path} not found in bundle under subsystem/ or patterns/"
             );
         }
+        referenced_guides
     }
 }

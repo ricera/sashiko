@@ -362,12 +362,15 @@ pub async fn run_worker(
     // the record of which commit this run actually read.
     for r in &references {
         info!(
-            "Reference repository {}: kind {}, path {}, revision {} -> {}",
+            "Reference repository {}: kind {}, path {}, revision {} -> {}, applies to {}",
             r.name,
             r.kind,
             r.path.display(),
             r.revision,
-            r.commit
+            r.commit,
+            r.applies_to
+                .as_ref()
+                .map_or("every patch".to_string(), |a| a.patterns().join(", "))
         );
     }
 
@@ -572,6 +575,217 @@ fn extract_inline_review(patch_index: i64, output: Option<&Value>) -> Result<Opt
     Ok(inline_content)
 }
 
+/// The files a patch touches: the list handed to the tools as the active
+/// patch files, and the wider list that decides which references attach.
+///
+/// The first is exactly what `git diff-tree` reports for the patch's commit,
+/// so tools that favour the patch's own files behave as they always have. The
+/// second adds the paths named in the patch text, because a patch reviewed
+/// from the current tree without a commit has no entry in `patch_shas`, and a
+/// scoped reference would otherwise go silently dormant for it.
+async fn touched_files(
+    worktree: &Path,
+    sha: Option<&str>,
+    diff: &str,
+) -> (Vec<String>, Vec<String>) {
+    let mut patch_files = Vec::new();
+    if let Some(sha) = sha {
+        // --no-renames, so a rename lists its old path as well as its new
+        // one: a reference scoped to the tree a file left must still attach.
+        // Plumbing does not detect renames by default today; the flag keeps
+        // it that way whatever diff.renames says.
+        let output = crate::git_cmd::in_dir_async(worktree)
+            .args([
+                "diff-tree",
+                "--no-commit-id",
+                "--name-only",
+                "--no-renames",
+                "-r",
+                sha,
+            ])
+            .output()
+            .await;
+        if let Ok(out) = output
+            && out.status.success()
+        {
+            let file_list = String::from_utf8_lossy(&out.stdout);
+            for file in file_list.lines() {
+                let trimmed = file.trim().to_string();
+                if !trimmed.is_empty() {
+                    patch_files.push(trimmed);
+                }
+            }
+        }
+    }
+    let mut touched = patch_files.clone();
+    for path in diff_paths(diff) {
+        if !touched.contains(&path) {
+            touched.push(path);
+        }
+    }
+    (patch_files, touched)
+}
+
+/// The paths a unified diff names: both sides of every `diff --git` line,
+/// file header, rename and copy, without the `a/` and `b/` prefixes and
+/// without `/dev/null`.
+///
+/// The `diff --git` line matters because some changes have nothing else: a
+/// binary change, a mode change, or an empty file added or deleted carries no
+/// `---`/`+++` pair. Paths git has C-quoted (`"a/foo\tbar"`) are unquoted
+/// before the prefix comes off, so they can match a glob like any other.
+///
+/// A `--- ` line counts only when a `+++ ` line follows it, because a removed
+/// hunk line whose text starts with `-- ` looks the same on its own. The other
+/// header lines need no such care: every hunk line starts with a space, `+`,
+/// `-` or `\`, so they cannot be mistaken for one.
+fn diff_paths(diff: &str) -> Vec<String> {
+    fn strip_side(path: &str) -> &str {
+        path.strip_prefix("a/")
+            .or_else(|| path.strip_prefix("b/"))
+            .unwrap_or(path)
+    }
+
+    fn header_path(rest: &str) -> Option<String> {
+        let path = if rest.starts_with('"') {
+            unquote_c_path(rest)?.0
+        } else {
+            // An unquoted header may carry a tab and a timestamp after the
+            // path; a quoted one has any tab escaped inside the quotes.
+            rest.split('\t')
+                .next()
+                .unwrap_or(rest)
+                .trim_end()
+                .to_string()
+        };
+        if path == "/dev/null" {
+            return None;
+        }
+        Some(strip_side(&path).to_string())
+    }
+
+    let mut paths: Vec<String> = Vec::new();
+    let mut push = |path: &str| {
+        if !path.is_empty() && !paths.iter().any(|p| p == path) {
+            paths.push(path.to_string());
+        }
+    };
+    let lines: Vec<&str> = diff.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
+            for path in diff_git_paths(rest) {
+                push(strip_side(&path));
+            }
+        } else if let Some(old) = line.strip_prefix("--- ")
+            && let Some(new) = lines.get(i + 1).and_then(|l| l.strip_prefix("+++ "))
+        {
+            for side in [old, new] {
+                if let Some(path) = header_path(side) {
+                    push(&path);
+                }
+            }
+        } else if let Some(rest) = ["rename from ", "rename to ", "copy from ", "copy to "]
+            .iter()
+            .find_map(|prefix| line.strip_prefix(prefix))
+        {
+            let rest = rest.trim_end();
+            match unquote_c_path(rest) {
+                Some((path, _)) => push(&path),
+                None => push(rest),
+            }
+        }
+    }
+    paths
+}
+
+/// Both paths of a `diff --git <old> <new>` line, still carrying their `a/`
+/// and `b/` prefixes.
+///
+/// A quoted side is unambiguous. Two unquoted sides are split on a ` b/` that
+/// leaves the same path on both sides, which is how git writes every change
+/// that is not a rename or copy; failing that, a line with exactly one ` b/`
+/// splits there. Anything else is left alone: a rename or copy has its own
+/// `rename`/`copy` lines, and a guess could invent a path the patch never
+/// touched.
+fn diff_git_paths(rest: &str) -> Vec<String> {
+    let rest = rest.trim_end();
+    if let Some((old, after)) = unquote_c_path(rest) {
+        let after = after.trim_start();
+        let new = match unquote_c_path(after) {
+            Some((new, _)) => new,
+            None => after.to_string(),
+        };
+        return vec![old, new];
+    }
+    if let Some(quote) = rest.find(" \"b/") {
+        let new = unquote_c_path(&rest[quote + 1..]).map(|(new, _)| new);
+        return std::iter::once(rest[..quote].to_string())
+            .chain(new)
+            .collect();
+    }
+    let splits: Vec<usize> = rest.match_indices(" b/").map(|(i, _)| i).collect();
+    let same = splits.iter().copied().find(|&i| {
+        let (old, new) = (&rest[..i], &rest[i + 1..]);
+        old.strip_prefix("a/")
+            .is_some_and(|o| Some(o) == new.strip_prefix("b/"))
+    });
+    let split = same.or(match splits.as_slice() {
+        [only] => Some(*only),
+        _ => None,
+    });
+    match split {
+        Some(i) => vec![rest[..i].to_string(), rest[i + 1..].to_string()],
+        None => Vec::new(),
+    }
+}
+
+/// Undoes git's C-style quoting of a path that starts with `"`, returning the
+/// path and whatever follows the closing quote. `None` when the text is not a
+/// well-formed quoted path.
+///
+/// Git escapes bytes, not characters, so octal escapes are gathered as bytes
+/// and decoded as UTF-8 at the end; a path that is not UTF-8 is decoded
+/// lossily, which cannot match a glob it would not have matched anyway.
+fn unquote_c_path(text: &str) -> Option<(String, &str)> {
+    let body = text.strip_prefix('"')?;
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return Some((String::from_utf8_lossy(&out).into_owned(), &body[i + 1..])),
+            b'\\' => {
+                let esc = *bytes.get(i + 1)?;
+                i += 2;
+                out.push(match esc {
+                    b'a' => 0x07,
+                    b'b' => 0x08,
+                    b'f' => 0x0c,
+                    b'n' => b'\n',
+                    b'r' => b'\r',
+                    b't' => b'\t',
+                    b'v' => 0x0b,
+                    b'\\' | b'"' => esc,
+                    b'0'..=b'3' => {
+                        let digits = bytes.get(i..i + 2)?;
+                        if !digits.iter().all(|d| (b'0'..=b'7').contains(d)) {
+                            return None;
+                        }
+                        i += 2;
+                        ((esc - b'0') << 6) | ((digits[0] - b'0') << 3) | (digits[1] - b'0')
+                    }
+                    _ => return None,
+                });
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn review_single_patch(
     worktree: &GitWorktree,
@@ -599,6 +813,25 @@ async fn review_single_patch(
                 as Arc<dyn crate::ai::backoff_provider::RetryBudget>
         });
     let max_attempts = worker_max_attempts(ai);
+
+    // Gathered once per patch rather than once per attempt: neither the files
+    // nor which references they attach depend on the attempt, and logging the
+    // decision once keeps it readable.
+    let (patch_files, touched) = touched_files(
+        &worktree.path,
+        patch_shas.get(&p.index).map(String::as_str),
+        &p.diff,
+    )
+    .await;
+    info!(
+        "Active patch files gathered for patch {}: {:?}",
+        p.index, patch_files
+    );
+    let attach = crate::references::attach_for_patch(references, &touched);
+    if let Some(line) = attach.summary(p.index) {
+        info!("{line}");
+    }
+
     let mut last_error = None;
     for attempt in 1..=max_attempts {
         emit(
@@ -625,32 +858,10 @@ async fn review_single_patch(
         // The directory itself: read_prompt resolves a name against it.
         let prompts_tool_path = Some(options.prompts.clone());
 
-        let mut patch_files = Vec::new();
-        if let Some(sha) = patch_shas.get(&p.index) {
-            let output = crate::git_cmd::in_dir_async(&worktree.path)
-                .args(["diff-tree", "--no-commit-id", "--name-only", "-r", sha])
-                .output()
-                .await;
-            if let Ok(out) = output
-                && out.status.success()
-            {
-                let file_list = String::from_utf8_lossy(&out.stdout);
-                for file in file_list.lines() {
-                    let trimmed = file.trim().to_string();
-                    if !trimmed.is_empty() {
-                        patch_files.push(trimmed);
-                    }
-                }
-            }
-        }
-        info!(
-            "Active patch files gathered for patch {}: {:?}",
-            p.index, patch_files
-        );
-
         let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path)
-            .with_references(references.iter().cloned());
-        tools.set_active_patch_files(patch_files);
+            .with_references(attach.attached.iter().cloned())
+            .with_dormant_references(attach.dormant.iter().cloned());
+        tools.set_active_patch_files(patch_files.clone());
 
         if let Some(sha) = patch_shas.get(&p.index) {
             info!("Setting virtual HEAD to {} for patch {}", sha, p.index);
@@ -2337,5 +2548,133 @@ mod tests {
         assert_eq!(formatted_err["status"], "error");
         assert_eq!(formatted_err["partial"], true);
         assert_eq!(formatted_err["error"], "patch 1: timed out");
+    }
+
+    fn rev_parse_head(repo: &Path) -> String {
+        let out = crate::git_cmd::in_dir(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// A rename lists both its paths, so a reference scoped to the tree the
+    /// file left still attaches, even with rename detection configured on.
+    #[tokio::test]
+    async fn touched_files_include_both_sides_of_a_rename() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path();
+        git(repo, &["init"])?;
+        git(repo, &["config", "user.email", "t@e"])?;
+        git(repo, &["config", "user.name", "T"])?;
+        git(repo, &["config", "diff.renames", "true"])?;
+        std::fs::create_dir_all(repo.join("rdma/drv"))?;
+        std::fs::write(repo.join("rdma/drv/a.c"), "int a;\n")?;
+        git(repo, &["add", "."])?;
+        git(repo, &["commit", "-m", "add"])?;
+        std::fs::create_dir_all(repo.join("eth"))?;
+        git(repo, &["mv", "rdma/drv/a.c", "eth/a.c"])?;
+        git(repo, &["commit", "-m", "move"])?;
+        let sha = rev_parse_head(repo);
+
+        let (active, touched) = touched_files(repo, Some(&sha), "").await;
+        let mut sorted = touched.clone();
+        sorted.sort();
+        assert_eq!(sorted, ["eth/a.c", "rdma/drv/a.c"]);
+        assert_eq!(active, touched, "the active files are the diff-tree list");
+        Ok(())
+    }
+
+    /// Without a commit the patch text names the files, renames and new files
+    /// included, and /dev/null is not a file.
+    #[tokio::test]
+    async fn touched_files_fall_back_to_the_patch_diff() {
+        let diff = "\
+diff --git a/rdma/drv/a.c b/eth/a.c
+similarity index 100%
+rename from rdma/drv/a.c
+rename to eth/a.c
+diff --git a/include/uapi/rdma/x-abi.h b/include/uapi/rdma/x-abi.h
+new file mode 100644
+--- /dev/null
++++ b/include/uapi/rdma/x-abi.h
+@@ -0,0 +1,2 @@
++-- not a header
++struct x;
+diff --git a/eth/b.c b/eth/b.c
+--- a/eth/b.c
++++ b/eth/b.c
+@@ -1,2 +1,2 @@
+--- removed text, not a header
+ context
+";
+        let temp = tempfile::tempdir().unwrap();
+        let (active, touched) = touched_files(temp.path(), None, diff).await;
+        assert!(active.is_empty());
+        assert_eq!(
+            touched,
+            [
+                "rdma/drv/a.c",
+                "eth/a.c",
+                "include/uapi/rdma/x-abi.h",
+                "eth/b.c"
+            ]
+        );
+    }
+
+    /// Changes with no `---`/`+++` pair still name their files through the
+    /// `diff --git` line, and quoted paths lose their quotes and prefixes.
+    #[test]
+    fn diff_paths_read_changes_without_file_headers() {
+        let diff = "\
+diff --git a/rdma/drv/fw.bin b/rdma/drv/fw.bin
+index 1111111..2222222 100644
+Binary files a/rdma/drv/fw.bin and b/rdma/drv/fw.bin differ
+diff --git a/rdma/drv/tool.sh b/rdma/drv/tool.sh
+old mode 100644
+new mode 100755
+diff --git a/include/uapi/rdma/empty.h b/include/uapi/rdma/empty.h
+new file mode 100644
+index 0000000..e69de29
+diff --git \"a/rdma/drv/odd\\tname.c\" \"b/rdma/drv/odd\\tname.c\"
+--- \"a/rdma/drv/odd\\tname.c\"
++++ \"b/rdma/drv/odd\\tname.c\"
+@@ -1 +1 @@
+-x
++y
+diff --git a/a b/c.c b/a b/c.c
+--- a/a b/c.c\t
++++ b/a b/c.c\t
+@@ -1 +1 @@
+-x
++y
+diff --git \"a/rdma/drv/caf\\303\\251.c\" \"b/rdma/drv/caf\\303\\251.c\"
+deleted file mode 100644
+index e69de29..0000000
+";
+        assert_eq!(
+            diff_paths(diff),
+            [
+                "rdma/drv/fw.bin",
+                "rdma/drv/tool.sh",
+                "include/uapi/rdma/empty.h",
+                "rdma/drv/odd\tname.c",
+                "a b/c.c",
+                "rdma/drv/café.c",
+            ]
+        );
+    }
+
+    /// A rename whose names cannot be told apart on the `diff --git` line
+    /// takes its paths from the rename lines alone, rather than a guess.
+    #[test]
+    fn diff_paths_do_not_guess_an_ambiguous_diff_git_line() {
+        let diff = "\
+diff --git a/x b/y b/z b/w
+similarity index 100%
+rename from x b/y
+rename to z b/w
+";
+        assert_eq!(diff_paths(diff), ["x b/y", "z b/w"]);
     }
 }
