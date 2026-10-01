@@ -1040,8 +1040,10 @@ function referenceChecks(fns) {
         && line.includes(`(${RDMA_SHA.slice(0, 12)})`));
     expect('present: read count', line.includes('34 reads'));
     expect('present: one read is singular', line.includes('1 read') && !line.includes('1 reads'));
-    expect('present: dormant note', line.includes('Not attached: iproute2')
-        && line.includes('ip/**'));
+    // A reference the patch was outside of is kept in the record, not shown:
+    // named on every such patch it was noise.
+    expect('present: dormant references are not named', !line.includes('iproute2')
+        && !line.includes('Not attached') && !line.includes('ip/**'));
     expect('present: shown on the card', card({ id: 1, status: 'Reviewed',
         reference_repos: finishedRefs }).includes('kernel @ v6.18'));
     expect('present: shown while running', card({ id: 1, status: 'In Review',
@@ -1092,9 +1094,8 @@ function referenceChecks(fns) {
         commit: SHA, reads: 1 }] });
     expect('malformed: no reason does not claim every patch',
         noWhy.includes('kernel @ v6.18') && !noWhy.includes('every patch'));
-    const noGlobs = render({ attached: [], dormant: [{ name: 'rdma-core' }] });
-    expect('malformed: a dormant reference without applies_to',
-        noGlobs.includes('Not attached: rdma-core') && !noGlobs.includes('applies only to'));
+    expect('absent: only dormant references render nothing',
+        render({ attached: [], dormant: [{ name: 'rdma-core', applies_to: ['rdma/drv/**'] }] }) === '');
     return failed;
 }
 
