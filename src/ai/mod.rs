@@ -282,6 +282,54 @@ pub struct AiResponse {
     pub truncated: bool,
 }
 
+/// Counts the characters of every tool call's serialised arguments.
+///
+/// A truncated response is measured by what it wrote, and a half-written tool
+/// call is writing just as answer text is, so both counts are needed to tell a
+/// long answer from one that never started.
+///
+/// Arguments are measured as the JSON text the model wrote, braces and quotes
+/// included. A call with no arguments, whose input is `{}` or `null`, counts
+/// as 0 rather than as the 2 or 4 characters of its JSON. Such a call costs a
+/// handful of tokens, so a truncation that produced only that spent its budget
+/// on reasoning, and the remedy has to say so rather than ask for less.
+pub(crate) fn tool_argument_chars(tool_calls: &[ToolCall]) -> usize {
+    tool_calls
+        .iter()
+        .map(|call| written_argument_chars(&call.arguments))
+        .sum()
+}
+
+/// Counts the characters of one call's arguments, 0 when it has none.
+fn written_argument_chars(arguments: &serde_json::Value) -> usize {
+    match arguments {
+        serde_json::Value::Null => 0,
+        serde_json::Value::Object(fields) if fields.is_empty() => 0,
+        written => written.to_string().chars().count(),
+    }
+}
+
+/// Says what to change when a truncated response wrote nothing at all.
+///
+/// Reasoning and answer draw on the same `max_tokens`, so a response that
+/// stopped before writing anything spent the whole allowance reasoning. Asking
+/// for a shorter answer cannot help there, because there was no answer; only
+/// a larger allowance or a lower `effort` can. A response that had started
+/// writing needs no remedy here, because its length is the thing to act on.
+///
+/// The counts are of emitted text, not of thinking: models that omit their
+/// reasoning by default, Opus 5 among them, send empty thinking blocks while
+/// still billing for them, so counting them would make every truncation look
+/// like a long answer.
+pub(crate) fn truncation_remedy(answer_chars: usize, tool_arg_chars: usize) -> &'static str {
+    if answer_chars == 0 && tool_arg_chars == 0 {
+        " Nothing was written, so the budget went on reasoning: raise max_tokens \
+         or lower effort rather than asking for less."
+    } else {
+        ""
+    }
+}
+
 /// Classifies a remote AI error using the typed stdio protocol payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "class", rename_all = "snake_case")]
@@ -1141,6 +1189,62 @@ mod tests {
     use crate::worker::prompts::ReviewError;
     use anyhow::anyhow;
     use serde_json::json;
+
+    /// A truncation that wrote nothing is a different problem from one that
+    /// wrote too much, and the log line has to tell them apart. It is the only
+    /// place the distinction is visible, because the thinking tokens that used
+    /// up the budget are billed but never shown.
+    #[test]
+    fn a_truncation_that_wrote_nothing_points_at_the_budget_not_the_answer() {
+        assert!(
+            truncation_remedy(0, 0).contains("went on reasoning"),
+            "an empty response means the allowance was spent before the answer began"
+        );
+        // Either kind of output means the answer had started, so the length of
+        // what it was writing is the thing to act on.
+        assert_eq!(truncation_remedy(1200, 0), "");
+        assert_eq!(
+            truncation_remedy(0, 800),
+            "",
+            "a half-written tool call is still the answer having started"
+        );
+    }
+
+    fn read_files_call(id: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            function_name: "read_files".to_string(),
+            arguments,
+            thought_signature: None,
+        }
+    }
+
+    /// Tool arguments are measured as the JSON the model wrote, summed over
+    /// every call, so one long call and several short ones are counted alike.
+    #[test]
+    fn tool_argument_chars_sums_every_call() {
+        assert_eq!(tool_argument_chars(&[]), 0);
+        let calls = [
+            read_files_call("a", json!({"p": "é"})),
+            read_files_call("b", json!({"q": 1})),
+        ];
+        // {"p":"é"} is 9 characters (not 10 bytes), and {"q":1} is 7.
+        assert_eq!(tool_argument_chars(&calls), 16);
+    }
+
+    /// A call that received no arguments wrote none, so a truncation whose
+    /// only output is such a call still reads as having spent its budget on
+    /// reasoning, and gets that remedy.
+    #[test]
+    fn a_tool_call_without_arguments_counts_as_nothing_written() {
+        for empty in [json!({}), serde_json::Value::Null] {
+            let calls = [read_files_call("a", empty.clone())];
+            assert_eq!(tool_argument_chars(&calls), 0, "input {empty}");
+            assert!(
+                truncation_remedy(0, tool_argument_chars(&calls)).contains("went on reasoning")
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_a_run_that_caches_through_the_daemon_does_not_cache_again() {
