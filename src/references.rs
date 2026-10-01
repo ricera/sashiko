@@ -39,6 +39,7 @@ use crate::settings::{ReferenceKind, ReferenceSettings};
 use crate::toolbox::{DormantReference, REPO_ARG_REVIEW, ReferenceRepo};
 use anyhow::{Result, anyhow, bail};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use tracing::warn;
@@ -503,7 +504,25 @@ pub struct PatchReferences {
     /// only so that naming one gets a specific error.
     pub dormant: Vec<DormantReference>,
     /// Why each attached reference is attached, parallel to `attached`.
-    reasons: Vec<String>,
+    reasons: Vec<AttachReason>,
+}
+
+/// Why a reference is attached to a patch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachReason {
+    /// The reference has no `applies_to`, so it goes with every patch.
+    Always,
+    /// The first touched file that matched, and the first pattern it matched.
+    Match { file: String, glob: String },
+}
+
+impl std::fmt::Display for AttachReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttachReason::Always => f.write_str("every patch"),
+            AttachReason::Match { file, glob } => write!(f, "{file} matches {glob}"),
+        }
+    }
 }
 
 /// Decides which references a patch is reviewed with, from the files it
@@ -517,10 +536,13 @@ pub fn attach_for_patch(refs: &[ReferenceRepo], touched: &[String]) -> PatchRefe
     let mut out = PatchReferences::default();
     for r in refs {
         let reason = match &r.applies_to {
-            None => Some("every patch".to_string()),
+            None => Some(AttachReason::Always),
             Some(scope) => scope
                 .first_match(touched)
-                .map(|(file, pattern)| format!("{file} matches {pattern}")),
+                .map(|(file, pattern)| AttachReason::Match {
+                    file: file.to_string(),
+                    glob: pattern.to_string(),
+                }),
         };
         match reason {
             Some(reason) => {
@@ -580,6 +602,164 @@ impl PatchReferences {
             "Patch {patch_index} references: attached {attached}; dormant {dormant}"
         ))
     }
+
+    /// What the review row records about this patch's references, or `None`
+    /// with none configured, so an unconfigured deployment stores NULL.
+    ///
+    /// `reads[i]` is the number of tool calls that named `attached[i]`. It is
+    /// `None` for the record sent before the review runs, and stays missing if
+    /// the review never finishes, which a reader must not mistake for zero.
+    pub fn record(&self, reads: Option<&[u64]>) -> Option<ReviewReferences> {
+        if self.attached.is_empty() && self.dormant.is_empty() {
+            return None;
+        }
+        let attached = self
+            .attached
+            .iter()
+            .zip(&self.reasons)
+            .enumerate()
+            .map(|(i, (r, why))| {
+                let (why, file, glob) = match why {
+                    AttachReason::Always => (AttachWhy::Always, None, None),
+                    AttachReason::Match { file, glob } => (
+                        AttachWhy::Match,
+                        Some(truncate_path(file)),
+                        Some(glob.clone()),
+                    ),
+                };
+                AttachedReference {
+                    name: r.name.clone(),
+                    kind: r.kind,
+                    revision: r.revision.clone(),
+                    commit: r.commit.clone(),
+                    why,
+                    file,
+                    glob,
+                    reads: reads.and_then(|n| n.get(i).copied()),
+                }
+            })
+            .collect();
+        let dormant = self
+            .dormant
+            .iter()
+            .map(|d| DormantRecord {
+                name: d.name.clone(),
+                applies_to: d.applies_to.clone(),
+            })
+            .collect();
+        Some(ReviewReferences { attached, dormant })
+    }
+}
+
+/// Longest matched file kept in a record, in bytes.
+const MAX_RECORDED_PATH: usize = 256;
+
+/// Cuts a matched file name to [`MAX_RECORDED_PATH`] bytes on a character
+/// boundary, marking the cut with "...".
+///
+/// The name comes from the patch, which anyone can send, so its length is not
+/// ours to choose; the record is meant to stay a line on a review card.
+fn truncate_path(file: &str) -> String {
+    if file.len() <= MAX_RECORDED_PATH {
+        return file.to_string();
+    }
+    let mut end = MAX_RECORDED_PATH;
+    while !file.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &file[..end])
+}
+
+/// Which references one review had attached and which it did not, as stored
+/// in `reviews.reference_repos` and returned by the API.
+///
+/// Kept on the review row because the per-patch log line is the only other
+/// record, and the deployment's logs last about an hour. Unknown fields are
+/// refused so that a malformed hand-off from a worker is dropped, not stored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewReferences {
+    pub attached: Vec<AttachedReference>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dormant: Vec<DormantRecord>,
+}
+
+/// One reference attached to the review.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttachedReference {
+    pub name: String,
+    pub kind: ReferenceKind,
+    /// The revision as configured, e.g. a release branch.
+    pub revision: String,
+    /// The commit `revision` resolved to for this review.
+    pub commit: String,
+    pub why: AttachWhy,
+    /// For [`AttachWhy::Match`], the first touched file that matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// For [`AttachWhy::Match`], the pattern `file` matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glob: Option<String>,
+    /// Tool calls that named this reference, cache hits and refused calls
+    /// included. Missing until the worker finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reads: Option<u64>,
+}
+
+/// The kind of [`AttachReason`], flattened beside `file` and `glob` in the
+/// record. Not a tagged enum because serde cannot combine `flatten` with
+/// `deny_unknown_fields`, and refusing unknown fields matters more here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachWhy {
+    Always,
+    Match,
+}
+
+/// A configured reference the review did not have, and what it applies to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DormantRecord {
+    pub name: String,
+    pub applies_to: Vec<String>,
+}
+
+/// The `type` of the stdout line a daemon-spawned worker sends with
+/// [`ReviewReferences`] as soon as the patch's references are decided.
+pub const REFERENCE_REPOS_MESSAGE: &str = "reference_repos";
+
+/// The worker's side of the early hand-off: one JSON line for the daemon.
+///
+/// Both sides of the wire live here so one test covers the contract.
+pub fn handoff_line(patch_index: i64, rec: &ReviewReferences) -> Result<String> {
+    Ok(serde_json::to_string(&serde_json::json!({
+        "type": REFERENCE_REPOS_MESSAGE,
+        "patch_index": patch_index,
+        "payload": rec,
+    }))?)
+}
+
+/// The daemon's side of the early hand-off: the patch index and the record,
+/// or `None` for anything that is not a well-formed hand-off.
+///
+/// More entries than a worker can be configured with means the line did not
+/// come from a worker this daemon would run, so it is refused rather than
+/// stored.
+pub fn parse_handoff(msg: &serde_json::Value) -> Option<(i64, ReviewReferences)> {
+    if msg.get("type")?.as_str()? != REFERENCE_REPOS_MESSAGE {
+        return None;
+    }
+    let patch_index = msg.get("patch_index")?.as_i64()?;
+    let rec = parse_record(msg.get("payload")?)?;
+    Some((patch_index, rec))
+}
+
+/// A stored or reported record, if it is well formed and no larger than any
+/// configuration could produce.
+pub fn parse_record(value: &serde_json::Value) -> Option<ReviewReferences> {
+    let rec: ReviewReferences = serde_json::from_value(value.clone()).ok()?;
+    (rec.attached.len() + rec.dormant.len() <= MAX_REFERENCES).then_some(rec)
 }
 
 #[cfg(test)]
@@ -1032,6 +1212,7 @@ mod tests {
     fn an_ethernet_patch_attaches_only_the_kernel() {
         let p = attach_for_patch(&driver_a(), &touched(&["eth/ionic/ionic_lif.c"]));
         assert_eq!(attached_names(&p), ["kernel"]);
+        assert_eq!(p.reasons, [AttachReason::Always]);
         assert_eq!(p.dormant.len(), 1);
         assert_eq!(p.dormant[0].name, "rdma-core");
         assert_eq!(
@@ -1059,6 +1240,16 @@ mod tests {
         let p = attach_for_patch(&driver_a(), &touched(&["rdma/drv/ionic/ionic_fw.h"]));
         assert_eq!(attached_names(&p), ["kernel", "rdma-core"]);
         assert!(p.dormant.is_empty());
+        assert_eq!(
+            p.reasons,
+            [
+                AttachReason::Always,
+                AttachReason::Match {
+                    file: "rdma/drv/ionic/ionic_fw.h".to_string(),
+                    glob: "rdma/drv/**".to_string(),
+                }
+            ]
+        );
         let line = p.summary(1).unwrap();
         assert!(
             line.contains("rdma-core (rdma/drv/ionic/ionic_fw.h matches rdma/drv/**)"),
@@ -1087,6 +1278,113 @@ mod tests {
             &touched(&["eth/ionic/x.c", "rdma/drv/ionic/x.c"]),
         );
         assert_eq!(attached_names(&p), ["kernel", "rdma-core"]);
+        assert_eq!(
+            p.reasons[1],
+            AttachReason::Match {
+                file: "rdma/drv/ionic/x.c".to_string(),
+                glob: "rdma/drv/**".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn record_says_why_each_reference_was_attached() {
+        let p = attach_for_patch(&driver_a(), &touched(&["rdma/drv/ionic/ionic_fw.h"]));
+        let rec = p.record(Some(&[3, 1])).unwrap();
+        let zeros = "0".repeat(40);
+        assert_eq!(
+            serde_json::to_string(&rec).unwrap(),
+            format!(
+                "{{\"attached\":[\
+                 {{\"name\":\"kernel\",\"kind\":\"kernel\",\"revision\":\"HEAD\",\
+                 \"commit\":\"{zeros}\",\"why\":\"always\",\"reads\":3}},\
+                 {{\"name\":\"rdma-core\",\"kind\":\"source\",\"revision\":\"HEAD\",\
+                 \"commit\":\"{zeros}\",\"why\":\"match\",\
+                 \"file\":\"rdma/drv/ionic/ionic_fw.h\",\"glob\":\"rdma/drv/**\",\"reads\":1}}]}}"
+            )
+        );
+    }
+
+    #[test]
+    fn record_lists_dormant_references() {
+        let p = attach_for_patch(&driver_a(), &touched(&["eth/ionic/ionic_lif.c"]));
+        let rec = p.record(None).unwrap();
+        assert_eq!(
+            rec.dormant,
+            [DormantRecord {
+                name: "rdma-core".to_string(),
+                applies_to: vec![
+                    "rdma/drv/**".to_string(),
+                    "eth/ionic/ionic_aux*".to_string(),
+                    "include/uapi/rdma/**".to_string(),
+                ],
+            }]
+        );
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            !json.contains("reads"),
+            "an unfinished review has no count: {json}"
+        );
+        assert!(
+            attach_for_patch(&[], &touched(&["a.c"]))
+                .record(None)
+                .is_none()
+        );
+        assert!(
+            attach_for_patch(&[], &touched(&["a.c"]))
+                .record(Some(&[]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn record_truncates_a_long_matched_file() {
+        // Multi-byte characters put a char boundary off the 256-byte mark.
+        let long = format!("rdma/drv/{}", "\u{e9}".repeat(500));
+        let p = attach_for_patch(&driver_a(), std::slice::from_ref(&long));
+        let rec = p.record(None).unwrap();
+        let file = rec.attached[1].file.as_deref().unwrap();
+        assert!(file.ends_with("..."), "{file}");
+        let kept = file.strip_suffix("...").unwrap();
+        assert!(kept.len() <= MAX_RECORDED_PATH, "{}", kept.len());
+        assert!(long.starts_with(kept));
+        assert_eq!(truncate_path("a/b.c"), "a/b.c");
+    }
+
+    #[test]
+    fn handoff_round_trips() {
+        let p = attach_for_patch(&driver_a(), &touched(&["eth/ionic/ionic_lif.c"]));
+        let rec = p.record(None).unwrap();
+        let line = handoff_line(2, &rec).unwrap();
+        assert!(!line.contains('\n'), "one line on the wire");
+        let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(parse_handoff(&msg), Some((2, rec.clone())));
+
+        let mut wrong_type = msg.clone();
+        wrong_type["type"] = "ai_request".into();
+        assert_eq!(parse_handoff(&wrong_type), None);
+
+        let mut unknown = msg.clone();
+        unknown["payload"]["attached"][0]["extra"] = 1.into();
+        assert_eq!(parse_handoff(&unknown), None);
+
+        let mut no_commit = msg.clone();
+        no_commit["payload"]["attached"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("commit");
+        assert_eq!(parse_handoff(&no_commit), None);
+
+        let mut too_many = rec.clone();
+        too_many.dormant = (0..MAX_REFERENCES)
+            .map(|i| DormantRecord {
+                name: format!("r{i}"),
+                applies_to: vec!["x/**".to_string()],
+            })
+            .collect();
+        let msg: serde_json::Value =
+            serde_json::from_str(&handoff_line(2, &too_many).unwrap()).unwrap();
+        assert_eq!(parse_handoff(&msg), None);
     }
 
     async fn git(dir: &std::path::Path, args: &[&str]) {

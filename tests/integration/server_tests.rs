@@ -481,3 +481,68 @@ async fn test_redirect_www_to_non_www() {
         );
     }
 }
+
+/// Each review on the patchset pages and the single-review endpoint carries
+/// the reference repositories it was recorded with, or null for a review that
+/// has none.
+#[tokio::test]
+#[ignore]
+async fn test_review_endpoints_include_reference_repos() {
+    let server = spawn_test_server(false).await;
+    let record = serde_json::json!({
+        "attached": [{
+            "name": "kernel",
+            "kind": "kernel",
+            "revision": "v6.18",
+            "commit": "1a2b3c4d5e6f1a2b3c4d5e6f1a2b3c4d5e6f1a2b",
+            "why": "always",
+            "reads": 34,
+        }],
+        "dormant": [{"name": "rdma-core", "applies_to": ["rdma/drv/**"]}],
+    });
+
+    for sql in [
+        "INSERT INTO patchsets (id, status, subject, author, date) \
+         VALUES (1, 'Reviewed', '[PATCH] test patch', 'Author <a@b.com>', 1234567890)"
+            .to_string(),
+        "INSERT INTO messages (message_id, subject, author, date) \
+         VALUES ('<refs-1@example.com>', '[PATCH] test patch', 'Author <a@b.com>', 1234567890)"
+            .to_string(),
+        "INSERT INTO patches (id, patchset_id, message_id, part_index) \
+         VALUES (1, 1, '<refs-1@example.com>', 1)"
+            .to_string(),
+        format!(
+            "INSERT INTO reviews (id, patchset_id, patch_id, status, created_at, reference_repos) \
+             VALUES (1, 1, 1, 'Reviewed', 1234567890, '{record}')"
+        ),
+        "INSERT INTO reviews (id, patchset_id, patch_id, status, created_at) \
+         VALUES (2, 1, 1, 'Reviewed', 1234567891)"
+            .to_string(),
+    ] {
+        server.db.conn.execute(&sql, ()).await.unwrap();
+    }
+
+    for endpoint in ["patch", "patchset"] {
+        let resp = reqwest::get(format!("{}/api/{endpoint}?id=1", server.base_url))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{endpoint}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        let reviews = body["reviews"].as_array().unwrap();
+        let by_id = |id: i64| {
+            reviews
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap_or_else(|| panic!("{endpoint}: review {id} missing"))
+        };
+        assert_eq!(by_id(1)["reference_repos"], record, "{endpoint}");
+        assert!(by_id(2)["reference_repos"].is_null(), "{endpoint}");
+    }
+
+    let resp = reqwest::get(format!("{}/api/review?id=1", server.base_url))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["reference_repos"], record);
+}

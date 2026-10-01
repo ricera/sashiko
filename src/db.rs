@@ -1101,15 +1101,17 @@ fn default_now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// Canonical projection for reads of a core bug row.
+/// Parses a review's stored `reference_repos` for the API.
 ///
-/// Every query whose rows are handed to `Database::parse_bug_row_core` must
-/// select exactly these columns, in this order. Keeping the list in one place
-/// is what stops a new query from silently shifting the column indices.
-///
-/// The deduplication embedding is intentionally absent: it lives in
-/// bug_vectors and is only fetched by the dedup path, so ordinary reads
-/// never carry the blob.
+/// Untyped on purpose, so a row written by another build still displays. NULL
+/// or text that is not JSON gives `null` rather than an error, so one bad row
+/// cannot fail a whole patchset page.
+#[cfg(feature = "server")]
+fn reference_repos_json(raw: Option<String>) -> serde_json::Value {
+    raw.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
 /// Renders the summary of a bug as it appears embedded in a patchset or review
 /// payload.
 ///
@@ -1139,6 +1141,15 @@ fn bug_reference_json(bug: &Bug, is_newly_discovered: bool) -> serde_json::Value
     })
 }
 
+/// Canonical projection for reads of a core bug row.
+///
+/// Every query whose rows are handed to `Database::parse_bug_row_core` must
+/// select exactly these columns, in this order. Keeping the list in one place
+/// is what stops a new query from silently shifting the column indices.
+///
+/// The deduplication embedding is intentionally absent: it lives in
+/// bug_vectors and is only fetched by the dedup path, so ordinary reads
+/// never carry the blob.
 #[cfg(feature = "server")]
 const BUG_ROW_COLUMNS: &str = "id, bugid, title, lifecycle_status, pipeline_state,
      reporter, reported_at, assignee, assigned_at,
@@ -2057,7 +2068,30 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 13.");
+        // Guarded like 012: a database whose version was set back -- as the
+        // replay tests for older migrations do -- already has the column, and
+        // ALTER TABLE has no IF NOT EXISTS.
+        if current_version < 14 {
+            info!("Applying database migration version 14 (review reference repositories)...");
+            let tx = self.begin_transaction().await?;
+            let has_column = {
+                let mut columns = tx.query("PRAGMA table_info(reviews)", ()).await?;
+                let mut found = false;
+                while let Some(row) = columns.next().await? {
+                    let name: String = row.get(1)?;
+                    found |= name == "reference_repos";
+                }
+                found
+            };
+            if !has_column {
+                tx.execute_batch(include_str!("migrations/014_review_reference_repos.sql"))
+                    .await?;
+            }
+            tx.execute("PRAGMA user_version = 14", ()).await?;
+            tx.commit().await?;
+        }
+
+        info!("Database schema is up to date at version 14.");
 
         Ok(())
     }
@@ -7922,7 +7956,8 @@ impl Database {
         let query_str = format!(
             "SELECT r.summary, r.created_at, ai.output_raw,
                     r.result_description, r.status, r.inline_review, {},
-                    ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached
+                    ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached,
+                    r.reference_repos
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -7949,6 +7984,7 @@ impl Database {
                 "patch_id": r.get::<Option<i64>>(9)?,
                 "id": r.get::<i64>(10)?,
                 "tokens_cached": r.get::<Option<u32>>(11)?,
+                "reference_repos": reference_repos_json(r.get::<Option<String>>(12)?),
                 "model": model_name,
                 "provider": provider,
                 "prompts_hash": prompts_git_hash,
@@ -8434,7 +8470,8 @@ impl Database {
                             (SELECT m.subject FROM patches p JOIN messages m ON p.message_id = m.message_id WHERE p.id = r.patch_id LIMIT 1),
                             (SELECT ps.subject FROM patchsets ps WHERE ps.id = r.patchset_id)
                         ),
-                        (SELECT ps.embargo_until FROM patchsets ps WHERE ps.id = r.patchset_id)
+                        (SELECT ps.embargo_until FROM patchsets ps WHERE ps.id = r.patchset_id),
+                        r.reference_repos
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              LEFT JOIN baselines b ON r.baseline_id = b.id
@@ -8475,11 +8512,25 @@ impl Database {
                 "patchset_id": r.get::<Option<i64>>(19).ok(),
                 "subject": r.get::<Option<String>>(20).ok(),
                 "embargo_until": r.get::<Option<i64>>(21).ok(),
+                "reference_repos": reference_repos_json(r.get::<Option<String>>(22).ok().flatten()),
                 "bugs": bugs_json,
             })))
         } else {
             Ok(None)
         }
+    }
+
+    /// Stores which reference repositories a review had, as the JSON of a
+    /// [`crate::references::ReviewReferences`]. Called once early, when the
+    /// worker reports the patch's references, and again with read counts when
+    /// it finishes.
+    pub async fn set_review_reference_repos(&self, review_id: i64, json: &str) -> Result<()> {
+        self.execute(
+            "UPDATE reviews SET reference_repos = ? WHERE id = ?",
+            libsql::params![json, review_id],
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn get_latest_review_for_patchset(
@@ -17621,6 +17672,169 @@ mod tests {
         // canonical bug already carries.
         let claimed = db.claim_pending_bug("worker:1", 300, 3).await.unwrap();
         assert_eq!(claimed.map(|b| b.id), Some(canonical));
+    }
+
+    async fn memory_db() -> Database {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&db_settings).await.unwrap();
+        db.migrate().await.unwrap();
+        db
+    }
+
+    async fn user_version(db: &Database) -> i64 {
+        let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    async fn reviews_have_reference_repos(db: &Database) -> bool {
+        let mut rows = db
+            .conn
+            .query("PRAGMA table_info(reviews)", ())
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            if row.get::<String>(1).unwrap() == "reference_repos" {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// A patchset with one patch, and two reviews of it.
+    async fn patchset_with_two_reviews(db: &Database) -> (i64, i64, i64) {
+        let thread_id = db.create_thread("refs_ps", "Refs", 1000).await.unwrap();
+        db.create_message(
+            "refs_p1", thread_id, None, "Author", "Refs", 1000, "Body", "", "", None, None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "refs_ps", "Refs", "Author", 1000, 1, 1, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let p_id = db
+            .create_patch(ps_id, "refs_p1", 1, "diff --git a/a b/a\n")
+            .await
+            .unwrap();
+        let first = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+        let second = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await
+            .unwrap();
+        (ps_id, first, second)
+    }
+
+    #[tokio::test]
+    async fn test_migration_adds_review_reference_repos() {
+        let db = memory_db().await;
+        assert_eq!(user_version(&db).await, 14);
+        assert!(reviews_have_reference_repos(&db).await);
+
+        // An existing database at version 13: a review row, no column.
+        let (_ps_id, review_id, _) = patchset_with_two_reviews(&db).await;
+        db.conn
+            .execute("ALTER TABLE reviews DROP COLUMN reference_repos", ())
+            .await
+            .unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 13", ())
+            .await
+            .unwrap();
+        assert!(!reviews_have_reference_repos(&db).await);
+
+        db.migrate().await.unwrap();
+        assert_eq!(user_version(&db).await, 14);
+        assert!(reviews_have_reference_repos(&db).await);
+        let review = db.get_review_details(review_id).await.unwrap().unwrap();
+        assert!(review["reference_repos"].is_null(), "{review}");
+
+        // Up to date: running again changes nothing and does not fail.
+        db.migrate().await.unwrap();
+        assert_eq!(user_version(&db).await, 14);
+
+        // Set back with the column still there, the migration does not try to
+        // add it twice, and what was stored survives.
+        db.set_review_reference_repos(review_id, "{\"attached\":[]}")
+            .await
+            .unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 13", ())
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        assert_eq!(user_version(&db).await, 14);
+        let review = db.get_review_details(review_id).await.unwrap().unwrap();
+        assert_eq!(
+            review["reference_repos"],
+            serde_json::json!({"attached": []})
+        );
+    }
+
+    #[tokio::test]
+    async fn test_review_reference_repos_round_trip() {
+        let db = memory_db().await;
+        let (ps_id, with, without) = patchset_with_two_reviews(&db).await;
+        let record = serde_json::json!({
+            "attached": [{
+                "name": "kernel",
+                "kind": "kernel",
+                "revision": "v6.18",
+                "commit": "0".repeat(40),
+                "why": "always",
+                "reads": 7,
+            }],
+            "dormant": [{"name": "rdma-core", "applies_to": ["rdma/drv/**"]}],
+        });
+        db.set_review_reference_repos(with, &record.to_string())
+            .await
+            .unwrap();
+
+        let review = db.get_review_details(with).await.unwrap().unwrap();
+        assert_eq!(review["reference_repos"], record);
+        let review = db.get_review_details(without).await.unwrap().unwrap();
+        assert!(review["reference_repos"].is_null(), "{review}");
+
+        let by_id = |reviews: &serde_json::Value, id: i64| {
+            reviews
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["id"] == id)
+                .unwrap()["reference_repos"]
+                .clone()
+        };
+        let details = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_id(&details["reviews"], with), record);
+        assert!(by_id(&details["reviews"], without).is_null());
+        let summary = db
+            .get_patchset_summary(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_id(&summary["reviews"], with), record);
+        assert!(by_id(&summary["reviews"], without).is_null());
+
+        // Text that is not JSON shows as null instead of failing the page.
+        db.set_review_reference_repos(with, "{not json")
+            .await
+            .unwrap();
+        let review = db.get_review_details(with).await.unwrap().unwrap();
+        assert!(review["reference_repos"].is_null(), "{review}");
+        assert!(db.get_patchset_details(ps_id, None, None).await.is_ok());
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use config::{Config, ConfigError, Environment, File};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub use crate::ai::{EffortMode, model_supports_effort};
@@ -938,7 +938,7 @@ pub struct GitSettings {
 }
 
 /// What a reference repository is, which decides how the prompt frames it.
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ReferenceKind {
     /// The Linux kernel tree the code under review builds against. Attaching

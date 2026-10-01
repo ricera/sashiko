@@ -14,6 +14,7 @@
 
 use crate::{
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
+    references::ReviewReferences,
     settings::{AiSettings, Settings},
     toolbox::ToolBox,
     worker::{
@@ -31,7 +32,7 @@ use std::{
     sync::Arc,
 };
 use tokio::sync::Semaphore;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// What a worker is asked to do: only what the settings have no notion of, such
 /// as which patch, which baseline, and where the prompts are.
@@ -452,7 +453,7 @@ fn decorate_provider(
         inner
     };
 
-    if ai.provider.starts_with("stdio-") {
+    if reaches_model_through_daemon(ai) {
         return provider;
     }
 
@@ -474,11 +475,20 @@ fn decorate_provider(
     ))
 }
 
+/// Whether this worker was spawned by the daemon and reaches the model through
+/// it, over a `stdio-*` provider.
+///
+/// One predicate for the limiters, the retry count and the reference hand-off, so
+/// the three cannot disagree about who is on the other end of stdout.
+fn reaches_model_through_daemon(ai: &AiSettings) -> bool {
+    ai.provider.starts_with("stdio-")
+}
+
 /// Daemon-spawned workers (`stdio-*`) already have their retry lifecycle managed
 /// by the parent `Reviewer` via `review.max_retries`, so retrying the full
 /// workflow inside the child process as well would multiply attempts.
 fn worker_max_attempts(ai: &AiSettings) -> usize {
-    if ai.provider.starts_with("stdio-") {
+    if reaches_model_through_daemon(ai) {
         1
     } else {
         3
@@ -742,11 +752,10 @@ async fn review_single_patch(
     timeout_seconds: u64,
     references: &[crate::toolbox::ReferenceRepo],
     progress: Option<&ProgressCallback<'_>>,
-) -> Result<Value> {
+) -> (Result<Value>, Option<ReviewReferences>) {
     // The AI section and the stage list as this process resolved them, command
     // line included.
     let ai = &settings.ai;
-    let stages = settings.review.stages.clone();
     let retry_budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>> =
         (timeout_seconds > 0).then(|| {
             let deadline = Arc::new(std::sync::Mutex::new(
@@ -775,8 +784,160 @@ async fn review_single_patch(
         info!("{line}");
     }
 
+    // Tell the daemon now which references this patch has, rather than only
+    // in the final output: the deployment's logs last about an hour, and a
+    // review that times out or is cancelled is killed before it writes a final
+    // output, as is a worker that crashes, yet each still has to record which
+    // trees it was given. Only
+    // the daemon reads these lines -- `sashiko-cli local` parses the worker's
+    // whole stdout as one JSON document -- and they go through the shared IPC
+    // writer so they cannot interleave with a concurrent model request.
+    if let Some(line) = early_reference_handoff(ai, p.index, &attach) {
+        let sent = match line {
+            Ok(line) => crate::ai::ipc_writer().write_line(&line).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = sent {
+            warn!(
+                "Could not report patch {}'s references to the daemon: {e}",
+                p.index
+            );
+        }
+    }
+
+    // Summed over every attempt, in configured order of the attached
+    // references, so the count describes everything the review read.
+    let mut reads = vec![0u64; attach.attached.len()];
+    let result = review_patch_attempts(
+        &attach,
+        &mut reads,
+        AttemptInputs {
+            worktree,
+            settings,
+            patchset_id,
+            subject,
+            p,
+            all_patches,
+            rich_patches,
+            patch_shas,
+            options,
+            baseline_sha,
+            llm_semaphore,
+            quota,
+            retry_budget: &retry_budget,
+            max_attempts,
+            patch_files: &patch_files,
+            progress,
+        },
+    )
+    .await;
+    // Reported for a failed review too: which trees it had is as much a part
+    // of its record as of a successful one.
+    (result, attach.record(Some(&reads)))
+}
+
+/// The line that tells the daemon which references a patch's review has, or
+/// `None` when nothing should be sent.
+///
+/// Apart from [`review_single_patch`] so the decision can be tested without a
+/// model: only a daemon-spawned worker has a reader on the other end of stdout,
+/// and a deployment with no references has nothing to record.
+fn early_reference_handoff(
+    ai: &AiSettings,
+    patch_index: i64,
+    attach: &crate::references::PatchReferences,
+) -> Option<Result<String>> {
+    if !reaches_model_through_daemon(ai) {
+        return None;
+    }
+    let rec = attach.record(None)?;
+    Some(crate::references::handoff_line(patch_index, &rec))
+}
+
+/// Runs `attempt` until one succeeds or `max_attempts` have failed, adding
+/// each attempt's reference reads into `reads` whatever its outcome.
+///
+/// Each attempt returns its outcome and its reads; an outer `Err` is fatal and
+/// ends the loop at once without a further attempt, and is returned as the
+/// outer `Err` here too, so the caller can tell it from a review whose every
+/// attempt failed. Apart from the review itself so the accounting can be
+/// tested without a model: an attempt that failed or was retried still read
+/// the trees, and counting only the successful one would understate what the
+/// review saw.
+async fn attempts_counting_reads<F, Fut>(
+    max_attempts: usize,
+    reads: &mut [u64],
+    mut attempt: F,
+) -> Result<Result<Value>>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Result<(Result<Value>, Vec<u64>)>>,
+{
     let mut last_error = None;
-    for attempt in 1..=max_attempts {
+    for n in 1..=max_attempts {
+        let (outcome, attempt_reads) = attempt(n).await?;
+        for (total, read) in reads.iter_mut().zip(attempt_reads) {
+            *total += read;
+        }
+        match outcome {
+            Ok(value) => return Ok(Ok(value)),
+            Err(e) => last_error = Some(e),
+        }
+    }
+    Ok(Err(
+        last_error.unwrap_or_else(|| anyhow!("Patch review failed"))
+    ))
+}
+
+/// What [`review_patch_attempts`] needs from [`review_single_patch`].
+struct AttemptInputs<'a, 'p> {
+    worktree: &'a GitWorktree,
+    settings: &'a Settings,
+    patchset_id: i64,
+    subject: &'a str,
+    p: &'a PatchInput,
+    all_patches: &'a [PatchInput],
+    rich_patches: &'a [Value],
+    patch_shas: &'a HashMap<i64, String>,
+    options: &'a WorkerOptions,
+    baseline_sha: &'a str,
+    llm_semaphore: &'a Arc<Semaphore>,
+    quota: &'a Arc<crate::ai::quota::QuotaManager>,
+    retry_budget: &'a Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>>,
+    max_attempts: usize,
+    patch_files: &'a [String],
+    progress: Option<&'a ProgressCallback<'p>>,
+}
+
+/// Runs the review attempts for one patch, adding each attempt's reference
+/// reads into `reads` whatever its outcome.
+async fn review_patch_attempts(
+    attach: &crate::references::PatchReferences,
+    reads: &mut [u64],
+    inputs: AttemptInputs<'_, '_>,
+) -> Result<Value> {
+    let AttemptInputs {
+        worktree,
+        settings,
+        patchset_id,
+        subject,
+        p,
+        all_patches,
+        rich_patches,
+        patch_shas,
+        options,
+        baseline_sha,
+        llm_semaphore,
+        quota,
+        retry_budget,
+        max_attempts,
+        patch_files,
+        progress,
+    } = inputs;
+    let ai = &settings.ai;
+    let stages = &settings.review.stages;
+
+    let result = attempts_counting_reads(max_attempts, reads, |attempt| async move {
         emit(
             progress,
             ProgressEvent::AiReviewAttempt {
@@ -797,14 +958,14 @@ async fn review_single_patch(
         let provider = crate::ai::create_provider_cached(ai, None)
             .await
             .context("Failed to create AI provider")?;
-        let provider = decorate_provider(provider, ai, llm_semaphore, quota, &retry_budget);
+        let provider = decorate_provider(provider, ai, llm_semaphore, quota, retry_budget);
         // The directory itself: read_prompt resolves a name against it.
         let prompts_tool_path = Some(options.prompts.clone());
 
         let mut tools = ToolBox::new(worktree.path.clone(), prompts_tool_path)
             .with_references(attach.attached.iter().cloned())
             .with_dormant_references(attach.dormant.iter().cloned());
-        tools.set_active_patch_files(patch_files.clone());
+        tools.set_active_patch_files(patch_files.to_vec());
 
         if let Some(sha) = patch_shas.get(&p.index) {
             info!("Setting virtual HEAD to {} for patch {}", sha, p.index);
@@ -819,9 +980,10 @@ async fn review_single_patch(
             baseline_sha,
         );
 
+        let tools = Arc::new(tools);
         let mut worker = Worker::new(
             provider,
-            std::sync::Arc::new(tools),
+            tools.clone(),
             prompts,
             WorkerConfig {
                 project: options.project,
@@ -892,15 +1054,18 @@ async fn review_single_patch(
             "baseline": baseline_sha
         });
 
-        match worker
+        let outcome = worker
             .run(
                 patchset_val,
                 progress_cb
                     .as_ref()
                     .map(|f| f as &(dyn Fn(_) + Send + Sync)),
             )
-            .await
-        {
+            .await;
+        // Taken before the outcome is looked at, so an attempt that fails or
+        // is retried still counts what it read.
+        let attempt_reads = tools.reference_reads();
+        let outcome = match outcome {
             Ok(result) => {
                 let inline_content = if options.agent {
                     None
@@ -909,8 +1074,7 @@ async fn review_single_patch(
                         Ok(content) => content,
                         Err(e) => {
                             error!("{}", e);
-                            last_error = Some(e);
-                            continue;
+                            return Ok((Err(e), attempt_reads));
                         }
                     }
                 };
@@ -923,7 +1087,7 @@ async fn review_single_patch(
                     },
                 );
 
-                return Ok(json!({
+                Ok(json!({
                     "patch_index": p.index,
                     "review": result.output,
                     "error": result.error,
@@ -933,25 +1097,29 @@ async fn review_single_patch(
                     "tokens_in": result.tokens_in,
                     "tokens_out": result.tokens_out,
                     "tokens_cached": result.tokens_cached
-                }));
+                }))
             }
             Err(e) => {
                 error!(
                     "AI review for patch {} failed with exception: {}",
                     p.index, e
                 );
-                last_error = Some(e);
+                Err(e)
             }
-        }
-    }
+        };
+        Ok((outcome, attempt_reads))
+    })
+    .await?;
 
-    emit(
-        progress,
-        ProgressEvent::AiReviewFailed {
-            patch_index: p.index,
-        },
-    );
-    Err(last_error.unwrap_or_else(|| anyhow!("Patch review failed")))
+    if result.is_err() {
+        emit(
+            progress,
+            ProgressEvent::AiReviewFailed {
+                patch_index: p.index,
+            },
+        );
+    }
+    result
 }
 
 /// Lists the failed patches in series order.
@@ -974,6 +1142,18 @@ fn mark_patch_review_incomplete(patches: &mut [Value], patch_index: i64, error: 
     {
         fields.insert("review_status".into(), json!("incomplete"));
         fields.insert("review_error".into(), json!(error));
+    }
+}
+
+/// Records which references a patch's review had, with their read counts, on
+/// the patch's entry, where the daemon picks it up for the review row.
+fn record_patch_references(patches: &mut [Value], patch_index: i64, refs: &ReviewReferences) {
+    if let Some(patch) = patches
+        .iter_mut()
+        .find(|patch| patch["index"].as_i64() == Some(patch_index))
+        && let Some(fields) = patch.as_object_mut()
+    {
+        fields.insert("reference_repos".into(), json!(refs));
     }
 }
 
@@ -1294,7 +1474,8 @@ async fn run_worker_in_worktree(
                 progress,
             )
             .await;
-            (p.index, result)
+            let (result, refs) = result;
+            (p.index, result, refs)
         }
     }));
 
@@ -1304,7 +1485,10 @@ async fn run_worker_in_worktree(
     let mut results = Vec::new();
     let mut review_errors = Vec::new();
     let mut failed_outcomes = Vec::new();
-    while let Some((patch_index, result)) = buffered.next().await {
+    while let Some((patch_index, result, refs)) = buffered.next().await {
+        if let Some(refs) = refs {
+            record_patch_references(&mut patch_results, patch_index, &refs);
+        }
         match result {
             Ok(res) => results.push(res),
             Err(err) => {
@@ -2003,6 +2187,25 @@ mod tests {
     }
 
     #[test]
+    fn daemon_worker_gate() -> Result<()> {
+        let mut settings = Settings::new()?;
+        for (provider, through_daemon) in [
+            ("stdio-claude", true),
+            ("stdio-gemini", true),
+            ("claude", false),
+            ("gemini", false),
+        ] {
+            settings.ai.provider = provider.to_string();
+            assert_eq!(
+                reaches_model_through_daemon(&settings.ai),
+                through_daemon,
+                "{provider}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_worker_max_attempts_skips_inner_retries_for_stdio_workers() -> Result<()> {
         let mut settings = Settings::new()?;
 
@@ -2467,6 +2670,129 @@ mod tests {
         assert!(patches[0].get("review_status").is_none());
         assert_eq!(patches[1]["review_status"], "incomplete");
         assert_eq!(patches[1]["review_error"], "output truncated");
+    }
+
+    /// The kernel for every patch and rdma-core for none of this test's, so a
+    /// record has both an attached and a dormant entry.
+    fn kernel_and_dormant_rdma() -> crate::references::PatchReferences {
+        let reference = |name: &str, kind, applies_to| crate::toolbox::ReferenceRepo {
+            name: name.to_string(),
+            kind,
+            path: std::path::PathBuf::from(format!("/srv/{name}")),
+            revision: "v6.18".to_string(),
+            commit: "0".repeat(40),
+            description: None,
+            applies_to,
+        };
+        let refs = [
+            reference("kernel", crate::settings::ReferenceKind::Kernel, None),
+            reference(
+                "rdma-core",
+                crate::settings::ReferenceKind::Source,
+                Some(
+                    crate::references::AppliesTo::new("rdma-core", &["rdma/drv/**".to_string()])
+                        .unwrap(),
+                ),
+            ),
+        ];
+        crate::references::attach_for_patch(&refs, &["eth/ionic/ionic_lif.c".to_string()])
+    }
+
+    #[test]
+    fn early_handoff_is_sent_only_by_a_daemon_worker_with_references() -> Result<()> {
+        let mut settings = Settings::new()?;
+        let attach = kernel_and_dormant_rdma();
+
+        settings.ai.provider = "stdio-claude".to_string();
+        let line = early_reference_handoff(&settings.ai, 3, &attach)
+            .expect("a daemon worker reports its references")?;
+        let msg: Value = serde_json::from_str(&line)?;
+        let (index, rec) =
+            crate::references::parse_handoff(&msg).expect("the daemon accepts the hand-off");
+        assert_eq!(index, 3);
+        assert_eq!(rec.attached.len(), 1);
+        assert_eq!(rec.attached[0].name, "kernel");
+        assert_eq!(rec.attached[0].reads, None, "no reads yet at hand-off");
+        assert_eq!(rec.dormant.len(), 1);
+        assert_eq!(rec.dormant[0].name, "rdma-core");
+
+        // Nobody reads a CLI worker's stdout line by line, and its whole
+        // stdout must stay one JSON document.
+        settings.ai.provider = "claude-cli".to_string();
+        assert!(early_reference_handoff(&settings.ai, 3, &attach).is_none());
+
+        // Without references there is nothing to record.
+        settings.ai.provider = "stdio-claude".to_string();
+        let none = crate::references::PatchReferences::default();
+        assert!(early_reference_handoff(&settings.ai, 3, &none).is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reads_of_failed_attempts_are_counted() {
+        // Fails once, then succeeds: both attempts' reads are in the total.
+        let mut reads = vec![0u64; 2];
+        let result = attempts_counting_reads(3, &mut reads, |attempt| async move {
+            Ok(if attempt == 1 {
+                (Err(anyhow!("model gave up")), vec![2, 1])
+            } else {
+                (Ok(json!({"attempt": attempt})), vec![3, 0])
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap()["attempt"], 2);
+        assert_eq!(reads, [5, 1]);
+
+        // Every attempt fails: still counted, and the last error is returned.
+        let mut reads = vec![0u64; 1];
+        let result = attempts_counting_reads(2, &mut reads, |attempt| async move {
+            Ok((Err(anyhow!("attempt {attempt} failed")), vec![4]))
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().to_string(), "attempt 2 failed");
+        assert_eq!(reads, [8]);
+
+        // A fatal error stops at once, keeping what earlier attempts read.
+        let mut reads = vec![0u64; 1];
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let calls = &calls;
+        let result = attempts_counting_reads(3, &mut reads, |attempt| async move {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt == 2 {
+                return Err(anyhow!("no provider"));
+            }
+            Ok((Err(anyhow!("retry")), vec![1]))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(reads, [1]);
+    }
+
+    #[test]
+    fn patch_results_carry_reference_repos() {
+        let refs: ReviewReferences = serde_json::from_value(json!({
+            "attached": [{
+                "name": "kernel",
+                "kind": "kernel",
+                "revision": "v6.18",
+                "commit": "0".repeat(40),
+                "why": "always",
+                "reads": 4,
+            }],
+        }))
+        .unwrap();
+        let mut patches = vec![json!({"index": 1}), json!({"index": 2})];
+        record_patch_references(&mut patches, 2, &refs);
+        assert!(patches[0].get("reference_repos").is_none());
+        assert_eq!(patches[1]["reference_repos"]["attached"][0]["reads"], 4);
+        assert_eq!(
+            crate::references::parse_record(&patches[1]["reference_repos"]),
+            Some(refs),
+            "what the worker writes is what the daemon reads back"
+        );
     }
 
     #[test]

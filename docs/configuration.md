@@ -420,13 +420,33 @@ is invited to wander into it, while an `rdma/drv/` patch gets both.
   values are valid here. A name that is not configured at all gets the usual
   unknown-repo error.
 - **Each patch logs one INFO line** with what it attached and why, and what it
-  left dormant and why. On the deployment host this lives only in the daemon's
-  log, so check it soon after the review:
+  left dormant and why. The daemon's log may not be kept for long; the same
+  decision is also recorded on the review (see the next item):
 
   ```
   Patch 1 references: attached kernel (every patch); dormant rdma-core (applies only to changes matching rdma/drv/**, eth/ionic/ionic_aux*, include/uapi/rdma/**; this patch touches none of them)
   Patch 2 references: attached kernel (every patch), rdma-core (rdma/drv/ionic/ionic_fw.h matches rdma/drv/**); dormant none
   ```
+
+- **Recorded on each review.** Every daemon review stores, as JSON in
+  `reviews.reference_repos` (API field `reference_repos` on reviews from
+  `/api/patch`, `/api/patchset` and `/api/review`), each attached reference's
+  name, kind, configured revision, resolved commit, why it was attached
+  (`always`, or the first matching file and glob), and its read count, plus
+  the dormant references with their `applies_to`. The worker sends the record
+  as soon as the patch's references are decided and again, with read counts,
+  in its final output, which it writes for a failed review as well as a
+  successful one. Only a review whose worker is killed (a timeout or a
+  cancellation) or exits without a final output keeps the record without read
+  counts. A read is any tool call that named the reference, cache hits and
+  calls git refused included. The review card shows it on one
+  line, e.g. `References: kernel @ v6.18 (1a2b3c4d5e6f), 34 reads; rdma-core @
+  origin/ionic-rdma (9f8e7d6c5b4a), 12 reads`, with dormant references in muted
+  text and the reason each was attached on hover. Reviews from before this was
+  added, and deployments with no references, show no line. `sashiko review`
+  and `sashiko-cli local` have no review row; their worker JSON carries the
+  same object under `patches[].reference_repos`, with reads summed over the
+  worker's in-process attempts.
 
 - **The kernel rule.** The out-of-tree caveats appear only when a
   `kind = "kernel"` reference is attached to that patch. A kernel entry may be
