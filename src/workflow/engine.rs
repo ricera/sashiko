@@ -48,6 +48,22 @@ pub struct WorkflowOutcome {
     pub stage_runs: Vec<StageRunRecord>,
     pub early_exit: bool,
     pub early_exit_reason: Option<&'static str>,
+    /// Stages that did not complete under `BestEffort` while a sibling did.
+    /// Recorded rather than only logged: a review that silently skipped a stage
+    /// but presents as complete is worse than one that fails outright, because
+    /// nothing signals the missing coverage. A batch where every stage failed is
+    /// still an error, so this only ever describes partial coverage.
+    pub stage_failures: Vec<StageFailure>,
+}
+
+/// A stage that failed while its siblings kept running.
+#[derive(Debug, Clone)]
+pub struct StageFailure {
+    pub stage_name: &'static str,
+    pub reason: String,
+    /// Cancellation is not a defect, and is classified apart from one. Always
+    /// false until the cooperative cancel token lets a stage observe it.
+    pub cancelled: bool,
 }
 
 /// Error wrapper attached by [`WorkflowEngine::execute`] when a workflow aborts,
@@ -122,6 +138,7 @@ fn merge_workflow_outcome(outcome: &mut WorkflowOutcome, branch_outcome: Workflo
         .tokens_cached
         .saturating_add(branch_outcome.tokens_cached);
     outcome.history.extend(branch_outcome.history);
+    outcome.stage_failures.extend(branch_outcome.stage_failures);
     for mut rec in branch_outcome.stage_runs {
         rec.history_start = rec.history_start.saturating_add(base_history_len);
         rec.history_end = rec.history_end.saturating_add(base_history_len);
@@ -350,6 +367,11 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                             err
                         );
                         record_stage_outcome(outcome, stage.name(), stage_outcome_from_error(&err));
+                        outcome.stage_failures.push(StageFailure {
+                            stage_name: stage.name(),
+                            reason: format!("{:#}", err),
+                            cancelled: false,
+                        });
                         if first_error.is_none() {
                             first_error = Some(err.context(format!(
                                 "All {} parallel stages failed under BestEffort policy (first failure in stage '{}')",

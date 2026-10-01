@@ -39,6 +39,7 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 use tracing::warn;
 
+use crate::ai::concurrency_limited_provider::SlotObserver;
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
     AiErrorClass, AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities,
@@ -129,6 +130,11 @@ pub struct BackoffProvider {
     /// Attempt ceiling, or None to retry until `budget` says to stop.
     max_attempts: Option<u32>,
     budget: Option<Arc<dyn RetryBudget>>,
+    /// Told when a call is about to back off and when it resumes. In the
+    /// daemon this is the only place a rate-limit wait happens, so it is the
+    /// only place that can report one: the worker's own backoff almost never
+    /// runs there, because the error is retried here before it reaches it.
+    observer: Option<Arc<dyn SlotObserver>>,
 }
 
 impl BackoffProvider {
@@ -146,6 +152,33 @@ impl BackoffProvider {
             base_delay: Duration::from_secs(1),
             max_attempts: budget.is_none().then_some(MAX_ATTEMPTS),
             budget,
+            observer: None,
+        }
+    }
+
+    /// Reports backoff waits to `observer`.
+    pub fn with_observer(mut self, observer: Arc<dyn SlotObserver>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// Reports a wait that is about to happen. Returns whether one was
+    /// reported, so the caller knows to report the end of it: a stage left
+    /// reading "rate limited" after it resumed would be as wrong as one that
+    /// never said so.
+    fn report_backoff(&self, request: &AiRequest, retry_in: Duration) -> bool {
+        match &self.observer {
+            Some(observer) if !retry_in.is_zero() => {
+                observer.backing_off(request, retry_in);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn report_resumed(&self, request: &AiRequest) {
+        if let Some(observer) = &self.observer {
+            observer.running(request);
         }
     }
 }
@@ -157,8 +190,14 @@ impl AiProvider for BackoffProvider {
         let mut transient_streak: i32 = 0;
         loop {
             // Honour any active global rate-limit window before trying. The
-            // wait is reported so a caller can keep it off its own deadline.
+            // wait is reported so a caller can keep it off its own deadline,
+            // and announced first, so whoever is watching the request can tell
+            // it is rate limited rather than slow.
+            let announced = self.report_backoff(&request, self.quota.pending_wait().await);
             let slept = self.quota.wait_for_access().await;
+            if announced {
+                self.report_resumed(&request);
+            }
             if let Some(budget) = &self.budget {
                 budget.credit_wait(slept);
                 budget.check()?;
@@ -203,7 +242,11 @@ impl AiProvider for BackoffProvider {
                                 retry_target,
                                 e
                             );
+                            let announced = self.report_backoff(&request, jittered);
                             sleep(jittered).await;
+                            if announced {
+                                self.report_resumed(&request);
+                            }
                         }
                         AiErrorClass::Fatal => return Err(e),
                     }
@@ -299,6 +342,7 @@ mod tests {
             base_delay: Duration::from_millis(1),
             max_attempts: Some(MAX_ATTEMPTS),
             budget: None,
+            observer: None,
         }
     }
 
@@ -378,6 +422,64 @@ mod tests {
             .unwrap();
         assert_eq!(resp.content.as_deref(), Some("ok"));
         assert_eq!(m.calls.load(Ordering::SeqCst), 3); // 2 rate-limit failures + success
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SlotObserver for RecordingObserver {
+        fn queued(&self, _request: &AiRequest) {
+            self.events.lock().unwrap().push("queued".into());
+        }
+        fn running(&self, _request: &AiRequest) {
+            self.events.lock().unwrap().push("running".into());
+        }
+        fn backing_off(&self, _request: &AiRequest, retry_in: Duration) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("backing_off {}", !retry_in.is_zero()));
+        }
+    }
+
+    /// In the daemon this is the only place a rate-limit or transient wait
+    /// happens, so unless it says so the stage reads as waiting on a slow model.
+    /// It must also say when the wait is over, or the stage stays "rate
+    /// limited" while the model works.
+    #[tokio::test]
+    async fn a_backoff_is_reported_and_so_is_its_end() {
+        let observer = Arc::new(RecordingObserver::default());
+        let provider =
+            fast(mock(Behaviour::Transient, 1, Duration::ZERO)).with_observer(observer.clone());
+        provider.generate_content(dummy_request()).await.unwrap();
+        assert_eq!(
+            observer.events.lock().unwrap().as_slice(),
+            ["backing_off true", "running"]
+        );
+
+        // A rate limit is waited out on the shared quota gate, at the top of
+        // the next attempt, and reported the same way.
+        let observer = Arc::new(RecordingObserver::default());
+        let provider = fast(mock(Behaviour::RateLimit, 1, Duration::from_millis(20)))
+            .with_observer(observer.clone());
+        provider.generate_content(dummy_request()).await.unwrap();
+        assert_eq!(
+            observer.events.lock().unwrap().as_slice(),
+            ["backing_off true", "running"]
+        );
+    }
+
+    /// A call that never waits has nothing to report; reporting anyway would
+    /// churn the stage's state on every request.
+    #[tokio::test]
+    async fn a_call_that_never_waits_reports_nothing() {
+        let observer = Arc::new(RecordingObserver::default());
+        let provider =
+            fast(mock(Behaviour::Transient, 0, Duration::ZERO)).with_observer(observer.clone());
+        provider.generate_content(dummy_request()).await.unwrap();
+        assert!(observer.events.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

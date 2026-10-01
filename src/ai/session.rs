@@ -158,6 +158,14 @@ pub trait LlmSession: Send {
     }
 }
 
+/// Fired around tool execution with the tool names, current turn, and turn cap.
+/// An empty name slice signals the tools finished.
+type ToolsCallback<'a> = dyn Fn(&[String], usize, usize) + Send + Sync + 'a;
+
+/// Fired around provider backoff with the wait in seconds (`None` once over),
+/// plus the current turn and turn cap.
+type BackoffCallback<'a> = dyn Fn(Option<u64>, usize, usize) + Send + Sync + 'a;
+
 /// Orchestrates the execution of an [`LlmSession`].
 pub struct SessionRunner<'a> {
     provider: &'a dyn AiProvider,
@@ -166,6 +174,12 @@ pub struct SessionRunner<'a> {
     max_transient_retries: usize,
     max_provider_error_retries: usize,
     on_turn: Option<Box<dyn Fn(usize, usize) + Send + Sync + 'a>>,
+    /// Called with the tool names when a turn starts executing tools, and with
+    /// an empty slice when they finish.
+    on_tools: Option<Box<ToolsCallback<'a>>>,
+    /// Called with the backoff duration when the provider asks us to slow down,
+    /// and with `None` once the wait is over.
+    on_backoff: Option<Box<BackoffCallback<'a>>>,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -178,6 +192,8 @@ impl<'a> SessionRunner<'a> {
             max_transient_retries: 5,
             max_provider_error_retries: 3,
             on_turn: None,
+            on_tools: None,
+            on_backoff: None,
         }
     }
 
@@ -202,6 +218,35 @@ impl<'a> SessionRunner<'a> {
     /// Configures the maximum provider error retries.
     pub fn with_max_provider_error_retries(mut self, retries: usize) -> Self {
         self.max_provider_error_retries = retries;
+        self
+    }
+
+    /// Configures a callback fired around tool execution.
+    ///
+    /// A turn's elapsed time is split between waiting on the model and running
+    /// git; without this the two are indistinguishable from outside, which is
+    /// the difference between "the model is slow" and "a tree-wide grep is
+    /// chewing through the kernel".
+    pub fn with_tools_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(&[String], usize, usize) + Send + Sync + 'a,
+    {
+        self.on_tools = Some(Box::new(cb));
+        self
+    }
+
+    /// Configures a callback fired around rate-limit and transient backoff.
+    ///
+    /// A rate limit with no `Retry-After` header sleeps a flat 60s, which from
+    /// outside is indistinguishable from a very slow model -- and calls for a
+    /// completely different response. In a daemon-spawned worker this path is
+    /// rare, because the daemon's `BackoffProvider` retries before the error
+    /// ever reaches the worker; it still fires when one is relayed.
+    pub fn with_backoff_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(Option<u64>, usize, usize) + Send + Sync + 'a,
+    {
+        self.on_backoff = Some(Box::new(cb));
         self
     }
 
@@ -337,7 +382,17 @@ impl<'a> SessionRunner<'a> {
                             transient_retries,
                             self.max_transient_retries
                         );
+                        if let Some(ref cb) = self.on_backoff {
+                            cb(
+                                Some(crate::activity::retry_in_seconds(retry_after)),
+                                turns,
+                                self.max_turns,
+                            );
+                        }
                         tokio::time::sleep(retry_after).await;
+                        if let Some(ref cb) = self.on_backoff {
+                            cb(None, turns, self.max_turns);
+                        }
                         turns = turns.saturating_sub(1);
                         continue;
                     }
@@ -433,7 +488,19 @@ impl<'a> SessionRunner<'a> {
                         "Model emitted tool calls on final turn; ignoring tools to force validation."
                     );
                 } else {
-                    let results = match session.call_tools(tool_calls.clone()).await {
+                    if let Some(ref cb) = self.on_tools {
+                        let names: Vec<String> =
+                            tool_calls.iter().map(|c| c.function_name.clone()).collect();
+                        cb(&names, turns, self.max_turns);
+                    }
+                    // The error is held until the "finished" report has gone
+                    // out, so a failing tool batch cannot leave the stage
+                    // reading as still running tools.
+                    let results = session.call_tools(tool_calls.clone()).await;
+                    if let Some(ref cb) = self.on_tools {
+                        cb(&[], turns, self.max_turns);
+                    }
+                    let results = match results {
                         Ok(r) => r,
                         Err(e) => {
                             let message = e.to_string();
@@ -616,6 +683,59 @@ mod tests {
             results[1].1,
             serde_json::json!({"error": "Tool execution failed"})
         );
+    }
+
+    /// Fails its first request with a sub-second transient error, then
+    /// answers.
+    struct BriefOutageProvider {
+        failed: Mutex<bool>,
+    }
+
+    #[async_trait]
+    impl AiProvider for BriefOutageProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let mut failed = self.failed.lock().unwrap();
+            if !*failed {
+                *failed = true;
+                return Err(crate::ai::RemoteAiError {
+                    message: "upstream hiccup".to_string(),
+                    class: AiErrorClass::Transient {
+                        retry_after: std::time::Duration::from_millis(50),
+                    },
+                }
+                .into());
+            }
+            Ok(AiResponse {
+                content: Some("answered".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 4096,
+            }
+        }
+    }
+
+    /// The daemon reports its own backoffs rounded up; the worker's must agree,
+    /// or a sub-second retry reaches the live display as "retrying in 0s".
+    #[tokio::test]
+    async fn a_sub_second_backoff_is_reported_as_a_whole_second() {
+        let provider = BriefOutageProvider {
+            failed: Mutex::new(false),
+        };
+        let reported: Mutex<Vec<Option<u64>>> = Mutex::new(Vec::new());
+        let runner = SessionRunner::new(&provider)
+            .with_backoff_callback(|secs, _, _| reported.lock().unwrap().push(secs));
+        let res = runner.run(&mut DummySession).await.unwrap();
+        assert_eq!(res.output, "answered");
+        assert_eq!(*reported.lock().unwrap(), vec![Some(1), None]);
     }
 
     #[tokio::test]

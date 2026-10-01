@@ -2002,6 +2002,29 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
     consolidation_stage_by_name(name).map(|s| s.short)
 }
 
+/// Rank of a stage in the order the pipeline runs them: the analysis stages in
+/// table order, then the consolidation stages that always follow.
+///
+/// Stage identity is a name rather than a number, so listing stages in the
+/// order a reader expects has to come from the table rather than from the
+/// identifier. A name the tables do not know has no rank (`None`) rather than a
+/// sentinel like `usize::MAX`, which a JSON reader in JavaScript could not
+/// even hold exactly; callers sort unranked stages last.
+pub fn stage_order(name: &str) -> Option<u32> {
+    let normalized = normalize_stage_name(name);
+    if let Some(i) = ANALYSIS_STAGES.iter().position(|s| s.name == normalized) {
+        return Some(i as u32);
+    }
+    // Through the lookup rather than by exact name, so each parallel
+    // post-verification-N stage ranks with the post-verification entry it
+    // runs for instead of falling to the end, after report.
+    let stage = consolidation_stage_by_name(name)?;
+    CONSOLIDATION_STAGES
+        .iter()
+        .position(|s| s.name == stage.name)
+        .map(|i| (ANALYSIS_STAGES.len() + i) as u32)
+}
+
 /// Whether a guide belongs to one stage rather than to the shared context.
 ///
 /// The pre-screen offers a guide to the whole review, but a guide some stage

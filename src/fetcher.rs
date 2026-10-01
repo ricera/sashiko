@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::activity::{ActivityKey, ActivityRegistry, Phase};
 use crate::events::{Event, MessageSource};
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Output, Stdio};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
@@ -38,6 +40,37 @@ pub struct FetchAgent {
     #[allow(clippy::type_complexity)]
     mr_metadata: HashMap<String, (Option<String>, Option<String>, Option<i64>)>,
     gitlab_token: Option<String>,
+    /// Where each requested commit or range reports the git operation in
+    /// flight. A fetch against a slow or unreachable remote otherwise leaves
+    /// its patchset sitting in Fetching with nothing to say why.
+    activity: Arc<ActivityRegistry>,
+}
+
+/// The fetch activity of one repository's batch, cleared when the batch is
+/// done however it ends: the loop over a batch leaves early on every failure,
+/// and an entry left behind would claim a fetch is still running.
+struct BatchMarks<'a> {
+    activity: &'a ActivityRegistry,
+    commits: Vec<String>,
+}
+
+impl BatchMarks<'_> {
+    /// Keyed by what was asked for, a commit or a range, because that is all
+    /// a fetch knows; the API finds the patchset through its placeholder.
+    fn mark(&self, phase: Phase) {
+        for commit in &self.commits {
+            self.activity
+                .update(ActivityKey::Commit(commit.clone()), phase.clone());
+        }
+    }
+}
+
+impl Drop for BatchMarks<'_> {
+    fn drop(&mut self) {
+        for commit in &self.commits {
+            self.activity.clear(&ActivityKey::Commit(commit.clone()));
+        }
+    }
 }
 
 impl FetchAgent {
@@ -45,6 +78,7 @@ impl FetchAgent {
         repo_path: PathBuf,
         main_tx: mpsc::Sender<Event>,
         gitlab_token: Option<String>,
+        activity: Arc<ActivityRegistry>,
     ) -> (Self, mpsc::Sender<FetchRequest>) {
         let (tx, rx) = mpsc::channel(100);
         (
@@ -54,6 +88,7 @@ impl FetchAgent {
                 main_tx,
                 mr_metadata: HashMap::new(),
                 gitlab_token,
+                activity,
             },
             tx,
         )
@@ -73,6 +108,10 @@ impl FetchAgent {
                             (req.mr_url.clone(), req.mr_title.clone(), req.mr_number)
                         );
                     }
+                    // Batched on a ten-second tick, so a request can wait
+                    // that long before anything happens to it.
+                    self.activity
+                        .update(ActivityKey::Commit(req.commit_hash.clone()), Phase::Queued);
                     queue.entry(req.repo_url)
                         .or_default()
                         .insert(req.commit_hash);
@@ -99,6 +138,13 @@ impl FetchAgent {
                 .as_deref()
                 .map(redact_secret)
                 .unwrap_or_else(|| "local".to_string());
+            let marks = BatchMarks {
+                activity: &self.activity,
+                commits: commit_list.clone(),
+            };
+            marks.mark(Phase::GitOp {
+                op: "git rev-parse (checking commit presence)".to_string(),
+            });
 
             info!(
                 "Processing {} commits for remote {}",
@@ -162,6 +208,12 @@ impl FetchAgent {
                     );
                     // Do not continue here; let it fall through to Step 3 where it will fail individually
                 } else {
+                    // Redacted: a forge token can ride in the URL, and this is
+                    // served to anyone who can read the patchset.
+                    let remote = redact_secret(&url);
+                    marks.mark(Phase::GitOp {
+                        op: format!("git remote setup for {}", remote),
+                    });
                     if let Err(e) = self.ensure_remote(&remote_name, &url).await {
                         let err_msg = redact_secret(&e.to_string());
                         error!("Failed to ensure remote {}: {}", url_display, err_msg);
@@ -182,6 +234,10 @@ impl FetchAgent {
                     }
 
                     // 1. Try optimistic fetch (fetch specific commits)
+                    marks.mark(Phase::Fetching {
+                        remote: remote.clone(),
+                        commits: missing_commits.len(),
+                    });
                     if let Err(e) = self.fetch_commits(&remote_name, &missing_commits).await {
                         warn!(
                             "Optimistic fetch failed for {}: {}. Falling back to full fetch.",
@@ -189,6 +245,10 @@ impl FetchAgent {
                             redact_secret(&e.to_string())
                         );
                         // 2. Fallback: Fetch everything (heads)
+                        marks.mark(Phase::Fetching {
+                            remote: format!("{} (all heads)", remote),
+                            commits: missing_commits.len(),
+                        });
                         if let Err(e) = self.fetch_all(&remote_name).await {
                             let err_msg = redact_secret(&e.to_string());
                             error!("Full fetch failed for {}: {}", url_display, err_msg);
@@ -218,6 +278,9 @@ impl FetchAgent {
             }
 
             // 3. Process each commit or range
+            marks.mark(Phase::GitOp {
+                op: "extracting patch metadata".to_string(),
+            });
             for commit_or_range in commit_list {
                 if commit_or_range.contains("..") {
                     // It's a range
@@ -629,7 +692,7 @@ mod tests {
     async fn test_fetch_agent_lifecycle() {
         let (tx, _rx) = mpsc::channel(1);
         let repo_path = PathBuf::from("/tmp");
-        let (_agent, _sender) = FetchAgent::new(repo_path, tx, None);
+        let (_agent, _sender) = FetchAgent::new(repo_path, tx, None, ActivityRegistry::new());
     }
 
     #[tokio::test]
@@ -665,7 +728,7 @@ mod tests {
             .await?;
 
         let (tx, _rx) = mpsc::channel(1);
-        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
+        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None, ActivityRegistry::new());
 
         let output = crate::git_cmd::in_dir_async(&repo_path)
             .args(["rev-parse", "HEAD"])
@@ -731,7 +794,7 @@ mod tests {
             .await?;
 
         let (tx, _rx) = mpsc::channel(1);
-        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None);
+        let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None, ActivityRegistry::new());
 
         let output = crate::git_cmd::in_dir_async(&repo_path)
             .args(["rev-parse", "HEAD^{tree}"])
@@ -769,7 +832,7 @@ mod tests {
             .await?;
 
         let (tx, mut rx) = mpsc::channel(10);
-        let (agent, _) = FetchAgent::new(repo_path, tx, None);
+        let (agent, _) = FetchAgent::new(repo_path, tx, None, Default::default());
 
         let req = FetchRequest {
             repo_url: Some("https://oauth2:glpat_secret123@127.0.0.1:0/group/repo.git".to_string()),

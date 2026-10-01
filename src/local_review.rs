@@ -151,9 +151,34 @@ pub enum ProgressEvent {
         turn: usize,
         max_turns: usize,
     },
+    /// A stage started running tools (non-empty `tools`) or finished them.
+    AiReviewStageTools {
+        patch_index: i64,
+        stage: String,
+        tools: Vec<String>,
+        turn: usize,
+        max_turns: usize,
+    },
+    /// A stage is backing off; `retry_in_seconds` is `None` once it is over.
+    AiReviewStageBackoff {
+        patch_index: i64,
+        stage: String,
+        retry_in_seconds: Option<u64>,
+        turn: usize,
+        max_turns: usize,
+    },
     AiReviewStageFinished {
         patch_index: i64,
         stage: String,
+    },
+    /// A stage stopped without finishing. Distinct from
+    /// [`ProgressEvent::AiReviewStageFinished`] because the two mean opposite
+    /// things to anyone watching: one stage is done, the other never will be.
+    AiReviewStageFailed {
+        patch_index: i64,
+        stage: String,
+        reason: String,
+        cancelled: bool,
     },
     AiReviewAttempt {
         patch_index: i64,
@@ -319,6 +344,23 @@ pub async fn run_worker(
         );
     }
 
+    // Decided here, on the resolved provider, so it is the same predicate the
+    // limiters and the reference hand-off use. Every event still reaches the
+    // caller's own callback (the `progress: ` lines on stderr, or a terminal
+    // display); a daemon-spawned worker also forwards it to the daemon, which
+    // is what lets a running review say what it is doing.
+    let daemon_progress = DaemonProgress::for_worker(&settings.ai);
+    let forward = |event: ProgressEvent| {
+        if let Some(daemon) = &daemon_progress {
+            daemon.send(&event);
+        }
+        if let Some(cb) = progress {
+            cb(event);
+        }
+    };
+    let progress: Option<&ProgressCallback<'_>> =
+        (progress.is_some() || daemon_progress.is_some()).then_some(&forward);
+
     let patchset_id = input.id;
     let subject = input.subject;
     let patches = input.patches;
@@ -428,6 +470,13 @@ pub async fn run_worker(
         },
     );
 
+    // Every progress line has to reach the daemon before the result does: the
+    // daemon stops reading at the result, so a stage's "finished" written after
+    // it would never be seen, and the stage would read as still running.
+    if let Some(daemon) = daemon_progress {
+        daemon.finish().await;
+    }
+
     result
 }
 
@@ -482,6 +531,140 @@ fn decorate_provider(
 /// the three cannot disagree about who is on the other end of stdout.
 fn reaches_model_through_daemon(ai: &AiSettings) -> bool {
     ai.provider.starts_with("stdio-")
+}
+
+/// Forwards review progress to the daemon as JSON lines on stdout.
+///
+/// Only for a worker that [`reaches_model_through_daemon`]: that is the one
+/// case with a reader on the other end of stdout that understands these lines.
+/// `sashiko-cli local` parses the worker's whole stdout as one JSON document,
+/// so a progress line there would corrupt its result.
+///
+/// Lines go through an unbounded channel to one writer task, so reporting
+/// never blocks or reorders the review, and through the shared IPC writer, so
+/// they cannot interleave with a concurrent model request.
+struct DaemonProgress {
+    tx: tokio::sync::mpsc::UnboundedSender<String>,
+    writer: tokio::task::JoinHandle<()>,
+}
+
+impl DaemonProgress {
+    /// A forwarder for a worker the daemon spawned, and `None` for any other:
+    /// the one place the gate is decided.
+    fn for_worker(ai: &AiSettings) -> Option<Self> {
+        reaches_model_through_daemon(ai).then(Self::start)
+    }
+
+    fn start() -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let writer = tokio::spawn(async move {
+            let ipc = crate::ai::ipc_writer();
+            while let Some(line) = rx.recv().await {
+                if let Err(e) = ipc.write_line(&line).await {
+                    // Advisory: a lost progress line must not fail the review.
+                    tracing::debug!("Could not report progress to the daemon: {e}");
+                }
+            }
+        });
+        Self { tx, writer }
+    }
+
+    fn send(&self, event: &ProgressEvent) {
+        if let Some((patch_index, wire)) = to_wire(event)
+            && let Some(line) = crate::activity::progress_line(patch_index, &wire)
+        {
+            let _ = self.tx.send(line);
+        }
+    }
+
+    /// Waits until every line sent so far is written, so all progress precedes
+    /// the final result line the caller prints next.
+    async fn finish(self) {
+        drop(self.tx);
+        let _ = self.writer.await;
+    }
+}
+
+/// The daemon's view of a progress event, or `None` for events it has no use
+/// for. The patch index travels beside it, as in the reference hand-off.
+fn to_wire(event: &ProgressEvent) -> Option<(i64, crate::activity::ProgressWire)> {
+    use crate::activity::ProgressWire;
+    let (patch_index, wire) = match event.clone() {
+        ProgressEvent::AiReviewPreScreenStarted { patch_index } => {
+            (patch_index, ProgressWire::PreScreen)
+        }
+        ProgressEvent::AiReviewPlanningStarted { patch_index } => {
+            (patch_index, ProgressWire::Planning)
+        }
+        ProgressEvent::AiReviewPlanReady {
+            patch_index,
+            planned_stages,
+        } => (patch_index, ProgressWire::PlanReady { planned_stages }),
+        ProgressEvent::AiReviewStageStarted { patch_index, stage } => {
+            (patch_index, ProgressWire::StageStarted { stage })
+        }
+        ProgressEvent::AiReviewStageTurn {
+            patch_index,
+            stage,
+            turn,
+            max_turns,
+        } => (
+            patch_index,
+            ProgressWire::StageTurn {
+                stage,
+                turn,
+                max_turns,
+            },
+        ),
+        ProgressEvent::AiReviewStageTools {
+            patch_index,
+            stage,
+            tools,
+            turn,
+            max_turns,
+        } => (
+            patch_index,
+            ProgressWire::StageTools {
+                stage,
+                tools,
+                turn,
+                max_turns,
+            },
+        ),
+        ProgressEvent::AiReviewStageBackoff {
+            patch_index,
+            stage,
+            retry_in_seconds,
+            turn,
+            max_turns,
+        } => (
+            patch_index,
+            ProgressWire::StageBackoff {
+                stage,
+                retry_in_seconds,
+                turn,
+                max_turns,
+            },
+        ),
+        ProgressEvent::AiReviewStageFinished { patch_index, stage } => {
+            (patch_index, ProgressWire::StageFinished { stage })
+        }
+        ProgressEvent::AiReviewStageFailed {
+            patch_index,
+            stage,
+            reason,
+            cancelled,
+        } => (
+            patch_index,
+            ProgressWire::StageFailed {
+                stage,
+                reason,
+                cancelled,
+            },
+        ),
+        _ => return None,
+    };
+    Some((patch_index, wire))
 }
 
 /// Daemon-spawned workers (`stdio-*`) already have their retry lifecycle managed
@@ -1037,10 +1220,50 @@ async fn review_patch_attempts(
                         max_turns,
                     });
                 }
+                crate::worker::WorkerProgressEvent::StageTools {
+                    stage,
+                    tools,
+                    turn,
+                    max_turns,
+                } => {
+                    cb(ProgressEvent::AiReviewStageTools {
+                        patch_index: p_index,
+                        stage,
+                        tools,
+                        turn,
+                        max_turns,
+                    });
+                }
+                crate::worker::WorkerProgressEvent::StageBackoff {
+                    stage,
+                    retry_in_seconds,
+                    turn,
+                    max_turns,
+                } => {
+                    cb(ProgressEvent::AiReviewStageBackoff {
+                        patch_index: p_index,
+                        stage,
+                        retry_in_seconds,
+                        turn,
+                        max_turns,
+                    });
+                }
                 crate::worker::WorkerProgressEvent::StageFinished { stage } => {
                     cb(ProgressEvent::AiReviewStageFinished {
                         patch_index: p_index,
                         stage,
+                    });
+                }
+                crate::worker::WorkerProgressEvent::StageFailed {
+                    stage,
+                    reason,
+                    cancelled,
+                } => {
+                    cb(ProgressEvent::AiReviewStageFailed {
+                        patch_index: p_index,
+                        stage,
+                        reason,
+                        cancelled,
                     });
                 }
             }
@@ -1529,6 +1752,7 @@ async fn run_worker_in_worktree(
             }
         }
     }
+    let mut combined_stage_failures = Vec::new();
 
     for res in results {
         let p_idx = res["patch_index"].as_i64().unwrap_or(0);
@@ -1571,6 +1795,16 @@ async fn run_worker_in_worktree(
             }
             if let Some(dismissed) = review.get("dismissed_concerns").and_then(|v| v.as_array()) {
                 combined_dismissed_concerns.extend(dismissed.clone());
+            }
+            // Carried through rather than dropped with the rest of the
+            // per-patch output: a review that lost a stage must not reach its
+            // reader as one with full coverage.
+            if let Some(failures) = review.get("stage_failures").and_then(|v| v.as_array()) {
+                for f in failures {
+                    let mut failure = f.clone();
+                    failure["patch_index"] = json!(p_idx);
+                    combined_stage_failures.push(failure);
+                }
             }
 
             if let Some(cc) = review.get("concerns_count").and_then(|v| v.as_u64()) {
@@ -1618,7 +1852,7 @@ async fn run_worker_in_worktree(
             total_tokens_cached.saturating_add(res["tokens_cached"].as_u64().unwrap_or(0));
     }
 
-    let review_output = build_review_output(
+    let mut review_output = build_review_output(
         combined_summary,
         combined_findings,
         combined_concerns,
@@ -1627,6 +1861,9 @@ async fn run_worker_in_worktree(
         total_dismissed_concerns_count,
         single_review_map,
     );
+    if !combined_stage_failures.is_empty() {
+        review_output["stage_failures"] = json!(combined_stage_failures);
+    }
 
     let mut combined_result = json!({
         "patchset_id": patchset_id,
@@ -1710,6 +1947,15 @@ pub fn progress_line(event: ProgressEvent) -> Option<String> {
         } => format!("patch {patch_index}: {stage} turn {turn}/{max_turns}"),
         ProgressEvent::AiReviewStageFinished { patch_index, stage } => {
             format!("patch {patch_index}: {stage} finished")
+        }
+        // Without the reason, deliberately. `sashiko-cli local` treats any
+        // line containing " turn " as a turn tick, and a provider's error text
+        // can contain those words; the reason reaches the daemon and the
+        // review's record by other routes.
+        ProgressEvent::AiReviewStageFailed {
+            patch_index, stage, ..
+        } => {
+            format!("patch {patch_index}: {stage} failed")
         }
         ProgressEvent::AiReviewAttempt {
             patch_index,
@@ -2836,6 +3082,17 @@ mod tests {
                 ProgressEvent::AiReviewFailed { patch_index: 1 },
                 "patch 1: incomplete",
             ),
+            // The reason stays off this line: provider error text can say
+            // anything, " turn " included, and would then read as a tick.
+            (
+                ProgressEvent::AiReviewStageFailed {
+                    patch_index: 1,
+                    stage: "locking".to_string(),
+                    reason: "Session exceeded max turns limit; last turn 20".to_string(),
+                    cancelled: false,
+                },
+                "patch 1: locking failed",
+            ),
         ] {
             let line = progress_line(event).unwrap();
             assert_eq!(line, expected);
@@ -2854,6 +3111,171 @@ mod tests {
         );
         assert!(progress_line(ProgressEvent::PatchApplied { index: 1 }).is_none());
         assert!(PROGRESS_LINE_PREFIX.ends_with(' '));
+
+        // What a turn is waiting on is for the daemon; on this channel it
+        // would only be noise between the ticks.
+        assert!(
+            progress_line(ProgressEvent::AiReviewStageTools {
+                patch_index: 1,
+                stage: "locking".to_string(),
+                tools: vec!["git_grep".to_string()],
+                turn: 2,
+                max_turns: 20,
+            })
+            .is_none()
+        );
+        assert!(
+            progress_line(ProgressEvent::AiReviewStageBackoff {
+                patch_index: 1,
+                stage: "locking".to_string(),
+                retry_in_seconds: Some(5),
+                turn: 2,
+                max_turns: 20,
+            })
+            .is_none()
+        );
+    }
+
+    /// Every review progress event reaches the daemon, through the same encode
+    /// and decode the two processes use, with the patch index it belongs to.
+    /// Everything else stays on this side.
+    #[test]
+    fn test_review_progress_reaches_the_daemon_and_nothing_else_does() {
+        use crate::activity::{ProgressWire, parse_progress, progress_line as wire_line};
+
+        let stage = || "locking".to_string();
+        let forwarded = [
+            (
+                ProgressEvent::AiReviewPreScreenStarted { patch_index: 3 },
+                ProgressWire::PreScreen,
+            ),
+            (
+                ProgressEvent::AiReviewPlanningStarted { patch_index: 3 },
+                ProgressWire::Planning,
+            ),
+            (
+                ProgressEvent::AiReviewPlanReady {
+                    patch_index: 3,
+                    planned_stages: vec![stage()],
+                },
+                ProgressWire::PlanReady {
+                    planned_stages: vec![stage()],
+                },
+            ),
+            (
+                ProgressEvent::AiReviewStageStarted {
+                    patch_index: 3,
+                    stage: stage(),
+                },
+                ProgressWire::StageStarted { stage: stage() },
+            ),
+            (
+                ProgressEvent::AiReviewStageTurn {
+                    patch_index: 3,
+                    stage: stage(),
+                    turn: 2,
+                    max_turns: 20,
+                },
+                ProgressWire::StageTurn {
+                    stage: stage(),
+                    turn: 2,
+                    max_turns: 20,
+                },
+            ),
+            (
+                ProgressEvent::AiReviewStageTools {
+                    patch_index: 3,
+                    stage: stage(),
+                    tools: vec!["git_grep".to_string()],
+                    turn: 2,
+                    max_turns: 20,
+                },
+                ProgressWire::StageTools {
+                    stage: stage(),
+                    tools: vec!["git_grep".to_string()],
+                    turn: 2,
+                    max_turns: 20,
+                },
+            ),
+            (
+                ProgressEvent::AiReviewStageBackoff {
+                    patch_index: 3,
+                    stage: stage(),
+                    retry_in_seconds: None,
+                    turn: 2,
+                    max_turns: 20,
+                },
+                ProgressWire::StageBackoff {
+                    stage: stage(),
+                    retry_in_seconds: None,
+                    turn: 2,
+                    max_turns: 20,
+                },
+            ),
+            (
+                ProgressEvent::AiReviewStageFinished {
+                    patch_index: 3,
+                    stage: stage(),
+                },
+                ProgressWire::StageFinished { stage: stage() },
+            ),
+            (
+                ProgressEvent::AiReviewStageFailed {
+                    patch_index: 3,
+                    stage: stage(),
+                    reason: "boom".to_string(),
+                    cancelled: false,
+                },
+                ProgressWire::StageFailed {
+                    stage: stage(),
+                    reason: "boom".to_string(),
+                    cancelled: false,
+                },
+            ),
+        ];
+        for (event, expected) in forwarded {
+            let (idx, wire) = to_wire(&event).expect("review progress is forwarded");
+            let line = wire_line(idx, &wire).unwrap();
+            let decoded = parse_progress(&serde_json::from_str(&line).unwrap());
+            assert_eq!(decoded, Some((3, expected)), "{line}");
+        }
+
+        for event in [
+            ProgressEvent::AiReviewStarted { patches: 1 },
+            ProgressEvent::AiReviewAttempt {
+                patch_index: 3,
+                attempt: 2,
+                max_attempts: 3,
+            },
+            ProgressEvent::AiReviewFinished { patch_index: 3 },
+            ProgressEvent::PatchApplied { index: 3 },
+            ProgressEvent::ReviewComplete { partial: false },
+        ] {
+            assert!(to_wire(&event).is_none(), "{event:?}");
+        }
+    }
+
+    /// `sashiko-cli local` parses the worker's whole stdout as one JSON
+    /// document, so only a worker the daemon spawned may write progress there.
+    #[tokio::test]
+    async fn test_only_a_daemon_spawned_worker_forwards_progress() -> Result<()> {
+        let mut settings = Settings::new()?;
+        for (provider, forwards) in [
+            ("stdio-claude", true),
+            ("stdio-gemini", true),
+            ("claude", false),
+            ("gemini", false),
+            ("claude-cli", false),
+        ] {
+            settings.ai.provider = provider.to_string();
+            let daemon = DaemonProgress::for_worker(&settings.ai);
+            assert_eq!(daemon.is_some(), forwards, "{provider}");
+            if let Some(daemon) = daemon {
+                // Nothing was sent, so nothing is written.
+                daemon.finish().await;
+            }
+        }
+        Ok(())
     }
 
     #[test]

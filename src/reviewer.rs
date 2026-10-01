@@ -53,6 +53,7 @@ struct ReviewContext {
     quota_manager: Arc<QuotaManager>,
     target_review_count: usize,
     provider: Arc<dyn AiProvider>,
+    activity: Arc<crate::activity::ActivityRegistry>,
 }
 
 enum PatchResult {
@@ -114,6 +115,63 @@ pub struct Reviewer {
     quota_manager: Arc<QuotaManager>,
     provider: Arc<dyn AiProvider>,
     initialized: std::sync::atomic::AtomicBool,
+    activity: Arc<crate::activity::ActivityRegistry>,
+}
+
+/// Writes the review's running total to the database on an interval.
+///
+/// A review task has many exit paths and a killed daemon takes none of them,
+/// so the total cannot be left to a write at the end. The interval matches
+/// the activity registry's: at most half a minute of a run's time is lost if
+/// the process dies, against one small UPDATE per in-flight patchset.
+struct ReviewClockGuard {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ReviewClockGuard {
+    /// Checkpoints only while `run` is the patchset's newest review. A rerun
+    /// requested mid-review resets the clock and starts a second task; the
+    /// superseded one would otherwise keep overwriting the reset with its own
+    /// total.
+    fn new(
+        db: Arc<Database>,
+        run: crate::activity::PatchsetRun,
+        carried_seconds: u64,
+        started: Instant,
+    ) -> Self {
+        const CHECKPOINT: Duration = Duration::from_secs(30);
+
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(CHECKPOINT);
+            // The first tick fires immediately; skip it, since zero elapsed
+            // would overwrite the carried total with itself for no reason.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if !run.is_current() {
+                    return;
+                }
+                let total = carried_seconds + started.elapsed().as_secs();
+                // Best effort: timing must never be able to fail a review.
+                let patchset_id = run.patchset_id();
+                if let Err(e) = db.set_patchset_review_duration(patchset_id, total).await {
+                    tracing::debug!(
+                        "Failed to checkpoint review duration for {}: {}",
+                        patchset_id,
+                        e
+                    );
+                }
+            }
+        });
+
+        Self { handle }
+    }
+}
+
+impl Drop for ReviewClockGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 impl Reviewer {
@@ -123,7 +181,13 @@ impl Reviewer {
     ///
     /// * `db` - The database connection.
     /// * `settings` - Application settings.
-    pub async fn new(db: Arc<Database>, settings: Settings) -> Self {
+    /// * `activity` - Where running reviews report what they are doing; shared
+    ///   with the API that serves it.
+    pub async fn new(
+        db: Arc<Database>,
+        settings: Settings,
+        activity: Arc<crate::activity::ActivityRegistry>,
+    ) -> Self {
         let concurrency = settings.review.concurrency;
         let repo_path = PathBuf::from(&settings.git.repository_path);
 
@@ -159,6 +223,7 @@ impl Reviewer {
             quota_manager: Arc::new(QuotaManager::new()),
             provider,
             initialized: std::sync::atomic::AtomicBool::new(false),
+            activity,
         }
     }
 
@@ -275,6 +340,7 @@ impl Reviewer {
                 quota_manager: self.quota_manager.clone(),
                 target_review_count,
                 provider: self.provider.clone(),
+                activity: self.activity.clone(),
             };
 
             let patchset_id = patchset.id;
@@ -355,6 +421,7 @@ impl Reviewer {
                 quota_manager: self.quota_manager.clone(),
                 target_review_count: 1,
                 provider: self.provider.clone(),
+                activity: self.activity.clone(),
             };
 
             if let Err(e) = Self::release_patchset_results(&context, &patchset).await {
@@ -550,6 +617,46 @@ impl Reviewer {
         }
         info!("Starting review for patchset {}", patchset_id);
 
+        // Held for the lifetime of the task: whichever way this returns, every
+        // entry for this patchset is cleared rather than left claiming work is
+        // still running. That includes the cancellation paths, which end this
+        // task (and kill its workers) rather than signalling them.
+        let activity = crate::activity::PatchsetActivityGuard::new(
+            ctx.activity.clone(),
+            patchset_id,
+            crate::activity::Phase::Queued,
+        );
+
+        // Clock for the whole patchset, covering every patch and every retry.
+        //
+        // Seeded from what is already banked, because a review interrupted by a
+        // restart is not redone from scratch: patches that completed keep their
+        // reviews and are skipped on the next run, so the earlier run bought
+        // work the final review still rests on.
+        let patchset_review_started = Instant::now();
+        let carried_seconds = ctx
+            .db
+            .get_patchset_review_duration(patchset_id)
+            .await
+            .unwrap_or(0);
+        if carried_seconds > 0 {
+            info!(
+                "Resuming review of patchset {} with {} already spent",
+                patchset_id,
+                crate::activity::format_duration(carried_seconds)
+            );
+        }
+
+        // Checkpointed while the review runs, not only at the end: a daemon
+        // killed mid-review never reaches the end, and that is exactly the run
+        // whose time would otherwise go unrecorded.
+        let _clock_guard = ReviewClockGuard::new(
+            ctx.db.clone(),
+            activity.run(),
+            carried_seconds,
+            patchset_review_started,
+        );
+
         if let Err(e) = ctx
             .db
             .update_patchset_status(patchset_id, ReviewStatus::InReview.as_str())
@@ -657,6 +764,9 @@ impl Reviewer {
         };
 
         // 1. Find a working baseline (apply series)
+        activity.update(crate::activity::Phase::GitOp {
+            op: "baseline resolution (applying the series)".to_string(),
+        });
         let (found_baseline, patch_commits, logs) = Self::prepare_baseline_worktree(
             &ctx,
             patchset_id,
@@ -871,6 +981,14 @@ impl Reviewer {
             // Reverse so that pop() processes in the original order (index 1 first)
             valid_jobs.reverse();
             let total_valid = valid_jobs.len();
+
+            // The one place the patchset's own phase moves once review work
+            // begins. Set here rather than from the patches, so the clock behind
+            // it spans the whole review instead of restarting whenever a patch
+            // moves.
+            activity.update(crate::activity::Phase::ReviewingPatches {
+                patches: total_valid,
+            });
             let valid_jobs_queue = Arc::new(tokio::sync::Mutex::new(valid_jobs));
             let mut handles = Vec::new();
             let baseline_ref_str = review_baseline;
@@ -1045,6 +1163,22 @@ impl Reviewer {
                         patchset_id, final_status, e
                     );
                 }
+
+                let elapsed = carried_seconds + patchset_review_started.elapsed().as_secs();
+                // A superseded run's total belongs to a review that has been
+                // restarted; the newer run records its own.
+                if activity.run().is_current() {
+                    let _ = ctx
+                        .db
+                        .set_patchset_review_duration(patchset_id, elapsed)
+                        .await;
+                }
+                info!(
+                    "Patchset {} finished review in {} ({})",
+                    patchset_id,
+                    crate::activity::format_duration(elapsed),
+                    final_status
+                );
 
                 if review_success {
                     if let Err(e) = Self::queue_forge_pr_comment(&ctx, &patchset, &diffs).await {
@@ -1698,6 +1832,11 @@ impl Reviewer {
         let mut retries = 0;
         let max_retries = ctx.settings.review.max_retries;
 
+        // Started before the retry loop, so the recorded duration covers every
+        // attempt. Timing each attempt separately would undercount a review that
+        // needed three goes, which is exactly the case worth measuring.
+        let review_started = Instant::now();
+
         let mut existing_pending_review_id = ctx
             .db
             .get_pending_review_id(patchset_id, Some(patch_id))
@@ -1769,6 +1908,10 @@ impl Reviewer {
                 );
             }
 
+            // Stamped before the work runs, not after, so a row that never
+            // reaches a terminal state still records which attempt it was.
+            let _ = ctx.db.set_review_attempt(review_id, retries + 1).await;
+
             let result = run_review_tool(
                 patchset_id,
                 input_payload,
@@ -1782,8 +1925,23 @@ impl Reviewer {
                 worktree_path,
                 ctx.provider.clone(),
                 ctx.llm_semaphore.clone(),
+                PatchActivity {
+                    registry: ctx.activity.clone(),
+                    patch_id,
+                    attempt: retries + 1,
+                    max_attempts: max_retries + 1,
+                },
             )
             .await;
+
+            // Stamped once per attempt with the cumulative elapsed time, so
+            // whichever row ends up final carries the full total. Recorded here
+            // rather than at each of the loop's exit points, which would be easy
+            // to add one more of and forget.
+            let _ = ctx
+                .db
+                .set_review_duration(review_id, review_started.elapsed().as_secs())
+                .await;
 
             if ctx
                 .db
@@ -1830,6 +1988,35 @@ impl Reviewer {
                         .and_then(|arr| arr.iter().find(|p| p["index"] == index))
                         .map(|p| p["status"] == "applied")
                         .unwrap_or(false);
+
+                    // Record incomplete coverage before anything else touches the
+                    // review row, so a partial review can never be presented as a
+                    // complete one.
+                    if let Some(failures) = json_output
+                        .get("review")
+                        .and_then(|r| r.get("stage_failures"))
+                        .or_else(|| json_output.get("stage_failures"))
+                        .and_then(|f| f.as_array())
+                        .filter(|f| !f.is_empty())
+                    {
+                        let stages: Vec<&str> = failures
+                            .iter()
+                            .filter_map(|f| f["stage"].as_str())
+                            .collect();
+                        warn!(
+                            "Review {} completed with {} incomplete stage(s): {:?}",
+                            review_id,
+                            failures.len(),
+                            stages
+                        );
+                        let _ = ctx
+                            .db
+                            .set_review_stage_failures(
+                                review_id,
+                                &serde_json::Value::Array(failures.clone()).to_string(),
+                            )
+                            .await;
+                    }
 
                     let history = json_output.get("history");
                     let logs_str = if let Some(h) = history {
@@ -2310,6 +2497,99 @@ impl Reviewer {
     }
 }
 
+/// Where one patch's review reports what it is doing, and which attempt it is.
+///
+/// Grouped because the review tool already takes a long list of arguments, and
+/// these four only ever travel together.
+struct PatchActivity {
+    registry: Arc<crate::activity::ActivityRegistry>,
+    /// The patch's database id, which activity keys use; the worker's own
+    /// messages carry the patch index instead.
+    patch_id: i64,
+    /// 1-based.
+    attempt: u32,
+    max_attempts: u32,
+}
+
+#[cfg(test)]
+impl PatchActivity {
+    /// A first attempt reporting to a registry nobody reads.
+    fn untracked(patch_id: i64) -> Self {
+        Self {
+            registry: crate::activity::ActivityRegistry::new(),
+            patch_id,
+            attempt: 1,
+            max_attempts: 1,
+        }
+    }
+}
+
+/// Reports a stage's waits for a model slot or a rate limit to the activity
+/// registry.
+///
+/// Both are invisible without this. A stage queued behind its siblings, or
+/// sleeping out a rate limit in the daemon, reports "awaiting model" exactly
+/// as a stage with a slow model does, and they call for different responses --
+/// more concurrency, more quota, or patience.
+struct StageSlotObserver {
+    activity: Arc<crate::activity::ActivityRegistry>,
+    project: crate::project::ProjectId,
+    patchset_id: i64,
+    patch_id: i64,
+}
+
+impl StageSlotObserver {
+    /// Only the wait is written. This side does not know which turn the request
+    /// belongs to -- the worker owns those numbers -- so writing a whole phase
+    /// here would overwrite them and leave the stage reading "starting" for
+    /// most of its life.
+    fn mark(&self, request: &crate::ai::AiRequest, wait: crate::activity::StageWait) {
+        let Some(stage) = request
+            .context_tag
+            .as_deref()
+            .and_then(crate::activity::stage_from_context_tag)
+        else {
+            return;
+        };
+        // Only stages the worker also reports on. The pre-screen and the
+        // planner tag their model calls like any other stage, but they are the
+        // patch's phase rather than stage rows, so nothing would ever advance or
+        // remove a row opened for them here: it would sit reading "starting
+        // (queued for a model slot)" for the rest of the patchset's run.
+        if !crate::workflows::reports_stage_row(self.project, &stage) {
+            return;
+        }
+        self.activity.update_stage_wait(
+            crate::activity::ActivityKey::PatchsetStage {
+                patchset_id: self.patchset_id,
+                patch_id: self.patch_id,
+                stage: stage.clone(),
+            },
+            stage,
+            wait,
+        );
+    }
+}
+
+impl crate::ai::concurrency_limited_provider::SlotObserver for StageSlotObserver {
+    fn queued(&self, request: &crate::ai::AiRequest) {
+        self.mark(request, crate::activity::StageWait::Queued);
+    }
+
+    fn running(&self, request: &crate::ai::AiRequest) {
+        self.mark(request, crate::activity::StageWait::Model);
+    }
+
+    fn backing_off(&self, request: &crate::ai::AiRequest, retry_in: Duration) {
+        self.mark(
+            request,
+            crate::activity::StageWait::RateLimited {
+                retry_in_seconds: crate::activity::retry_in_seconds(retry_in),
+            },
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_review_tool(
     patchset_id: i64,
@@ -2324,6 +2604,7 @@ async fn run_review_tool(
     worktree_path: Option<&Path>,
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
+    patch: PatchActivity,
 ) -> Result<serde_json::Value> {
     let cmd = default_worker_command()?;
     run_review_tool_with_cmd(
@@ -2340,6 +2621,7 @@ async fn run_review_tool(
         worktree_path,
         provider,
         llm_semaphore,
+        patch,
     )
     .await
 }
@@ -2384,7 +2666,20 @@ async fn run_review_tool_with_cmd(
     worktree_path: Option<&Path>,
     provider: Arc<dyn AiProvider>,
     llm_semaphore: Arc<Semaphore>,
+    patch: PatchActivity,
 ) -> Result<serde_json::Value> {
+    let project = settings.project.kind.unwrap_or_default();
+    let activity = patch.registry.clone();
+    // The limiter and the backoff are the only layers that know a request is
+    // queued or rate limited rather than merely slow, so they are the ones
+    // that say so. The worker supplies the stage, through the context tag.
+    let slot_observer = Arc::new(StageSlotObserver {
+        activity: activity.clone(),
+        project,
+        patchset_id,
+        patch_id: patch.patch_id,
+    });
+
     // Cap concurrent model calls with the shared limiter instead of taking the
     // semaphore by hand around each call. This also releases the permit as soon
     // as the call returns, so a request that is backing off no longer occupies
@@ -2393,7 +2688,8 @@ async fn run_review_tool_with_cmd(
         crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
             provider,
             llm_semaphore.clone(),
-        ),
+        )
+        .with_observer(slot_observer.clone()),
     );
     // Always, in practice: the daemon is required to name one. Without the flag
     // a worker puts its worktree under the system temporary directory.
@@ -2519,14 +2815,20 @@ async fn run_review_tool_with_cmd(
     // than an open-coded loop. A review is bounded by its activity deadline
     // rather than an attempt count, and time spent waiting out a rate limit is
     // credited back so it does not consume that budget.
-    let provider: Arc<dyn AiProvider> =
-        Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
+    let provider: Arc<dyn AiProvider> = Arc::new(
+        crate::ai::backoff_provider::BackoffProvider::new(
             provider,
             quota_manager.clone(),
             Some(Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(
                 deadline.clone(),
             ))),
-        ));
+        )
+        .with_observer(slot_observer),
+    );
+
+    // Applies the worker's progress to the registry and times each stage.
+    // Outside the interaction block so its timings outlive it.
+    let mut stages = crate::activity::StageTracker::new(activity.clone());
 
     let mut spawned_tasks = Vec::new();
     let interaction_result =
@@ -2829,6 +3131,35 @@ async fn run_review_tool_with_cmd(
                                             }
                                         }
                                     }
+                                    // What the review is doing, stage by stage.
+                                    // Advisory: a line that does not decode, or
+                                    // belongs to another patch, is dropped and
+                                    // never disturbs the review.
+                                    crate::activity::PROGRESS_MESSAGE => {
+                                        match crate::activity::parse_progress(&json_msg) {
+                                            Some((idx, wire)) if Some(idx) == review_index => {
+                                                if let Some(update) = crate::activity::progress_update(
+                                                    project,
+                                                    patchset_id,
+                                                    patch.patch_id,
+                                                    &wire,
+                                                    patch.attempt,
+                                                    patch.max_attempts,
+                                                ) {
+                                                    stages.apply(update);
+                                                }
+                                            }
+                                            Some((idx, _)) => {
+                                                warn!(
+                                                    "Ignoring progress for patch {} from the worker of review {} (patch {:?})",
+                                                    idx, review_id, review_index
+                                                );
+                                            }
+                                            None => {
+                                                tracing::debug!("Ignoring a malformed progress message from the worker of review {}", review_id);
+                                            }
+                                        }
+                                    }
                                     _ => {
                                         // Unknown type. Assume it's result if it matches result structure.
                                         if json_msg.get("patchset_id").is_some() {
@@ -2860,6 +3191,31 @@ async fn run_review_tool_with_cmd(
             }
         }
         .await;
+
+    // Recorded for a completed attempt only. A failed one is retried with its
+    // stages run again, and the breakdown of a run that did not finish would
+    // describe work the review does not rest on.
+    if interaction_result.is_ok() && !stages.timings().is_empty() {
+        // Stored in pipeline order rather than the order the stages happened to
+        // finish in, because readers cannot recover it: they do not know which
+        // project's pipeline ran.
+        let mut timings = stages.timings().to_vec();
+        timings.sort_by_cached_key(|t| {
+            (
+                crate::workflows::stage_order(project, &t.stage).unwrap_or(u32::MAX),
+                t.stage.clone(),
+            )
+        });
+        match serde_json::to_string(&timings) {
+            Ok(json) => {
+                let _ = db.set_review_stage_durations(review_id, &json).await;
+            }
+            Err(e) => warn!(
+                "Failed to encode stage timings for review {}: {}",
+                review_id, e
+            ),
+        }
+    }
 
     // Abort all spawned AI request tasks to drop their stdin clones
     for task in spawned_tasks {
@@ -2904,6 +3260,16 @@ async fn run_review_tool_with_cmd(
     } else {
         let _ = child.wait().await; // Reap zombie
     }
+
+    // The patch's own entry describes work in flight, and this patch has none
+    // left however it ended. Leaving it meant a reviewed patch still read
+    // "running review stages" until the last of its siblings finished. Its
+    // stage rows stay: they are the record of what ran, and the patchset's
+    // guard clears them when the patchset is done.
+    activity.clear(&crate::activity::ActivityKey::PatchsetPatch {
+        patchset_id,
+        patch_id: patch.patch_id,
+    });
 
     match interaction_result {
         Ok(json) => {
@@ -3588,6 +3954,7 @@ mod tests {
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
+            activity: crate::activity::ActivityRegistry::new(),
         };
         let candidate = BaselineResolution::Commit(CommitId::parse(&base_sha).unwrap());
         let diffs = vec![(
@@ -3711,6 +4078,7 @@ mod tests {
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
+            activity: crate::activity::ActivityRegistry::new(),
         };
 
         // A decoy tree that is unreachable, and one that shares the local
@@ -3810,6 +4178,32 @@ mod tests {
         provider: Arc<dyn AiProvider>,
         timeout_seconds: u64,
     ) -> Result<(Result<Value>, Arc<Database>, i64)> {
+        let run = run_review_tool_mock_reporting(
+            mock_script,
+            provider,
+            timeout_seconds,
+            crate::activity::ActivityRegistry::new(),
+        )
+        .await?;
+        Ok((run.result, run.db, run.review_id))
+    }
+
+    /// One mock review's outcome, with the ids its activity is keyed by.
+    struct MockRun {
+        result: Result<Value>,
+        db: Arc<Database>,
+        review_id: i64,
+        patchset_id: i64,
+        patch_id: i64,
+    }
+
+    /// As [`run_review_tool_mock`], reporting into `activity`.
+    async fn run_review_tool_mock_reporting(
+        mock_script: &str,
+        provider: Arc<dyn AiProvider>,
+        timeout_seconds: u64,
+        activity: Arc<crate::activity::ActivityRegistry>,
+    ) -> Result<MockRun> {
         let temp_dir = tempdir()?;
         let bin_path = temp_dir.path().join("mock_review");
 
@@ -3866,9 +4260,290 @@ mod tests {
             None,
             provider,
             Arc::new(Semaphore::new(56)),
+            PatchActivity {
+                registry: activity,
+                patch_id: p_id,
+                attempt: 1,
+                max_attempts: 1,
+            },
         )
         .await;
-        Ok((result, db, review_id))
+        Ok(MockRun {
+            result,
+            db,
+            review_id,
+            patchset_id: ps_id,
+            patch_id: p_id,
+        })
+    }
+
+    /// A worker's progress line for patch `index`, as the worker writes it.
+    fn progress(index: i64, wire: crate::activity::ProgressWire) -> String {
+        crate::activity::progress_line(index, &wire).unwrap()
+    }
+
+    /// A mock worker that prints `lines` after reading its input, then a final
+    /// result for patch 1.
+    fn worker_printing(lines: &[String]) -> String {
+        let mut script = String::from("#!/bin/sh\nread -r _payload\n");
+        for line in lines {
+            script.push_str(&format!("echo '{}'\n", line));
+        }
+        script.push_str(
+            "echo '{\"patchset_id\": 1, \"patches\": [{\"index\": 1, \"status\": \"applied\"}]}'\n",
+        );
+        script
+    }
+
+    /// The whole path from a worker's stdout to the registry and the review
+    /// row, through the real daemon loop. A clean build is no evidence this
+    /// works: decode the stage wrongly, or miss the message type, and every
+    /// update is silently dropped.
+    #[tokio::test]
+    async fn test_worker_progress_drives_live_activity_and_stage_timings() -> Result<()> {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase, ProgressWire};
+
+        let goal = || "goal".to_string();
+        let lines = vec![
+            progress(
+                1,
+                ProgressWire::PlanReady {
+                    planned_stages: vec![goal()],
+                },
+            ),
+            progress(1, ProgressWire::StageStarted { stage: goal() }),
+            progress(
+                1,
+                ProgressWire::StageTurn {
+                    stage: goal(),
+                    turn: 1,
+                    max_turns: 20,
+                },
+            ),
+            progress(
+                1,
+                ProgressWire::StageTurn {
+                    stage: goal(),
+                    turn: 2,
+                    max_turns: 20,
+                },
+            ),
+            progress(1, ProgressWire::StageFinished { stage: goal() }),
+            // Another patch's progress is not this review's to report.
+            progress(
+                2,
+                ProgressWire::StageStarted {
+                    stage: "locking".to_string(),
+                },
+            ),
+            // A numbered stage is not a stage; the line is dropped.
+            r#"{"type":"progress","patch_index":1,"payload":{"kind":"stage_started","stage":5}}"#
+                .to_string(),
+        ];
+        let activity = ActivityRegistry::new();
+        let run = run_review_tool_mock_reporting(
+            &worker_printing(&lines),
+            Arc::new(MockProvider),
+            30,
+            activity.clone(),
+        )
+        .await?;
+        run.result.expect("the review completes");
+
+        let goal_key = ActivityKey::PatchsetStage {
+            patchset_id: run.patchset_id,
+            patch_id: run.patch_id,
+            stage: goal(),
+        };
+        match activity.get(&goal_key).map(|e| e.phase) {
+            Some(Phase::StageDone { stage, turns, .. }) => {
+                assert_eq!(stage, "goal");
+                assert_eq!(turns, 2, "the highest turn reached, not the event count");
+            }
+            other => panic!("the finished stage must settle as done, got {other:?}"),
+        }
+        assert_eq!(
+            activity.patchset_snapshot(run.patchset_id).len(),
+            1,
+            "only the finished stage remains: no row for the other patch or the \
+             numbered stage, and the patch's own entry goes when its review ends"
+        );
+        assert!(
+            activity
+                .get(&ActivityKey::PatchsetPatch {
+                    patchset_id: run.patchset_id,
+                    patch_id: run.patch_id,
+                })
+                .is_none()
+        );
+
+        let review = run.db.get_review_details(run.review_id).await?.unwrap();
+        assert_eq!(
+            review["stage_durations"],
+            json!([{"stage": "goal", "seconds": 0, "turns": 2}])
+        );
+        Ok(())
+    }
+
+    /// A stage that fails says so, instead of sitting on its last turn.
+    #[tokio::test]
+    async fn test_a_failed_stage_from_the_worker_reads_as_failed() -> Result<()> {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase, ProgressWire};
+
+        let stage = || "implementation".to_string();
+        let lines = vec![
+            progress(1, ProgressWire::StageStarted { stage: stage() }),
+            progress(
+                1,
+                ProgressWire::StageTurn {
+                    stage: stage(),
+                    turn: 20,
+                    max_turns: 20,
+                },
+            ),
+            progress(
+                1,
+                ProgressWire::StageFailed {
+                    stage: stage(),
+                    reason: "Failed to generate valid response".to_string(),
+                    cancelled: false,
+                },
+            ),
+        ];
+        let activity = ActivityRegistry::new();
+        let run = run_review_tool_mock_reporting(
+            &worker_printing(&lines),
+            Arc::new(MockProvider),
+            30,
+            activity.clone(),
+        )
+        .await?;
+        run.result.expect("the review completes without the stage");
+
+        let entry = activity
+            .get(&ActivityKey::PatchsetStage {
+                patchset_id: run.patchset_id,
+                patch_id: run.patch_id,
+                stage: stage(),
+            })
+            .expect("a failed stage keeps its row");
+        assert!(
+            matches!(entry.phase, Phase::StageFailed { .. }),
+            "{entry:?}"
+        );
+        assert_eq!(
+            entry.description,
+            "stage implementation failed: Failed to generate valid response"
+        );
+
+        // Nothing finished, so there is no breakdown to record.
+        let review = run.db.get_review_details(run.review_id).await?.unwrap();
+        assert!(review["stage_durations"].is_null(), "{review}");
+        Ok(())
+    }
+
+    /// The observer may only open rows for stages the worker will close.
+    ///
+    /// The pre-screen and the planner tag their model calls like any other
+    /// stage, so the queue observer would create a row for each that nothing
+    /// ever advanced or removed, because the worker reports them as the patch's
+    /// phase instead.
+    #[test]
+    fn a_queue_wait_opens_no_row_for_a_stage_the_worker_never_reports() {
+        use crate::activity::{ActivityRegistry, StageWait};
+        use crate::project::ProjectId;
+
+        for (project, real_stage) in [
+            (ProjectId::Linux, "locking"),
+            (ProjectId::Sashiko, "llm-pipeline"),
+        ] {
+            let activity = ActivityRegistry::new();
+            let observer = StageSlotObserver {
+                activity: activity.clone(),
+                project,
+                patchset_id: 5,
+                patch_id: 19,
+            };
+            let request = |stage: &str| crate::ai::AiRequest {
+                system: None,
+                messages: vec![],
+                tools: None,
+                temperature: None,
+                response_format: None,
+                context_tag: Some(format!("[ps:5 p:19] [s:{}] ", stage)),
+                reasoning_effort: None,
+            };
+
+            for uncounted in ["planning", "pre-screen"] {
+                observer.mark(&request(uncounted), StageWait::Queued);
+            }
+            // A request with no stage in its tag is not attributed to any.
+            observer.mark(
+                &crate::ai::AiRequest {
+                    context_tag: Some("[ps:5 p:19] ".to_string()),
+                    ..request("x")
+                },
+                StageWait::Queued,
+            );
+            assert!(
+                activity.patchset_snapshot(5).is_empty(),
+                "a stage the worker never reports on must get no row at all"
+            );
+
+            // A real stage still does: this is the only side that can tell a
+            // queue wait from a slow model.
+            observer.mark(&request(real_stage), StageWait::Queued);
+            let entries = activity.patchset_snapshot(5);
+            assert_eq!(entries.len(), 1, "{project:?}");
+            assert_eq!(entries[0].stage.as_deref(), Some(real_stage));
+            assert_eq!(
+                entries[0].description,
+                format!("stage {real_stage}, starting (queued for a model slot)")
+            );
+        }
+    }
+
+    /// A backoff in the daemon reads as a rate limit, rounded up so a short
+    /// transient wait does not claim "retrying in 0s", and its end reads as
+    /// the model's time again.
+    #[test]
+    fn a_daemon_backoff_reads_as_rate_limited_until_it_resumes() {
+        use crate::activity::{ActivityKey, ActivityRegistry};
+        use crate::ai::concurrency_limited_provider::SlotObserver;
+
+        let activity = ActivityRegistry::new();
+        let observer = StageSlotObserver {
+            activity: activity.clone(),
+            project: crate::project::ProjectId::Linux,
+            patchset_id: 5,
+            patch_id: 19,
+        };
+        let request = crate::ai::AiRequest {
+            system: None,
+            messages: vec![],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: Some("[ps:5 p:19] [s:security] ".to_string()),
+            reasoning_effort: None,
+        };
+        let key = ActivityKey::PatchsetStage {
+            patchset_id: 5,
+            patch_id: 19,
+            stage: "security".to_string(),
+        };
+        activity.update_stage_turn(key.clone(), "security".to_string(), 4, 20);
+
+        observer.backing_off(&request, Duration::from_millis(1300));
+        assert_eq!(
+            activity.get(&key).unwrap().description,
+            "stage security, turn 4/20 (rate limited, retrying in 2s)"
+        );
+        observer.running(&request);
+        assert_eq!(
+            activity.get(&key).unwrap().description,
+            "stage security, turn 4/20 (awaiting model)"
+        );
     }
 
     /// The early reference hand-off as a worker would print it for patch
@@ -4210,6 +4885,7 @@ sleep 30
                 None,
                 provider,
                 Arc::new(Semaphore::new(56)),
+                PatchActivity::untracked(p_id),
             ),
         )
         .await;
@@ -4314,6 +4990,7 @@ fi
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
+            activity: crate::activity::ActivityRegistry::new(),
         })
     }
 
@@ -4519,6 +5196,7 @@ fi
             quota_manager,
             target_review_count: 1,
             provider,
+            activity: crate::activity::ActivityRegistry::new(),
         };
 
         // Create dummy patchset and patch in DB
@@ -4796,6 +5474,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             None,
             provider,
             Arc::new(Semaphore::new(56)),
+            PatchActivity::untracked(p_id),
         )
         .await
         .map(|_| ())
@@ -4918,6 +5597,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
+            activity: crate::activity::ActivityRegistry::new(),
         };
 
         // Scenario 1: Mixed findings
@@ -5246,6 +5926,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
+            activity: crate::activity::ActivityRegistry::new(),
         };
 
         Reviewer::queue_notifications(
@@ -5411,6 +6092,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
+            activity: Default::default(),
         };
 
         let empty_findings = Vec::new();
@@ -5619,6 +6301,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             quota_manager: Arc::new(QuotaManager::new()),
             target_review_count: 1,
             provider: Arc::new(MockProvider),
+            activity: Default::default(),
         };
 
         Reviewer::review_patchset_task(ctx, patchset).await;

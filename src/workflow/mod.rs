@@ -22,7 +22,7 @@ pub mod policy;
 pub mod prompt;
 pub mod stage;
 
-pub use engine::{StageRunRecord, WorkflowEngine, WorkflowFailure, WorkflowOutcome};
+pub use engine::{StageFailure, StageRunRecord, WorkflowEngine, WorkflowFailure, WorkflowOutcome};
 pub use events::WorkflowEvent;
 pub use graph::{Workflow, WorkflowBuilder, WorkflowStep};
 pub use output::OutputFormat;

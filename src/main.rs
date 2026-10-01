@@ -630,6 +630,11 @@ async fn run_daemon(
         Err(e) => error!("Failed to clean up interrupted Fetching patchsets: {}", e),
     }
 
+    // What running fetches and reviews are doing. One registry, written by the
+    // fetcher and the reviewer and read by the API, with its last-known state
+    // persisted so a restart can still say where interrupted work stopped.
+    let activity = sashiko::activity::ActivityRegistry::with_persistence(db.clone());
+
     // Load and initialize authoritative immutable MAINTAINERS index when the
     // reviewed project uses kernel MAINTAINERS.
     let maintainers_index = if project.uses_maintainers() {
@@ -675,6 +680,7 @@ async fn run_daemon(
         repo_path,
         raw_tx.clone(),
         settings.forge.api_token.clone(),
+        activity.clone(),
     );
 
     // Spawn FetchAgent
@@ -1165,6 +1171,7 @@ async fn run_daemon(
         dry_run: settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false),
         local_token,
         email_worker_heartbeat: email_worker_heartbeat.clone(),
+        activity: activity.clone(),
     };
     let api_handle = tokio::spawn(async move {
         if let Err(e) =
@@ -1347,7 +1354,7 @@ async fn run_daemon(
     };
 
     // Start Reviewer Service
-    let reviewer = Arc::new(Reviewer::new(db.clone(), settings.clone()).await);
+    let reviewer = Arc::new(Reviewer::new(db.clone(), settings.clone(), activity.clone()).await);
     let reviewer_handle = spawn_supervised_worker("Reviewer", move || {
         let reviewer = Arc::clone(&reviewer);
         async move {
@@ -2525,6 +2532,22 @@ async fn handle_review_command(
                     render_progress(&mut s);
                 }
             }
+            // A failed stage stops being active, but is not counted as
+            // completed: the bar would otherwise claim work that did not
+            // happen. A patch that ends settles its total either way.
+            ProgressEvent::AiReviewStageFailed {
+                patch_index, stage, ..
+            } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.active_stages.remove(&stage);
+                    p.active_stage_turns.remove(&stage);
+                    render_progress(&mut s);
+                }
+            }
+            // What a turn is waiting on is for the daemon's activity view; the
+            // terminal display counts turns and stages, which these do not move.
+            ProgressEvent::AiReviewStageTools { .. }
+            | ProgressEvent::AiReviewStageBackoff { .. } => {}
             ProgressEvent::AiReviewAttempt {
                 patch_index: _,
                 attempt,

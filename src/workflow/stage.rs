@@ -529,16 +529,36 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             });
         }
 
-        let system_prompt = if let Some(sys) = &self.system_prompt {
-            sys.render_for_model(state, env.base_dir).await?
-        } else {
-            String::new()
+        // A prompt that fails to render fails the stage after it has been
+        // reported as started, so it has to be reported as failed as well.
+        // Without that the stage's live row is left reading "starting" until
+        // the whole patchset ends, although the stage is long gone.
+        let rendered = async {
+            let system_prompt = if let Some(sys) = &self.system_prompt {
+                sys.render_for_model(state, env.base_dir).await?
+            } else {
+                String::new()
+            };
+            let user_prompt = self
+                .user_prompt
+                .render_for_model(state, env.base_dir)
+                .await?;
+            anyhow::Ok((system_prompt, user_prompt))
+        }
+        .await;
+        let (system_prompt, user_prompt) = match rendered {
+            Ok(prompts) => prompts,
+            Err(e) => {
+                if let Some(cb) = event_cb {
+                    cb(WorkflowEvent::StageFailed {
+                        stage_name: self.name,
+                        reason: format!("{:#}", e),
+                        cancelled: false,
+                    });
+                }
+                return Err(e);
+            }
         };
-
-        let user_prompt = self
-            .user_prompt
-            .render_for_model(state, env.base_dir)
-            .await?;
         let log_user_prompt = self.user_prompt.render_for_log(state);
 
         let stage_name = self.name;
@@ -550,7 +570,18 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 system_prompt,
                 user_prompt,
                 log_user_prompt,
-                context_tag: env.context_tag.clone(),
+                // The stage rides the tag because the request is all the
+                // supervising daemon sees, and every stage of a patch shares
+                // that patch's tag. Without it a queue wait cannot be
+                // attributed to the stage that is doing the waiting. Carried
+                // here rather than as an `AiRequest` field so there is one
+                // producer instead of every construction site; the daemon
+                // reads it back with `activity::stage_from_context_tag`.
+                context_tag: Some(format!(
+                    "{}[s:{}] ",
+                    env.context_tag.clone().unwrap_or_default(),
+                    stage_name
+                )),
                 recitation_fallback_active: false,
                 last_tool_call: None,
             };
@@ -566,9 +597,49 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                             max_turns,
                         });
                     }
+                })
+                .with_tools_callback(move |tools, turn, max_turns| {
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::StageTools {
+                            stage_name,
+                            tools: tools.to_vec(),
+                            turn,
+                            max_turns,
+                        });
+                    }
+                })
+                .with_backoff_callback(move |retry_in_seconds, turn, max_turns| {
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::StageBackoff {
+                            stage_name,
+                            retry_in_seconds,
+                            turn,
+                            max_turns,
+                        });
+                    }
                 });
 
-            runner.run(&mut session).await?
+            // Reported here rather than by the caller: a failed stage that says
+            // nothing leaves its last turn frozen on display, indistinguishable
+            // from one still waiting on the model.
+            //
+            // `cancelled` is always false for now. Upstream cancellation kills
+            // the worker outright, so a stage never observes it; telling a
+            // cancelled stage apart from a failed one arrives with the
+            // cooperative cancel token.
+            match runner.run(&mut session).await {
+                Ok(result) => result,
+                Err(e) => {
+                    if let Some(cb) = event_cb {
+                        cb(WorkflowEvent::StageFailed {
+                            stage_name,
+                            reason: format!("{:#}", e),
+                            cancelled: false,
+                        });
+                    }
+                    return Err(e);
+                }
+            }
         };
 
         let tokens_in = u32::try_from(result.usage.prompt_tokens).unwrap_or(u32::MAX);
@@ -768,6 +839,215 @@ mod tests {
             .await
             .expect("the batch must run concurrently; a sequential loop never clears the barrier")
             .expect("the stage must not end");
+    }
+
+    /// The daemon learns which stage a model call belongs to from the request's
+    /// context tag, and nothing else; the tag has to carry it, after whatever
+    /// the patch put there.
+    #[tokio::test]
+    async fn test_every_request_carries_its_stage_in_the_context_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ToolCallingProvider::probing(1));
+        let mut toolbox = ToolBox::new(tmp.path().to_path_buf(), None);
+        toolbox.register_tool(ConcurrencyProbe {
+            barrier: Arc::new(tokio::sync::Barrier::new(1)),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(toolbox),
+            base_dir: tmp.path(),
+            context_tag: Some("[ps:12 p:34] ".to_string()),
+        };
+
+        let stage: Stage<EmptyState, String> = Stage::builder("conflict-resolution")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text())
+            .reduce(|_: &mut EmptyState, _: String| {})
+            .build();
+
+        let events: Mutex<Vec<WorkflowEvent>> = Mutex::new(Vec::new());
+        let record = |e: WorkflowEvent| events.lock().unwrap().push(e);
+        let (_outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, Some(&record))
+            .await
+            .expect("the stage completes");
+
+        let seen = provider.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        for request in seen.iter() {
+            let tag = request.context_tag.as_deref().unwrap();
+            assert_eq!(tag, "[ps:12 p:34] [s:conflict-resolution] ");
+            assert_eq!(
+                crate::activity::stage_from_context_tag(tag).as_deref(),
+                Some("conflict-resolution")
+            );
+        }
+
+        // Tool time is reported as such, and its end is reported too, or the
+        // stage would read as running tools while it waits on the model.
+        let tools: Vec<Vec<String>> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                WorkflowEvent::StageTools { tools, .. } => Some(tools.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tools, [vec!["concurrency_probe".to_string()], vec![]]);
+    }
+
+    fn recorded_turn_reached(events: &[WorkflowEvent], turn: usize) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, WorkflowEvent::StageTurn { turn: t, .. } if *t == turn))
+    }
+
+    /// A provider that always asks for another tool call, so the stage can only
+    /// end by failing.
+    struct NeverFinishesProvider;
+
+    #[async_trait]
+    impl AiProvider for NeverFinishesProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            Ok(AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_0".to_string(),
+                    function_name: "git_read_files".to_string(),
+                    arguments: json!({ "files": [{ "path": "a" }] }),
+                    thought_signature: None,
+                }]),
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// A stage that runs out of turns fails between round trips: turn N/N is
+    /// reported, the final answer is refused, and the loop bails. Without a
+    /// failure event the last thing ever said about the stage is "turn N/N",
+    /// and the idle clock climbs from there -- which reads as a hung
+    /// connection, at exactly the turn number that proves it was not one.
+    ///
+    /// The last turn withholds tools and demands an answer, so a model that
+    /// never gives one fails on validation rather than on the cap itself.
+    #[tokio::test]
+    async fn a_stage_that_runs_out_of_turns_reports_the_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = WorkflowEnv {
+            provider: Arc::new(NeverFinishesProvider),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, Value> = Stage::builder("turn-cap")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::json())
+            .policy(StagePolicy {
+                max_turns: 3,
+                ..StagePolicy::default()
+            })
+            .reduce(|_: &mut EmptyState, _: Value| {})
+            .build();
+
+        let events: Mutex<Vec<WorkflowEvent>> = Mutex::new(Vec::new());
+        let record = |e: WorkflowEvent| events.lock().unwrap().push(e);
+
+        let res = stage
+            .execute_isolated(&env, &EmptyState, Some(&record))
+            .await;
+        let err = res
+            .err()
+            .expect("running out of turns must still fail the stage");
+        assert!(
+            recorded_turn_reached(&events.lock().unwrap(), 3),
+            "the stage did reach its last turn before failing"
+        );
+
+        let recorded = events.lock().unwrap();
+        match recorded.last() {
+            Some(WorkflowEvent::StageFailed {
+                stage_name,
+                reason,
+                cancelled,
+            }) => {
+                assert_eq!(*stage_name, "turn-cap");
+                assert_eq!(
+                    *reason,
+                    format!("{:#}", err),
+                    "the reason is the error itself"
+                );
+                assert!(reason.contains("valid response"), "{reason}");
+                assert!(!cancelled, "running out of turns is not a cancellation");
+            }
+            other => panic!("the last word on a failed stage must be its failure, got {other:?}"),
+        }
+    }
+
+    /// A stage that cannot even render its prompt has still been reported as
+    /// started, so it must be reported as failed, or its live row would read
+    /// "starting" for as long as the rest of the review runs.
+    #[tokio::test]
+    async fn a_stage_whose_prompt_fails_to_render_reports_the_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A directory where the prompt expects a file: it exists, so the
+        // inclusion is attempted, and reading it fails.
+        std::fs::create_dir(tmp.path().join("not-a-file")).unwrap();
+        let env = WorkflowEnv {
+            provider: Arc::new(NeverFinishesProvider),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+        };
+
+        let stage: Stage<EmptyState, Value> = Stage::builder("unrenderable")
+            .user_prompt(PromptTemplate::new("go").include_file("not-a-file"))
+            .output_format(OutputFormat::json())
+            .reduce(|_: &mut EmptyState, _: Value| {})
+            .build();
+
+        let events: Mutex<Vec<WorkflowEvent>> = Mutex::new(Vec::new());
+        let record = |e: WorkflowEvent| events.lock().unwrap().push(e);
+
+        let err = stage
+            .execute_isolated(&env, &EmptyState, Some(&record))
+            .await
+            .err()
+            .expect("an unreadable inclusion must fail the stage");
+
+        let recorded = events.lock().unwrap();
+        assert!(
+            matches!(
+                recorded.first(),
+                Some(WorkflowEvent::StageStarted {
+                    stage_name: "unrenderable"
+                })
+            ),
+            "{recorded:?}"
+        );
+        match recorded.last() {
+            Some(WorkflowEvent::StageFailed {
+                stage_name,
+                reason,
+                cancelled,
+            }) => {
+                assert_eq!(*stage_name, "unrenderable");
+                assert_eq!(*reason, format!("{:#}", err));
+                assert!(!cancelled);
+            }
+            other => panic!("a started stage must end with its failure, got {other:?}"),
+        }
     }
 
     #[tokio::test]

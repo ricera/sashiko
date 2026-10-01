@@ -65,6 +65,16 @@ impl QuotaManager {
         total_slept
     }
 
+    /// How long [`wait_for_access`](Self::wait_for_access) would sleep if
+    /// called now. Lets a caller say it is about to wait before it does, so the
+    /// wait can be reported as a rate limit rather than read as a slow model.
+    pub async fn pending_wait(&self) -> Duration {
+        let guard = self.blocked_until.lock().await;
+        guard
+            .map(|until| until.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::ZERO)
+    }
+
     pub async fn report_success(&self) {
         let mut guard = self.blocked_until.lock().await;
         if guard.is_some() {

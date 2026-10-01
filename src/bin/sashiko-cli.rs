@@ -16,7 +16,11 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local, TimeZone, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
-use sashiko::api::{PatchsetsResponse, SubmitRequest, SubmitResponse};
+use sashiko::activity::{Phase, StageTiming, format_duration};
+use sashiko::api::{
+    ActivityEntry, ActivityResponse, PatchsetActivityResponse, PatchsetsResponse, SubmitRequest,
+    SubmitResponse,
+};
 use sashiko::auth::LocalToken;
 use sashiko::patch::parse_email;
 use sashiko::project::ProjectId;
@@ -91,6 +95,7 @@ struct ShowOptions {
     issues: bool,
     since: Option<i64>,
     inline: bool,
+    timings: bool,
     diff: Option<String>,
 }
 
@@ -168,6 +173,11 @@ enum Commands {
         /// Include inline review content in text output
         #[arg(long)]
         inline: bool,
+
+        /// Show per-stage timings and turn counts for each patch, live while a
+        /// review runs and as recorded once it has finished
+        #[arg(long)]
+        timings: bool,
 
         /// Compare with another patchset ID
         #[arg(long, short = 'd')]
@@ -482,6 +492,7 @@ async fn run_command(
             issues,
             since,
             inline,
+            timings,
             diff,
         } => {
             let opts = ShowOptions {
@@ -490,6 +501,7 @@ async fn run_command(
                 issues,
                 since,
                 inline,
+                timings,
                 diff,
             };
             handle_show(client, base_url, id, watch, format, opts).await
@@ -1038,6 +1050,8 @@ async fn handle_status(client: &Client, base_url: &str, format: OutputFormat) ->
                         println!("  {:<15} {}", label, val);
                     }
                 }
+
+                print_live_activity(client, base_url).await;
             }
         }
     } else {
@@ -1045,6 +1059,42 @@ async fn handle_status(client: &Client, base_url: &str, format: OutputFormat) ->
     }
 
     Ok(())
+}
+
+/// Prints everything the daemon is currently working on.
+///
+/// `idle` is the useful column: a large value means that unit of work has not
+/// reported progress recently, which is the signature of a wedged fetch or
+/// review. Best-effort: a daemon without the endpoint prints nothing extra.
+async fn print_live_activity(client: &Client, base_url: &str) {
+    let url = format!("{}/api/activity", base_url);
+    let Ok(resp) = client.get(&url).send().await else {
+        return;
+    };
+    if !resp.status().is_success() {
+        return;
+    }
+    let Ok(data) = resp.json::<ActivityResponse>().await else {
+        return;
+    };
+
+    println!();
+    if data.entries.is_empty() {
+        print_colored(Color::Cyan, "Live Activity:");
+        println!(" (idle)");
+        return;
+    }
+
+    print_colored(Color::Cyan, "Live Activity:\n");
+    println!("  {:<36} {:<48} {:>10}", "WORK", "PHASE", "IDLE");
+    for entry in &data.entries {
+        println!(
+            "  {:<36} {:<48} {:>10}",
+            entry.key,
+            entry.description,
+            format_duration(entry.idle_seconds.unwrap_or(0))
+        );
+    }
 }
 
 async fn handle_list(
@@ -1248,6 +1298,331 @@ fn print_patch_line(patch: &Value, review: Option<&Value>, show_inline: bool) {
     }
 }
 
+/// Notes how long a review took, and how many attempts it needed when that
+/// was more than one.
+///
+/// The live attempt counter in the activity view vanishes the moment the review
+/// ends, so without this there is no way to see after the fact that a result
+/// took three goes to produce.
+fn print_attempt_note(review: &Value) {
+    let attempt = review.get("attempt").and_then(|a| a.as_u64());
+    let duration = review.get("duration_seconds").and_then(|d| d.as_u64());
+
+    let mut parts = Vec::new();
+    if let Some(d) = duration {
+        parts.push(format!("reviewed in {}", format_duration(d)));
+    }
+    // Only worth saying when it took more than one go; annotating every review
+    // with "attempt 1" would bury the case worth noticing.
+    if let Some(a) = attempt.filter(|a| *a > 1) {
+        parts.push(format!("succeeded on attempt {}", a));
+    }
+
+    if !parts.is_empty() {
+        println!("  ({})", parts.join(", "));
+    }
+}
+
+/// Warns when a review did not run every stage it was supposed to.
+///
+/// The concurrent review stages run best-effort, so one failure does not abort
+/// the review; that is only acceptable if the missing coverage is stated. A
+/// review that skipped the security stage but reads as clean is worse than one
+/// that failed outright.
+fn print_coverage_warning(review: &Value) {
+    let Some(failures) = review
+        .get("stage_failures")
+        .and_then(|f| f.as_array())
+        .filter(|f| !f.is_empty())
+    else {
+        return;
+    };
+
+    println!();
+    print_colored(
+        Color::Red,
+        &format!(
+            "Incomplete coverage: {} stage(s) did not complete\n",
+            failures.len()
+        ),
+    );
+    for f in failures {
+        let stage = f["stage"].as_str().unwrap_or("?");
+        let what = if f["cancelled"].as_bool().unwrap_or(false) {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        let reason = f["reason"].as_str().unwrap_or("unknown");
+        println!("  Stage {} {}: {}", stage, what, reason);
+    }
+}
+
+/// Live stage activity for one patchset, grouped by the patch it describes.
+struct PatchActivity {
+    /// False once the daemon has stopped: the entries then say where the work
+    /// got to, not what it is doing.
+    live: bool,
+    /// In the order the daemon sent them, which is the order its pipeline runs
+    /// them. This side does not know the daemon's project, so it does not
+    /// re-sort.
+    by_patch: std::collections::HashMap<i64, Vec<ActivityEntry>>,
+}
+
+async fn fetch_patchset_activity(
+    client: &Client,
+    base_url: &str,
+    patchset_id: &str,
+) -> Option<PatchsetActivityResponse> {
+    let url = format!("{}/api/patchset/activity?id={}", base_url, patchset_id);
+    let resp = client.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json().await.ok()
+}
+
+async fn fetch_patch_activity(
+    client: &Client,
+    base_url: &str,
+    patchset_id: &str,
+) -> Option<PatchActivity> {
+    let data = fetch_patchset_activity(client, base_url, patchset_id).await?;
+    let mut by_patch: std::collections::HashMap<i64, Vec<ActivityEntry>> =
+        std::collections::HashMap::new();
+    for entry in data.entries {
+        // Entries with no patch describe the patchset as a whole and belong in
+        // the activity summary, not under any one patch.
+        if let Some(patch_id) = entry.patch_id {
+            by_patch.entry(patch_id).or_default().push(entry);
+        }
+    }
+    Some(PatchActivity {
+        live: data.live,
+        by_patch,
+    })
+}
+
+/// How many turns, for a table column.
+fn turns_cell(turns: u64) -> String {
+    match turns {
+        0 => "—".to_string(),
+        1 => "1 turn".to_string(),
+        n => format!("{} turns", n),
+    }
+}
+
+/// One row of a patch's stage table.
+///
+/// Built from the deserialised `Phase` rather than the server's rendered
+/// description, so the columns line up and the CLI does not carry a second
+/// copy of the wording that can drift from the daemon's.
+fn stage_row(entry: &ActivityEntry, live: bool) -> String {
+    let stage = entry.stage.as_deref().unwrap_or("this patch");
+    let dash = "—".to_string();
+    let describe_or_stored = |p: Option<&Phase>| {
+        p.map(Phase::describe)
+            .unwrap_or_else(|| entry.description.clone())
+    };
+
+    // A persisted entry has no clocks: it records where the work got to, not
+    // how long it has been there.
+    if !live {
+        return format!(
+            "    {:<20} {:>10}  {:>12}  {}",
+            stage,
+            dash,
+            dash,
+            describe_or_stored(entry.phase.as_ref())
+        );
+    }
+
+    let age = entry.age_seconds.unwrap_or(0);
+    let (elapsed, turns, state) = match &entry.phase {
+        Some(Phase::StageDone { seconds, turns, .. }) => (
+            format_duration(*seconds),
+            turns_cell(*turns),
+            "done".to_string(),
+        ),
+        Some(phase @ Phase::StageFailed { .. }) => (
+            format!("{} ago", format_duration(age)),
+            dash.clone(),
+            phase.describe(),
+        ),
+        Some(Phase::Stage {
+            turn,
+            max_turns,
+            waiting,
+            ..
+        }) => (
+            format_duration(age),
+            if *max_turns == 0 {
+                "starting".to_string()
+            } else {
+                format!("turn {}/{}", turn, max_turns)
+            },
+            {
+                // `describe` on a Stage repeats the stage and turn, which are
+                // already their own columns; only the wait belongs here.
+                let full = Phase::Stage {
+                    stage: String::new(),
+                    turn: *turn,
+                    max_turns: *max_turns,
+                    waiting: waiting.clone(),
+                }
+                .describe();
+                full.rsplit_once('(')
+                    .map(|(_, tail)| tail.trim_end_matches(')').to_string())
+                    .unwrap_or(full)
+            },
+        ),
+        // The patch's own entry: screening, planning, or running its stages.
+        other => (
+            format_duration(age),
+            dash.clone(),
+            describe_or_stored(other.as_ref()),
+        ),
+    };
+
+    let idle = entry.idle_seconds.unwrap_or(0);
+    let stalled = if idle > 300 && !matches!(entry.phase, Some(Phase::StageDone { .. })) {
+        format!("  — no progress for {}", format_duration(idle))
+    } else {
+        String::new()
+    };
+
+    format!(
+        "    {:<20} {:>10}  {:>12}  {}{}",
+        stage, elapsed, turns, state, stalled
+    )
+}
+
+/// Footnote for a finished review's stage table.
+///
+/// The rows will not add up to the patch's review time, because the stages
+/// overlap. The longest stage beside the sum makes the gap visible, and both
+/// numbers are about this review. With one stage there is nothing to overlap
+/// and nothing to sum.
+fn stage_breakdown_note(stages: &[StageTiming]) -> String {
+    if let [only] = stages {
+        return format!("1 stage, {}", format_duration(only.seconds));
+    }
+
+    format!(
+        "{} stages overlapping: longest {}, {} summed",
+        stages.len(),
+        format_duration(stages.iter().map(|s| s.seconds).max().unwrap_or(0)),
+        format_duration(stages.iter().map(|s| s.seconds).sum())
+    )
+}
+
+/// Per-patch stage tables.
+///
+/// Printed whatever the patchset's status. The recorded breakdown only exists
+/// once a review has finished, and the most interesting moment to ask what the
+/// stages are doing is while they are still doing it.
+fn print_patch_timings(patches: &[Value], reviews: &[&Value], activity: Option<&PatchActivity>) {
+    if patches.is_empty() {
+        return;
+    }
+
+    println!();
+    print_colored(Color::Cyan, "Stage timings:\n");
+
+    for patch in patches {
+        let idx = patch["part_index"].as_i64().unwrap_or(0);
+        let p_id = patch["id"].as_i64().unwrap_or(0);
+        let subject = patch["subject"].as_str().unwrap_or("");
+        println!("  Patch {}: {}", idx, subject);
+
+        let live_entries = activity
+            .and_then(|a| a.by_patch.get(&p_id))
+            .filter(|e| !e.is_empty());
+        // Stored by the daemon in pipeline order, which this side cannot
+        // reconstruct from the names.
+        let recorded: Option<Vec<StageTiming>> = find_best_review_for_patch_refs(p_id, reviews)
+            .and_then(|r| r.get("stage_durations"))
+            .and_then(|d| serde_json::from_value(d.clone()).ok())
+            .filter(|d: &Vec<StageTiming>| !d.is_empty());
+
+        match (live_entries, recorded) {
+            // Live wins: it is the current truth, and the recorded breakdown for
+            // an earlier attempt would contradict it.
+            (Some(entries), _) => {
+                let live = activity.map(|a| a.live).unwrap_or(true);
+                println!(
+                    "    {:<20} {:>10}  {:>12}  STATE",
+                    "STAGE", "ELAPSED", "TURNS"
+                );
+                for entry in entries {
+                    println!("{}", stage_row(entry, live));
+                }
+            }
+            (None, Some(stages)) => {
+                println!("    {:<20} {:>10}  {:>12}", "STAGE", "ELAPSED", "TURNS");
+                for st in &stages {
+                    println!(
+                        "    {:<20} {:>10}  {:>12}",
+                        st.stage,
+                        format_duration(st.seconds),
+                        turns_cell(st.turns)
+                    );
+                }
+                println!("    ({})", stage_breakdown_note(&stages));
+            }
+            // Said plainly rather than left blank, which is indistinguishable
+            // from the flag not working.
+            (None, None) => println!("    no stage timings recorded"),
+        }
+    }
+}
+
+/// One-line summary of everything a patchset is currently doing.
+///
+/// Live entries report both clocks: `age` is how long that activity has been
+/// running, `idle` is how long since it last moved. A large idle beside a
+/// growing age is the signature of a wedged stage.
+///
+/// When nothing is live the daemon returns the last state recorded before it
+/// stopped, prefixed "stopped while" -- so it is neither mistaken for something
+/// still running, nor read as the cause of a failure.
+///
+/// Best-effort: a daemon without the endpoint yields `None` rather than
+/// breaking `show --watch`.
+async fn fetch_activity_summary(
+    client: &Client,
+    base_url: &str,
+    patchset_id: &str,
+) -> Option<String> {
+    let data = fetch_patchset_activity(client, base_url, patchset_id).await?;
+    if data.entries.is_empty() {
+        return None;
+    }
+
+    let parts: Vec<String> = data
+        .entries
+        .iter()
+        .map(|e| match (e.age_seconds, e.idle_seconds) {
+            (Some(age), Some(idle)) if data.live => format!(
+                "{} [{}, idle {}]",
+                e.description,
+                format_duration(age),
+                format_duration(idle)
+            ),
+            _ => e.description.clone(),
+        })
+        .collect();
+
+    let joined = parts.join(" | ");
+    if data.live {
+        Some(joined)
+    } else {
+        // An observation, not a diagnosis: the work stopped during this
+        // activity, which is not the same as failing because of it.
+        Some(format!("stopped while: {}", joined))
+    }
+}
+
 async fn handle_show(
     client: &Client,
     base_url: &str,
@@ -1279,6 +1654,7 @@ async fn handle_show(
     }
 
     let mut last_status = String::new();
+    let mut last_activity = String::new();
     loop {
         let url = format!("{}/api/patch?id={}", base_url, id);
         let resp = client.get(&url).send().await?;
@@ -1304,6 +1680,18 @@ async fn handle_show(
             }
 
             if watch && !is_terminal {
+                // Status alone sits on "In Review" or "Fetching" for the whole
+                // run. The activity feed is what shows it is actually moving --
+                // and, when it stops moving, where it got stuck.
+                if matches!(format, OutputFormat::Text) {
+                    let pid = details["id"].to_string();
+                    if let Some(desc) = fetch_activity_summary(client, base_url, &pid).await
+                        && desc != last_activity
+                    {
+                        println!("[{}]   {}", chrono::Local::now().format("%H:%M:%S"), desc);
+                        last_activity = desc;
+                    }
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 continue;
             }
@@ -1406,6 +1794,14 @@ async fn handle_show(
                         print_patch_line(patch, review, opts.inline);
                     }
 
+                    // Outside the review-log block below, which is only fetched
+                    // for terminal statuses. Timings asked for while a review is
+                    // running are the ones worth having.
+                    if opts.timings {
+                        let activity = fetch_patch_activity(client, base_url, &numeric_id).await;
+                        print_patch_timings(&patches, &reviews_filtered, activity.as_ref());
+                    }
+
                     if let Some(review) = review_data {
                         println!("\nReview Summary:");
                         if let Some(verdict) = review.get("verdict").and_then(|v| v.as_str()) {
@@ -1436,19 +1832,23 @@ async fn handle_show(
                             let subject = patch["subject"].as_str().unwrap_or("");
                             let p_id = patch["id"].as_i64().unwrap_or(0);
 
-                            if let Some(r) = find_best_review_for_patch(p_id, &reviews)
-                                && let Some(output_str) = r.get("output").and_then(|o| o.as_str())
-                                && let Ok(output_json) = from_str::<Value>(output_str)
-                                && let Some(findings) =
-                                    output_json.get("findings").and_then(|f| f.as_array())
-                            {
-                                let inline = r.get("inline_review").and_then(|s| s.as_str());
-                                print_findings_summary(
-                                    &format!("Patch {}: {}", idx, subject),
-                                    findings,
-                                    inline,
-                                    SummaryMode::Patch,
-                                );
+                            if let Some(r) = find_best_review_for_patch(p_id, &reviews) {
+                                print_attempt_note(r);
+                                print_coverage_warning(r);
+
+                                if let Some(output_str) = r.get("output").and_then(|o| o.as_str())
+                                    && let Ok(output_json) = from_str::<Value>(output_str)
+                                    && let Some(findings) =
+                                        output_json.get("findings").and_then(|f| f.as_array())
+                                {
+                                    let inline = r.get("inline_review").and_then(|s| s.as_str());
+                                    print_findings_summary(
+                                        &format!("Patch {}: {}", idx, subject),
+                                        findings,
+                                        inline,
+                                        SummaryMode::Patch,
+                                    );
+                                }
                             }
                         }
                     } else if let Some(logs) = details.get("baseline_logs").and_then(|l| l.as_str())
@@ -1566,6 +1966,15 @@ fn show_summary(
             println!("  In Review:   {:>3}", in_review);
             println!("  Not Started: {:>3}", not_started);
             println!("  Failed:      {:>3}", failed);
+
+            // Time spent reviewing, not time since submission: a patchset can
+            // sit in the queue for a while before a worker picks it up.
+            if let Some(secs) = details
+                .get("review_duration_seconds")
+                .and_then(|d| d.as_u64())
+            {
+                println!("  Review Time: {:>3}", format_duration(secs));
+            }
 
             if !issues_list.is_empty() && !opts.issues {
                 println!("\nIssues Found:");

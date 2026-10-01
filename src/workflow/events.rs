@@ -27,6 +27,34 @@ pub enum WorkflowEvent {
         turn: usize,
         max_turns: usize,
     },
+    /// A stage started running tools, or finished them (empty `tools`).
+    ///
+    /// Splits a turn's elapsed time into waiting on the model versus running
+    /// git, which are indistinguishable from outside without this.
+    StageTools {
+        stage_name: &'static str,
+        tools: Vec<String>,
+        turn: usize,
+        max_turns: usize,
+    },
+    /// A stage is backing off after the provider asked us to slow down.
+    /// `retry_in_seconds` is `None` once the wait is over.
+    StageBackoff {
+        stage_name: &'static str,
+        retry_in_seconds: Option<u64>,
+        turn: usize,
+        max_turns: usize,
+    },
+    /// A stage ended in an error rather than completing.
+    ///
+    /// The bookend to a stage is `StageFinished`, which is only reached on
+    /// success. Without this a failed stage reports nothing at all and its last
+    /// turn stays frozen on display, claiming to still be running.
+    StageFailed {
+        stage_name: &'static str,
+        reason: String,
+        cancelled: bool,
+    },
     /// A stage has finished executing.
     StageFinished {
         stage_name: &'static str,
