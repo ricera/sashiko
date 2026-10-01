@@ -57,6 +57,12 @@ pub struct WorkflowOutcome {
     pub stage_failures: Vec<StageFailure>,
 }
 
+/// The reason recorded for a stage that wound down at the review's deadline
+/// and still produced output. One text, so the daemon's record of such a
+/// stage reads the same as the engine's.
+pub const CUT_SHORT_REASON: &str =
+    "cut short: the review ran out of time; its findings so far were kept";
+
 /// Why a stage stopped without completing.
 ///
 /// Carried by every hop from the workflow to the stored review, so the reader

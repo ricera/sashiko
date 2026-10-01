@@ -23,8 +23,8 @@ pub mod prompt;
 pub mod stage;
 
 pub use engine::{
-    ParallelGroupFailed, StageFailure, StageRunRecord, StageStopCause, WorkflowEngine,
-    WorkflowFailure, WorkflowOutcome,
+    CUT_SHORT_REASON, ParallelGroupFailed, StageFailure, StageRunRecord, StageStopCause,
+    WorkflowEngine, WorkflowFailure, WorkflowOutcome,
 };
 pub use events::WorkflowEvent;
 pub use graph::{Workflow, WorkflowBuilder, WorkflowStep};

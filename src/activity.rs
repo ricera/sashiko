@@ -27,7 +27,7 @@
 //! explain itself.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -1225,6 +1225,15 @@ pub enum ProgressUpdate {
     /// The stage finished. Recorded by the daemon, which alone holds the
     /// stage's start time and turn count.
     Finished { key: ActivityKey, stage: String },
+    /// The stage stopped before finishing. Recorded by the daemon, so it
+    /// knows the stage is no longer running if the worker stops later.
+    /// `reason` is whole; only the row's copy is cut to its public form.
+    Failed {
+        key: ActivityKey,
+        stage: String,
+        reason: String,
+        cause: StageStopCause,
+    },
     /// A sign of life for the entry, with no change to what it is doing.
     Touch(ActivityKey),
 }
@@ -1380,14 +1389,12 @@ pub fn progress_update(
             reason,
             cause,
         } => match stage_key(stage) {
-            Some(key) => ProgressUpdate::Set(
+            Some(key) => ProgressUpdate::Failed {
                 key,
-                Phase::StageFailed {
-                    stage: stage.clone(),
-                    reason: public_reason(reason),
-                    cause: *cause,
-                },
-            ),
+                stage: stage.clone(),
+                reason: reason.clone(),
+                cause: *cause,
+            },
             None => ProgressUpdate::Touch(patch),
         },
         // Conversation text never enters the registry. /api/activity and
@@ -1411,7 +1418,47 @@ pub struct StageTiming {
     pub turns: u64,
 }
 
-/// Applies decoded progress to the registry, and keeps the per-stage timing
+/// One stage that did not run to completion, in the shape
+/// `reviews.stage_failures` stores: `{stage, reason, cause}`.
+///
+/// Written by the worker for the stages it reports, and by the daemon for an
+/// attempt that ended without a review from the worker, so both writers share
+/// this one shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageFailureRecord {
+    pub stage: String,
+    pub reason: String,
+    pub cause: StageStopCause,
+}
+
+/// What the daemon knows of one stage of the review it is running.
+///
+/// Typed per stage so the daemon can tell, when a worker stops, which stages
+/// were still running without reading the registry's rows back.
+#[derive(Debug)]
+enum TrackedStage {
+    /// Reported a start or a turn and has not finished.
+    Running {
+        key: ActivityKey,
+        started: Instant,
+        /// The highest turn seen: how many round trips it needed so far.
+        turns: u64,
+    },
+    /// Finished. `cut_short` is set when it finished by winding down at the
+    /// review's deadline, so its output covers less than a full run.
+    Done {
+        timing: StageTiming,
+        cut_short: bool,
+    },
+    /// Stopped before finishing, as the worker reported it or as the daemon
+    /// settled it when the worker stopped.
+    Failed {
+        reason: String,
+        cause: StageStopCause,
+    },
+}
+
+/// Applies decoded progress to the registry, and keeps the per-stage state
 /// that only the daemon can measure.
 ///
 /// Derived from the progress events the worker already emits, rather than
@@ -1419,20 +1466,15 @@ pub struct StageTiming {
 /// the consolidation stages that run outside the concurrent block.
 pub struct StageTracker {
     activity: Arc<ActivityRegistry>,
-    /// When each stage first reported, which is when its clock starts.
-    starts: HashMap<String, Instant>,
-    /// Highest turn seen per stage: how many round trips it needed.
-    turns: HashMap<String, u64>,
-    finished: Vec<StageTiming>,
+    /// Every stage that has reported, by name.
+    stages: BTreeMap<String, TrackedStage>,
 }
 
 impl StageTracker {
     pub fn new(activity: Arc<ActivityRegistry>) -> Self {
         Self {
             activity,
-            starts: HashMap::new(),
-            turns: HashMap::new(),
-            finished: Vec::new(),
+            stages: BTreeMap::new(),
         }
     }
 
@@ -1445,48 +1487,170 @@ impl StageTracker {
                 turn,
                 max_turns,
             } => {
-                self.starts
-                    .entry(stage.clone())
-                    .or_insert_with(Instant::now);
-                let seen = self.turns.entry(stage.clone()).or_insert(0);
-                *seen = (*seen).max(turn as u64);
+                self.turn(&key, &stage, turn as u64);
                 self.activity.update_stage_turn(key, stage, turn, max_turns);
             }
-            ProgressUpdate::Finished { key, stage } => {
-                // Marked done rather than removed. Dropping it made a patch's
-                // card show less and less as the review went on. Carries the
-                // numbers the recorded breakdown will show, so the row settles
-                // in place.
-                match self.starts.remove(&stage) {
-                    Some(started) => {
-                        let seconds = started.elapsed().as_secs();
-                        let turns = self.turns.remove(&stage).unwrap_or(0);
-                        self.finished.push(StageTiming {
-                            stage: stage.clone(),
-                            seconds,
-                            turns,
-                        });
-                        self.activity.update(
-                            key,
-                            Phase::StageDone {
-                                stage,
-                                seconds,
-                                turns,
-                            },
-                        );
-                    }
-                    // No start time means nothing true to say about it, and a
-                    // row saying only "done" is worse than none.
-                    None => self.activity.clear(&key),
-                }
+            ProgressUpdate::Finished { key, stage } => self.finish(key, stage),
+            ProgressUpdate::Failed {
+                key,
+                stage,
+                reason,
+                cause,
+            } => {
+                // The row carries the public form of the reason, because the
+                // activity routes are public. The record keeps the whole
+                // reason, as the worker's own list does.
+                self.activity.update(
+                    key,
+                    Phase::StageFailed {
+                        stage: stage.clone(),
+                        reason: public_reason(&reason),
+                        cause,
+                    },
+                );
+                self.stages
+                    .insert(stage, TrackedStage::Failed { reason, cause });
             }
             ProgressUpdate::Touch(key) => self.activity.touch(&key),
         }
     }
 
-    /// Every stage that finished, in the order they finished.
-    pub fn timings(&self) -> &[StageTiming] {
-        &self.finished
+    /// Starts the stage's clock on its first report, and keeps the highest
+    /// turn it has reached since.
+    fn turn(&mut self, key: &ActivityKey, stage: &str, turn: u64) {
+        match self.stages.get_mut(stage) {
+            Some(TrackedStage::Running { turns, .. }) => *turns = (*turns).max(turn),
+            _ => {
+                self.stages.insert(
+                    stage.to_string(),
+                    TrackedStage::Running {
+                        key: key.clone(),
+                        started: Instant::now(),
+                        turns: turn,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Marks the stage done rather than removing its row. Dropping it made a
+    /// patch's card show less and less as the review went on. The row carries
+    /// the numbers the recorded breakdown will show, so it settles in place.
+    fn finish(&mut self, key: ActivityKey, stage: String) {
+        match self.stages.remove(&stage) {
+            Some(TrackedStage::Running { started, turns, .. }) => {
+                let timing = StageTiming {
+                    stage: stage.clone(),
+                    seconds: started.elapsed().as_secs(),
+                    turns,
+                };
+                self.activity.update(
+                    key,
+                    Phase::StageDone {
+                        stage: stage.clone(),
+                        seconds: timing.seconds,
+                        turns,
+                    },
+                );
+                self.stages.insert(
+                    stage,
+                    TrackedStage::Done {
+                        timing,
+                        cut_short: false,
+                    },
+                );
+            }
+            // No start time means nothing true to say about it, and a row
+            // saying only "done" is worse than none.
+            other => {
+                if let Some(previous) = other {
+                    self.stages.insert(stage, previous);
+                }
+                self.activity.clear(&key);
+            }
+        }
+    }
+
+    /// Every stage that finished, by name.
+    pub fn timings(&self) -> Vec<StageTiming> {
+        self.stages
+            .values()
+            .filter_map(|s| match s {
+                TrackedStage::Done { timing, .. } => Some(timing.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stops every stage still running when the worker stopped, with `cause`
+    /// as the reason it stopped, and returns their records.
+    ///
+    /// Only the worker moves a stage's row, so a stage still mid-turn when its
+    /// worker died kept saying "turn 7/100, awaiting model" beside a patch
+    /// whose review had ended. Stages that finished or reported their own
+    /// failure are left alone: theirs is the true account.
+    pub fn settle(&mut self, cause: StageStopCause) -> Vec<StageFailureRecord> {
+        let mut settled = Vec::new();
+        for (stage, state) in self.stages.iter_mut() {
+            let TrackedStage::Running {
+                key,
+                started,
+                turns,
+            } = state
+            else {
+                continue;
+            };
+            let reason = format!(
+                "still running when the review stopped, after {} and {}",
+                format_duration(started.elapsed().as_secs()),
+                match *turns {
+                    1 => "1 turn".to_string(),
+                    n => format!("{} turns", n),
+                }
+            );
+            self.activity.update(
+                key.clone(),
+                Phase::StageFailed {
+                    stage: stage.clone(),
+                    reason: reason.clone(),
+                    cause,
+                },
+            );
+            settled.push(StageFailureRecord {
+                stage: stage.clone(),
+                reason: reason.clone(),
+                cause,
+            });
+            *state = TrackedStage::Failed { reason, cause };
+        }
+        settled
+    }
+
+    /// Every stage that did not run to completion: each failed stage with its
+    /// own cause, and each stage that finished by being cut short.
+    ///
+    /// A cut-short stage is listed although it finished, because its output
+    /// covers less than a full run. Leaving it out would record a stage that
+    /// wound down and was then killed as an ordinary finished one.
+    pub fn stopped(&self) -> Vec<StageFailureRecord> {
+        self.stages
+            .iter()
+            .filter_map(|(stage, state)| match state {
+                TrackedStage::Failed { reason, cause } => Some(StageFailureRecord {
+                    stage: stage.clone(),
+                    reason: reason.clone(),
+                    cause: *cause,
+                }),
+                TrackedStage::Done {
+                    cut_short: true, ..
+                } => Some(StageFailureRecord {
+                    stage: stage.clone(),
+                    reason: crate::workflow::CUT_SHORT_REASON.to_string(),
+                    cause: StageStopCause::CutShort,
+                }),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -3461,14 +3625,12 @@ mod tests {
                     reason: "Session exceeded max turns limit (50)".into(),
                     cause: StageStopCause::Error,
                 },
-                ProgressUpdate::Set(
-                    key("implementation"),
-                    Phase::StageFailed {
-                        stage: "implementation".into(),
-                        reason: "Session exceeded max turns limit (50)".into(),
-                        cause: StageStopCause::Error,
-                    },
-                ),
+                ProgressUpdate::Failed {
+                    key: key("implementation"),
+                    stage: "implementation".into(),
+                    reason: "Session exceeded max turns limit (50)".into(),
+                    cause: StageStopCause::Error,
+                },
             ),
             // The cause crosses the pipe as it was sent, so the row says why
             // the stage stopped, not only that it did.
@@ -3478,14 +3640,12 @@ mod tests {
                     reason: "stopped".into(),
                     cause: StageStopCause::OutOfTime,
                 },
-                ProgressUpdate::Set(
-                    key("security"),
-                    Phase::StageFailed {
-                        stage: "security".into(),
-                        reason: "stopped".into(),
-                        cause: StageStopCause::OutOfTime,
-                    },
-                ),
+                ProgressUpdate::Failed {
+                    key: key("security"),
+                    stage: "security".into(),
+                    reason: "stopped".into(),
+                    cause: StageStopCause::OutOfTime,
+                },
             ),
         ];
         for (wire, expected) in cases {
@@ -3516,11 +3676,19 @@ mod tests {
                 reason: reason.to_string(),
                 cause: StageStopCause::Error,
             };
-            let Some(ProgressUpdate::Set(_, phase)) =
-                progress_update(ProjectId::Linux, 77, 3, &wire, 1, 4)
-            else {
-                panic!("a failed stage must set its row");
-            };
+            let update = progress_update(ProjectId::Linux, 77, 3, &wire, 1, 4)
+                .expect("a failed stage must set its row");
+            let reg = ActivityRegistry::new();
+            let mut tracker = StageTracker::new(reg.clone());
+            tracker.apply(update);
+            let phase = reg
+                .get(&ActivityKey::PatchsetStage {
+                    patchset_id: 77,
+                    patch_id: 3,
+                    stage: "security".into(),
+                })
+                .expect("a failed stage keeps its row")
+                .phase;
             let json = serde_json::to_string(&phase).unwrap();
             assert!(!json.contains("SECRET-FINDING"), "{json}");
             assert!(!json.contains("Caused by"), "{json}");
@@ -3624,7 +3792,10 @@ mod tests {
             }]
         );
         assert!(
-            tracker.starts.is_empty(),
+            !tracker
+                .stages
+                .values()
+                .any(|s| matches!(s, TrackedStage::Running { .. })),
             "a finished stage must not stay open"
         );
 
@@ -3650,6 +3821,166 @@ mod tests {
                 stage: "locking".into()
             })
             .is_none()
+        );
+    }
+
+    /// Nothing on a stopped review's card may still claim to be running.
+    ///
+    /// Only the worker moves a stage's row, so a killed worker left its stages
+    /// mid-turn: "turn 23/100 (awaiting model)" outlived the review running
+    /// it. Settling must not overwrite a stage that finished or reported its
+    /// own failure, whose account is the true one.
+    #[test]
+    fn stages_left_mid_turn_stop_claiming_to_be_running() {
+        let reg = ActivityRegistry::new();
+        let mut tracker = StageTracker::new(reg.clone());
+        let apply = |tracker: &mut StageTracker, wire| {
+            tracker.apply(progress_update(ProjectId::Linux, 5, 19, &wire, 1, 1).unwrap())
+        };
+        let key = |stage: &str| ActivityKey::PatchsetStage {
+            patchset_id: 5,
+            patch_id: 19,
+            stage: stage.to_string(),
+        };
+        for (stage, turn) in [("hardware", 23), ("locking", 100), ("goal", 5)] {
+            apply(
+                &mut tracker,
+                ProgressWire::StageTurn {
+                    stage: stage.into(),
+                    turn,
+                    max_turns: 100,
+                },
+            );
+        }
+        let long_reason = format!(
+            "Session exceeded max turns limit (100)\n{}",
+            "x".repeat(300)
+        );
+        apply(
+            &mut tracker,
+            ProgressWire::StageFailed {
+                stage: "locking".into(),
+                reason: long_reason.clone(),
+                cause: StageStopCause::Error,
+            },
+        );
+        apply(
+            &mut tracker,
+            ProgressWire::StageFinished {
+                stage: "goal".into(),
+            },
+        );
+
+        let settled = tracker.settle(StageStopCause::OutOfTime);
+        let reason = "still running when the review stopped, after 0s and 23 turns";
+        assert_eq!(
+            settled,
+            [StageFailureRecord {
+                stage: "hardware".into(),
+                reason: reason.into(),
+                cause: StageStopCause::OutOfTime,
+            }]
+        );
+        assert_eq!(
+            reg.get(&key("hardware")).map(|e| e.phase),
+            Some(Phase::StageFailed {
+                stage: "hardware".into(),
+                reason: reason.into(),
+                cause: StageStopCause::OutOfTime,
+            }),
+            "a stage left mid-turn must stop claiming to run"
+        );
+        match reg.get(&key("locking")).map(|e| e.phase) {
+            Some(Phase::StageFailed { reason, cause, .. }) => {
+                assert_eq!(reason, "Session exceeded max turns limit (100)");
+                assert_eq!(cause, StageStopCause::Error);
+            }
+            other => panic!("a reported failure must survive untouched: {other:?}"),
+        }
+        assert!(
+            matches!(
+                reg.get(&key("goal")).map(|e| e.phase),
+                Some(Phase::StageDone { .. })
+            ),
+            "a finished stage is not retroactively stopped"
+        );
+
+        // The record lists the reported failure with its whole reason and the
+        // settled stage, and not the finished one.
+        assert_eq!(
+            tracker.stopped(),
+            [
+                StageFailureRecord {
+                    stage: "hardware".into(),
+                    reason: reason.into(),
+                    cause: StageStopCause::OutOfTime,
+                },
+                StageFailureRecord {
+                    stage: "locking".into(),
+                    reason: long_reason,
+                    cause: StageStopCause::Error,
+                },
+            ]
+        );
+        assert_eq!(tracker.timings().len(), 1);
+        assert!(
+            tracker.settle(StageStopCause::Interrupted).is_empty(),
+            "a settled stage is not running any more"
+        );
+    }
+
+    /// A stage that wound down and finished covers less than a full run, so
+    /// it is listed among the stopped stages, and still has its timing.
+    #[test]
+    fn a_cut_short_stage_is_listed_as_stopped() {
+        let mut tracker = StageTracker::new(ActivityRegistry::new());
+        let timing = StageTiming {
+            stage: "security".into(),
+            seconds: 900,
+            turns: 31,
+        };
+        tracker.stages.insert(
+            "security".into(),
+            TrackedStage::Done {
+                timing: timing.clone(),
+                cut_short: true,
+            },
+        );
+        tracker.stages.insert(
+            "goal".into(),
+            TrackedStage::Done {
+                timing: StageTiming {
+                    stage: "goal".into(),
+                    seconds: 40,
+                    turns: 3,
+                },
+                cut_short: false,
+            },
+        );
+        assert_eq!(
+            tracker.stopped(),
+            [StageFailureRecord {
+                stage: "security".into(),
+                reason: crate::workflow::CUT_SHORT_REASON.into(),
+                cause: StageStopCause::CutShort,
+            }]
+        );
+        assert!(tracker.timings().contains(&timing));
+        assert!(tracker.settle(StageStopCause::OutOfTime).is_empty());
+    }
+
+    /// The stored shape of a stopped stage is the one the page and the CLI
+    /// read: `{stage, reason, cause}`, with the cause in snake case.
+    #[test]
+    fn a_stage_failure_record_is_stored_as_stage_reason_and_cause() {
+        let record = StageFailureRecord {
+            stage: "security".into(),
+            reason: "why".into(),
+            cause: StageStopCause::OutOfTime,
+        };
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            serde_json::json!({"stage": "security", "reason": "why", "cause": "out_of_time"})
         );
     }
 
