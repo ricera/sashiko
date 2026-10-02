@@ -992,12 +992,84 @@ pub fn scrub_thought_signatures(val: &mut serde_json::Value) {
 
 // --- Multiplexed IPC Protocol Support ---
 
+/// The kinds of message the daemon writes to a worker's stdin.
+///
+/// The worker accepts only these. A line with any other `type` fails to
+/// parse as an [`IpcEnvelope`], and the worker exits, because the daemon and
+/// the worker are one binary and a kind one of them does not know is a
+/// protocol violation rather than something to skip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IpcMessageType {
+    /// The model's answer to the request with the same `tx_id`.
+    AiResponse,
+    /// The provider error that ended the request with the same `tx_id`.
+    Error,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IpcEnvelope {
     #[serde(rename = "type")]
-    pub msg_type: String,
+    pub msg_type: IpcMessageType,
     pub tx_id: u64,
     pub payload: serde_json::Value,
+}
+
+impl IpcEnvelope {
+    /// Builds the newline-terminated stdin line for one daemon-to-worker
+    /// message.
+    ///
+    /// The daemon writes every reply through this, so the writer and the
+    /// worker's reader share one envelope type and one spelling of each kind.
+    #[cfg(any(feature = "server", test))]
+    pub(crate) fn line(
+        msg_type: IpcMessageType,
+        tx_id: u64,
+        payload: &impl Serialize,
+    ) -> serde_json::Result<String> {
+        let envelope = IpcEnvelope {
+            msg_type,
+            tx_id,
+            payload: serde_json::to_value(payload)?,
+        };
+        let mut line = serde_json::to_string(&envelope)?;
+        line.push('\n');
+        Ok(line)
+    }
+}
+
+/// The reply one stdin line carries: its `tx_id` and the result to dispatch.
+type IpcReply = (u64, Result<AiResponse, RemoteAiError>);
+
+/// Reads one line from the worker's stdin into the reply it carries.
+///
+/// An `Err` is a protocol violation, described for the log. It is returned
+/// rather than acted on so that the parsing can be tested without ending the
+/// test process.
+fn parse_ipc_reply(line: &str) -> Result<IpcReply, String> {
+    let envelope = serde_json::from_str::<IpcEnvelope>(line)
+        .map_err(|e| format!("Received a malformed message on stdin ({}): {}", e, line))?;
+    let tx_id = envelope.tx_id;
+    let result = match envelope.msg_type {
+        IpcMessageType::AiResponse => {
+            let response =
+                serde_json::from_value::<AiResponse>(envelope.payload).map_err(|_| {
+                    format!("Failed to parse payload as AiResponse for tx_id {}", tx_id)
+                })?;
+            Ok(response)
+        }
+        IpcMessageType::Error => {
+            let payload = serde_json::from_value::<RemoteAiErrorPayload>(envelope.payload)
+                .map_err(|_| {
+                    format!(
+                        "Failed to parse payload as RemoteAiErrorPayload for tx_id {}",
+                        tx_id
+                    )
+                })?;
+            Err(payload.into_error())
+        }
+    };
+    Ok((tx_id, result))
 }
 
 pub(crate) struct IpcRegistry {
@@ -1183,46 +1255,12 @@ pub(crate) fn start_stdin_reader(registry: Arc<IpcRegistry>) -> tokio::task::Joi
         let mut lines = reader.lines();
 
         while let Ok(Some(line)) = lines.next_line().await {
-            if let Ok(envelope) = serde_json::from_str::<IpcEnvelope>(&line) {
-                match envelope.msg_type.as_str() {
-                    "ai_response" => {
-                        if let Ok(payload) = serde_json::from_value::<AiResponse>(envelope.payload)
-                        {
-                            registry.dispatch(envelope.tx_id, Ok(payload)).await;
-                        } else {
-                            eprintln!(
-                                "CRITICAL PROTOCOL ERROR: Failed to parse payload as AiResponse for tx_id {}",
-                                envelope.tx_id
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                    "error" => {
-                        if let Ok(payload) =
-                            serde_json::from_value::<RemoteAiErrorPayload>(envelope.payload)
-                        {
-                            registry
-                                .dispatch(envelope.tx_id, Err(payload.into_error()))
-                                .await;
-                        } else {
-                            eprintln!(
-                                "CRITICAL PROTOCOL ERROR: Failed to parse payload as RemoteAiErrorPayload for tx_id {}",
-                                envelope.tx_id
-                            );
-                            std::process::exit(1);
-                        }
-                    }
-                    unknown => {
-                        eprintln!("CRITICAL PROTOCOL ERROR: Unknown message type: {}", unknown);
-                        std::process::exit(1);
-                    }
+            match parse_ipc_reply(&line) {
+                Ok((tx_id, result)) => registry.dispatch(tx_id, result).await,
+                Err(violation) => {
+                    eprintln!("CRITICAL PROTOCOL ERROR: {}", violation);
+                    std::process::exit(1);
                 }
-            } else {
-                eprintln!(
-                    "CRITICAL PROTOCOL ERROR: Received malformed JSON on stdin: {}",
-                    line
-                );
-                std::process::exit(1);
             }
         }
 
@@ -1489,6 +1527,126 @@ mod tests {
         assert_eq!(usage.total_tokens, 150);
 
         Ok(())
+    }
+
+    /// Each kind keeps its wire spelling. Both ends share the enum, so this
+    /// guards the protocol against a rename of a variant or of its serde
+    /// spelling, which would otherwise pass every in-process test.
+    #[test]
+    fn ipc_message_type_reads_and_writes_the_wire_spelling() -> Result<()> {
+        for (wire, kind) in [
+            ("ai_response", IpcMessageType::AiResponse),
+            ("error", IpcMessageType::Error),
+        ] {
+            let parsed: IpcMessageType = serde_json::from_value(json!(wire))?;
+            assert_eq!(parsed, kind);
+            assert_eq!(serde_json::to_value(kind)?, json!(wire));
+        }
+        Ok(())
+    }
+
+    /// A reply built the way the daemon builds it (`reviewer.rs` writes every
+    /// reply through [`IpcEnvelope::line`]) is one line that the worker's
+    /// reader dispatches to the same transaction with the same result.
+    #[test]
+    fn ipc_envelope_line_is_read_back_by_the_worker() -> Result<()> {
+        let response: AiResponse = serde_json::from_value(json!({"content": "hello"}))?;
+        let line = IpcEnvelope::line(IpcMessageType::AiResponse, 11, &response)?;
+        let text = line
+            .strip_suffix('\n')
+            .ok_or_else(|| anyhow!("a reply ends its line"))?;
+        assert!(!text.contains('\n'), "a reply is exactly one line");
+        let (tx_id, result) = parse_ipc_reply(text).map_err(|e| anyhow!(e))?;
+        assert_eq!(tx_id, 11);
+        let read = result.map_err(|e| anyhow!(e))?;
+        assert_eq!(read.content.as_deref(), Some("hello"));
+
+        let payload = RemoteAiErrorPayload::new("over quota".to_string(), AiErrorClass::Fatal);
+        let line = IpcEnvelope::line(IpcMessageType::Error, 12, &payload)?;
+        let text = line
+            .strip_suffix('\n')
+            .ok_or_else(|| anyhow!("a reply ends its line"))?;
+        let (tx_id, result) = parse_ipc_reply(text).map_err(|e| anyhow!(e))?;
+        assert_eq!(tx_id, 12);
+        let Err(err) = result else {
+            panic!("an error reply must dispatch an error");
+        };
+        assert_eq!(err.message, "over quota");
+        assert_eq!(err.class, AiErrorClass::Fatal);
+        Ok(())
+    }
+
+    /// A kind the worker does not know is a protocol violation, not a line to
+    /// skip, so it fails to parse and takes the reader's exit path.
+    #[test]
+    fn ipc_envelope_rejects_an_unknown_message_type() {
+        for kind in ["ai_request", "AiResponse", "cancel", ""] {
+            let line = json!({"type": kind, "tx_id": 1, "payload": null}).to_string();
+            assert!(
+                serde_json::from_str::<IpcEnvelope>(&line).is_err(),
+                "{kind:?} must not parse"
+            );
+            let violation = parse_ipc_reply(&line).expect_err("an unknown kind is a violation");
+            assert!(
+                violation.contains("unknown variant"),
+                "the violation says what was wrong: {violation}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_ipc_reply_dispatches_a_response_to_its_transaction() -> Result<()> {
+        let line = json!({
+            "type": "ai_response",
+            "tx_id": 7,
+            "payload": {"content": "hello"}
+        })
+        .to_string();
+        let (tx_id, result) = parse_ipc_reply(&line).map_err(|e| anyhow!(e))?;
+        assert_eq!(tx_id, 7);
+        let response = result.map_err(|e| anyhow!(e))?;
+        assert_eq!(response.content.as_deref(), Some("hello"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_ipc_reply_dispatches_an_error_with_its_class() -> Result<()> {
+        let payload = RemoteAiErrorPayload::new("over quota".to_string(), AiErrorClass::Fatal);
+        let line = json!({"type": "error", "tx_id": 9, "payload": payload}).to_string();
+        let (tx_id, result) = parse_ipc_reply(&line).map_err(|e| anyhow!(e))?;
+        assert_eq!(tx_id, 9);
+        let Err(err) = result else {
+            panic!("an error message must dispatch an error");
+        };
+        assert_eq!(err.message, "over quota");
+        assert_eq!(err.class, AiErrorClass::Fatal);
+        Ok(())
+    }
+
+    /// A known kind whose payload does not fit it is still a violation, and
+    /// the description names the transaction.
+    #[test]
+    fn parse_ipc_reply_rejects_a_payload_that_does_not_fit_its_kind() {
+        for (kind, expected) in [
+            (
+                "ai_response",
+                "Failed to parse payload as AiResponse for tx_id 3",
+            ),
+            (
+                "error",
+                "Failed to parse payload as RemoteAiErrorPayload for tx_id 3",
+            ),
+        ] {
+            let line = json!({"type": kind, "tx_id": 3, "payload": "not an object"}).to_string();
+            assert_eq!(parse_ipc_reply(&line).err().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn parse_ipc_reply_rejects_a_line_that_is_not_json() {
+        let violation = parse_ipc_reply("not json").expect_err("not JSON is a violation");
+        assert!(violation.starts_with("Received a malformed message on stdin"));
+        assert!(violation.ends_with(": not json"));
     }
 
     #[test]
