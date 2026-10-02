@@ -61,6 +61,21 @@ const CLOSED_TO_NEW_PARTS_SQL: &str = "(status = 'Cancelled'
       OR (status IN ('Reviewed', 'Failed', 'Failed To Apply')
           AND received_parts >= total_parts))";
 
+/// The patchset statuses that let a series be submitted again, as an SQL
+/// list for `status NOT IN` tests. It is the SQL form of
+/// [`Database::is_resubmittable`], and a test below checks that the two
+/// answer alike, so the ingestion check and the reset to Fetching cannot
+/// drift apart.
+#[cfg(feature = "server")]
+const RESUBMITTABLE_STATUSES_SQL: &str =
+    "('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply')";
+
+/// The unspaced spelling of Failed To Apply. No writer uses it today, but the
+/// resubmittable statuses have always accepted it, so a row that carries it
+/// is still treated as a failure to apply.
+#[cfg(feature = "server")]
+const LEGACY_FAILED_TO_APPLY: &str = "FailedToApply";
+
 #[cfg(feature = "server")]
 fn get_required_text(row: &libsql::Row, index: i32) -> Result<String> {
     get_optional_text(row, index)?
@@ -6601,6 +6616,29 @@ impl Database {
         }
     }
 
+    /// Report whether a patchset in this status may be submitted again.
+    ///
+    /// A series whose review failed, was cancelled or did not apply has no
+    /// result worth keeping, so a new submission of it starts over. Every
+    /// other status the review pipeline defines is listed, so that a new
+    /// variant cannot become resubmittable, or stop being so, without a
+    /// decision here.
+    fn is_resubmittable(status: &str) -> bool {
+        match ReviewStatus::from_str(status) {
+            Ok(ReviewStatus::Failed | ReviewStatus::Cancelled | ReviewStatus::FailedToApply) => {
+                true
+            }
+            Ok(
+                ReviewStatus::Incomplete
+                | ReviewStatus::Pending
+                | ReviewStatus::InReview
+                | ReviewStatus::Skipped
+                | ReviewStatus::Reviewed,
+            ) => false,
+            Err(()) => status == LEGACY_FAILED_TO_APPLY,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_patchset(
         &self,
@@ -10043,7 +10081,9 @@ impl Database {
             let mut rows = self
                 .conn
                 .query(
-                    "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    &format!(
+                        "SELECT 1 FROM patchsets WHERE cover_letter_message_id = ? AND status NOT IN {RESUBMITTABLE_STATUSES_SQL} LIMIT 1"
+                    ),
                     libsql::params![clid.clone()],
                 )
                 .await?;
@@ -10054,7 +10094,9 @@ impl Database {
             let mut p_rows = self
                 .conn
                 .query(
-                    "SELECT 1 FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id WHERE p.message_id = ? AND ps.status NOT IN ('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply') LIMIT 1",
+                    &format!(
+                        "SELECT 1 FROM patches p JOIN patchsets ps ON p.patchset_id = ps.id WHERE p.message_id = ? AND ps.status NOT IN {RESUBMITTABLE_STATUSES_SQL} LIMIT 1"
+                    ),
                     libsql::params![clid.clone()],
                 )
                 .await?;
@@ -10118,14 +10160,12 @@ impl Database {
                 let status: String = row.get::<Option<String>>(1)?.unwrap_or_default();
                 drop(rows);
 
-                // Only reset to Fetching if it failed or is currently fetching.
+                // Only reset to Fetching if it may be resubmitted or is currently fetching.
                 // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
-                if status == "Failed"
-                    || status == "Fetching"
-                    || status == "Cancelled"
-                    || status == "Failed To Apply"
-                    || status == "FailedToApply"
-                {
+                // Fetching is not one of the resubmittable statuses because
+                // has_patchset_by_msgid counts a fetching series as already
+                // ingested, so it is accepted here by a term of its own.
+                if Self::is_resubmittable(&status) || status == "Fetching" {
                     if let Some(s) = slug {
                         self.rotate_mr_slug(s, Some(id)).await?;
                     }
@@ -20509,6 +20549,65 @@ mod tests {
                     "the two forms of the predicate disagree about {status} at {received}/{total}"
                 );
             }
+        }
+    }
+
+    /// The ingestion check and the reset to Fetching have to agree on which
+    /// series may be submitted again, or a resubmission is either refused as
+    /// already ingested or accepted and then never fetched.
+    #[tokio::test]
+    async fn test_resubmittable_statuses_agree_with_their_sql_form() {
+        let db = setup_db().await;
+        let thread_id = db
+            .create_thread("resubmit@example.com", "A subject", 1000)
+            .await
+            .unwrap();
+
+        let statuses = [
+            ("Incomplete", false),
+            ("Pending", false),
+            ("In Review", false),
+            ("Cancelled", true),
+            ("Skipped", false),
+            ("Reviewed", false),
+            ("Failed", true),
+            ("Failed To Apply", true),
+            ("FailedToApply", true),
+            ("Fetching", false),
+        ];
+
+        for (index, (status, expected)) in statuses.iter().enumerate() {
+            let id = 100 + index as i64;
+            db.conn
+                .execute(
+                    "INSERT INTO patchsets (id, thread_id, subject, author, date, status)
+                     VALUES (?, ?, 'A subject', 'An Author', 1000, ?)",
+                    libsql::params![id, thread_id, *status],
+                )
+                .await
+                .unwrap();
+
+            let mut rows = db
+                .conn
+                .query(
+                    &format!(
+                        "SELECT status IN {RESUBMITTABLE_STATUSES_SQL} FROM patchsets WHERE id = ?"
+                    ),
+                    libsql::params![id],
+                )
+                .await
+                .unwrap();
+            let sql_says: bool = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() != 0;
+
+            assert_eq!(
+                Database::is_resubmittable(status),
+                sql_says,
+                "the two forms of the resubmittable statuses disagree about {status}"
+            );
+            assert_eq!(
+                sql_says, *expected,
+                "{status} changed whether it may be resubmitted"
+            );
         }
     }
 
