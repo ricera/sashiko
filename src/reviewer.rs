@@ -7949,6 +7949,9 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         ctx: ReviewContext,
         patchset_id: i64,
         patch_id: i64,
+        /// When the patchset's embargo ends, if it has one. Its reviews are
+        /// told, so a review that finishes before then queues nothing.
+        embargo_until: Option<i64>,
         /// Holds the worker scripts.
         dir: tempfile::TempDir,
     }
@@ -8017,8 +8020,20 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 ctx,
                 patchset_id,
                 patch_id,
+                embargo_until: None,
                 dir,
             })
+        }
+
+        /// Embargoes the patchset until `until`, in the database and for the
+        /// reviews this fixture runs.
+        async fn embargo(&mut self, until: i64) -> Result<()> {
+            self.ctx
+                .db
+                .set_patchset_embargo_until(self.patchset_id, until)
+                .await?;
+            self.embargo_until = Some(until);
+            Ok(())
         }
 
         /// Reviews the patch once, as the patchset's run would.
@@ -8052,7 +8067,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 None,
                 None,
                 Self::DIFF,
-                None,
+                self.embargo_until,
             )
             .await
         }
@@ -8658,9 +8673,17 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
     impl TwoPartRun {
         async fn new(first_worker: &str, configure: impl FnOnce(&mut Settings)) -> Result<Self> {
-            let reviewed = for_part(&reviewed_output(json!([])), 2)?;
-            let reviewing = worker_reporting_then(&[], &format!("echo '{reviewed}'\n"));
-            Self::with_second(first_worker, &reviewing, configure).await
+            Self::start(first_worker, &Self::reviewing_second()?, configure, None).await
+        }
+
+        /// As `new`, under an embargo that ends at `embargo_until`.
+        async fn embargoed(
+            first_worker: &str,
+            configure: impl FnOnce(&mut Settings),
+            embargo_until: i64,
+        ) -> Result<Self> {
+            let second_worker = Self::reviewing_second()?;
+            Self::start(first_worker, &second_worker, configure, Some(embargo_until)).await
         }
 
         /// As `new`, but the second part is reviewed by `second_worker`,
@@ -8670,8 +8693,26 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             second_worker: &str,
             configure: impl FnOnce(&mut Settings),
         ) -> Result<Self> {
-            let fixture =
+            Self::start(first_worker, second_worker, configure, None).await
+        }
+
+        /// A worker that gives the second part a full review.
+        fn reviewing_second() -> Result<String> {
+            let reviewed = for_part(&reviewed_output(json!([])), 2)?;
+            Ok(worker_reporting_then(&[], &format!("echo '{reviewed}'\n")))
+        }
+
+        async fn start(
+            first_worker: &str,
+            second_worker: &str,
+            configure: impl FnOnce(&mut Settings),
+            embargo_until: Option<i64>,
+        ) -> Result<Self> {
+            let mut fixture =
                 WorkerFixture::new(first_worker, Arc::new(MockProvider), configure).await?;
+            if let Some(until) = embargo_until {
+                fixture.embargo(until).await?;
+            }
             let second = fixture.add_patch(2).await?;
             let second_ctx = fixture.with_worker("second_worker", second_worker)?;
             let mut run = Self {
@@ -8697,14 +8738,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                     .await,
             );
 
-            let patchset: PatchsetRow = serde_json::from_value(json!({
-                "id": self.fixture.patchset_id,
-                "message_id": "msg_id_1",
-                "mailing_lists": [],
-                "subsystems": [],
-                "mr_url": "https://github.com/owner/repo/pull/7",
-                "mr_number": 7,
-            }))?;
+            let patchset = self.patchset_row()?;
             let diffs: Vec<(i64, i64, String, String, String, i64, String)> =
                 [(self.first, 1), (self.second, 2)]
                     .into_iter()
@@ -8721,6 +8755,21 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                     })
                     .collect();
             Ok(Reviewer::finish_patchset(&self.fixture.ctx, &patchset, &diffs, tally).await)
+        }
+
+        /// The patchset as the reviewer reads it. The embargo is set apart,
+        /// because the row does not deserialise it.
+        fn patchset_row(&self) -> Result<PatchsetRow> {
+            let mut patchset: PatchsetRow = serde_json::from_value(json!({
+                "id": self.fixture.patchset_id,
+                "message_id": "msg_id_1",
+                "mailing_lists": [],
+                "subsystems": [],
+                "mr_url": "https://github.com/owner/repo/pull/7",
+                "mr_number": 7,
+            }))?;
+            patchset.embargo_until = self.fixture.embargo_until;
+            Ok(patchset)
         }
 
         /// Processes the patchset again as a daemon restart does: the
@@ -8793,6 +8842,66 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             0,
             "no forge comment for a Partial series"
         );
+        Ok(())
+    }
+
+    /// An embargoed patchset with a salvaged patch holds every email while
+    /// its embargo lasts and is not released early. Once the embargo ends,
+    /// the release emails its Reviewed patch only, because a salvaged review
+    /// never leaves the server, and clears the embargo.
+    #[tokio::test]
+    async fn test_an_embargoed_partial_patchset_emails_its_reviewed_patch_on_release() -> Result<()>
+    {
+        let cut_short = json!([{"stage": "security", "reason": "r", "cause": "cut_short"}]);
+        let salvaging = worker_winding_down(
+            &stage_reaching("security", 1),
+            &format!("echo '{}'\n", reviewed_output(cut_short)),
+        );
+        let now = chrono::Utc::now().timestamp();
+
+        let run = TwoPartRun::embargoed(&salvaging, out_of_time_with_salvage, now + 3600).await?;
+        assert_eq!(run.final_status, Some(ReviewStatus::Partial));
+        assert_eq!(
+            (
+                run.emails_for(run.first).await?,
+                run.emails_for(run.second).await?
+            ),
+            (0, 0),
+            "the embargo holds every email"
+        );
+        let ctx = &run.fixture.ctx;
+        let patchset_id = run.fixture.patchset_id;
+        let due = |now: i64| async move {
+            ctx.db
+                .get_releasable_embargoed_patchsets(now, 10)
+                .await
+                .map(|due| due.into_iter().find(|p| p.id == patchset_id))
+        };
+        assert!(
+            due(now).await?.is_none(),
+            "released before its embargo ended"
+        );
+
+        ctx.db
+            .set_patchset_embargo_until(patchset_id, now - 1)
+            .await?;
+        let patchset = due(now)
+            .await?
+            .ok_or_else(|| anyhow!("not released when its embargo ended"))?;
+        Reviewer::release_patchset_results(ctx, &patchset).await?;
+
+        assert_eq!(
+            run.emails_for(run.first).await?,
+            0,
+            "nothing leaves a Partial review"
+        );
+        assert!(
+            run.emails_for(run.second).await? > 0,
+            "the Reviewed patch is emailed"
+        );
+        assert_eq!(run.forge_comments().await?, 0);
+        assert!(due(now).await?.is_none(), "the embargo was not cleared");
+        assert_eq!(run.stored_status().await?.as_deref(), Some("Partial"));
         Ok(())
     }
 
