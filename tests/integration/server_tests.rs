@@ -627,6 +627,7 @@ async fn test_stats_reviews_endpoint() {
 
     assert_eq!(body["total_reviews"], 1005);
     assert_eq!(body["total_failures"], 5);
+    assert_eq!(body["total_partial"], 0);
 
     let reviews = body["reviews"].as_array().unwrap();
     assert_eq!(reviews.len(), 1);

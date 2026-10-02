@@ -1,6 +1,8 @@
 // Checks the web UI's review card, the per-patch stage table (live and
 // recorded), how live activity is routed and polled, the live conversation log,
-// and the line naming the reference repositories each review had.
+// the line naming the reference repositories each review had, and how partial
+// and timed-out reviews read in the list, the summary table, the card and the
+// statistics.
 //
 // static/index.html has no build step and no other test coverage, so this is the
 // only thing standing between a bad edit and a page that silently renders
@@ -50,7 +52,10 @@ const LETS = ['activityPoll', 'viewGeneration', 'logView', 'logTimer'];
 const NAMES = ['escapeHtml', 'renderReviewReferences', 'renderReviewCard',
                'formatDuration', 'describeStageWait', 'summarizeReason', 'compareStageRows',
                'stageTableLabel', 'stageRowsFromRecord', 'stageStopCause', 'stageStopLabel',
-               'stageRowsFromActivity',
+               'stoppedStageStatus', 'stageRowsFromActivity',
+               'renderFindingsBadges', 'renderPatchsetListStatus', 'countNewFindings',
+               'maxFindingCounts', 'maxOfRunsNote', 'patchSummaryStatus', 'renderStatCard', 'renderReviewStatCards',
+               'reviewOutcomeColor',
                'renderStageRow', 'stageTableParts', 'hostForPatch', 'paintStageProgress',
                'refreshActivity', 'startActivityPolling', 'stopActivityPolling',
                'renderInteractionLogEntries', 'formatJsonExpandable', 'formatFuncCallExpandable',
@@ -172,6 +177,7 @@ const app = new El('app');
 byId.set('activity-row', row); byId.set('activity-value', value); byId.set('app', app);
 
 globalThis.document = {
+    body: {},
     getElementById: id => byId.get(id) || null,
     querySelectorAll: sel => sel === '[data-stage-progress]' ? all : [],
     querySelector: sel => {
@@ -181,6 +187,9 @@ globalThis.document = {
     createElement: tag => new El(null, tag),
 };
 globalThis.config = {};
+// The theme's colours, as the stats chart reads them from the page.
+const THEME = { '--status-inreview': ' #d67f05', '--status-partial': ' #9a6700' };
+globalThis.getComputedStyle = () => ({ getPropertyValue: name => THEME[name] || '' });
 const scrolls = [];
 globalThis.window = { scrollY: 0, scrollTo: (x, y) => { scrolls.push(y); } };
 
@@ -739,7 +748,7 @@ function causeChecks(fns) {
 
     for (const [cause, words] of [
         ['error', 'failed'], ['cancelled', 'cancelled'], ['out_of_time', 'stopped: out of time'],
-        ['cut_short', 'cut short'], ['interrupted', 'still running when the review stopped'],
+        ['interrupted', 'still running when the review stopped'],
     ]) {
         const fromRecord = recorded({ cause });
         expect(`cause: a recorded ${cause} reads "${words}"`, shows(fromRecord, words));
@@ -747,6 +756,13 @@ function causeChecks(fns) {
         expect(`cause: a recorded and a live ${cause} render alike`, fromRecord === live({ cause }));
         expect(`cause: only an error is coloured as a fault (${cause})`, red(fromRecord) === (cause === 'error'));
     }
+    // A cut-short stage's reason only repeats its label, so the cell reads
+    // the label alone and the tooltip says what it means.
+    const cut = recorded({ cause: 'cut_short' });
+    expect('cause: a recorded cut_short reads "cut short", without its reason',
+        visibleText(cut).includes('cut short') && !visibleText(cut).includes(': why'));
+    expect('cause: a recorded and a live cut_short render alike', cut === live({ cause: 'cut_short' }));
+    expect('cause: a cut-short stage is not coloured as a fault', !red(cut));
     expect('cause: a cause wins over a legacy flag beside it',
         shows(recorded({ cause: 'error', cancelled: true }), 'failed'));
     expect('legacy: cancelled reads "stopped", not "cancelled"',
@@ -820,6 +836,32 @@ function stoppedTimeChecks(fns) {
     expect('cut short: with its time and label',
         security.includes(fns.formatDuration(900)) && security.includes('31 turns')
             && security.includes('cut short') && !/\bdone\b/.test(security));
+    expect('cut short: it reads "cut short after" the time it ran, once',
+        security.includes(`cut short after ${fns.formatDuration(900)}`)
+            && security.split('cut short').length === 2);
+    // The live row of the same stage reads as the recorded one, so a
+    // cut-short stage does not change shape when the review ends.
+    const recordedCut = guard(() => fns.stageRowsFromRecord(
+        [{ stage: 'security', order: ORDER.security, seconds: 900, turns: 31, stopped_by: 'cut_short' }],
+        [{ stage: 'security', order: ORDER.security, cause: 'cut_short',
+           reason: 'cut short: the review ran out of time; its findings so far were kept' }]));
+    const liveCut = guard(() => fns.stageRowsFromActivity([{
+        patch_id: 31, stage: 'security', order: ORDER.security,
+        phase: { kind: 'stage_done', stage: 'security', seconds: 900, turns: 31, cut_short: true },
+        description: 'stage security cut short after 15m 0s, 31 turns', age_seconds: 4 }], true));
+    expect('cut short: the live finish is a stopped row, not a done one',
+        Array.isArray(liveCut) && liveCut[0].state === 'stopped' && liveCut[0].cause === 'cut_short');
+    expect('cut short: live and recorded render alike',
+        Array.isArray(liveCut) && Array.isArray(recordedCut)
+            && String(guard(() => fns.renderStageRow(liveCut[0])))
+                === String(guard(() => fns.renderStageRow(recordedCut[0]))));
+    expect('cut short: a live table counts it as stopped',
+        Array.isArray(liveCut) && fns.stageTableLabel(liveCut, true) === 'Stages (0 running, 1 stopped)');
+    const plainDone = guard(() => fns.stageRowsFromActivity([{
+        patch_id: 31, stage: 'goal', order: 0,
+        phase: { kind: 'stage_done', stage: 'goal', seconds: 9, turns: 1, cut_short: false } }], true));
+    expect('cut short: a finish that was not cut short is still done',
+        Array.isArray(plainDone) && plainDone[0].state === 'done');
 
     // A stopped duration with no failure beside it still reads as stopped.
     const alone = guard(() => fns.stageRowsFromRecord(
@@ -837,6 +879,148 @@ console.log('stopped stages keep their time');
 {
     const stoppedFailures = stoppedTimeChecks(ctx);
     check('every stopped-time check passes', stoppedFailures.length === 0, stoppedFailures.join(', '));
+}
+
+// ---- partial and timed-out reviews -----------------------------------------
+// A review that ran out of time keeps the findings of the stages that
+// finished and is Partial: its findings are shown and counted like a Reviewed
+// review's, but nothing claims it ran to the end or showed the code clean. A
+// patch whose review ran out of time with nothing salvaged is TimedOut.
+function partialChecks(fns) {
+    const failed = [];
+    const expect = (name, cond) => { if (!cond) failed.push(name); };
+    const guard = f => { try { return String(f()); } catch (e) { return `THREW ${e}`; } };
+    const output = findings => JSON.stringify({ summary: 'what was found', findings });
+    const CRITICAL = { severity: 'Critical', problem: 'use after free' };
+
+    // The patchset list.
+    const listed = (status, counts) => {
+        try { return fns.renderPatchsetListStatus({ status, ...counts }); }
+        catch (e) { return { statusHtml: `THREW ${e}`, findingsHtml: `THREW ${e}` }; }
+    };
+    const partialRow = listed('Partial', { findings_low: 0, findings_medium: 0, findings_high: 0,
+                                           findings_critical: 1 });
+    expect('list: a Partial patchset wears its own badge',
+        partialRow.statusHtml.includes('status-Partial') && partialRow.statusHtml.includes('>Partial<'));
+    expect('list: its critical finding is counted',
+        /color:var\(--sev-critical\)[^>]*title="Critical">1</.test(partialRow.findingsHtml));
+    const zero = { findings_low: 0, findings_medium: 0, findings_high: 0, findings_critical: 0 };
+    expect('list: a Partial patchset with no findings shows "-", not the check mark',
+        listed('Partial', zero).findingsHtml.includes('-') && !listed('Partial', zero).findingsHtml.includes('✓'));
+    expect('list: a Reviewed patchset with no findings keeps the check mark',
+        listed('Reviewed', zero).findingsHtml.includes('✓'));
+    expect('list: the status is escaped',
+        !listed('<b>x</b>', zero).statusHtml.includes('<b>'));
+
+    // The per-patch summary table.
+    const summary = (patch, reviews) => guard(() => fns.patchSummaryStatus(patch, reviews));
+    const partialReview = { status: 'Partial', output: output([CRITICAL]) };
+    const salvaged = summary({ status: 'Partial' }, [partialReview]);
+    expect('summary: a Partial review shows its findings',
+        /title="Critical">1</.test(salvaged) && !salvaged.includes('In progress'));
+    expect('summary: tagged partial', visibleText(salvaged).includes('partial'));
+    const rerun = summary({ status: 'Reviewed' },
+        [partialReview, { status: 'Reviewed', output: output([]) }]);
+    expect('summary: a Reviewed review takes over from a Partial one',
+        rerun.includes('✓') && !visibleText(rerun).includes('partial'));
+    expect('summary: the runs note leaves out the Partial run the badges leave out',
+        !visibleText(rerun).includes('max of'));
+    const twoReviewed = summary({ status: 'Reviewed' }, [partialReview,
+        { status: 'Reviewed', output: output([]) }, { status: 'Reviewed', output: output([]) }]);
+    expect('summary: two Reviewed runs beside a Partial one are "max of 2 runs"',
+        visibleText(twoReviewed).includes('(max of 2 runs)'));
+    const twoPartial = summary({ status: 'Partial' },
+        [partialReview, { status: 'Partial', output: output([]) }]);
+    expect('summary: two Partial runs carry the runs note',
+        visibleText(twoPartial).includes('(max of 2 runs)') && visibleText(twoPartial).includes('partial'));
+    expect('summary: a single Reviewed run after a failed one keeps the old runs note',
+        visibleText(summary({ status: 'Reviewed' },
+            [{ status: 'Failed' }, { status: 'Reviewed', output: output([]) }])).includes('(max of 2 runs)'));
+    const afterFailure = summary({ status: 'Partial' }, [{ status: 'Failed' }, partialReview]);
+    expect('summary: a Partial review wins over a failed one',
+        visibleText(afterFailure).includes('partial') && !afterFailure.includes('Failed'));
+    expect('summary: a Partial review with no findings shows "-"',
+        !summary({ status: 'Partial' }, [{ status: 'Partial', output: output([]) }]).includes('✓'));
+    const timedOut = summary({ status: 'TimedOut' }, [{ status: 'Failed' }]);
+    expect('summary: a TimedOut patch says it timed out',
+        timedOut.includes('status-TimedOut') && visibleText(timedOut).includes('Timed out'));
+    expect('summary: a Failed patch still shows the failure',
+        visibleText(summary({ status: 'Failed' }, [{ status: 'Failed' }])).includes('Failed'));
+
+    // The review card.
+    const card = guard(() => fns.renderReviewCard({
+        id: 50, status: 'Partial', patch_id: 60, attempt: 2, duration_seconds: 9000,
+        output: output([CRITICAL]), summary: 'the summary text', inline_review: 'the inline review',
+        stage_durations: [{ stage: 'security', order: ORDER.security, seconds: 900, turns: 31,
+                            stopped_by: 'cut_short' }],
+        stage_failures: [{ stage: 'security', order: ORDER.security, cause: 'cut_short',
+                           reason: 'cut short: the review ran out of time; its findings so far were kept' }],
+    }));
+    expect('card: its findings are shown', card.includes('Critical: <span') && card.includes('>1<'));
+    expect('card: its summary is shown', card.includes('the summary text'));
+    expect('card: its inline review is shown', card.includes('the inline review'));
+    expect('card: no live-progress host hides them', !card.includes('data-stage-progress'));
+    expect('card: says it stopped out of time',
+        card.includes(`Stopped (out of time) after ${fns.formatDuration(9000)}`));
+    expect('card: never claims to have succeeded', !card.includes('succeeded'));
+    expect('card: the attempt is still reported', card.includes('on attempt 2'));
+    expect('card: says where its findings come from',
+        card.includes('Any findings below come only from the stages that finished.'));
+    expect('card: the note sits under the coverage banner',
+        card.indexOf('Incomplete coverage') >= 0
+            && card.indexOf('Incomplete coverage') < card.indexOf('Any findings below'));
+    expect('card: the badge is Partial', card.includes('status-badge status-Partial'));
+    const nothingFound = guard(() => fns.renderReviewCard({
+        id: 51, status: 'Partial', patch_id: 61, output: output([]), inline_review: 'nothing' }));
+    expect('card: a Partial review with no findings does not claim no regressions',
+        !nothingFound.includes('No regressions')
+            && nothingFound.includes('No findings from the stages that finished'));
+    expect('card: and does not open its inline review as if it found something',
+        nothingFound.includes('▶ Inline Review') && !nothingFound.includes('▼ Inline Review'));
+    expect('card: a Partial review that found something opens it', card.includes('▼ Inline Review'));
+    const reviewed = guard(() => fns.renderReviewCard({
+        id: 52, status: 'Reviewed', patch_id: 62, output: output([]) }));
+    expect('card: a Reviewed review with no findings still reads no regressions',
+        reviewed.includes('No regressions') && !reviewed.includes('Any findings below'));
+
+    // The statistics.
+    const cards = guard(() => fns.renderReviewStatCards({
+        total_reviews: 10, total_failures: 2, total_partial: 3,
+        reviews: [{ status: 'Reviewed', count: 5 }, { status: 'Partial', count: 3 },
+                  { status: 'Failed', count: 2 }, { status: 'In Review', count: 4 }],
+    }));
+    expect('stats: a Partial card with its count',
+        /Total Partial<\/h3>\s*<div class="value">3</.test(cards));
+    expect('stats: failures do not include it', /Total Failures<\/h3>\s*<div class="value">2</.test(cards));
+    expect('stats: the success rate is Reviewed over every finished review',
+        /Success Rate[^<]*<\/h3>\s*<div class="value">50%</.test(cards));
+    expect('stats: an older server without the count reads 0',
+        /Total Partial<\/h3>\s*<div class="value">0</.test(
+            guard(() => fns.renderReviewStatCards({ total_reviews: 1, total_failures: 0, reviews: [] }))));
+    const colours = { secondary: 'green', primary: 'blue', failure: 'red' };
+    expect('stats: the chart colours Partial with the theme colour',
+        guard(() => fns.reviewOutcomeColor('Partial', colours)) === '#9a6700');
+    expect('stats: and still colours a failure as one',
+        guard(() => fns.reviewOutcomeColor('Failed To Apply', colours)) === 'red');
+    return failed;
+}
+console.log('partial and timed-out reviews');
+{
+    const partialFailures = partialChecks(ctx);
+    check('every partial check passes', partialFailures.length === 0, partialFailures.join(', '));
+
+    // Each theme gives both statuses a colour, and every badge and dot form
+    // has a class, since badges are built as status-<status without spaces>.
+    const themes = (src.match(/--status-failed:/g) || []).length;
+    for (const v of ['--status-partial:', '--status-timedout:']) {
+        check(`every theme defines ${v}`, (src.match(new RegExp(v, 'g')) || []).length === themes,
+            `${themes} themes`);
+    }
+    check('there are eight themes', themes === 8, String(themes));
+    for (const cls of ['.status-Partial {', '.status-TimedOut {',
+                       '.status-dot.status-Partial {', '.status-dot.status-TimedOut {']) {
+        check(`the page styles ${cls.slice(0, -2)}`, src.includes(cls));
+    }
 }
 
 // ---- polling hygiene -------------------------------------------------------
@@ -1163,7 +1347,7 @@ console.log('live log');
 // (i) one link, one name
 console.log('log link naming');
 {
-    for (const status of ['In Review', 'Pending', 'Reviewed', 'Failed']) {
+    for (const status of ['In Review', 'Pending', 'Reviewed', 'Partial', 'Failed']) {
         const card = ctx.renderReviewCard({ id: 42, status, patch_id: 10 });
         check(`"View Raw Log" while ${status}`, card.includes('>View Raw Log<')
             && !card.includes('>View Log<') && !card.includes('View Live Log'), card.slice(0, 300));
@@ -1307,6 +1491,31 @@ const mutate = (name, from, to) => {
     const byInfinity = load({ ...sources, compareStageRows: replaceBody('compareStageRows',
         ' return (a.order ?? Infinity) - (b.order ?? Infinity);') });
     check('a comparator subtracting missing ranks is caught', stageChecks(byInfinity).length > 0);
+
+    const checkForPartial = mutate('renderFindingsBadges',
+        "if (status === 'Reviewed' || status === 'Finished') {", "if (status !== 'Pending') {");
+    check('a check mark for a Partial review is caught', partialChecks(checkForPartial).length > 0);
+    const partialInProgress = mutate('patchSummaryStatus',
+        "const partial = reviews.filter(r => r.status === 'Partial');", 'const partial = [];');
+    check('a summary that ignores Partial reviews is caught', partialChecks(partialInProgress).length > 0);
+    const partialRunCounted = mutate('patchSummaryStatus', "maxOfRunsNote(reviews, 'Partial')",
+        "maxOfRunsNote(reviews, null)");
+    check('a runs note that counts a Partial run left out of the badges is caught',
+        partialChecks(partialRunCounted).length > 0);
+    const partialNoRuns = mutate('patchSummaryStatus', "+ maxOfRunsNote(reviews, 'Reviewed')", '');
+    check('a Partial summary without the runs note is caught', partialChecks(partialNoRuns).length > 0);
+    const partialHidden = mutate('renderReviewCard', '|| partial;', '|| false;');
+    check('a card that hides the findings of a Partial review is caught', partialChecks(partialHidden).length > 0);
+    const partialSucceeded = mutate('renderReviewCard', 'failed || partial ?', 'failed ?');
+    check('a Partial card that says it succeeded is caught', partialChecks(partialSucceeded).length > 0);
+    const openOnNothing = mutate('renderReviewCard', 'parsedFindings && !foundNothing', 'parsedFindings');
+    check('a Partial card that opens an empty inline review is caught',
+        partialChecks(openOnNothing).length > 0);
+    const noPartialCard = mutate('renderReviewStatCards',
+        "+ renderStatCard('Total Partial', reviewsData.total_partial ?? 0)", '');
+    check('a stats page without the Partial card is caught', partialChecks(noPartialCard).length > 0);
+    const cutShortDone = mutate('stageRowsFromActivity', "phase.cut_short === true", 'false');
+    check('a live cut-short stage shown as done is caught', stoppedTimeChecks(cutShortDone).length > 0);
 
     const ownRenderer = mutate('renderLogView', '${renderInteractionLogEntries(logs)}',
         "${isLive ? logs.map(e => '<div>' + escapeHtml(e.content || '') + '</div>').join('')"

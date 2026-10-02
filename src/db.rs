@@ -79,6 +79,15 @@ const RESUBMITTABLE_STATUSES_SQL: &str =
 #[cfg(feature = "server")]
 const EMBARGO_RELEASED_STATUSES_SQL: &str = "('Reviewed', 'Partial')";
 
+/// The review statuses whose findings the patchset list counts, as an SQL
+/// list for `status IN` tests. A Partial review's findings went through
+/// deduplication, conflict resolution and verification like a Reviewed
+/// review's, so a critical one must not read as zero in the list; the
+/// patchset's Partial status beside the counts says the coverage is
+/// incomplete.
+#[cfg(feature = "server")]
+const FINDINGS_COUNTED_STATUSES_SQL: &str = "('Reviewed', 'Partial')";
+
 /// The patch verdicts that are final when a patchset is processed again, as
 /// after a restart: a review that ran out of time (`Partial`, `TimedOut`)
 /// and a review that failed for good (`Failed`). Each is cleared by a rerun
@@ -5185,32 +5194,31 @@ impl Database {
         }))
     }
 
-    pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
-        let mut total_rows = self
-            .conn
-            .query(
-                "SELECT count(*) FROM reviews WHERE status NOT IN ('Pending', 'In Review')",
-                (),
-            )
-            .await?;
-        let total_reviews: i64 = if let Ok(Some(row)) = total_rows.next().await {
-            row.get(0).unwrap_or(0)
-        } else {
-            0
-        };
+    /// Counts the finished reviews that match `condition`, an SQL boolean
+    /// over a `reviews` row. The condition is always a constant of this
+    /// file, never user input.
+    async fn count_finished_reviews(&self, condition: &str) -> Result<i64> {
+        let sql = format!(
+            "SELECT count(*) FROM reviews WHERE status NOT IN ('Pending', 'In Review') AND ({condition})"
+        );
+        let mut rows = self.conn.query(&sql, ()).await?;
+        Ok(match rows.next().await {
+            Ok(Some(row)) => row.get(0).unwrap_or(0),
+            _ => 0,
+        })
+    }
 
-        let mut failed_rows = self
-            .conn
-            .query(
-                "SELECT count(*) FROM reviews WHERE status NOT IN ('Pending', 'In Review') AND (lower(status) LIKE '%failed%' OR lower(status) LIKE '%error%')",
-                (),
-            )
+    /// The statistics page's review counts. A Partial review is counted on
+    /// its own in `total_partial`: it is neither a failure, which
+    /// `total_failures` counts by a status naming one, nor a full review.
+    pub async fn get_review_stats(&self) -> Result<serde_json::Value> {
+        let total_reviews = self.count_finished_reviews("1").await?;
+        let total_failures = self
+            .count_finished_reviews("lower(status) LIKE '%failed%' OR lower(status) LIKE '%error%'")
             .await?;
-        let total_failures: i64 = if let Ok(Some(row)) = failed_rows.next().await {
-            row.get(0).unwrap_or(0)
-        } else {
-            0
-        };
+        let total_partial = self
+            .count_finished_reviews(&format!("status = '{}'", ReviewStatus::Partial.as_str()))
+            .await?;
 
         let sql = "WITH last_reviews AS (
             SELECT * FROM reviews ORDER BY id DESC LIMIT 1000
@@ -5253,6 +5261,7 @@ impl Database {
         Ok(json!({
             "total_reviews": total_reviews,
             "total_failures": total_failures,
+            "total_partial": total_partial,
             "reviews": stats
         }))
     }
@@ -7332,7 +7341,7 @@ impl Database {
                     SUM(CASE WHEN f.severity = 4 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as critical
                 FROM reviews r
                 JOIN findings f ON r.id = f.review_id
-                WHERE r.status = 'Reviewed'
+                WHERE r.status IN {FINDINGS_COUNTED_STATUSES_SQL}
                 GROUP BY r.patchset_id
              ) f ON p.id = f.patchset_id
              GROUP BY p.id
@@ -12092,6 +12101,64 @@ mod tests {
         assert_eq!(
             db.get_patchset_review_outcome(ps_id).await.unwrap(),
             PatchsetReviewOutcome::Clean
+        );
+    }
+
+    /// The patchset list counts a Partial review's findings with a Reviewed
+    /// review's, so a salvaged finding does not read as zero there. A
+    /// Failed review's findings are still not counted.
+    #[tokio::test]
+    async fn test_the_patchset_list_counts_the_findings_of_a_partial_review() {
+        let db = setup_db().await;
+        let (ps_id, patch_id) = one_part_series(&db, "msg_partial_list", 73000).await;
+        finished_review_with_a_finding(&db, ps_id, patch_id, "Partial").await;
+        finished_review_with_a_finding(&db, ps_id, patch_id, "Failed").await;
+        db.update_patchset_status(ps_id, "Partial").await.unwrap();
+
+        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, ps_id);
+        assert_eq!(list[0].status.as_deref(), Some("Partial"));
+        assert_eq!(
+            list[0].findings_high,
+            Some(1),
+            "the Partial review's finding is counted, the Failed one's is not"
+        );
+
+        finished_review_with_a_finding(&db, ps_id, patch_id, "Reviewed").await;
+        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        assert_eq!(
+            list[0].findings_high,
+            Some(2),
+            "a Reviewed review's finding is added, as for any second review"
+        );
+    }
+
+    /// Partial reviews are counted on their own in the review statistics,
+    /// and not as failures. Unfinished reviews are in no count.
+    #[tokio::test]
+    async fn test_review_stats_count_partial_reviews_apart_from_failures() {
+        let db = setup_db().await;
+        let (ps_id, patch_id) = one_part_series(&db, "msg_partial_stats", 74000).await;
+        for status in [
+            "Partial",
+            "Partial",
+            "Failed",
+            "Reviewed",
+            "Failed To Apply",
+        ] {
+            finished_review_with_a_finding(&db, ps_id, patch_id, status).await;
+        }
+        db.create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+
+        let stats = db.get_review_stats().await.unwrap();
+        assert_eq!(stats["total_reviews"], 5, "{stats}");
+        assert_eq!(stats["total_partial"], 2, "{stats}");
+        assert_eq!(
+            stats["total_failures"], 2,
+            "Failed and Failed To Apply, not Partial: {stats}"
         );
     }
 

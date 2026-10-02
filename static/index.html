@@ -48,6 +48,8 @@
             --status-inreview: #d67f05;
             --status-reviewed: #22863a;
             --status-failed: #d73a49;
+            --status-partial: #9a6700;
+            --status-timedout: #bf3989;
             --status-embargoed: #6f42c1;
             --tag-bg: #e0f7fa;
             --tag-text: #006064;
@@ -108,6 +110,8 @@
                 --status-inreview: #d29922;
                 --status-reviewed: #3fb950;
                 --status-failed: #f85149;
+                --status-partial: #f2cc60;
+                --status-timedout: #db61a2;
                 --status-embargoed: #d2a8ff;
                 --tag-bg: #032f62;
                 --tag-text: #79c0ff;
@@ -142,6 +146,8 @@
             --status-inreview: #8A5F00;  /* Dark Orange */
             --status-reviewed: #004D73;  /* Dark Blue */
             --status-failed: #803800;    /* Dark Vermilion */
+            --status-partial: #787221;   /* Dark Yellow */
+            --status-timedout: #00694D;  /* Dark Bluish Green */
             --status-embargoed: #7A4864; /* Dark Reddish Purple */
 
             --sev-critical: #803800;     /* Dark Vermilion */
@@ -166,6 +172,8 @@
                 --status-inreview: #E69F00;  /* Orange */
                 --status-reviewed: #0072B2;  /* Blue */
                 --status-failed: #D55E00;    /* Vermilion */
+                --status-partial: #F0E442;   /* Yellow */
+                --status-timedout: #009E73;  /* Bluish Green */
                 --status-embargoed: #CC79A7; /* Reddish Purple */
 
                 --sev-critical: #D55E00;     /* Vermilion */
@@ -190,6 +198,8 @@
             --status-inreview: #8A5F00;
             --status-reviewed: #004D73;
             --status-failed: #803800;
+            --status-partial: #787221;
+            --status-timedout: #00694D;
             --status-embargoed: #7A4864;
 
             --sev-critical: #803800;
@@ -213,6 +223,8 @@
             --status-inreview: #E69F00;
             --status-reviewed: #0072B2;
             --status-failed: #D55E00;
+            --status-partial: #F0E442;
+            --status-timedout: #009E73;
             --status-embargoed: #CC79A7;
 
             --sev-critical: #D55E00;
@@ -264,6 +276,8 @@
             --status-inreview: #d67f05;
             --status-reviewed: #22863a;
             --status-failed: #d73a49;
+            --status-partial: #9a6700;
+            --status-timedout: #bf3989;
             --status-embargoed: #6f42c1;
             --tag-bg: #e0f7fa;
             --tag-text: #006064;
@@ -320,6 +334,8 @@
             --status-inreview: #d29922;
             --status-reviewed: #3fb950;
             --status-failed: #f85149;
+            --status-partial: #f2cc60;
+            --status-timedout: #db61a2;
             --status-embargoed: #d2a8ff;
             --tag-bg: #032f62;
             --tag-text: #79c0ff;
@@ -735,6 +751,17 @@
             color: var(--status-failed);
         }
 
+        /* A review that ran out of time: its findings come from the stages
+           that finished. Amber, so it reads neither as done nor as failed. */
+        .status-Partial {
+            color: var(--status-partial);
+        }
+
+        /* A patch whose review ran out of time with nothing salvaged. */
+        .status-TimedOut {
+            color: var(--status-timedout);
+        }
+
         .status-Cancelled,
         .status-Skipped {
             color: var(--thought-color);
@@ -857,6 +884,8 @@
         .status-dot.status-Reviewed { background-color: var(--status-reviewed); }
         .status-dot.status-Failed { background-color: var(--status-failed); }
         .status-dot.status-FailedToApply { background-color: var(--status-failed); }
+        .status-dot.status-Partial { background-color: var(--status-partial); }
+        .status-dot.status-TimedOut { background-color: var(--status-timedout); }
         .status-dot.status-Embargoed { background-color: var(--status-embargoed); }
         .status-dot.status-Cancelled { background-color: var(--thought-color); }
         .status-dot.status-Incomplete { background-color: var(--thought-color); }
@@ -2716,6 +2745,41 @@
             return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
         }
 
+        // The summary cards of the statistics page's AI Reviews section.
+        //
+        // Partial reviews have a card of their own. They are not failures, so
+        // the server leaves them out of total_failures, and they are not
+        // successes, so the success rate stays Reviewed over every finished
+        // review. Without the card they would sit in that denominator and in
+        // no card, and the cards would not add up.
+        function renderReviewStatCards(reviewsData) {
+            const reviews = Array.isArray(reviewsData.reviews) ? reviewsData.reviews : [];
+            // Total Reviews and the success rate count finished reviews only.
+            const completedReviews = reviews.filter(r => !['Pending', 'In Review'].includes(r.status));
+            const totalReviewsLast1k = completedReviews.reduce((acc, r) => acc + r.count, 0);
+            const successfulLast1k = completedReviews.filter(r => r.status === 'Reviewed').reduce((acc, r) => acc + r.count, 0);
+            const successRateLast1k = totalReviewsLast1k ? Math.round(successfulLast1k / totalReviewsLast1k * 100) + '%' : '-';
+
+            return renderStatCard('Total Reviews', reviewsData.total_reviews)
+                + renderStatCard('Total Partial', reviewsData.total_partial ?? 0)
+                + renderStatCard('Total Failures', reviewsData.total_failures)
+                + renderStatCard('Success Rate (last 1k reviews)', successRateLast1k);
+        }
+
+        // The colour of one status in the review-outcomes chart, or null to
+        // let the chart pick one. The page's own status colours are read from
+        // the theme, so a status looks alike in the chart and in its badges.
+        function reviewOutcomeColor(status, colors) {
+            const themed = (name, fallback) =>
+                getComputedStyle(document.body).getPropertyValue(name).trim() || fallback;
+            if (status === 'Reviewed') return colors.secondary;
+            if (status === 'Pending') return colors.primary;
+            if (status === 'In Review') return themed('--status-inreview', '#d67f05');
+            if (status === 'Partial') return themed('--status-partial', '#9a6700');
+            if (String(status).toLowerCase().includes('failed')) return colors.failure;
+            return null;
+        }
+
         function toggleCollapsible(id, btn) {
             const el = document.getElementById(id);
             if (el.classList.contains('open')) {
@@ -2727,6 +2791,9 @@
             }
         }
 
+        // A row's findings as four severity counts. No findings is a check
+        // mark only for a review that ran to the end: a Partial one shows "-",
+        // because the stages that did not finish have not shown the code clean.
         function renderFindingsBadges(counts, status) {
             const { low = 0, medium = 0, high = 0, critical = 0 } = counts;
             if (low + medium + high + critical === 0) {
@@ -2743,6 +2810,31 @@
                     <span style="color:${low > 0 ? 'var(--sev-low)' : 'var(--text-dim)'}" title="Low">${low}</span>
                 </div>
             `;
+        }
+
+        // The status and findings cells of one row of the patchset list.
+        //
+        // The server counts the findings of Partial reviews with those of
+        // Reviewed ones, because a salvaged finding went through the same
+        // verification and a critical one must not read as zero here. The
+        // status beside the counts is what says the coverage is incomplete,
+        // and renderFindingsBadges keeps the check mark for a Reviewed
+        // patchset only. The status is data from the server, so it is escaped.
+        function renderPatchsetListStatus(p) {
+            const statusLabel = String(p.status || 'Pending');
+            let findingsHtml = '-';
+            if (p.findings_low !== undefined || p.findings_medium !== undefined || p.findings_high !== undefined || p.findings_critical !== undefined) {
+                const counts = {
+                    low: p.findings_low || 0,
+                    medium: p.findings_medium || 0,
+                    high: p.findings_high || 0,
+                    critical: p.findings_critical || 0
+                };
+                findingsHtml = renderFindingsBadges(counts, statusLabel);
+            }
+            const statusHtml = `<span class="status-badge status-${escapeHtml(statusLabel.replace(/ /g, ''))}">`
+                + `${escapeHtml(statusLabel)}</span>`;
+            return { statusHtml, findingsHtml };
         }
 
         function sortToolArgs(entries) {
@@ -3080,24 +3172,13 @@
                             tagsHtml = '<div style="margin-top:2px">' + lists.map(s => `<span class="tag">${escapeHtml(s)}</span>`).join('') + '</div>';
                         }
 
-                        let statusLabel = p.status || 'Pending';
-                        let findingsHtml = '-';
-                        if (p.findings_low !== undefined || p.findings_medium !== undefined || p.findings_high !== undefined || p.findings_critical !== undefined) {
-                            const counts = {
-                                low: p.findings_low || 0,
-                                medium: p.findings_medium || 0,
-                                high: p.findings_high || 0,
-                                critical: p.findings_critical || 0
-                            };
-                            findingsHtml = renderFindingsBadges(counts, statusLabel);
-                        }
-
+                        const { statusHtml, findingsHtml } = renderPatchsetListStatus(p);
                         row.innerHTML = `
                             <td><div>${escapeHtml(p.subject) || '(no subject)'}</div>${tagsHtml}</td>
                             <td style="line-height:1.2;">${authorHtml}</td>
                             <td style="line-height:1.2;">${dateHtml}</td>
                             <td>${parts}</td>
-                            <td><span class="status-badge status-${statusLabel.replace(/ /g, '')}">${statusLabel}</span></td>
+                            <td>${statusHtml}</td>
                             <td>${findingsHtml}</td>
                         `;
                     } else if (state.listMode === 'bugs') {
@@ -3675,6 +3756,27 @@
             }
         }
 
+        // The status cell of a stopped stage's row, as HTML, and its tooltip.
+        //
+        // A cut-short stage reads "cut short after" the time it ran, the words
+        // its live activity description uses. Its recorded reason only repeats
+        // that label, so the tooltip says what it means instead, and the live
+        // row, which has no reason, renders the same. Every other cause shows
+        // the first line of its reason, with the whole reason in the tooltip.
+        // A recorded duration that stopped with no failure beside it has no
+        // reason to give, and its label says all there is.
+        function stoppedStageStatus(row, ran) {
+            const what = stageStopLabel(row.cause);
+            if (row.cause === 'cut_short') {
+                return {
+                    status: ran ? `${what} after ${formatDuration(row.seconds)}` : what,
+                    title: 'The review ran out of time while this stage ran; what it found so far was kept.',
+                };
+            }
+            const why = row.timeOnly ? '' : `: ${escapeHtml(summarizeReason(row.reason))}`;
+            return { status: `${what}${why}`, title: String(row.reason || '') };
+        }
+
         // The same rows, from the activity registry instead of the database.
         //
         // The registry deliberately reports a finished stage with the numbers the
@@ -3702,6 +3804,16 @@
                 }
                 if (stage == null) {
                     return { stage: null, order: null, state: 'patch', age, description: entry.description };
+                }
+                // A stage the deadline cut short finished, but its record is a
+                // stopped stage with the time it ran, so it reads as one here
+                // too rather than settling as done and changing when the
+                // review ends.
+                if (phase.kind === 'stage_done' && phase.cut_short === true) {
+                    return {
+                        stage, order, stage_label, state: 'stopped', cause: 'cut_short', reason: '',
+                        seconds: phase.seconds || 0, turns: phase.turns || 0,
+                    };
                 }
                 if (phase.kind === 'stage_done') {
                     return {
@@ -3787,7 +3899,6 @@
             // Only a stage's own error is coloured as a fault: a cancel or a
             // deadline says nothing about the stage.
             if (row.state === 'stopped') {
-                const what = stageStopLabel(row.cause);
                 const colour = row.cause === 'error' ? 'var(--status-failed)' : 'var(--text-muted)';
                 const ran = row.seconds != null;
                 const when = ran ? formatDuration(row.seconds)
@@ -3795,15 +3906,13 @@
                 const turns = !row.turns
                     ? '—'
                     : row.turns === 1 ? '1 turn' : `${escapeHtml(String(row.turns))} turns`;
-                // A recorded duration that stopped with no failure beside it
-                // has no reason to give, and its label says all there is.
-                const why = row.timeOnly ? '' : `: ${escapeHtml(summarizeReason(row.reason))}`;
-                return `<tr title="${escapeHtml(String(row.reason || ''))}">`
+                const { status, title } = stoppedStageStatus(row, ran);
+                return `<tr title="${escapeHtml(title)}">`
                     + `<td style="${cell}">${label}</td>`
                     + `<td style="${num}${ran ? '' : ' color:var(--text-muted);'}">${when}</td>`
                     + `<td style="${num}">${turns}</td>`
                     + `<td style="padding:2px 0; color:${colour};">`
-                    + `${what}${why}</td></tr>`;
+                    + `${status}</td></tr>`;
             }
 
             const age = row.age || 0;
@@ -4216,76 +4325,7 @@
                 `;
 
                 if (sortedPatchIds.length > 1) {
-                    let summaryStatus = '';
-
-                    if (patch && (patch.status === 'error' || patch.status === 'failed')) {
-                        summaryStatus = `<span class="text-error-bold">Apply Failed</span>`;
-                    } else if (patch && patch.status === 'Skipped') {
-                        summaryStatus = '<span style="color:var(--text-dim)">Skipped</span>';
-                    } else if (!reviews || reviews.length === 0) {
-                        summaryStatus = '<span style="color:var(--text-dim)">No reviews</span>';
-                    } else {                         // Aggregate "MAX" across all reviews for this patch
-                        let maxCounts = { low: 0, medium: 0, high: 0, critical: 0 };
-                        let hasSuccessful = false;
-                        let hasSkipped = false;
-                        let hasInProgress = false;
-                        let skippedReason = '';
-                        let errors = [];
-
-                        let validRunCount = 0;
-                        reviews.forEach(r => {
-                           if (r.status !== 'Failed To Apply') {
-                               validRunCount++;
-                           }
-
-                           if (r.status === 'Reviewed') {
-                               hasSuccessful = true;
-                               try {
-                                   if (r.output) {
-                                       const out = typeof r.output === 'string' ? JSON.parse(r.output) : r.output;
-                                       if (out && out.findings && Array.isArray(out.findings)) {
-                                           let current = { low: 0, medium: 0, high: 0, critical: 0 };
-                                           out.findings.forEach(f => {
-                                               if (f.preexisting) return; // Skip preexisting findings for summary counts
-                                               const s = String(f.severity || '').toLowerCase();
-                                               if (s === 'critical') current.critical++;
-                                               else if (s === 'high') current.high++;
-                                               else if (s === 'medium') current.medium++;
-                                               else current.low++;
-                                           });
-
-                                           // Max aggregation
-                                           maxCounts.critical = Math.max(maxCounts.critical, current.critical);
-                                           maxCounts.high = Math.max(maxCounts.high, current.high);
-                                           maxCounts.medium = Math.max(maxCounts.medium, current.medium);
-                                           maxCounts.low = Math.max(maxCounts.low, current.low);
-                                       }
-                                   }
-                               } catch (e) {}
-                           } else if (r.status === 'Skipped') {
-                               hasSkipped = true;
-                               skippedReason = r.result || 'Skipped';
-                           } else if (r.status && (r.status.toLowerCase().includes('failed') || r.status.toLowerCase().includes('error'))) {
-                               errors.push(r.status);
-                           } else if (r.status === 'Pending' || r.status === 'In Review') {
-                               hasInProgress = true;
-                           }
-                        });
-
-                        if (hasSuccessful) {
-                           summaryStatus = renderFindingsBadges(maxCounts, 'Reviewed');
-                           if (validRunCount > 1) {
-                               summaryStatus += ` <span style="color:var(--text-dim); font-size:0.85em; font-style:italic;">(max of ${validRunCount} runs)</span>`;
-                           }
-                        } else if (errors.length > 0) {
-                           summaryStatus = `<span class="text-error-bold">${escapeHtml(errors[0])}</span>`;
-                        } else if (hasSkipped && !hasInProgress) {
-                           // Only skipped
-                            summaryStatus = `<span style="color:var(--text-dim)" title="${escapeHtml(skippedReason)}">Skipped</span>`;
-                        } else {
-                            summaryStatus = '<span style="color:var(--text-dim)">In progress...</span>';
-                        }
-                    }
+                    const summaryStatus = patchSummaryStatus(patch, reviews);
                     const patchLabel = patch ? `Patch ${patch.part_index}` : `Patch ${pid}`;
                     const patchSubject = patch ? escapeHtml(patch.subject || '(no subject)') : '';
                     summaryHtml += `<tr onclick="document.getElementById('patch-${pid}').scrollIntoView({behavior: 'smooth'})" style="cursor:pointer"><td><strong>${patchLabel}</strong>: ${patchSubject}</td><td>${summaryStatus}</td></tr>`;
@@ -4628,18 +4668,115 @@
             }
         }
 
+        // Counts a review's new findings by severity. Preexisting findings are
+        // left out, because the summary is about what the patch introduces. An
+        // output that is missing or does not parse counts nothing.
+        function countNewFindings(r) {
+            const counts = { low: 0, medium: 0, high: 0, critical: 0 };
+            try {
+                const out = typeof r.output === 'string' ? JSON.parse(r.output) : r.output;
+                if (!out || !Array.isArray(out.findings)) return counts;
+                out.findings.forEach(f => {
+                    if (!f || f.preexisting) return;
+                    const s = String(f.severity || '').toLowerCase();
+                    if (s === 'critical') counts.critical++;
+                    else if (s === 'high') counts.high++;
+                    else if (s === 'medium') counts.medium++;
+                    else counts.low++;
+                });
+            } catch (e) {}
+            return counts;
+        }
+
+        // The highest count of each severity across several reviews of one
+        // patch, so a patch reviewed more than once shows its worst run.
+        function maxFindingCounts(reviews) {
+            return reviews.map(countNewFindings).reduce((max, c) => ({
+                low: Math.max(max.low, c.low),
+                medium: Math.max(max.medium, c.medium),
+                high: Math.max(max.high, c.high),
+                critical: Math.max(max.critical, c.critical),
+            }), { low: 0, medium: 0, high: 0, critical: 0 });
+        }
+
+        // The "(max of N runs)" note after a patch's badges. N counts the runs
+        // the maximum was taken over plus the runs that found nothing, such as
+        // failed ones, so the note never claims to cover a run whose findings
+        // were left out of the badges. An empty string for a single run.
+        function maxOfRunsNote(reviews, excludedStatus) {
+            const runs = reviews.filter(r => r.status !== 'Failed To Apply'
+                && r.status !== excludedStatus).length;
+            return runs > 1
+                ? ` <span style="color:var(--text-dim); font-size:0.85em; font-style:italic;">(max of ${runs} runs)</span>`
+                : '';
+        }
+
+        // One patch's cell in a patchset's per-patch summary table.
+        //
+        // The reviews are read in a fixed precedence: Reviewed, then Partial,
+        // then an error. A Partial review's findings are shown as a Reviewed
+        // review's are, tagged "partial": they were verified like any others
+        // but come only from the stages that finished before the deadline. A
+        // Reviewed review of the same patch, which a rerun gives, takes over.
+        // A patch whose review ran out of time with nothing salvaged says so
+        // instead of showing its review row's Failed.
+        function patchSummaryStatus(patch, reviews) {
+            if (patch && (patch.status === 'error' || patch.status === 'failed')) {
+                return '<span class="text-error-bold">Apply Failed</span>';
+            }
+            if (patch && patch.status === 'Skipped') {
+                return '<span style="color:var(--text-dim)">Skipped</span>';
+            }
+            if (!reviews || reviews.length === 0) {
+                return '<span style="color:var(--text-dim)">No reviews</span>';
+            }
+            const reviewed = reviews.filter(r => r.status === 'Reviewed');
+            if (reviewed.length > 0) {
+                // A Partial run's findings are not in these badges, so the
+                // runs note leaves it out too.
+                return renderFindingsBadges(maxFindingCounts(reviewed), 'Reviewed')
+                    + maxOfRunsNote(reviews, 'Partial');
+            }
+            const partial = reviews.filter(r => r.status === 'Partial');
+            if (partial.length > 0) {
+                return renderFindingsBadges(maxFindingCounts(partial), 'Partial')
+                    + maxOfRunsNote(reviews, 'Reviewed')
+                    + ' <span style="color:var(--status-partial); font-size:0.85em; font-style:italic;"'
+                    + ' title="The review ran out of time; these findings come only from the stages that finished.">'
+                    + 'partial</span>';
+            }
+            const errors = reviews.map(r => String(r.status || '')).filter(st => /failed|error/i.test(st));
+            if (errors.length > 0) {
+                if (patch && patch.status === 'TimedOut') {
+                    return '<span class="status-TimedOut" style="font-weight:bold;"'
+                        + ' title="The review ran out of time before anything could be salvaged.">Timed out</span>';
+                }
+                return `<span class="text-error-bold">${escapeHtml(errors[0])}</span>`;
+            }
+            const inProgress = reviews.some(r => r.status === 'Pending' || r.status === 'In Review');
+            const skipped = reviews.filter(r => r.status === 'Skipped').pop();
+            if (skipped && !inProgress) {
+                return `<span style="color:var(--text-dim)" title="${escapeHtml(skipped.result || 'Skipped')}">Skipped</span>`;
+            }
+            return '<span style="color:var(--text-dim)">In progress...</span>';
+        }
+
         function renderReviewCard(r, emailHtml = '') {
             const uniqueId = Math.random().toString(36).substr(2, 9);
 
             const statusRaw = r.status || 'Finished';
             const s = statusRaw.toLowerCase();
-            const showDetails = s === 'reviewed' || s === 'finished' || s === 'failed' || s === 'skipped';
+            // A Partial review ran out of time and kept the findings of the
+            // stages that finished, so it shows them as a finished review does.
+            const partial = s === 'partial';
+            const showDetails = s === 'reviewed' || s === 'finished' || s === 'failed' || s === 'skipped'
+                || partial;
             const failed = s === 'failed';
 
             // The live attempt counter disappears when the review ends, so the
             // finished review has to carry the number itself. Duration and
-            // attempt are stamped on failed attempts too, so the wording has to
-            // follow the status: a failed review never "succeeded".
+            // attempt are stamped on failed and partial attempts too, so the
+            // wording has to follow the status: neither one "succeeded".
             const runNotes = [];
             if (typeof r.duration_seconds === 'number') {
                 // The recorded duration covers every attempt, not just the one
@@ -4647,13 +4784,14 @@
                 // Otherwise the fourth attempt of a three-hour timeout reads as
                 // a single twelve-hour one.
                 const total = typeof r.attempt === 'number' && r.attempt > 1 ? ' total' : '';
-                const verb = failed ? 'Failed after' : 'Reviewed in';
+                const verb = failed ? 'Failed after'
+                    : partial ? 'Stopped (out of time) after' : 'Reviewed in';
                 runNotes.push(`${verb} ${formatDuration(r.duration_seconds)}${total}`);
             }
             // Only worth saying when it took more than one go, which is rare
             // enough that "attempt 1" everywhere would be noise.
             if (typeof r.attempt === 'number' && r.attempt > 1) {
-                runNotes.push(failed ? `on attempt ${r.attempt}` : `succeeded on attempt ${r.attempt}`);
+                runNotes.push(failed || partial ? `on attempt ${r.attempt}` : `succeeded on attempt ${r.attempt}`);
             }
             const attemptHtml = runNotes.length
                 ? `<div style="color:var(--text-muted); font-size:0.9em;">${escapeHtml(runNotes.join(', '))}</div>`
@@ -4707,9 +4845,22 @@
                     + `<strong>Incomplete coverage — ${r.stage_failures.length} stage(s) did not complete</strong>`
                     + `</div>`;
             }
+            // The table and the banner say which stages stopped; this says what
+            // that means for the findings, which a Partial card shows in full.
+            if (partial) {
+                coverageHtml += `<div style="margin:0 0 8px; color:var(--text-muted); font-size:0.9em;">`
+                    + `Any findings below come only from the stages that finished.</div>`;
+            }
 
             let displayResult = '';
-            
+            // No findings is "No regressions" only for a review that ran to the
+            // end. A Partial review has not shown the code clean, only that the
+            // stages that finished found nothing.
+            const noFindingsHtml = partial
+                ? '<span style="color:var(--text-muted); font-style:italic;">No findings from the stages that finished</span>'
+                : '<span class="text-success-bold">No regressions</span>';
+            let foundNothing = false;
+
             // 1. Try to parse output for structured findings
             let parsedFindings = false;
             let outputJson = null;
@@ -4739,7 +4890,8 @@
                             
                             const total = counts.low + counts.medium + counts.high + counts.critical;
                             if (total === 0) {
-                                displayResult = '<span class="text-success-bold">No regressions</span>';
+                                displayResult = noFindingsHtml;
+                                foundNothing = true;
                             } else {
                                 const parts = [];
                                 parts.push(`Critical: <span style="${counts.critical > 0 ? 'color:var(--sev-critical);font-weight:bold' : 'color:var(--text-dim)'}">${counts.critical}</span>`);
@@ -4770,7 +4922,8 @@
                             const totalPre = counts.low.preexisting + counts.medium.preexisting + counts.high.preexisting + counts.critical.preexisting;
                             
                             if (totalNew + totalPre === 0) {
-                                displayResult = '<span class="text-success-bold">No regressions</span>';
+                                displayResult = noFindingsHtml;
+                                foundNothing = true;
                             } else {
                                 const renderSeverity = (label, severityCounts, color) => {
                                     const newCount = severityCounts.new;
@@ -4833,8 +4986,8 @@
             let inlineHtml = '';
             const inlineReview = r.inline_review || r.description;
             if (inlineReview) {
-                // If we found issues (parsedFindings is true and result isn't "No regressions"), expand by default
-                const hasIssues = parsedFindings && !displayResult.includes('No regressions');
+                // Expanded by default when the review found something.
+                const hasIssues = parsedFindings && !foundNothing;
                 const isOpen = hasIssues ? 'open' : '';
                 const icon = hasIssues ? '▼' : '▶';
                 inlineHtml = `
@@ -6241,8 +6394,6 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
                 const { timeline, reviewsData, tools } = state.statsData;
                 const reviews = reviewsData.reviews;
-                const historicalTotal = reviewsData.total_reviews;
-                const historicalFailed = reviewsData.total_failures;
 
                 // Colors
                 
@@ -6268,16 +6419,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 html += '<h2>AI Reviews</h2>';
                 html += '<div class="stat-card-grid">';
 
-                // Filter for Total Reviews and Success Rate: Exclude in-progress reviews
-                const completedReviews = reviews.filter(r => !['Pending', 'In Review'].includes(r.status));
-                const totalReviewsLast1k = completedReviews.reduce((acc, r) => acc + r.count, 0);
-                const successfulLast1k = completedReviews.filter(r => r.status === 'Reviewed').reduce((acc, r) => acc + r.count, 0);
-                
-                const successRateLast1k = totalReviewsLast1k ? Math.round(successfulLast1k / totalReviewsLast1k * 100) + '%' : '-';
-
-                html += renderStatCard('Total Reviews', historicalTotal);
-                html += renderStatCard('Total Failures', historicalFailed);
-                html += renderStatCard('Success Rate (last 1k reviews)', successRateLast1k);
+                html += renderReviewStatCards(reviewsData);
                 html += '</div>';
                 
                 html += '<h3>Review Outcomes</h3><div class="chart-section"><div id="chart-review-outcomes" class="chart-container"></div></div>';
@@ -6356,18 +6498,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     
                     const statuses = [...new Set(timeline.reviews.map(r => r.status))];
                     
-                    // Custom colors for known statuses
-                    const getColor = (s) => {
-                         if (s === 'Reviewed') return colors.secondary;
-                         if (s === 'Pending') return colors.primary;
-                         if (s === 'In Review') return getComputedStyle(document.body).getPropertyValue('--status-inreview').trim() || '#d67f05';
-                         if (s.toLowerCase().includes('failed')) return colors.failure;
-                         return null;
-                    };
-
                     const series = statuses.map(s => {
                         const style = {};
-                        const c = getColor(s);
+                        const c = reviewOutcomeColor(s, colors);
                         if (c) style.color = c;
                         
                         return {
