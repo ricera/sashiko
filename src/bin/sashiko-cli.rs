@@ -1510,6 +1510,23 @@ fn stage_row(entry: &ActivityEntry, live: bool) -> String {
     )
 }
 
+/// One row of a finished review's stage table.
+///
+/// A stage that did not run to completion says what stopped it, in the label
+/// the coverage warning uses, so its time is not read as a finished stage's.
+fn recorded_stage_row(timing: &StageTiming) -> String {
+    let row = format!(
+        "    {:<20} {:>10}  {:>12}",
+        timing.stage,
+        format_duration(timing.seconds),
+        turns_cell(timing.turns)
+    );
+    match timing.stopped_by {
+        Some(cause) => format!("{}  {}", row, cause.label()),
+        None => row,
+    }
+}
+
 /// Footnote for a finished review's stage table.
 ///
 /// The rows will not add up to the patch's review time, because the stages
@@ -1574,12 +1591,7 @@ fn print_patch_timings(patches: &[Value], reviews: &[&Value], activity: Option<&
             (None, Some(stages)) => {
                 println!("    {:<20} {:>10}  {:>12}", "STAGE", "ELAPSED", "TURNS");
                 for st in &stages {
-                    println!(
-                        "    {:<20} {:>10}  {:>12}",
-                        st.stage,
-                        format_duration(st.seconds),
-                        turns_cell(st.turns)
-                    );
+                    println!("{}", recorded_stage_row(st));
                 }
                 println!("    ({})", stage_breakdown_note(&stages));
             }
@@ -3096,6 +3108,24 @@ mod tests {
         ] {
             assert_eq!(stage_failure_label(&failure), expected, "{failure}");
         }
+    }
+
+    /// A recorded stage that did not run to completion is printed with the
+    /// label of what stopped it, so its time is not read as a finished
+    /// stage's, while a finished stage's row is printed as before.
+    #[test]
+    fn test_a_recorded_stage_says_what_stopped_it() {
+        let timing = |stopped_by| StageTiming {
+            stage: "deduplication".to_string(),
+            seconds: 18,
+            turns: 3,
+            stopped_by,
+        };
+        let finished = recorded_stage_row(&timing(None));
+        assert_eq!(finished.trim_end(), finished, "{finished:?}");
+        assert!(finished.ends_with("3 turns"), "{finished:?}");
+        let stopped = recorded_stage_row(&timing(Some(StageStopCause::OutOfTime)));
+        assert_eq!(stopped, format!("{finished}  stopped: out of time"));
     }
 
     /// `show --watch` stops on a Partial patchset and shows its review log,

@@ -3987,28 +3987,52 @@
         // The recorded stages of a finished review, as table rows.
         //
         // Durations and failures are stored apart -- one says how long a stage
-        // took, the other why a stage has no duration at all -- but they are the
-        // same list to a reader, so they are merged here rather than shown as two
-        // things. A stopped stage has no duration to report: the daemon records
-        // only its reason, which already carries the elapsed time in its text.
+        // ran, the other why a stage did not run to completion -- but they are
+        // the same list to a reader, so they are merged here rather than shown as
+        // two things. A duration with `stopped_by` belongs to a stage that did
+        // not finish: it counts up to the moment the stage stopped, so it joins
+        // that stage's failure as one stopped row and is never shown or counted
+        // as done. Rows written before `stopped_by` existed have no duration for
+        // a stopped stage, whose elapsed time is then only in its reason's text.
         // `order` and `stage_label` come from the server, as they do for live
         // entries.
         function stageRowsFromRecord(stageDurations, stageFailures) {
             const rows = [];
+            // Keyed by stage name, which is data from the worker; a Map holds
+            // any name without touching an object's own properties.
+            const stoppedTimes = new Map();
             for (const st of (Array.isArray(stageDurations) ? stageDurations : [])) {
                 if (!st || typeof st !== 'object') continue;
+                if (st.stopped_by != null) {
+                    stoppedTimes.set(st.stage, st);
+                    continue;
+                }
                 rows.push({
                     stage: st.stage, state: 'done',
                     order: st.order, stage_label: st.stage_label,
                     seconds: st.seconds || 0, turns: st.turns || 0,
                 });
             }
+            const timeOf = st => (st ? { seconds: st.seconds || 0, turns: st.turns || 0 } : {});
             for (const f of (Array.isArray(stageFailures) ? stageFailures : [])) {
                 if (!f || typeof f !== 'object') continue;
+                const time = stoppedTimes.get(f.stage);
+                stoppedTimes.delete(f.stage);
                 rows.push({
                     stage: f.stage, state: 'stopped',
                     order: f.order, stage_label: f.stage_label,
                     reason: f.reason || '', cause: stageStopCause(f),
+                    ...timeOf(time),
+                });
+            }
+            // A stopped stage with no failure beside it still reads as stopped,
+            // by the cause its duration carries.
+            for (const st of stoppedTimes.values()) {
+                rows.push({
+                    stage: st.stage, state: 'stopped',
+                    order: st.order, stage_label: st.stage_label,
+                    reason: '', cause: String(st.stopped_by), timeOnly: true,
+                    ...timeOf(st),
                 });
             }
             return rows.sort(compareStageRows);
@@ -4145,20 +4169,30 @@
 
             // Stopped. Kept rather than dropped: a stage that vanished would be
             // indistinguishable from one that never ran, and the review carries
-            // on without it. A recorded stopped stage has no duration -- only its
-            // reason was written down, and the elapsed time is inside that text.
+            // on without it. A recorded stopped stage shows how long it ran and
+            // how many turns it reached before it stopped, when the record has
+            // them; an older record has only its reason, with the elapsed time
+            // inside that text, and a live one says how long ago it stopped.
             // Only a stage's own error is coloured as a fault: a cancel or a
             // deadline says nothing about the stage.
             if (row.state === 'stopped') {
                 const what = stageStopLabel(row.cause);
                 const colour = row.cause === 'error' ? 'var(--status-failed)' : 'var(--text-muted)';
-                const when = row.age ? `${formatDuration(row.age)} ago` : '—';
+                const ran = row.seconds != null;
+                const when = ran ? formatDuration(row.seconds)
+                    : row.age ? `${formatDuration(row.age)} ago` : '—';
+                const turns = !row.turns
+                    ? '—'
+                    : row.turns === 1 ? '1 turn' : `${escapeHtml(String(row.turns))} turns`;
+                // A recorded duration that stopped with no failure beside it
+                // has no reason to give, and its label says all there is.
+                const why = row.timeOnly ? '' : `: ${escapeHtml(summarizeReason(row.reason))}`;
                 return `<tr title="${escapeHtml(String(row.reason || ''))}">`
                     + `<td style="${cell}">${label}</td>`
-                    + `<td style="${num} color:var(--text-muted);">${when}</td>`
-                    + `<td style="${num}">—</td>`
+                    + `<td style="${num}${ran ? '' : ' color:var(--text-muted);'}">${when}</td>`
+                    + `<td style="${num}">${turns}</td>`
                     + `<td style="padding:2px 0; color:${colour};">`
-                    + `${what}: ${escapeHtml(summarizeReason(row.reason))}</td></tr>`;
+                    + `${what}${why}</td></tr>`;
             }
 
             const age = row.age || 0;

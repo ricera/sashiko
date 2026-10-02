@@ -1436,11 +1436,23 @@ pub fn progress_update(
 ///
 /// Stored as JSON in `reviews.stage_durations`. The stage is its name: there
 /// is no numeric stage identity anywhere on this path.
+///
+/// Every stage that ran has one, whether or not it finished, so the timings
+/// of a failed or timed-out review still show which stage used up the time.
+/// For a stage that did not run to completion, `seconds` and `turns` count
+/// up to the moment it stopped, and `stopped_by` says what stopped it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageTiming {
     pub stage: String,
     pub seconds: u64,
     pub turns: u64,
+    /// What stopped the stage before it ran to completion, or `None` for a
+    /// stage that did. The same cause the stage's entry in
+    /// `reviews.stage_failures` carries, so a reader can tell the two kinds of
+    /// row apart without joining the lists. Left out of the JSON when `None`,
+    /// which is also how every row written before it existed reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_by: Option<StageStopCause>,
 }
 
 /// One stage that did not run to completion, in the shape
@@ -1454,6 +1466,24 @@ pub struct StageFailureRecord {
     pub stage: String,
     pub reason: String,
     pub cause: StageStopCause,
+}
+
+/// How far one stage got: how long it ran and the highest turn it reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StageRun {
+    seconds: u64,
+    turns: u64,
+}
+
+impl StageRun {
+    fn timing(self, stage: &str, stopped_by: Option<StageStopCause>) -> StageTiming {
+        StageTiming {
+            stage: stage.to_string(),
+            seconds: self.seconds,
+            turns: self.turns,
+            stopped_by,
+        }
+    }
 }
 
 /// What the daemon knows of one stage of the review it is running.
@@ -1471,16 +1501,31 @@ enum TrackedStage {
     },
     /// Finished. `cut_short` is set when it finished by winding down at the
     /// review's deadline, so its output covers less than a full run.
-    Done {
-        timing: StageTiming,
-        cut_short: bool,
-    },
+    Done { run: StageRun, cut_short: bool },
     /// Stopped before finishing, as the worker reported it or as the daemon
-    /// settled it when the worker stopped.
+    /// settled it when the worker stopped. `run` is how far it got by then,
+    /// or `None` when it stopped without ever reporting a start, which leaves
+    /// nothing true to say about its time.
     Failed {
         reason: String,
         cause: StageStopCause,
+        run: Option<StageRun>,
     },
+}
+
+impl TrackedStage {
+    /// How far the stage has got: up to now while it runs, and up to the
+    /// moment it stopped once it has.
+    fn run(&self) -> Option<StageRun> {
+        match self {
+            Self::Running { started, turns, .. } => Some(StageRun {
+                seconds: started.elapsed().as_secs(),
+                turns: *turns,
+            }),
+            Self::Done { run, .. } => Some(*run),
+            Self::Failed { run, .. } => *run,
+        }
+    }
 }
 
 /// Applies decoded progress to the registry, and keeps the per-stage state
@@ -1537,8 +1582,11 @@ impl StageTracker {
                         cause,
                     },
                 );
+                // The clock stops here, so the stage's timing counts up to
+                // the failure and not up to when the worker ends.
+                let run = self.stages.get(&stage).and_then(TrackedStage::run);
                 self.stages
-                    .insert(stage, TrackedStage::Failed { reason, cause });
+                    .insert(stage, TrackedStage::Failed { reason, cause, run });
             }
             ProgressUpdate::Touch(key) => self.activity.touch(&key),
         }
@@ -1568,8 +1616,7 @@ impl StageTracker {
     fn finish(&mut self, key: ActivityKey, stage: String, cut_short: bool) {
         match self.stages.remove(&stage) {
             Some(TrackedStage::Running { started, turns, .. }) => {
-                let timing = StageTiming {
-                    stage: stage.clone(),
+                let run = StageRun {
                     seconds: started.elapsed().as_secs(),
                     turns,
                 };
@@ -1577,13 +1624,13 @@ impl StageTracker {
                     key,
                     Phase::StageDone {
                         stage: stage.clone(),
-                        seconds: timing.seconds,
+                        seconds: run.seconds,
                         turns,
                         cut_short,
                     },
                 );
                 self.stages
-                    .insert(stage, TrackedStage::Done { timing, cut_short });
+                    .insert(stage, TrackedStage::Done { run, cut_short });
             }
             // No start time means nothing true to say about it, and a row
             // saying only "done" is worse than none.
@@ -1596,13 +1643,26 @@ impl StageTracker {
         }
     }
 
-    /// Every stage that finished, by name.
+    /// Every stage that ran and has stopped running, by name: each finished
+    /// stage, and each stage that did not run to completion with how far it
+    /// got and what stopped it.
+    ///
+    /// A stage still running has no final time yet and is left out, so call
+    /// this after [`Self::settle`], which stops the clock of every stage the
+    /// worker left running. Each stage is listed once, whatever it went
+    /// through: a stage that wound down and finished is one timing, marked
+    /// [`StageStopCause::CutShort`], not a finished timing and a stopped one.
     pub fn timings(&self) -> Vec<StageTiming> {
         self.stages
-            .values()
-            .filter_map(|s| match s {
-                TrackedStage::Done { timing, .. } => Some(timing.clone()),
-                _ => None,
+            .iter()
+            .filter_map(|(stage, state)| match state {
+                TrackedStage::Running { .. } => None,
+                TrackedStage::Done { run, cut_short } => {
+                    Some(run.timing(stage, cut_short.then_some(StageStopCause::CutShort)))
+                }
+                TrackedStage::Failed { cause, run, .. } => {
+                    run.map(|run| run.timing(stage, Some(*cause)))
+                }
             })
             .collect()
     }
@@ -1617,24 +1677,22 @@ impl StageTracker {
     pub fn settle(&mut self, cause: StageStopCause) -> Vec<StageFailureRecord> {
         let mut settled = Vec::new();
         for (stage, state) in self.stages.iter_mut() {
-            let TrackedStage::Running {
-                key,
-                started,
-                turns,
-            } = state
-            else {
+            let (TrackedStage::Running { key, .. }, Some(run)) = (&*state, state.run()) else {
                 continue;
             };
+            let key = key.clone();
+            // Measured once, so the reason and the stage's timing give the
+            // same time.
             let reason = format!(
                 "still running when the review stopped, after {} and {}",
-                format_duration(started.elapsed().as_secs()),
-                match *turns {
+                format_duration(run.seconds),
+                match run.turns {
                     1 => "1 turn".to_string(),
                     n => format!("{} turns", n),
                 }
             );
             self.activity.update(
-                key.clone(),
+                key,
                 Phase::StageFailed {
                     stage: stage.clone(),
                     reason: reason.clone(),
@@ -1646,7 +1704,11 @@ impl StageTracker {
                 reason: reason.clone(),
                 cause,
             });
-            *state = TrackedStage::Failed { reason, cause };
+            *state = TrackedStage::Failed {
+                reason,
+                cause,
+                run: Some(run),
+            };
         }
         settled
     }
@@ -1661,7 +1723,7 @@ impl StageTracker {
         self.stages
             .iter()
             .filter_map(|(stage, state)| match state {
-                TrackedStage::Failed { reason, cause } => Some(StageFailureRecord {
+                TrackedStage::Failed { reason, cause, .. } => Some(StageFailureRecord {
                     stage: stage.clone(),
                     reason: reason.clone(),
                     cause: *cause,
@@ -3825,6 +3887,7 @@ mod tests {
                 stage: "execution-flow".into(),
                 seconds: 0,
                 turns: 5,
+                stopped_by: None,
             }]
         );
         assert!(
@@ -3960,7 +4023,22 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(tracker.timings().len(), 1);
+        // Every stage that ran has a timing, and only the one that finished
+        // reads as finished.
+        let timing = |stage: &str, turns, stopped_by| StageTiming {
+            stage: stage.into(),
+            seconds: 0,
+            turns,
+            stopped_by,
+        };
+        assert_eq!(
+            tracker.timings(),
+            [
+                timing("goal", 5, None),
+                timing("hardware", 23, Some(StageStopCause::OutOfTime)),
+                timing("locking", 100, Some(StageStopCause::Error)),
+            ]
+        );
         assert!(
             tracker.settle(StageStopCause::Interrupted).is_empty(),
             "a settled stage is not running any more"
@@ -3972,23 +4050,20 @@ mod tests {
     #[test]
     fn a_cut_short_stage_is_listed_as_stopped() {
         let mut tracker = StageTracker::new(ActivityRegistry::new());
-        let timing = StageTiming {
-            stage: "security".into(),
-            seconds: 900,
-            turns: 31,
-        };
         tracker.stages.insert(
             "security".into(),
             TrackedStage::Done {
-                timing: timing.clone(),
+                run: StageRun {
+                    seconds: 900,
+                    turns: 31,
+                },
                 cut_short: true,
             },
         );
         tracker.stages.insert(
             "goal".into(),
             TrackedStage::Done {
-                timing: StageTiming {
-                    stage: "goal".into(),
+                run: StageRun {
                     seconds: 40,
                     turns: 3,
                 },
@@ -4003,8 +4078,162 @@ mod tests {
                 cause: StageStopCause::CutShort,
             }]
         );
-        assert!(tracker.timings().contains(&timing));
+        // One timing each: the cut-short stage is not listed once as finished
+        // and again as stopped.
+        assert_eq!(
+            tracker.timings(),
+            [
+                StageTiming {
+                    stage: "goal".into(),
+                    seconds: 40,
+                    turns: 3,
+                    stopped_by: None,
+                },
+                StageTiming {
+                    stage: "security".into(),
+                    seconds: 900,
+                    turns: 31,
+                    stopped_by: Some(StageStopCause::CutShort),
+                },
+            ]
+        );
         assert!(tracker.settle(StageStopCause::OutOfTime).is_empty());
+    }
+
+    /// A stage that stopped before it finished keeps the time it ran, up to
+    /// the moment it stopped, so the timings of a killed review say which
+    /// stage used up the time. Without this, deduplication killed at the
+    /// hard limit after 18 s had no timing at all, and its time survived only
+    /// inside the text of its failure reason.
+    #[test]
+    fn a_stage_that_stopped_keeps_the_time_it_ran() {
+        let reg = ActivityRegistry::new();
+        let mut tracker = StageTracker::new(reg);
+        let running = |stage: &str, seconds: u64, turns: u64| TrackedStage::Running {
+            key: ActivityKey::PatchsetStage {
+                patchset_id: 5,
+                patch_id: 19,
+                stage: stage.to_string(),
+            },
+            started: Instant::now()
+                .checked_sub(std::time::Duration::from_secs(seconds))
+                .expect("the clock reaches back a minute"),
+            turns,
+        };
+        tracker
+            .stages
+            .insert("deduplication".into(), running("deduplication", 18, 3));
+        tracker
+            .stages
+            .insert("security".into(), running("security", 40, 7));
+
+        // The worker reports one failure and is then killed in the other.
+        tracker.apply(
+            progress_update(
+                ProjectId::Linux,
+                5,
+                19,
+                &ProgressWire::StageFailed {
+                    stage: "security".into(),
+                    reason: "provider unavailable".into(),
+                    cause: StageStopCause::Error,
+                },
+                1,
+                1,
+            )
+            .unwrap(),
+        );
+        // A failure with no start has no time to report.
+        tracker.apply(
+            progress_update(
+                ProjectId::Linux,
+                5,
+                19,
+                &ProgressWire::StageFailed {
+                    stage: "locking".into(),
+                    reason: "never started".into(),
+                    cause: StageStopCause::OutOfTime,
+                },
+                1,
+                1,
+            )
+            .unwrap(),
+        );
+        assert!(
+            tracker.timings().iter().all(|t| t.stage != "deduplication"),
+            "a stage still running has no final time yet"
+        );
+        let settled = tracker.settle(StageStopCause::OutOfTime);
+        assert_eq!(
+            settled[0].reason,
+            "still running when the review stopped, after 18s and 3 turns"
+        );
+        // Each settled stage's reason states the time its timing records.
+        // This checks that the two agree; it does not prove the clock is read
+        // once, since two reads only differ when they straddle a second.
+        let timings = tracker.timings();
+        for record in &settled {
+            let timing = timings
+                .iter()
+                .find(|t| t.stage == record.stage)
+                .expect("a settled stage has a timing");
+            let said = format!("after {} and", format_duration(timing.seconds));
+            assert!(record.reason.contains(&said), "{record:?} vs {timing:?}");
+        }
+
+        assert_eq!(
+            tracker.timings(),
+            [
+                StageTiming {
+                    stage: "deduplication".into(),
+                    seconds: 18,
+                    turns: 3,
+                    stopped_by: Some(StageStopCause::OutOfTime),
+                },
+                StageTiming {
+                    stage: "security".into(),
+                    seconds: 40,
+                    turns: 7,
+                    stopped_by: Some(StageStopCause::Error),
+                },
+            ]
+        );
+        // Every timing of a stopped stage agrees with its stopped record.
+        for timing in tracker.timings() {
+            let record = tracker
+                .stopped()
+                .into_iter()
+                .find(|r| r.stage == timing.stage)
+                .expect("a stopped timing has a stopped record");
+            assert_eq!(timing.stopped_by, Some(record.cause));
+        }
+    }
+
+    /// The stored form of a finished stage is unchanged, a stopped one names
+    /// its cause, and rows written before the cause existed read as finished.
+    #[test]
+    fn a_stage_timing_says_what_stopped_it_only_when_something_did() {
+        let finished = StageTiming {
+            stage: "goal".into(),
+            seconds: 9,
+            turns: 2,
+            stopped_by: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&finished).unwrap(),
+            serde_json::json!({"stage": "goal", "seconds": 9, "turns": 2})
+        );
+        let stopped = StageTiming {
+            stopped_by: Some(StageStopCause::Interrupted),
+            ..finished.clone()
+        };
+        assert_eq!(
+            serde_json::to_value(&stopped).unwrap()["stopped_by"],
+            "interrupted"
+        );
+        let old: StageTiming =
+            serde_json::from_str(r#"{"stage": "goal", "seconds": 9, "turns": 2}"#).unwrap();
+        assert_eq!(old, finished);
     }
 
     /// A stage the deadline cut short reaches the daemon as a finish, settles
@@ -4082,7 +4311,15 @@ mod tests {
                 cause: StageStopCause::CutShort,
             }]
         );
-        assert_eq!(tracker.timings().len(), 1, "it still has its timing");
+        assert_eq!(
+            tracker
+                .timings()
+                .iter()
+                .map(|t| t.stopped_by)
+                .collect::<Vec<_>>(),
+            [Some(StageStopCause::CutShort)],
+            "it still has its one timing, marked cut short"
+        );
     }
 
     /// Rows and lines written before `cut_short` existed still read back, as

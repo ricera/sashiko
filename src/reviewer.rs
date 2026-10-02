@@ -2196,11 +2196,11 @@ impl Reviewer {
         }
     }
 
-    /// Settles the stages still running when the worker stopped, and writes
-    /// the daemon's record of an attempt that ended without a review from the
-    /// worker. Returns the conversation that attempt streamed, for its review
-    /// row's log, or `None` when the worker returned a review or nothing was
-    /// streamed.
+    /// Settles the stages still running when the worker stopped, records the
+    /// attempt's stage timings, and writes the daemon's record of an attempt
+    /// that ended without a review from the worker. Returns the conversation
+    /// that attempt streamed, for its review row's log, or `None` when the
+    /// worker returned a review or nothing was streamed.
     ///
     /// Settling always runs, because it is also what stops a killed worker's
     /// stage rows claiming to be mid-turn. When the worker returned a review,
@@ -2221,6 +2221,7 @@ impl Reviewer {
                 settled.iter().map(|s| s.stage.as_str()).collect::<Vec<_>>()
             );
         }
+        Self::store_stage_timings(ctx, review_id, stages).await;
         if end.has_worker_review() {
             return None;
         }
@@ -2252,6 +2253,38 @@ impl Reviewer {
                 );
                 None
             }
+        }
+    }
+
+    /// Writes the timing of every stage the attempt ran, in pipeline order.
+    ///
+    /// Recorded for every attempt however it ended. Each attempt has its own
+    /// review row, so the timings of attempts never mix, and on a row that
+    /// failed or timed out they show which stage used up the time. Written
+    /// after the stages are settled, not when the worker's output arrives,
+    /// because a stage the worker was still running gets its timing only
+    /// when settling stops its clock: before, the stage that ran out the
+    /// clock was the one stage the timings left out.
+    async fn store_stage_timings(
+        ctx: &ReviewContext,
+        review_id: i64,
+        stages: &crate::activity::StageTracker,
+    ) {
+        let mut timings = stages.timings();
+        if timings.is_empty() {
+            return;
+        }
+        let project = ctx.settings.project.kind.unwrap_or_default();
+        timings.sort_by_cached_key(|t| pipeline_position(project, &t.stage));
+        let stored = match serde_json::to_string(&timings) {
+            Ok(json) => ctx.db.set_review_stage_durations(review_id, &json).await,
+            Err(e) => Err(e.into()),
+        };
+        if let Err(e) = stored {
+            warn!(
+                "Failed to record the stage timings of review {}: {}",
+                review_id, e
+            );
         }
     }
 
@@ -3865,23 +3898,6 @@ async fn run_review_tool_with_cmd(
         DeadlinePhase::WindingDown { .. } => Some(deadline.timed_out()),
     };
 
-    // Recorded for every attempt however it ended. Each attempt has its own
-    // review row, so the timings of attempts never mix, and on a row that
-    // failed or timed out they show which stage used up the time.
-    let mut timings = stages.timings();
-    if !timings.is_empty() {
-        timings.sort_by_cached_key(|t| pipeline_position(project, &t.stage));
-        match serde_json::to_string(&timings) {
-            Ok(json) => {
-                let _ = db.set_review_stage_durations(review_id, &json).await;
-            }
-            Err(e) => warn!(
-                "Failed to encode stage timings for review {}: {}",
-                review_id, e
-            ),
-        }
-    }
-
     // Abort all spawned AI request tasks to drop their stdin clones
     for task in spawned_tasks {
         task.abort();
@@ -5275,9 +5291,10 @@ mod tests {
                 .is_none()
         );
 
-        let review = run.db.get_review_details(run.review_id).await?.unwrap();
+        // The daemon writes these to the review row once it has settled the
+        // attempt; the tests that run a whole attempt check the row.
         assert_eq!(
-            review["stage_durations"],
+            serde_json::to_value(run.stages.timings())?,
             json!([{"stage": "goal", "seconds": 0, "turns": 2}])
         );
         Ok(())
@@ -5447,9 +5464,16 @@ mod tests {
             "stage implementation failed: Failed to generate valid response"
         );
 
-        // Nothing finished, so there is no breakdown to record.
-        let review = run.db.get_review_details(run.review_id).await?.unwrap();
-        assert!(review["stage_durations"].is_null(), "{review}");
+        // It ran, so it keeps how far it got, marked as stopped by its error.
+        assert_eq!(
+            run.stages.timings(),
+            [crate::activity::StageTiming {
+                stage: stage(),
+                seconds: 0,
+                turns: 20,
+                stopped_by: Some(crate::workflow::StageStopCause::Error),
+            }]
+        );
 
         // The daemon knows the stage stopped, should the worker stop later.
         assert_eq!(
@@ -8181,10 +8205,11 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .collect()
     }
 
-    /// The stored stage timings as (stage, turns) pairs. The seconds are left
-    /// out because they are wall-clock time spent around a real subprocess,
-    /// which a loaded machine can push past a whole second.
-    fn recorded_timings(review: &Value) -> Vec<(String, u64)> {
+    /// The stored stage timings as (stage, turns, what stopped it) triples,
+    /// the last `None` for a stage that finished. The seconds are left out
+    /// because they are wall-clock time spent around a real subprocess, which
+    /// a loaded machine can push past a whole second.
+    fn recorded_timings(review: &Value) -> Vec<(String, u64, Option<String>)> {
         review["stage_durations"]
             .as_array()
             .into_iter()
@@ -8193,9 +8218,15 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 (
                     t["stage"].as_str().unwrap_or_default().to_string(),
                     t["turns"].as_u64().unwrap_or_default(),
+                    t["stopped_by"].as_str().map(str::to_string),
                 )
             })
             .collect()
+    }
+
+    /// One expected entry of [`recorded_timings`].
+    fn timing(stage: &str, turns: u64, stopped_by: Option<&str>) -> (String, u64, Option<String>) {
+        (stage.to_string(), turns, stopped_by.map(str::to_string))
     }
 
     /// A worker's line streaming `content` from `stage` to the live log.
@@ -8313,8 +8344,12 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             );
             assert_eq!(
                 recorded_timings(review),
-                vec![("goal".to_string(), 2)],
-                "a failed attempt keeps its timings: {review}"
+                vec![
+                    timing("goal", 2, None),
+                    timing("locking", 3, Some("interrupted")),
+                    timing("security", 1, Some("error")),
+                ],
+                "a failed attempt keeps the timing of every stage it ran: {review}"
             );
             assert_eq!(
                 recorded_log(review),
@@ -8408,8 +8443,12 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         );
         assert_eq!(
             recorded_timings(review),
-            vec![("goal".to_string(), 1)],
-            "{review}"
+            vec![
+                timing("goal", 1, None),
+                timing("security", 4, Some("out_of_time")),
+            ],
+            "the stage the deadline killed has a timing, so the row says what \
+             used up the time: {review}"
         );
         assert_eq!(
             recorded_log(review),
@@ -8601,9 +8640,19 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             "reason": "cut short: the review ran out of time; its findings so far were kept",
             "cause": StageStopCause::CutShort,
         }]);
+        let wound_down = progress(
+            1,
+            crate::activity::ProgressWire::StageFinished {
+                stage: "security".into(),
+                cut_short: true,
+            },
+        );
         let script = worker_winding_down(
             &stage_reaching("security", 3),
-            &format!("echo '{}'\n", reviewed_output(cut_short)),
+            &format!(
+                "echo '{wound_down}'\necho '{}'\n",
+                reviewed_output(cut_short)
+            ),
         );
 
         let run = review_patch_with_worker(&script, out_of_time_with_salvage).await?;
@@ -8630,6 +8679,12 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 .map(|(stage, cause, _)| (stage, cause))
                 .collect::<Vec<_>>(),
             vec![("security".to_string(), "cut_short".to_string())]
+        );
+        assert_eq!(
+            recorded_timings(review),
+            vec![timing("security", 3, Some("cut_short"))],
+            "a stage that wound down and finished is one timing, not a finished \
+             one and a stopped one: {review}"
         );
         let review_id = review["id"].as_i64().unwrap_or_default();
         assert_eq!(
@@ -9114,7 +9169,13 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             (failures[0].0.as_str(), failures[0].1.as_str()),
             ("security", "out_of_time")
         );
-        assert_eq!(recorded_timings(review), vec![("goal".to_string(), 1)]);
+        assert_eq!(
+            recorded_timings(review),
+            vec![
+                timing("goal", 1, None),
+                timing("security", 2, Some("out_of_time")),
+            ]
+        );
         assert_eq!(
             recorded_log(review),
             promoted(&[(Some("security"), "still tracing")])

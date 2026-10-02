@@ -764,6 +764,81 @@ console.log('stage stop causes');
     check('every cause check passes', causeFailures.length === 0, causeFailures.join(', '));
 }
 
+// ---- a stage that stopped keeps the time it ran ----------------------------
+// The daemon records a duration for every stage that ran, and marks one that
+// did not finish with `stopped_by`. Such a duration joins its stage's failure
+// as one stopped row with the time it ran; it must never read or count as a
+// finished stage, and a stage must not appear twice.
+function stoppedTimeChecks(fns) {
+    const failed = [];
+    const expect = (name, cond) => { if (!cond) failed.push(name); };
+    const guard = f => { try { return f(); } catch (e) { return `THREW ${e}`; } };
+    const rowText = (html, label) => String(guard(() => visibleText(rowFor(html, label))));
+
+    const killed = String(guard(() => fns.renderReviewCard({
+        id: 20, status: 'Failed', patch_id: 30,
+        result: 'Tool error: Review tool timed out (active time exceeded)',
+        stage_durations: [
+            { stage: 'goal', order: ORDER.goal, seconds: 120, turns: 3 },
+            { stage: 'deduplication', order: ORDER.deduplication, seconds: 18, turns: 3,
+              stopped_by: 'out_of_time' },
+        ],
+        stage_failures: [
+            { stage: 'deduplication', order: ORDER.deduplication, cause: 'out_of_time',
+              reason: 'still running when the review stopped, after 18s and 3 turns' },
+        ],
+    })));
+    const dedup = rowText(killed, 'Stage deduplication');
+    expect('stopped time: the killed stage is one row',
+        killed.split('>Stage deduplication<').length === 2);
+    expect('stopped time: it shows how long it ran and how far it got',
+        dedup.includes('18s') && dedup.includes('3 turns'));
+    expect('stopped time: it says what stopped it', dedup.includes('stopped: out of time'));
+    expect('stopped time: it does not read as done', !/\bdone\b/.test(dedup));
+    expect('stopped time: the finished stage still reads as done',
+        /\bdone\b/.test(rowText(killed, 'Stage goal')));
+    expect('stopped time: the heading counts the time it ran',
+        killed.includes('2 stages overlapping')
+            && killed.includes(`${fns.formatDuration(138)} summed`));
+    const rows = guard(() => fns.stageRowsFromRecord(
+        [{ stage: 'deduplication', order: 7, seconds: 18, turns: 3, stopped_by: 'out_of_time' }],
+        [{ stage: 'deduplication', order: 7, reason: 'x', cause: 'out_of_time' }]));
+    expect('stopped time: no finished row for a stopped stage',
+        Array.isArray(rows) && rows.length === 1 && rows[0].state === 'stopped'
+            && rows[0].seconds === 18 && rows[0].turns === 3);
+
+    // A stage that wound down and finished is one row, not done and stopped.
+    const cut = String(guard(() => fns.renderReviewCard({
+        id: 21, status: 'Partial', patch_id: 31,
+        stage_durations: [{ stage: 'security', order: ORDER.security, seconds: 900, turns: 31,
+                            stopped_by: 'cut_short' }],
+        stage_failures: [{ stage: 'security', order: ORDER.security, cause: 'cut_short',
+                           reason: 'cut short: the review ran out of time; its findings so far were kept' }],
+    })));
+    const security = rowText(cut, 'Stage security');
+    expect('cut short: one row', cut.split('>Stage security<').length === 2);
+    expect('cut short: with its time and label',
+        security.includes(fns.formatDuration(900)) && security.includes('31 turns')
+            && security.includes('cut short') && !/\bdone\b/.test(security));
+
+    // A stopped duration with no failure beside it still reads as stopped.
+    const alone = guard(() => fns.stageRowsFromRecord(
+        [{ stage: 'locking', order: 4, seconds: 18, turns: 1, stopped_by: 'interrupted' }], []));
+    const aloneHtml = Array.isArray(alone) ? String(guard(() => fns.renderStageRow(alone[0]))) : String(alone);
+    expect('alone: a stopped duration with no failure is a stopped row',
+        Array.isArray(alone) && alone.length === 1 && alone[0].state === 'stopped');
+    expect('alone: it reads by its own cause, with its time and no invented reason',
+        visibleText(aloneHtml).includes('still running when the review stopped')
+            && visibleText(aloneHtml).includes('18s') && visibleText(aloneHtml).includes('1 turn')
+            && !aloneHtml.includes('no reason given'));
+    return failed;
+}
+console.log('stopped stages keep their time');
+{
+    const stoppedFailures = stoppedTimeChecks(ctx);
+    check('every stopped-time check passes', stoppedFailures.length === 0, stoppedFailures.join(', '));
+}
+
 // ---- polling hygiene -------------------------------------------------------
 console.log('activity polling');
 {
@@ -1194,6 +1269,12 @@ const mutate = (name, from, to) => {
     check('a stage row that does not escape is caught', stageChecks(rowUnescaped).length > 0);
     const oneLabel = load({ ...sources, stageStopLabel: replaceBody('stageStopLabel', " return 'failed';") });
     check('a label that ignores the cause is caught', causeChecks(oneLabel).length > 0);
+    const timeAsDone = mutate('stageRowsFromRecord', 'if (st.stopped_by != null) {', 'if (false) {');
+    check('a reader that shows a stopped duration as done is caught',
+        stoppedTimeChecks(timeAsDone).length > 0);
+    const noTime = mutate('stageRowsFromRecord', '...timeOf(time),', '');
+    check('a reader that drops a stopped stage\'s time is caught',
+        stoppedTimeChecks(noTime).length > 0);
     const noLegacy = load({ ...sources, stageStopCause: replaceBody('stageStopCause',
         " return record.cause != null ? String(record.cause) : 'error';") });
     check('a reader that ignores the legacy flag is caught', causeChecks(noLegacy).length > 0);
