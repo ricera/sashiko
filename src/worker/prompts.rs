@@ -110,8 +110,11 @@ pub enum WorkerProgressEvent {
     StageStarted {
         stage: String,
     },
+    /// A stage finished. `cut_short` is set when the review ran out of time
+    /// while it gathered evidence, so its output covers less than a full run.
     StageFinished {
         stage: String,
+        cut_short: bool,
     },
     StageTurn {
         stage: String,
@@ -254,11 +257,14 @@ fn worker_progress_event(
                 planned_stages: next,
             })
         }
-        WorkflowEvent::StageFinished { stage_name, .. } if counted(stage_name) => {
-            Some(WorkerProgressEvent::StageFinished {
-                stage: stage_name.to_string(),
-            })
-        }
+        WorkflowEvent::StageFinished {
+            stage_name,
+            cut_short,
+            ..
+        } if counted(stage_name) => Some(WorkerProgressEvent::StageFinished {
+            stage: stage_name.to_string(),
+            cut_short,
+        }),
         WorkflowEvent::StageTurn {
             stage_name,
             turn,
@@ -392,6 +398,9 @@ pub struct Worker {
     skip_report: bool,
     report_preexisting: bool,
     effort: Option<crate::ai::EffortMode>,
+    /// Set when the daemon says the review reached its deadline. `None`
+    /// unless the daemon spawned this worker.
+    wind_down: Option<Arc<crate::ai::WindDownSignal>>,
 }
 
 impl Worker {
@@ -417,7 +426,17 @@ impl Worker {
             skip_report: config.skip_report,
             report_preexisting: config.report_preexisting,
             effort: config.effort,
+            wind_down: None,
         }
+    }
+
+    /// Lets the review's deadline wind this worker's review down.
+    ///
+    /// Only a daemon-spawned worker has a daemon on stdin to send the
+    /// wind-down, so only it passes the signal its stdin reader sets.
+    pub fn with_wind_down(mut self, signal: Arc<crate::ai::WindDownSignal>) -> Self {
+        self.wind_down = Some(signal);
+        self
     }
 
     pub async fn run(
@@ -625,6 +644,7 @@ impl Worker {
             tools: self.tools.clone(),
             base_dir: &self.prompts.base_dir,
             context_tag: self.context_tag.clone(),
+            wind_down: self.wind_down.clone(),
         };
 
         let project = self.project;
@@ -664,10 +684,11 @@ impl Worker {
             state.review_inline
         };
 
-        // Stages that did not complete while their siblings did, so the caller
-        // can report which parts of the review are missing instead of
-        // presenting partial coverage as full. A batch where every stage failed
-        // never gets here: the engine turns that into an error.
+        // Stages that did not complete while their siblings did, and stages
+        // the deadline cut short, so the caller can report which parts of the
+        // review are missing instead of presenting partial coverage as full.
+        // A batch where every stage failed never gets here: the engine turns
+        // that into an error.
         let stage_failures = stage_failures_json(&outcome.stage_failures);
 
         if !stage_failures.is_empty() {
@@ -1417,6 +1438,36 @@ mod tests {
             "{refined:?}"
         );
         assert_eq!(refined.len(), initial.len() + 1, "{refined:?}");
+    }
+
+    /// Whether a finished stage was cut short reaches the worker's caller as
+    /// it was given, for both values.
+    #[test]
+    fn worker_progress_event_carries_whether_a_stage_was_cut_short() {
+        for cut_short in [false, true] {
+            let event = worker_progress_event(
+                ProjectId::Linux,
+                false,
+                &std::sync::Mutex::new(Vec::new()),
+                WorkflowEvent::StageFinished {
+                    stage_name: "goal",
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    tokens_cached: 0,
+                    cut_short,
+                },
+            );
+            match event {
+                Some(WorkerProgressEvent::StageFinished {
+                    stage,
+                    cut_short: got,
+                }) => {
+                    assert_eq!(stage, "goal");
+                    assert_eq!(got, cut_short);
+                }
+                other => panic!("expected StageFinished, got {other:?}"),
+            }
+        }
     }
 
     #[test]

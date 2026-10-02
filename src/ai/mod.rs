@@ -1005,6 +1005,11 @@ pub(crate) enum IpcMessageType {
     AiResponse,
     /// The provider error that ended the request with the same `tx_id`.
     Error,
+    /// The review has reached its deadline and should wind down: the stages
+    /// that gather concerns stop, and the ones that turn concerns into
+    /// findings finish. Answers no request, so its `tx_id` is 0, which the
+    /// registry never issues.
+    WindDown,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1041,12 +1046,21 @@ impl IpcEnvelope {
 /// The reply one stdin line carries: its `tx_id` and the result to dispatch.
 type IpcReply = (u64, Result<AiResponse, RemoteAiError>);
 
-/// Reads one line from the worker's stdin into the reply it carries.
+/// What one stdin line asks the worker to do.
+#[derive(Debug)]
+enum IpcInbound {
+    /// Hand a reply to the request it answers.
+    Reply(IpcReply),
+    /// Set the worker's wind-down signal.
+    WindDown,
+}
+
+/// Reads one line from the worker's stdin into what it asks for.
 ///
 /// An `Err` is a protocol violation, described for the log. It is returned
 /// rather than acted on so that the parsing can be tested without ending the
 /// test process.
-fn parse_ipc_reply(line: &str) -> Result<IpcReply, String> {
+fn parse_ipc_message(line: &str) -> Result<IpcInbound, String> {
     let envelope = serde_json::from_str::<IpcEnvelope>(line)
         .map_err(|e| format!("Received a malformed message on stdin ({}): {}", e, line))?;
     let tx_id = envelope.tx_id;
@@ -1068,8 +1082,55 @@ fn parse_ipc_reply(line: &str) -> Result<IpcReply, String> {
                 })?;
             Err(payload.into_error())
         }
+        IpcMessageType::WindDown => return Ok(IpcInbound::WindDown),
     };
-    Ok((tx_id, result))
+    Ok(IpcInbound::Reply((tx_id, result)))
+}
+
+/// Acts on one stdin line: dispatches a reply, or sets the wind-down signal.
+///
+/// Apart from the reader so a test can drive it with its own registry and
+/// signal. The process-wide signal is shared by every test in the binary, so
+/// setting it there would wind down unrelated tests.
+async fn handle_ipc_line(
+    registry: &IpcRegistry,
+    wind_down: &WindDownSignal,
+    line: &str,
+) -> Result<(), String> {
+    match parse_ipc_message(line)? {
+        IpcInbound::Reply((tx_id, result)) => registry.dispatch(tx_id, result).await,
+        IpcInbound::WindDown => {
+            tracing::info!(
+                "The review reached its deadline: stopping the analysis stages and \
+                 finishing the consolidation stages"
+            );
+            wind_down.request();
+        }
+    }
+    Ok(())
+}
+
+/// Tells a worker's review that it has reached its deadline.
+///
+/// Set by the stdin reader when the daemon sends
+/// [`IpcMessageType::WindDown`], and read by every session at its turn
+/// boundaries. It is a plain flag rather than a cancellation token because
+/// the worker build has no `tokio-util`, and nothing waits on it: a session
+/// only asks, between turns, whether it is set. It is never cleared, because
+/// a worker reviews exactly one patch per spawn.
+#[derive(Debug, Default)]
+pub struct WindDownSignal(std::sync::atomic::AtomicBool);
+
+impl WindDownSignal {
+    /// Asks every session that reads this signal to wind down.
+    pub fn request(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Whether the review has been asked to wind down.
+    pub fn is_requested(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 pub(crate) struct IpcRegistry {
@@ -1190,6 +1251,9 @@ impl Default for AtomicWriter {
 // a response could land in a registry that never issued that id.
 static IPC_REGISTRY: std::sync::OnceLock<Arc<IpcRegistry>> = std::sync::OnceLock::new();
 static IPC_WRITER: std::sync::OnceLock<Arc<AtomicWriter>> = std::sync::OnceLock::new();
+// One per process, like the registry: the stdin reader that sets it is shared
+// by every review the process runs.
+static WIND_DOWN: std::sync::OnceLock<Arc<WindDownSignal>> = std::sync::OnceLock::new();
 // Holding the join handle rather than a "started" flag lets
 // ensure_stdin_reader() tell a running reader from one that has stopped --
 // stdin EOF, a read error, or the runtime it was spawned on being dropped --
@@ -1201,6 +1265,16 @@ static IPC_READER: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>> =
 pub(crate) fn ipc_registry() -> Arc<IpcRegistry> {
     IPC_REGISTRY
         .get_or_init(|| Arc::new(IpcRegistry::new()))
+        .clone()
+}
+
+/// The signal the stdin reader sets when the daemon sends `wind_down`.
+///
+/// Only a daemon-spawned worker hands it to its review: nothing else has a
+/// daemon on stdin to send one.
+pub fn wind_down_signal() -> Arc<WindDownSignal> {
+    WIND_DOWN
+        .get_or_init(|| Arc::new(WindDownSignal::default()))
         .clone()
 }
 
@@ -1244,10 +1318,13 @@ pub(crate) fn ensure_stdin_reader() {
     if matches!(reader.as_ref(), Some(handle) if !handle.is_finished()) {
         return;
     }
-    *reader = Some(start_stdin_reader(registry));
+    *reader = Some(start_stdin_reader(registry, wind_down_signal()));
 }
 
-pub(crate) fn start_stdin_reader(registry: Arc<IpcRegistry>) -> tokio::task::JoinHandle<()> {
+pub(crate) fn start_stdin_reader(
+    registry: Arc<IpcRegistry>,
+    wind_down: Arc<WindDownSignal>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         use tokio::io::{AsyncBufReadExt, BufReader};
         let stdin = tokio::io::stdin();
@@ -1255,12 +1332,9 @@ pub(crate) fn start_stdin_reader(registry: Arc<IpcRegistry>) -> tokio::task::Joi
         let mut lines = reader.lines();
 
         while let Ok(Some(line)) = lines.next_line().await {
-            match parse_ipc_reply(&line) {
-                Ok((tx_id, result)) => registry.dispatch(tx_id, result).await,
-                Err(violation) => {
-                    eprintln!("CRITICAL PROTOCOL ERROR: {}", violation);
-                    std::process::exit(1);
-                }
+            if let Err(violation) = handle_ipc_line(&registry, &wind_down, &line).await {
+                eprintln!("CRITICAL PROTOCOL ERROR: {}", violation);
+                std::process::exit(1);
             }
         }
 
@@ -1537,11 +1611,77 @@ mod tests {
         for (wire, kind) in [
             ("ai_response", IpcMessageType::AiResponse),
             ("error", IpcMessageType::Error),
+            ("wind_down", IpcMessageType::WindDown),
         ] {
             let parsed: IpcMessageType = serde_json::from_value(json!(wire))?;
             assert_eq!(parsed, kind);
             assert_eq!(serde_json::to_value(kind)?, json!(wire));
         }
+        Ok(())
+    }
+
+    /// The reply a line carries, for the tests of reply lines. A wind-down
+    /// line carries none and reads as a violation here.
+    fn parse_ipc_reply(line: &str) -> std::result::Result<IpcReply, String> {
+        match parse_ipc_message(line)? {
+            IpcInbound::Reply(reply) => Ok(reply),
+            IpcInbound::WindDown => Err("a wind-down carries no reply".to_string()),
+        }
+    }
+
+    /// The daemon's wind-down line sets the worker's signal and is not
+    /// dispatched as a reply. Dispatching it would end the worker, because no
+    /// request has `tx_id` 0 and an unsolicited reply is a protocol violation.
+    #[tokio::test]
+    async fn a_wind_down_line_sets_the_signal_and_answers_no_request() -> Result<()> {
+        let registry = IpcRegistry::new();
+        let signal = WindDownSignal::default();
+
+        let line = IpcEnvelope::line(IpcMessageType::WindDown, 0, &serde_json::Value::Null)?;
+        let text = line
+            .strip_suffix('\n')
+            .ok_or_else(|| anyhow!("a message ends its line"))?;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text)?,
+            json!({"type": "wind_down", "tx_id": 0, "payload": null}),
+            "the wire form the design names"
+        );
+        assert!(matches!(
+            parse_ipc_message(text).map_err(|e| anyhow!(e))?,
+            IpcInbound::WindDown
+        ));
+
+        handle_ipc_line(&registry, &signal, text)
+            .await
+            .map_err(|e| anyhow!(e))?;
+        assert!(signal.is_requested(), "the reader sets the signal");
+
+        // Setting it again changes nothing: the signal is never cleared.
+        handle_ipc_line(&registry, &signal, text)
+            .await
+            .map_err(|e| anyhow!(e))?;
+        assert!(signal.is_requested());
+        Ok(())
+    }
+
+    /// A reply reaches its request and leaves the signal alone.
+    #[tokio::test]
+    async fn a_reply_line_is_dispatched_without_winding_down() -> Result<()> {
+        let registry = IpcRegistry::new();
+        let signal = WindDownSignal::default();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let tx_id = registry.next_id();
+        registry.register(tx_id, tx).await.map_err(|e| anyhow!(e))?;
+
+        let response: AiResponse = serde_json::from_value(json!({"content": "hello"}))?;
+        let line = IpcEnvelope::line(IpcMessageType::AiResponse, tx_id, &response)?;
+        handle_ipc_line(&registry, &signal, line.trim_end())
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        let read = rx.await?.map_err(|e| anyhow!(e))?;
+        assert_eq!(read.content.as_deref(), Some("hello"));
+        assert!(!signal.is_requested());
         Ok(())
     }
 

@@ -14,11 +14,13 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 use super::{
     AiErrorClass, AiMessage, AiProvider, AiRequest, AiResponse, AiResponseFormat, AiRole, AiTool,
-    AiUsage, OutputTruncated, ReasoningEffort, ToolCall, classify_ai_error,
+    AiUsage, OutputTruncated, ReasoningEffort, ToolCall, WindDownSignal, classify_ai_error,
 };
 
 /// The unified result of executing an [`LlmSession`].
@@ -29,6 +31,44 @@ pub struct SessionResult<T> {
     pub history: Vec<AiMessage>,
     /// Accumulated token usage statistics.
     pub usage: AiUsage,
+    /// The review ran out of time while this session was gathering evidence,
+    /// so its output came from one forced tool-less turn and covers less than
+    /// a full run would have.
+    pub cut_short: bool,
+}
+
+/// Why a session stopped short of its own end.
+///
+/// Serialised in snake case: the worker reports it as `review_stopped_by` on a
+/// patch whose review it ended, and the daemon reads it back from there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopCause {
+    /// The review reached its deadline and was told to wind down.
+    OutOfTime,
+}
+
+impl StopCause {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::OutOfTime => "the review ran out of time",
+        }
+    }
+}
+
+/// A session that stopped because of something outside it, not a fault of
+/// its own.
+///
+/// Typed so the engine and the worker can tell a stage the deadline stopped
+/// from one that failed, by `downcast_ref`, which also finds it beneath
+/// further context. It is the whole error when the session stopped before
+/// spending anything, and the context of the session's own error when the
+/// session failed while winding down, so that failure is still put down to
+/// the deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Session stopped: {}", cause.describe())]
+pub struct SessionStopped {
+    pub cause: StopCause,
 }
 
 /// Error returned when an [`LlmSession`] fails, preserving partial conversation
@@ -168,10 +208,17 @@ pub trait LlmSession: Send {
 enum FinalTurn {
     /// The session used up `max_turns`.
     TurnBudget,
+    /// The review reached its deadline while this session was gathering
+    /// evidence, and the session may be interrupted.
+    OutOfTime,
 }
 
 /// Sent once when a multi-turn session reaches its last turn.
 const TURN_BUDGET_PROMPT: &str = "TURN BUDGET EXHAUSTED: You have reached the maximum allowed investigation turns. Do NOT call any tools. Synthesize your final JSON verdict now based on the evidence gathered so far.";
+
+/// Sent once when the review runs out of time during a session that has
+/// already gathered evidence.
+const OUT_OF_TIME_PROMPT: &str = "TIME BUDGET EXHAUSTED: The review has run out of time. Do NOT call any tools. Synthesize your final JSON verdict now from the evidence gathered so far.";
 
 impl FinalTurn {
     /// The message that announces this final turn, if any.
@@ -181,6 +228,7 @@ impl FinalTurn {
     fn prompt(self, max_turns: usize) -> Option<&'static str> {
         match self {
             Self::TurnBudget => (max_turns > 1).then_some(TURN_BUDGET_PROMPT),
+            Self::OutOfTime => Some(OUT_OF_TIME_PROMPT),
         }
     }
 }
@@ -313,6 +361,13 @@ pub struct SessionRunner<'a> {
     on_backoff: Option<Box<BackoffCallback<'a>>>,
     /// Called with every message that joins the logged history, in order.
     on_message: Option<Box<MessageCallback<'a>>>,
+    /// Set when the review reaches its deadline. `None` where nothing can
+    /// send a wind-down: a local review, or a session outside a review.
+    wind_down: Option<Arc<WindDownSignal>>,
+    /// Whether the wind-down stops this session. The stages that turn
+    /// gathered concerns into findings are not interruptible, because a
+    /// salvage has nothing to show without them.
+    interruptible: bool,
 }
 
 impl<'a> SessionRunner<'a> {
@@ -328,7 +383,65 @@ impl<'a> SessionRunner<'a> {
             on_tools: None,
             on_backoff: None,
             on_message: None,
+            wind_down: None,
+            interruptible: true,
         }
+    }
+
+    /// Lets the review's deadline stop this session.
+    ///
+    /// When `signal` is set and the session is `interruptible`, the session
+    /// stops at its next turn boundary: at once if it has had no answer from
+    /// the model yet, or else after one forced tool-less turn that turns the
+    /// evidence it has gathered into its verdict. A session that is not
+    /// interruptible ignores the signal.
+    pub fn with_wind_down(
+        mut self,
+        signal: Option<Arc<WindDownSignal>>,
+        interruptible: bool,
+    ) -> Self {
+        self.wind_down = signal;
+        self.interruptible = interruptible;
+        self
+    }
+
+    /// Whether this session has been told to wind down.
+    fn winding_down(&self) -> bool {
+        self.interruptible
+            && self
+                .wind_down
+                .as_ref()
+                .is_some_and(|signal| signal.is_requested())
+    }
+
+    /// Acts on the wind-down at a turn boundary.
+    ///
+    /// Returns `Err(SessionStopped)` when the session has had no answer from
+    /// the model, because there is no evidence to synthesise and stopping now
+    /// spends nothing. Otherwise switches the session to its out-of-time
+    /// final turn, once. A session already on its turn-budget final turn is
+    /// left there: it is asking for its verdict already, and the evidence it
+    /// gathered was not cut short.
+    fn check_wind_down(
+        &self,
+        answered: bool,
+        final_turn: &mut Option<FinalTurn>,
+        history: &mut Vec<AiMessage>,
+        log_history: &mut Vec<AiMessage>,
+    ) -> Result<()> {
+        if final_turn.is_some() || !self.winding_down() {
+            return Ok(());
+        }
+        if !answered {
+            return Err(SessionStopped {
+                cause: StopCause::OutOfTime,
+            }
+            .into());
+        }
+        tracing::info!("The review ran out of time; asking the stage for its verdict now");
+        *final_turn = Some(FinalTurn::OutOfTime);
+        self.announce_final_turn(FinalTurn::OutOfTime, history, log_history);
+        Ok(())
     }
 
     /// Configures the maximum validation retries.
@@ -498,7 +611,35 @@ impl<'a> SessionRunner<'a> {
     }
 
     /// Runs the session to completion. Returns the validated output and conversation history (for logging).
+    ///
+    /// A session that fails on its out-of-time final turn has its error
+    /// wrapped in [`SessionStopped`], so the stop is still put down to the
+    /// deadline rather than read as a fault of the stage.
     pub async fn run<S>(&self, session: &mut S) -> Result<SessionResult<S::Output>>
+    where
+        S: LlmSession,
+    {
+        let mut final_turn = None;
+        let result = self.run_turns(session, &mut final_turn).await;
+        match (result, final_turn) {
+            (Err(e), Some(FinalTurn::OutOfTime))
+                if e.downcast_ref::<SessionStopped>().is_none() =>
+            {
+                Err(e.context(SessionStopped {
+                    cause: StopCause::OutOfTime,
+                }))
+            }
+            (result, _) => result,
+        }
+    }
+
+    /// The turn loop of [`Self::run`]. `final_turn` is the caller's, so the
+    /// caller can tell how the loop ended when it returns an error.
+    async fn run_turns<S>(
+        &self,
+        session: &mut S,
+        final_turn: &mut Option<FinalTurn>,
+    ) -> Result<SessionResult<S::Output>>
     where
         S: LlmSession,
     {
@@ -534,8 +675,11 @@ impl<'a> SessionRunner<'a> {
         let mut total_prompt_tokens = 0;
         let mut total_completion_tokens = 0;
         let mut total_cached_tokens = 0;
-        let mut final_turn: Option<FinalTurn> = None;
         let mut turn_truncations = TurnTruncations::default();
+        // Whether the model has answered at all, which decides what the
+        // wind-down does: there is nothing to synthesise before the first
+        // answer.
+        let mut answered = false;
 
         let make_failure = |message: String,
                             history: Vec<AiMessage>,
@@ -556,6 +700,24 @@ impl<'a> SessionRunner<'a> {
         };
 
         loop {
+            // Wrapped like every other early exit, so the stage keeps the
+            // history and usage it had; the typed SessionStopped still
+            // downcasts through the context.
+            if let Err(e) =
+                self.check_wind_down(answered, final_turn, &mut history, &mut log_history)
+            {
+                let message = e.to_string();
+                return Err(e.context(SessionFailure {
+                    message,
+                    history: log_history,
+                    usage: AiUsage {
+                        prompt_tokens: total_prompt_tokens,
+                        completion_tokens: total_completion_tokens,
+                        total_tokens: total_prompt_tokens.saturating_add(total_completion_tokens),
+                        cached_tokens: Some(total_cached_tokens),
+                    },
+                }));
+            }
             turns = turns.saturating_add(1);
             if turns > self.max_turns {
                 return Err(make_failure(
@@ -571,7 +733,7 @@ impl<'a> SessionRunner<'a> {
             }
 
             if final_turn.is_none() && turns == self.max_turns {
-                final_turn = Some(FinalTurn::TurnBudget);
+                *final_turn = Some(FinalTurn::TurnBudget);
                 self.announce_final_turn(FinalTurn::TurnBudget, &mut history, &mut log_history);
             }
             let is_final_turn = final_turn.is_some();
@@ -668,6 +830,7 @@ impl<'a> SessionRunner<'a> {
                 },
             };
 
+            answered = true;
             // A truncated answer was billed like any other, so its usage counts
             // even though the answer itself is discarded.
             if let Some(usage) = &resp.usage {
@@ -715,7 +878,7 @@ impl<'a> SessionRunner<'a> {
             turn_truncations = TurnTruncations::default();
 
             let assistant_msg = assistant_message(&resp);
-            history.push(reply_for_history(&assistant_msg, final_turn));
+            history.push(reply_for_history(&assistant_msg, *final_turn));
             self.push_log(&mut log_history, assistant_msg);
 
             // Handle Tool Calls
@@ -785,6 +948,7 @@ impl<'a> SessionRunner<'a> {
                         output,
                         history: log_history,
                         usage,
+                        cut_short: *final_turn == Some(FinalTurn::OutOfTime),
                     });
                 }
                 Result::Err(ValidationError::FormatViolation(violation)) => {
@@ -1696,6 +1860,258 @@ mod tests {
         assert_eq!(
             truncation_action(&nothing, &after_reasoning),
             ErrorAction::Fail
+        );
+    }
+
+    /// Offers one tool, and the review reaches its deadline while that tool
+    /// runs: the signal is set mid-turn, as a worker's stdin reader sets it.
+    struct DeadlineDuringToolsSession {
+        signal: Arc<WindDownSignal>,
+        rejections: usize,
+    }
+
+    #[async_trait]
+    impl LlmSession for DeadlineDuringToolsSession {
+        type Output = String;
+
+        fn system_prompt(&self) -> String {
+            "system".to_string()
+        }
+
+        fn initial_user_prompt(&self) -> String {
+            "initial prompt".to_string()
+        }
+
+        fn tools(&self) -> Option<Vec<AiTool>> {
+            Some(vec![AiTool {
+                name: "git_grep".to_string(),
+                description: "search".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            }])
+        }
+
+        async fn call_tool(&mut self, _name: &str, _args: Value) -> Result<Value> {
+            self.signal.request();
+            Ok(serde_json::json!({"content": "file"}))
+        }
+
+        fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
+            if self.rejections > 0 {
+                self.rejections -= 1;
+                return Err(ValidationError::FormatViolation("not json".to_string()));
+            }
+            Ok(response.content.clone().unwrap_or_default())
+        }
+    }
+
+    fn out_of_time_prompts(messages: &[AiMessage]) -> usize {
+        messages
+            .iter()
+            .filter(|m| m.content.as_deref() == Some(OUT_OF_TIME_PROMPT))
+            .count()
+    }
+
+    fn requested_signal() -> Arc<WindDownSignal> {
+        let signal = Arc::new(WindDownSignal::default());
+        signal.request();
+        signal
+    }
+
+    const STOPPED_BY_DEADLINE: SessionStopped = SessionStopped {
+        cause: StopCause::OutOfTime,
+    };
+
+    /// A session that has had no answer yet has gathered nothing to
+    /// synthesise, so the wind-down stops it before it sends a request.
+    #[tokio::test]
+    async fn test_wind_down_stops_an_interruptible_session_before_it_spends() {
+        let provider = RecordingProvider::new(vec![text_answer("done")]);
+        let Err(err) = SessionRunner::new(&provider)
+            .with_wind_down(Some(requested_signal()), true)
+            .run(&mut DummySession)
+            .await
+        else {
+            panic!("an interruptible session must stop when the review runs out of time");
+        };
+
+        assert_eq!(
+            err.downcast_ref::<SessionStopped>(),
+            Some(&STOPPED_BY_DEADLINE),
+            "the stop is typed, so it is not read as a fault of the stage: {err:#}"
+        );
+        assert!(
+            provider.requests().is_empty(),
+            "stopping after paying for a turn would defeat the point"
+        );
+    }
+
+    /// The consolidation stages run on, which is what makes a salvage
+    /// possible.
+    #[tokio::test]
+    async fn test_wind_down_lets_a_non_interruptible_session_finish() {
+        let provider = RecordingProvider::new(vec![text_answer("done")]);
+        let res = SessionRunner::new(&provider)
+            .with_wind_down(Some(requested_signal()), false)
+            .run(&mut DummySession)
+            .await
+            .expect("a non-interruptible session must survive a wind-down");
+
+        assert_eq!(res.output, "done");
+        assert!(!res.cut_short, "nothing about it was cut short");
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    /// An unset signal changes nothing: the session uses its tools as usual.
+    #[tokio::test]
+    async fn an_unset_wind_down_signal_changes_nothing() {
+        let provider = RecordingProvider::new(vec![tool_answer("c1"), text_answer("verdict")]);
+        let res = SessionRunner::new(&provider)
+            .with_wind_down(Some(Arc::new(WindDownSignal::default())), true)
+            .run(&mut RejectingToolSession { rejections: 0 })
+            .await
+            .unwrap();
+        assert!(!res.cut_short);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|r| r.tools.is_some()));
+        assert!(
+            requests
+                .iter()
+                .all(|r| out_of_time_prompts(&r.messages) == 0)
+        );
+    }
+
+    /// A session that has gathered evidence is asked for its verdict in one
+    /// more call with no tools, and its output is kept as cut short.
+    #[tokio::test]
+    async fn a_wind_down_after_one_turn_asks_for_the_verdict_once_without_tools() {
+        let provider = RecordingProvider::new(vec![tool_answer("c1"), text_answer("verdict")]);
+        let signal = Arc::new(WindDownSignal::default());
+        let res = SessionRunner::new(&provider)
+            .with_max_turns(10)
+            .with_wind_down(Some(signal.clone()), true)
+            .run(&mut DeadlineDuringToolsSession {
+                signal,
+                rejections: 0,
+            })
+            .await
+            .expect("the evidence gathered so far becomes the verdict");
+
+        assert_eq!(res.output, "verdict");
+        assert!(res.cut_short);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "exactly one call after the deadline");
+        assert!(requests[0].tools.is_some());
+        assert!(
+            requests[1].tools.is_none(),
+            "no tools on the out-of-time turn"
+        );
+        assert_eq!(out_of_time_prompts(&requests[1].messages), 1);
+        assert_eq!(
+            budget_prompts(&requests[1].messages),
+            0,
+            "it is the deadline, not the turn cap, that ended the session"
+        );
+        assert_eq!(
+            out_of_time_prompts(&res.history),
+            1,
+            "the log says why the model stopped using tools"
+        );
+    }
+
+    /// A rejected verdict on the out-of-time turn is asked for again without
+    /// the prompt being pushed a second time.
+    #[tokio::test]
+    async fn a_validation_retry_on_the_out_of_time_turn_pushes_its_prompt_once() {
+        let provider = RecordingProvider::new(vec![
+            tool_answer("c1"),
+            text_answer("bad"),
+            text_answer("verdict"),
+        ]);
+        let signal = Arc::new(WindDownSignal::default());
+        let res = SessionRunner::new(&provider)
+            .with_max_turns(10)
+            .with_wind_down(Some(signal.clone()), true)
+            .run(&mut DeadlineDuringToolsSession {
+                signal,
+                rejections: 1,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(res.output, "verdict");
+        assert!(res.cut_short);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].tools.is_none());
+        assert_eq!(out_of_time_prompts(&requests[2].messages), 1);
+    }
+
+    /// A session that fails on its out-of-time turn is still put down to the
+    /// deadline, with its own error kept as the cause beneath.
+    #[tokio::test]
+    async fn a_failed_out_of_time_verdict_is_a_stop_not_a_stage_fault() {
+        let provider = RecordingProvider::new(vec![
+            tool_answer("c1"),
+            text_answer("bad"),
+            text_answer("still bad"),
+        ]);
+        let signal = Arc::new(WindDownSignal::default());
+        let Err(err) = SessionRunner::new(&provider)
+            .with_max_turns(10)
+            .with_max_validation_attempts(2)
+            .with_wind_down(Some(signal.clone()), true)
+            .run(&mut DeadlineDuringToolsSession {
+                signal,
+                rejections: 5,
+            })
+            .await
+        else {
+            panic!("two rejected verdicts must still fail the session");
+        };
+
+        assert_eq!(
+            err.downcast_ref::<SessionStopped>(),
+            Some(&STOPPED_BY_DEADLINE)
+        );
+        assert_eq!(
+            err.to_string(),
+            "Session stopped: the review ran out of time"
+        );
+        assert!(
+            format!("{err:#}").contains("after 2 validation attempts"),
+            "the session's own failure stays in the chain: {err:#}"
+        );
+        assert_eq!(provider.requests().len(), 3);
+    }
+
+    /// A failure before the deadline is the session's own and is not
+    /// wrapped, even when a signal is wired in.
+    #[tokio::test]
+    async fn a_failure_before_the_deadline_is_not_put_down_to_it() {
+        let provider = RecordingProvider::new(vec![text_answer("bad"), text_answer("still bad")]);
+        let Err(err) = SessionRunner::new(&provider)
+            .with_max_validation_attempts(2)
+            .with_wind_down(Some(Arc::new(WindDownSignal::default())), true)
+            .run(&mut RejectingToolSession { rejections: 5 })
+            .await
+        else {
+            panic!("two rejected answers must fail the session");
+        };
+        assert!(err.downcast_ref::<SessionStopped>().is_none(), "{err:#}");
+    }
+
+    /// The worker writes the cause as `review_stopped_by`, and the daemon
+    /// reads it back, so its spelling is pinned.
+    #[test]
+    fn a_stop_cause_is_written_in_snake_case() {
+        assert_eq!(
+            serde_json::to_value(StopCause::OutOfTime).unwrap(),
+            serde_json::json!("out_of_time")
+        );
+        assert_eq!(
+            serde_json::from_value::<StopCause>(serde_json::json!("out_of_time")).unwrap(),
+            StopCause::OutOfTime
         );
     }
 }

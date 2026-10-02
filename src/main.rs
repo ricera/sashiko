@@ -2524,7 +2524,12 @@ async fn handle_review_command(
                 s.total_turns += 1;
                 render_progress(&mut s);
             }
-            ProgressEvent::AiReviewStageFinished { patch_index, stage } => {
+            // A stage the deadline cut short still finished, so it counts as
+            // completed. A local review is never wound down anyway: only the
+            // daemon sends the wind-down.
+            ProgressEvent::AiReviewStageFinished {
+                patch_index, stage, ..
+            } => {
                 if let Some(p) = s.patches.get_mut(&patch_index) {
                     p.active_stages.remove(&stage);
                     p.active_stage_turns.remove(&stage);

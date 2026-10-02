@@ -4760,7 +4760,13 @@ mod tests {
                     max_turns: 20,
                 },
             ),
-            progress(1, ProgressWire::StageFinished { stage: goal() }),
+            progress(
+                1,
+                ProgressWire::StageFinished {
+                    stage: goal(),
+                    cut_short: false,
+                },
+            ),
             // Another patch's progress is not this review's to report.
             progress(
                 2,
@@ -7396,6 +7402,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             1,
             ProgressWire::StageFinished {
                 stage: "goal".into(),
+                cut_short: false,
             },
         ));
         lines.extend(stage_reaching("security", 1));
@@ -7504,6 +7511,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             1,
             ProgressWire::StageFinished {
                 stage: "goal".into(),
+                cut_short: false,
             },
         ));
         lines.extend(stage_reaching("security", 4));

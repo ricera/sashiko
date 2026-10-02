@@ -247,6 +247,12 @@ pub enum Phase {
         stage: String,
         seconds: u64,
         turns: u64,
+        /// The review ran out of time while the stage gathered evidence, so
+        /// it finished with a forced verdict that covers less than a full
+        /// run. Defaulted because the phase is stored, and rows written
+        /// before this field existed must still read back.
+        #[serde(default)]
+        cut_short: bool,
     },
     /// A stage stopped before finishing.
     ///
@@ -411,15 +417,24 @@ impl Phase {
                 stage,
                 seconds,
                 turns,
+                cut_short,
             } => {
                 let turns = match turns {
                     0 => String::new(),
                     1 => ", 1 turn".to_string(),
                     n => format!(", {} turns", n),
                 };
+                // The same words as the stored record of such a stage, so
+                // the live row and the finished review describe it alike.
+                let how = if *cut_short {
+                    format!("{} after", StageStopCause::CutShort.label())
+                } else {
+                    "done in".to_string()
+                };
                 format!(
-                    "stage {} done in {}{}",
+                    "stage {} {} {}{}",
                     stage,
+                    how,
                     format_duration(*seconds),
                     turns
                 )
@@ -1154,6 +1169,10 @@ pub enum ProgressWire {
     },
     StageFinished {
         stage: String,
+        /// The review ran out of time while the stage gathered evidence.
+        /// Defaulted so a line without it reads as an ordinary finish.
+        #[serde(default)]
+        cut_short: bool,
     },
     StageFailed {
         stage: String,
@@ -1223,8 +1242,13 @@ pub enum ProgressUpdate {
         max_turns: usize,
     },
     /// The stage finished. Recorded by the daemon, which alone holds the
-    /// stage's start time and turn count.
-    Finished { key: ActivityKey, stage: String },
+    /// stage's start time and turn count. `cut_short` is set when the
+    /// deadline made it finish early.
+    Finished {
+        key: ActivityKey,
+        stage: String,
+        cut_short: bool,
+    },
     /// The stage stopped before finishing. Recorded by the daemon, so it
     /// knows the stage is no longer running if the worker stops later.
     /// `reason` is whole; only the row's copy is cut to its public form.
@@ -1373,10 +1397,11 @@ pub fn progress_update(
             },
             (None, _) => ProgressUpdate::Touch(patch),
         },
-        ProgressWire::StageFinished { stage } => match stage_key(stage) {
+        ProgressWire::StageFinished { stage, cut_short } => match stage_key(stage) {
             Some(key) => ProgressUpdate::Finished {
                 key,
                 stage: stage.clone(),
+                cut_short: *cut_short,
             },
             None => ProgressUpdate::Touch(patch),
         },
@@ -1490,7 +1515,11 @@ impl StageTracker {
                 self.turn(&key, &stage, turn as u64);
                 self.activity.update_stage_turn(key, stage, turn, max_turns);
             }
-            ProgressUpdate::Finished { key, stage } => self.finish(key, stage),
+            ProgressUpdate::Finished {
+                key,
+                stage,
+                cut_short,
+            } => self.finish(key, stage, cut_short),
             ProgressUpdate::Failed {
                 key,
                 stage,
@@ -1536,7 +1565,7 @@ impl StageTracker {
     /// Marks the stage done rather than removing its row. Dropping it made a
     /// patch's card show less and less as the review went on. The row carries
     /// the numbers the recorded breakdown will show, so it settles in place.
-    fn finish(&mut self, key: ActivityKey, stage: String) {
+    fn finish(&mut self, key: ActivityKey, stage: String, cut_short: bool) {
         match self.stages.remove(&stage) {
             Some(TrackedStage::Running { started, turns, .. }) => {
                 let timing = StageTiming {
@@ -1550,15 +1579,11 @@ impl StageTracker {
                         stage: stage.clone(),
                         seconds: timing.seconds,
                         turns,
+                        cut_short,
                     },
                 );
-                self.stages.insert(
-                    stage,
-                    TrackedStage::Done {
-                        timing,
-                        cut_short: false,
-                    },
-                );
+                self.stages
+                    .insert(stage, TrackedStage::Done { timing, cut_short });
             }
             // No start time means nothing true to say about it, and a row
             // saying only "done" is worse than none.
@@ -2763,6 +2788,7 @@ mod tests {
                 stage: "goal".to_string(),
                 seconds: 185,
                 turns: 12,
+                cut_short: false,
             },
         );
 
@@ -2788,6 +2814,7 @@ mod tests {
                 stage: "resources".to_string(),
                 seconds,
                 turns,
+                cut_short: false,
             }
             .describe()
         };
@@ -3133,6 +3160,7 @@ mod tests {
                     stage: "goal".into(),
                     seconds: 1,
                     turns: 1,
+                    cut_short: false,
                 },
                 "stage_done",
             ),
@@ -3243,6 +3271,7 @@ mod tests {
             },
             ProgressWire::StageFinished {
                 stage: "goal".into(),
+                cut_short: false,
             },
             ProgressWire::StageFailed {
                 stage: "goal".into(),
@@ -3499,6 +3528,7 @@ mod tests {
                     },
                     ProgressWire::StageFinished {
                         stage: stage.into(),
+                        cut_short: false,
                     },
                     ProgressWire::StageFailed {
                         stage: stage.into(),
@@ -3527,10 +3557,12 @@ mod tests {
             },
             ProgressWire::StageFinished {
                 stage: "pre-screen".into(),
+                cut_short: false,
             },
             ProgressWire::Planning,
             ProgressWire::StageFinished {
                 stage: "planning".into(),
+                cut_short: false,
             },
         ] {
             tracker.apply(progress_update(ProjectId::Linux, 7, 70, &wire, 1, 4).unwrap());
@@ -3610,10 +3642,12 @@ mod tests {
             (
                 ProgressWire::StageFinished {
                     stage: "execution-flow".into(),
+                    cut_short: false,
                 },
                 ProgressUpdate::Finished {
                     key: key("execution-flow"),
                     stage: "execution-flow".into(),
+                    cut_short: false,
                 },
             ),
             // A failed stage is relabelled, not removed: the review carries on
@@ -3729,6 +3763,7 @@ mod tests {
             &mut tracker,
             ProgressWire::StageFinished {
                 stage: "implementation".into(),
+                cut_short: false,
             },
         );
         let remaining = reg.patchset_snapshot(5);
@@ -3779,6 +3814,7 @@ mod tests {
             },
             ProgressWire::StageFinished {
                 stage: "execution-flow".into(),
+                cut_short: false,
             },
         ] {
             tracker.apply(progress_update(ProjectId::Linux, 1, 2, &wire, 1, 1).unwrap());
@@ -3807,6 +3843,7 @@ mod tests {
                 2,
                 &ProgressWire::StageFinished {
                     stage: "locking".into(),
+                    cut_short: false,
                 },
                 1,
                 1,
@@ -3868,6 +3905,7 @@ mod tests {
             &mut tracker,
             ProgressWire::StageFinished {
                 stage: "goal".into(),
+                cut_short: false,
             },
         );
 
@@ -3967,6 +4005,121 @@ mod tests {
         );
         assert!(tracker.timings().contains(&timing));
         assert!(tracker.settle(StageStopCause::OutOfTime).is_empty());
+    }
+
+    /// A stage the deadline cut short reaches the daemon as a finish, settles
+    /// its row in the same words its stored record uses, keeps its timing,
+    /// and is listed among the stopped stages, so a review whose worker is
+    /// later killed still records the coverage it lost.
+    #[test]
+    fn a_cut_short_finish_travels_from_the_wire_to_the_row_and_the_record() {
+        let wire = ProgressWire::StageFinished {
+            stage: "security".into(),
+            cut_short: true,
+        };
+        let line = progress_line(5, &wire).unwrap();
+        let (patch_index, decoded) = parse_progress(&serde_json::from_str(&line).unwrap()).unwrap();
+        assert_eq!((patch_index, &decoded), (5, &wire));
+
+        let key = ActivityKey::PatchsetStage {
+            patchset_id: 9,
+            patch_id: 3,
+            stage: "security".into(),
+        };
+        let update = progress_update(ProjectId::Linux, 9, 3, &decoded, 1, 1).unwrap();
+        assert_eq!(
+            update,
+            ProgressUpdate::Finished {
+                key: key.clone(),
+                stage: "security".into(),
+                cut_short: true,
+            }
+        );
+
+        let reg = ActivityRegistry::new();
+        let mut tracker = StageTracker::new(reg.clone());
+        tracker.apply(
+            progress_update(
+                ProjectId::Linux,
+                9,
+                3,
+                &ProgressWire::StageTurn {
+                    stage: "security".into(),
+                    turn: 7,
+                    max_turns: 50,
+                },
+                1,
+                1,
+            )
+            .unwrap(),
+        );
+        tracker.apply(update);
+
+        let entries = reg.patchset_snapshot(9);
+        let row = entries
+            .iter()
+            .find(|e| e.key == key.to_string())
+            .expect("the finished stage keeps its row");
+        assert!(
+            matches!(
+                row.phase,
+                Phase::StageDone {
+                    cut_short: true,
+                    ..
+                }
+            ),
+            "{row:?}"
+        );
+        assert_eq!(
+            row.description,
+            "stage security cut short after 0s, 7 turns"
+        );
+        assert_eq!(
+            tracker.stopped(),
+            [StageFailureRecord {
+                stage: "security".into(),
+                reason: crate::workflow::CUT_SHORT_REASON.into(),
+                cause: StageStopCause::CutShort,
+            }]
+        );
+        assert_eq!(tracker.timings().len(), 1, "it still has its timing");
+    }
+
+    /// Rows and lines written before `cut_short` existed still read back, as
+    /// ordinary finishes. The phase is stored, so an old row is read after
+    /// an upgrade.
+    #[test]
+    fn a_finish_written_without_cut_short_reads_as_an_ordinary_one() {
+        let phase: Phase = serde_json::from_value(serde_json::json!({
+            "kind": "stage_done",
+            "stage": "goal",
+            "seconds": 185,
+            "turns": 12
+        }))
+        .unwrap();
+        assert_eq!(
+            phase,
+            Phase::StageDone {
+                stage: "goal".into(),
+                seconds: 185,
+                turns: 12,
+                cut_short: false,
+            }
+        );
+        assert_eq!(phase.describe(), "stage goal done in 3m 5s, 12 turns");
+
+        let wire: ProgressWire = serde_json::from_value(serde_json::json!({
+            "kind": "stage_finished",
+            "stage": "goal"
+        }))
+        .unwrap();
+        assert_eq!(
+            wire,
+            ProgressWire::StageFinished {
+                stage: "goal".into(),
+                cut_short: false,
+            }
+        );
     }
 
     /// The stored shape of a stopped stage is the one the page and the CLI
