@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::{
+    activity::StageFailureRecord,
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
     references::ReviewReferences,
     settings::{AiSettings, Settings},
@@ -1483,6 +1484,39 @@ fn mark_patch_review_incomplete(
     }
 }
 
+/// The stage failures one patch's `review` reported, each marked with
+/// `patch_index`.
+///
+/// Carried through rather than dropped with the rest of the per-patch output:
+/// a review that lost a stage must not reach its reader as one with full
+/// coverage. Read as [`StageFailureRecord`], the shape the workflow run wrote
+/// them in and the one the daemon stores, so the series' list cannot carry a
+/// field the stored rows lack. An entry that does not read as one is kept as
+/// the stand-in [`StageFailureRecord::read_reported`] makes of it, with a
+/// warning, so the lost stage is still reported.
+fn patch_stage_failures(review: &Value, patch_index: i64) -> Vec<StageFailureRecord> {
+    let Some(failures) = review.get("stage_failures").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    failures
+        .iter()
+        .map(|f| {
+            let (record, error) = StageFailureRecord::read_reported(f);
+            if let Some(e) = error {
+                warn!(
+                    "Patch {}: a stage failure does not read as one ({}), kept as a failed \
+                     stage: {}",
+                    patch_index, e, f
+                );
+            }
+            StageFailureRecord {
+                patch_index: Some(patch_index),
+                ..record
+            }
+        })
+        .collect()
+}
+
 /// Records which references a patch's review had, with their read counts, on
 /// the patch's entry, where the daemon picks it up for the review row.
 fn record_patch_references(patches: &mut [Value], patch_index: i64, refs: &ReviewReferences) {
@@ -1831,13 +1865,7 @@ async fn run_worker_in_worktree(
             // Carried through rather than dropped with the rest of the
             // per-patch output: a review that lost a stage must not reach its
             // reader as one with full coverage.
-            if let Some(failures) = review.get("stage_failures").and_then(|v| v.as_array()) {
-                for f in failures {
-                    let mut failure = f.clone();
-                    failure["patch_index"] = json!(p_idx);
-                    combined_stage_failures.push(failure);
-                }
-            }
+            combined_stage_failures.extend(patch_stage_failures(review, p_idx));
 
             if let Some(cc) = review.get("concerns_count").and_then(|v| v.as_u64()) {
                 total_concerns_count += cc;
@@ -3719,5 +3747,33 @@ rename from x b/y
 rename to z b/w
 ";
         assert_eq!(diff_paths(diff), ["x b/y", "z b/w"]);
+    }
+
+    /// Each patch's failures reach the series' list marked with the patch,
+    /// and one that does not read as a stage failure is kept as a failed
+    /// stage, so the series never reads as fully covered after losing one.
+    #[test]
+    fn patch_stage_failures_mark_the_patch_and_keep_unreadable_entries() {
+        let review = json!({"stage_failures": [
+            {"stage": "security", "reason": "why", "cause": "out_of_time"},
+            {"stage": "goal", "reason": "no cause"},
+        ]});
+        let failures = patch_stage_failures(&review, 4);
+        let stored: Vec<(&str, crate::workflow::StageStopCause, Option<i64>)> = failures
+            .iter()
+            .map(|f| (f.stage.as_str(), f.cause, f.patch_index))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                (
+                    "security",
+                    crate::workflow::StageStopCause::OutOfTime,
+                    Some(4)
+                ),
+                ("goal", crate::workflow::StageStopCause::Error, Some(4)),
+            ]
+        );
+        assert!(patch_stage_failures(&json!({}), 4).is_empty());
     }
 }

@@ -18,8 +18,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::ai::AiMessage;
 use crate::ai::session::{SessionStopped, StopCause};
+use crate::api::ReviewLogEntry;
 
 use super::events::WorkflowEvent;
 use super::graph::{Workflow, WorkflowStep};
@@ -32,7 +32,10 @@ pub struct WorkflowOutcome {
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub tokens_cached: u32,
-    pub history: Vec<AiMessage>,
+    /// Every stage's conversation, each message marked with the stage it
+    /// belongs to: the shape a review's stored log keeps, so the log a worker
+    /// returns and the one the daemon keeps from the stream agree.
+    pub history: Vec<ReviewLogEntry>,
     pub early_exit: bool,
     pub early_exit_reason: Option<&'static str>,
     /// Stages that did not complete under `BestEffort` while a sibling did,
@@ -168,7 +171,12 @@ impl WorkflowOutcome {
         self.tokens_in += stage.tokens_in;
         self.tokens_out += stage.tokens_out;
         self.tokens_cached += stage.tokens_cached;
-        self.history.extend(stage.history);
+        self.history.extend(
+            stage
+                .history
+                .into_iter()
+                .map(|message| ReviewLogEntry::new(Some(stage_name), message)),
+        );
         if stage.cut_short {
             info!(
                 "Stage '{}' was cut short: the review ran out of time",

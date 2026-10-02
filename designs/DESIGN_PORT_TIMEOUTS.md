@@ -487,7 +487,7 @@ stored JSON:
 | `local_review::ProgressEvent::AiReviewStageFailed` | `local_review.rs:194-198`, mapped at `:721-731` and `:1326-1335`; printed at `main.rs:2267` |
 | `ProgressWire::StageFailed` | the `stage_failed` wire kind |
 | `Phase::StageFailed` | `activity.rs:261`; its description text at `:429-433` (`if *cancelled { "cancelled" } else { "failed" }`) becomes the cause label of §5 |
-| stored `reviews.stage_failures` | `{stage, reason, cause}` |
+| stored `reviews.stage_failures` | `StageFailureRecord` `{stage, reason, cause, patch_index}` (§3.9) |
 
 The description text matters on its own: the CLI and the public activity
 endpoints show it, so it must use the same labels as the UI.
@@ -824,7 +824,7 @@ of the three shapes the attempt ended in:
   sorted by `workflows::stage_order(project, ..)`. The tracker saw every
   `StageFailed` the worker sent (each stage reports its own failure,
   `stage.rs:440, 531`), so this is complete even when the worker's output
-  carries no list.
+  carries no list. It goes through the column's one writer (below).
 - The live log is promoted (below) and becomes the row's `logs`. Today the
   Ok-with-error path stores the worker's empty `history` as `"[]"`
   (`reviewer.rs:1972-1978`) and `complete_review` then deletes the live log
@@ -833,6 +833,47 @@ of the three shapes the attempt ended in:
 For `Finished` and `Salvaged`, the worker's `stage_failures` and `history`
 stay the authority, as today (`:1943-1970`). `settle`'s records are dropped
 there; in practice nothing is still running when the worker returns a review.
+
+**One shape per column.** Each of the two columns has two writers, the
+worker's output and the daemon's record, and an end-to-end run found them
+storing different shapes: the worker's stage failures carried `patch_index`
+and the daemon's did not, and the worker's history held bare messages while
+a promoted live log held live entries with `seq`, `stage`, `stage_label` and
+`created_at`. Each column now has one typed entry and one writer that both
+paths go through:
+
+- `reviews.stage_failures` entries are `activity::StageFailureRecord
+  { stage, reason, cause, patch_index }`. `store_stage_failures` (fed by
+  `tracker.stopped()` for a daemon record, and by the worker's list read
+  typed, as the salvage classification reads it, for a returned review) sets
+  `patch_index` to the reviewed patch's series index on every record and
+  sorts them by `stage_order`. A reported entry that does not read as the
+  record is kept, not dropped, as the stand-in
+  `StageFailureRecord::read_reported` makes: a failure of the stage it names
+  (or `unknown`) with cause `error` and a reason saying it was unreadable,
+  so a review that lost a stage is never stored or shown as complete. The
+  daemon's writer and the local review's series list both read entries this
+  way and log a warning for each stand-in. `patch_index` is optional in the type: a
+  workflow run's own list and the tracker's records name no patch until they
+  are stored, and daemon rows written before this change have none. The
+  series list of a local review marks each record with its patch, as before,
+  now through the type.
+- `reviews.logs` entries are `api::ReviewLogEntry { stage?, stage_label?,
+  ..AiMessage }`: the message, flattened, with the stage it belongs to and
+  that stage's short label, both left out for a message of no stage (the
+  system prompt, the unfinished-log header). The stage stays because stages
+  run concurrently and the page marks each entry with it. `seq` and
+  `created_at` are the live stream's bookkeeping, a poll cursor and a
+  storage time, and are not stored. The worker's history carries the stage:
+  `WorkflowOutcome.history` is `Vec<ReviewLogEntry>`, each stage's messages
+  marked as the engine absorbs them. The daemon writes both paths through
+  `stored_log`, which labels each stage for the project and scrubs thought
+  signatures. `LiveLogEntry` is `{seq, created_at, ..ReviewLogEntry}`, so
+  promotion keeps each live entry's `entry` part. A live entry of no stage
+  therefore leaves `stage` and `stage_label` out, where it used to send
+  them as `null` (§5 API).
+
+Readers keep reading rows written by older builds (§5).
 
 **Token counts.** A daemon-spawned worker has no provider of its own: every
 model call it makes is relayed through the daemon's provider. The I/O loop
@@ -887,14 +928,19 @@ is visible.
 - reads `get_review_log_entries(review_id, None)`;
 - prepends a `system` message: "[The review did not finish. This is the
   conversation streamed while it ran{, capped at 2000 entries}.]";
-- returns the JSON array, which goes into `complete_review`'s `logs`.
+- keeps the `ReviewLogEntry` part of each live entry, dropping `seq` and
+  `created_at`;
+- returns the JSON array through `stored_log`, which goes into
+  `complete_review`'s `logs`.
 
 `complete_review` deletes the live rows in the same call, as it does today
 (`db.rs:2216-2221`). Because the logs are read before that call, the existing
 comment there already describes this case. No new DB functions are needed.
 
-The live log has the same shape as the finished log (`live_log_message`,
-`worker/prompts.rs:178-203`), so the page draws both with one renderer.
+A live entry is a stored log entry plus its place in the stream
+(`live_log_message`, `worker/prompts.rs:178-203`, for the message), so the
+page draws both with one renderer, and a stored log, whichever path wrote
+it, draws exactly as the live view drew the same conversation.
 
 ### 3.10 How this fits with the rest of the system
 
@@ -1117,6 +1163,8 @@ unlisted status as finished, which is right for `Partial`.
 | `workflow::ParallelGroupFailed { failures }` (error context) | the text context of an all-failed BestEffort group (`engine.rs:226-231`) |
 | `review_stopped_by: StopCause` on the worker's per-patch entry | inferring a timeout from when an error output arrived |
 | `activity::TrackedStage` (with `Done { cut_short }`) | the `starts`/`turns` maps in `StageTracker` |
+| `activity::StageFailureRecord { stage, reason, cause, patch_index }` | two hand-built shapes of a `reviews.stage_failures` entry, the worker's with `patch_index` and the daemon's without (§3.9) |
+| `api::ReviewLogEntry { stage, stage_label, message }` | a worker's history of bare messages and a promoted live log of live entries in one `reviews.logs` column (§3.9) |
 | `reviewer::DeadlinePhase`, `ReviewToolOutcome`, `AttemptEnd` | the fork's `Option<WindDown>`, `timed_out` and `wound_down` booleans, and HEAD's choice of what to record by `Ok`/`Err` |
 | `ReviewStatus::Partial` | the fork's patch-only `"Partial"` string under a `Failed` review and patchset |
 | `PatchOutcome { Reviewed, Partial, TimedOut, Failed, Skipped, Cancelled }` | raw strings passed to `update_patch_status` (13 call sites in reviewer.rs) |
@@ -1171,7 +1219,17 @@ only JSON content moves.
 **Stored JSON.**
 
 - `reviews.stage_failures` entries become
-  `{stage, reason, cause, patch_index?}` instead of `{stage, reason, cancelled}`.
+  `{stage, reason, cause, patch_index}` instead of `{stage, reason, cancelled}`,
+  whichever path wrote the row (§3.9). Rows written between commit 9 and the
+  one-shape change by the daemon have no `patch_index`; they still read as a
+  `StageFailureRecord`, whose `patch_index` is optional, and no reader uses
+  the field to decide anything.
+- `reviews.logs` entries are `{stage?, stage_label?, role, content, ...}`
+  whichever path wrote the row (§3.9). Older rows hold two other shapes, and
+  both still read as `ReviewLogEntry` and draw with the page's one renderer:
+  a worker's history of bare messages, which draw with no stage mark, and a
+  promoted live log whose entries also carry `seq` and `created_at`, which
+  are ignored.
 - `reviews.stage_durations` entries gain `stopped_by` (a `StageStopCause`)
   for a stage that did not run to completion (§3.9). A finished stage's
   entry is unchanged, `{stage, seconds, turns}`, so rows written before it
@@ -1179,8 +1237,9 @@ only JSON content moves.
   stage's failure as one stopped row showing the time it ran, and never
   shows or counts it as done; the CLI prints the cause label after it.
 - Readers (the UI and the CLI `print_coverage_warning`,
-  `bin/sashiko-cli.rs:1202-1229`) fall back to `cancelled` when `cause` is
-  missing: `cause ?? (cancelled ? 'stopped' : 'error')`. A legacy
+  `bin/sashiko-cli.rs:1202-1229`, which label an entry by its `cause` alone,
+  so both writers' rows and older daemon rows without `patch_index` read
+  alike) fall back to `cancelled` when `cause` is missing: `cause ?? (cancelled ? 'stopped' : 'error')`. A legacy
   `cancelled: true` gets the neutral label "stopped", not the `cancelled`
   cause label. The fork wrote `cancelled: true` mostly for stages that ran
   out of time or were still running when the worker died (dcdcdf5ac937,
@@ -1208,9 +1267,18 @@ only JSON content moves.
   - `stage_finished` gains `cut_short` (default false);
   - `stage_failed` carries `cause` instead of `cancelled`. Both sides ship in
     one binary.
-- Worker output: `review.stage_failures[].cause`, and
-  `patches[].review_stopped_by` on a patch whose review failed because of
-  the deadline (§3.8).
+- Worker output (both sides ship in one binary):
+  - `review.stage_failures[]` entries are `StageFailureRecord`s
+    `{stage, reason, cause, patch_index?}`; the series list a local review
+    builds is made from the typed record. An entry that does not read as
+    one, in that list or in the daemon's writer, becomes an `error` failure
+    of the stage it names and is never dropped (§3.9);
+  - `patches[].review_stopped_by` on a patch whose review failed because of
+    the deadline (§3.8);
+  - `history[]` entries are `ReviewLogEntry`s `{stage?, stage_label?,
+    ..AiMessage}`: every message but the system prompt carries the stage it
+    belongs to. The worker leaves `stage_label` out and the daemon sets it
+    when it stores the log (§3.9).
 
 **Claude/Vertex request body:** top-level `output_config.effort`. `thinking`
 no longer carries `effort`.
@@ -1219,7 +1287,12 @@ no longer carries `effort`.
 be `"Partial"`; a patch's can also be `"TimedOut"`. A Partial patchset reports
 `finished: true` on the activity route, because `Partial` is not in
 `UNFINISHED_PATCHSET_STATUSES` (`server.rs:982`). The stats route gains
-`total_partial` (D20). `stage_failures` entries carry `cause`. Public activity
+`total_partial` (D20). `stage_failures` entries carry `cause`. The
+`live_log` entries of a review leave `stage` and `stage_label` out for a
+message of no stage (the system prompt) instead of sending them as `null`,
+because they now share the stored log's entry type; a client treats a
+missing key as no stage, as the page (`entry.stage != null`) and
+`scripts/verify_live_log.sh` already do. Public activity
 routes still strip model text from failure reasons. There is no status filter
 on any list route or CLI command, so there is no filter to extend.
 
@@ -1373,6 +1446,19 @@ salvage_seconds = 1800
   stage whose failure the worker reported keep the time they ran up to the
   stop, with `stopped_by`, and a cut-short stage is one timing. A finished
   timing's JSON is unchanged and an old one reads as finished.
+- **One shape per column.** The same attempt recorded by the worker (a
+  returned review) and by the daemon (an error output after streaming) stores
+  equal `stage_failures` (with `patch_index`) and an equal log after the
+  daemon's header (each entry with its stage and label, no `seq` or
+  `created_at`). A worker's failures reported out of pipeline order, one
+  naming the wrong patch and two unreadable entries, are stored sorted, each
+  naming the reviewed patch, the unreadable ones as `error` failures
+  (`test_worker_stage_failures_are_stored_for_the_patch_in_order`), and
+  `StageFailureRecord::read_reported` and the local series list keep an
+  unreadable entry as an `error` stand-in.
+  `StageFailureRecord` and `ReviewLogEntry` read the rows of older builds. The worker's history marks every entry but the system prompt
+  with the stage it streamed under. The UI verifier draws a stored log in
+  the one shape exactly as the live view, and an older promoted log the same.
 - **PatchOutcome.** `as_str` round-trip, and the existing SQL gate tests are
   unchanged. `prior_final_outcome` returns `Partial` and `TimedOut` for those
   patch statuses and keeps today's answer for a Failed row with no

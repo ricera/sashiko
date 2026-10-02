@@ -2394,13 +2394,15 @@ impl Database {
             };
             out.push(crate::api::LiveLogEntry {
                 seq: row.get::<i64>(0)?,
-                stage: row.get::<Option<String>>(1)?,
-                // The project is the daemon's setting, not the database's;
-                // the live-log route that serves the entries and the reviewer
-                // that keeps them as an unfinished review's log add the label.
-                stage_label: None,
                 created_at: row.get::<i64>(3)?,
-                message,
+                // Unlabelled: the project is the daemon's setting, not the
+                // database's; the live-log route that serves the entries and
+                // the reviewer that keeps them as an unfinished review's log
+                // add the label.
+                entry: crate::api::ReviewLogEntry::new(
+                    row.get::<Option<String>>(1)?.as_deref(),
+                    message,
+                ),
             });
         }
         Ok(out)
@@ -22106,11 +22108,15 @@ mod tests {
         let entries = db.get_review_log_entries(review_id, None).await.unwrap();
         let seqs: Vec<i64> = entries.iter().map(|e| e.seq).collect();
         assert_eq!(seqs, [0, 1, 2]);
-        assert_eq!(entries[0].message.role, crate::ai::AiRole::System);
-        assert_eq!(entries[0].stage, None);
-        assert_eq!(entries[2].stage.as_deref(), Some("execution-flow"));
-        assert_eq!(entries[2].message.content.as_deref(), Some("tool output"));
+        assert_eq!(entries[0].entry.message.role, crate::ai::AiRole::System);
+        assert_eq!(entries[0].entry.stage, None);
+        assert_eq!(entries[2].entry.stage.as_deref(), Some("execution-flow"));
+        assert_eq!(
+            entries[2].entry.message.content.as_deref(),
+            Some("tool output")
+        );
         let calls = entries[1]
+            .entry
             .message
             .tool_calls
             .as_ref()
@@ -22153,7 +22159,10 @@ mod tests {
         let kind: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(kind, "blob");
         let entries = db.get_review_log_entries(review_id, None).await.unwrap();
-        assert_eq!(entries[0].message.content.as_deref(), Some(big.as_str()));
+        assert_eq!(
+            entries[0].entry.message.content.as_deref(),
+            Some(big.as_str())
+        );
     }
 
     /// Writes past the cap are dropped rather than erroring, and the cap is
@@ -22298,7 +22307,7 @@ mod tests {
         let entries = db.get_review_log_entries(review_id, None).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].seq, 1);
-        assert_eq!(entries[0].message.content.as_deref(), Some("new"));
+        assert_eq!(entries[0].entry.message.content.as_deref(), Some("new"));
         assert_eq!(
             db.review_live_log_span(review_id).await.unwrap().first_seq,
             Some(1),

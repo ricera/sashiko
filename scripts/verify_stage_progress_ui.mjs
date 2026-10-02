@@ -1029,6 +1029,29 @@ console.log('live log');
         && promoted.includes('>Goal Analysis<'), promoted.slice(0, 600));
     check('and is not polled', pending() === 0, String(pending()));
 
+    // Both writers of a stored log store one shape: each message with its
+    // stage and label, none of the stream's seq or created_at, and no stage
+    // fields on a message that belongs to no stage. A stored log in that
+    // shape is drawn exactly as the live view drew the same conversation, and
+    // a promoted log an older build stored with the stream's fields is drawn
+    // the same way.
+    timers.clear();
+    const storedShape = msgs => withSeq(msgs).map(({ seq, created_at, stage, stage_label, ...m }) =>
+        (stage == null ? m : { stage, stage_label, ...m }));
+    const liveView = await logPage(ctx, { id: 42, status: 'In Review', logs: null,
+        live_log: withSeq(MESSAGES) }) || '';
+    ctx.stopLogPolling();
+    timers.clear();
+    const storedView = await logPage(ctx, { id: 42, status: 'Reviewed',
+        logs: JSON.stringify(storedShape(MESSAGES)) }) || '';
+    check('a stored log is drawn as the live view drew it', storedView !== '' && storedView === liveView,
+        storedView.slice(0, 600));
+    check('and is not polled', pending() === 0, String(pending()));
+    const olderPromoted = await logPage(ctx, { id: 42, status: 'Failed',
+        logs: JSON.stringify(withSeq(MESSAGES)) }) || '';
+    check('a log stored with the stream\'s fields by an older build is drawn the same',
+        olderPromoted === storedView, olderPromoted.slice(0, 600));
+
     // The status is data and is escaped.
     await logPage(ctx, { id: 42, status: '<img src=x onerror=alert(1)>', logs: '[]' });
     check('the status in the header is escaped', !app.innerHTML.includes('<img'), app.innerHTML.slice(0, 600));

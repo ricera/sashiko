@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::ai::{AiErrorClass, AiMessage, AiProvider, ClassifyAiError};
+use crate::api::ReviewLogEntry;
 use crate::toolbox::ToolBox;
 use anyhow::Result;
 
@@ -298,7 +299,9 @@ fn worker_progress_event(
 /// as `reviews.stage_failures`.
 ///
 /// Built from [`StageFailureRecord`], the shape the daemon writes for an
-/// attempt that ended without a review, so both writers agree.
+/// attempt that ended without a review, so both writers agree. The patch is
+/// left unset: one workflow run reviews one patch, and the caller that
+/// gathers the runs of a series marks each entry with its patch.
 fn stage_failures_json(failures: &[StageFailure]) -> Vec<StageFailureRecord> {
     failures
         .iter()
@@ -306,6 +309,7 @@ fn stage_failures_json(failures: &[StageFailure]) -> Vec<StageFailureRecord> {
             stage: f.stage_name.to_string(),
             reason: f.reason.clone(),
             cause: f.cause,
+            patch_index: None,
         })
         .collect()
 }
@@ -314,9 +318,12 @@ pub struct WorkerResult {
     pub output: Option<Value>,
     pub error: Option<String>,
     pub input_context: String,
-    pub history: Vec<AiMessage>,
-    pub history_before_pruning: Vec<AiMessage>,
-    pub history_after_pruning: Vec<AiMessage>,
+    /// The review's conversation in the shape a stored log keeps: the
+    /// system prompt, which belongs to no stage, then each stage's messages
+    /// marked with their stage.
+    pub history: Vec<ReviewLogEntry>,
+    pub history_before_pruning: Vec<ReviewLogEntry>,
+    pub history_after_pruning: Vec<ReviewLogEntry>,
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub tokens_cached: u32,
@@ -360,7 +367,7 @@ pub struct Worker {
     provider: Arc<dyn AiProvider>,
     tools: Arc<ToolBox>,
     prompts: PromptRegistry,
-    global_history: Vec<AiMessage>,
+    global_history: Vec<ReviewLogEntry>,
     max_interactions: usize,
     temperature: f32,
     series_range: Option<String>,
@@ -586,7 +593,7 @@ impl Worker {
                     message: live_log_message(&system),
                 });
             }
-            self.global_history.push(system);
+            self.global_history.push(ReviewLogEntry::new(None, system));
         }
 
         let workflow = match self.project {
@@ -1768,7 +1775,7 @@ mod tests {
                 )
                 .await
                 .expect("review runs");
-            res.history[0].content.clone().unwrap_or_default()
+            res.history[0].message.content.clone().unwrap_or_default()
         }
 
         let grounded = system_prompt_for(
@@ -1869,7 +1876,11 @@ mod tests {
         let worker_res = res.unwrap();
         assert!(!worker_res.history.is_empty());
         // System prompt contains the Active Git Metadata:
-        let sys_content = worker_res.history[0].content.as_deref().unwrap_or_default();
+        let sys_content = worker_res.history[0]
+            .message
+            .content
+            .as_deref()
+            .unwrap_or_default();
         assert!(sys_content.contains("Baseline SHA: explicit_baseline_sha"));
         assert!(sys_content.contains("Target Commit SHA: target_sha"));
     }
@@ -1921,7 +1932,11 @@ mod tests {
         assert!(res.is_ok());
         let worker_res = res.unwrap();
         assert!(!worker_res.history.is_empty());
-        let sys_content = worker_res.history[0].content.as_deref().unwrap_or_default();
+        let sys_content = worker_res.history[0]
+            .message
+            .content
+            .as_deref()
+            .unwrap_or_default();
         assert!(sys_content.contains("Target Commit SHA: sha1"));
         assert!(sys_content.contains("patch1_unique_symbol"));
         assert!(!sys_content.contains("patch2_unique_symbol"));
@@ -2024,6 +2039,7 @@ mod tests {
         let verification_user_msg = worker_res
             .history
             .iter()
+            .map(|e| &e.message)
             .find(|m| {
                 m.role == crate::ai::AiRole::User
                     && m.content
@@ -2241,15 +2257,24 @@ mod tests {
             "only the system message is outside a stage"
         );
         // Stages run concurrently, so the stream interleaves what the finished
-        // log groups by stage. The messages are the same either way.
+        // log groups by stage. The messages are the same either way, and so is
+        // the stage each belongs to: the finished log marks its entries with
+        // their stage as the stream does, so the two logs have one shape.
         assert_eq!(streamed.len(), res.history.len());
-        for message in &res.history {
-            let live = live_log_message(message);
+        for entry in &res.history {
+            let live = live_log_message(&entry.message);
             assert!(
-                streamed.iter().any(|(_, m)| *m == live),
-                "not streamed: {message:?}"
+                streamed
+                    .iter()
+                    .any(|(stage, m)| *m == live && *stage == entry.stage),
+                "not streamed with its stage: {entry:?}"
             );
         }
+        assert_eq!(res.history[0].stage, None, "the system prompt has no stage");
+        assert!(
+            res.history[1..].iter().all(|e| e.stage.is_some()),
+            "every other entry names its stage"
+        );
         // The consolidation stages run outside the concurrent block and are
         // streamed like any other.
         assert!(

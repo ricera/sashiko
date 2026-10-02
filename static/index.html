@@ -5744,13 +5744,16 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 else rowClass += ' role-system';
 
                 let label = (role === 'model' || role === 'assistant') ? 'LLM' : (role === 'tool' || role === 'function') ? 'TOOL' : role.toUpperCase();
-                // A live entry names its stage, and so does each entry of the
-                // streamed conversation a review that did not finish keeps as
-                // its log. Stages run concurrently, so the stream interleaves
-                // conversations a worker's finished log keeps apart, and
-                // without this a reader cannot tell which a message belongs
-                // to. A worker's finished log carries no stage and is drawn as
-                // before. Both the label and the name are worker data: escaped.
+                // Every entry names its stage: a live one, and each entry of a
+                // stored log, whether the worker returned it or the daemon kept
+                // the conversation a review that did not finish streamed. Both
+                // store one shape. Stages run concurrently, so a stream
+                // interleaves their conversations, and without this a reader
+                // cannot tell which a message belongs to. Logs stored by older
+                // builds hold worker entries with no stage, which are drawn
+                // unmarked, and promoted entries with the stream's seq, which
+                // is ignored. Both the label and the name are worker data:
+                // escaped.
                 if (entry.stage != null && entry.stage !== '') {
                     const stageName = String(entry.stage);
                     const stageText = entry.stage_label ? String(entry.stage_label) : stageName;

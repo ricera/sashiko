@@ -1456,16 +1456,58 @@ pub struct StageTiming {
 }
 
 /// One stage that did not run to completion, in the shape
-/// `reviews.stage_failures` stores: `{stage, reason, cause}`.
+/// `reviews.stage_failures` stores: `{stage, reason, cause, patch_index}`.
 ///
-/// Written by the worker for the stages it reports, and by the daemon for an
-/// attempt that ended without a review from the worker, so both writers share
-/// this one shape.
+/// The worker reports the stages of a review it returns in this shape, and
+/// the daemon records the stages of an attempt that ended without one in it.
+/// Every row the daemon stores goes through this type, with `patch_index` set
+/// to the patch the row reviews, so a reader of the column meets one shape
+/// whichever path wrote it.
+///
+/// Rows written by older builds read as follows: the daemon's lack
+/// `patch_index`, which is optional for that reason, and those written before
+/// the cause existed carry `cancelled` instead of `cause` and do not read as
+/// this type at all, so their readers fall back to the flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageFailureRecord {
     pub stage: String,
     pub reason: String,
     pub cause: StageStopCause,
+    /// The patch whose review the stage belonged to, by its index in the
+    /// series. `None` only where no patch is known yet: in the list one
+    /// workflow run returns for its own patch, which the caller marks, and in
+    /// the stage tracker's records before the daemon stores them. Left out of
+    /// the JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch_index: Option<i64>,
+}
+
+impl StageFailureRecord {
+    /// Reads one stage failure a workflow run reported, with the error when
+    /// the entry does not read as a record, for the caller to log.
+    ///
+    /// An unreadable entry still says a stage did not finish, so it reads as
+    /// a stand-in rather than nothing: dropping it would let a review that
+    /// lost a stage be stored and shown as a complete one. The stand-in is
+    /// the stage the entry names, or `"unknown"`, failed with
+    /// [`StageStopCause::Error`], because the entry does not say what stopped
+    /// the stage and an error is the one cause that claims neither the
+    /// deadline nor a cancel. That also keeps an attempt from counting as a
+    /// salvage on the strength of an entry nobody can read.
+    pub fn read_reported(entry: &serde_json::Value) -> (Self, Option<serde_json::Error>) {
+        match serde_json::from_value(entry.clone()) {
+            Ok(record) => (record, None),
+            Err(e) => {
+                let stand_in = Self {
+                    stage: entry["stage"].as_str().unwrap_or("unknown").to_string(),
+                    reason: format!("the report of this stage was unreadable: {e}"),
+                    cause: StageStopCause::Error,
+                    patch_index: entry["patch_index"].as_i64(),
+                };
+                (stand_in, Some(e))
+            }
+        }
+    }
 }
 
 /// How far one stage got: how long it ran and the highest turn it reached.
@@ -1703,6 +1745,7 @@ impl StageTracker {
                 stage: stage.clone(),
                 reason: reason.clone(),
                 cause,
+                patch_index: None,
             });
             *state = TrackedStage::Failed {
                 reason,
@@ -1727,6 +1770,7 @@ impl StageTracker {
                     stage: stage.clone(),
                     reason: reason.clone(),
                     cause: *cause,
+                    patch_index: None,
                 }),
                 TrackedStage::Done {
                     cut_short: true, ..
@@ -1734,6 +1778,7 @@ impl StageTracker {
                     stage: stage.clone(),
                     reason: crate::workflow::CUT_SHORT_REASON.to_string(),
                     cause: StageStopCause::CutShort,
+                    patch_index: None,
                 }),
                 _ => None,
             })
@@ -3980,6 +4025,7 @@ mod tests {
                 stage: "hardware".into(),
                 reason: reason.into(),
                 cause: StageStopCause::OutOfTime,
+                patch_index: None,
             }]
         );
         assert_eq!(
@@ -4015,11 +4061,13 @@ mod tests {
                     stage: "hardware".into(),
                     reason: reason.into(),
                     cause: StageStopCause::OutOfTime,
+                    patch_index: None,
                 },
                 StageFailureRecord {
                     stage: "locking".into(),
                     reason: long_reason,
                     cause: StageStopCause::Error,
+                    patch_index: None,
                 },
             ]
         );
@@ -4076,6 +4124,7 @@ mod tests {
                 stage: "security".into(),
                 reason: crate::workflow::CUT_SHORT_REASON.into(),
                 cause: StageStopCause::CutShort,
+                patch_index: None,
             }]
         );
         // One timing each: the cut-short stage is not listed once as finished
@@ -4309,6 +4358,7 @@ mod tests {
                 stage: "security".into(),
                 reason: crate::workflow::CUT_SHORT_REASON.into(),
                 cause: StageStopCause::CutShort,
+                patch_index: None,
             }]
         );
         assert_eq!(
@@ -4360,18 +4410,87 @@ mod tests {
     }
 
     /// The stored shape of a stopped stage is the one the page and the CLI
-    /// read: `{stage, reason, cause}`, with the cause in snake case.
+    /// read: `{stage, reason, cause, patch_index}`, with the cause in snake
+    /// case. A record that names no patch yet leaves the field out.
     #[test]
-    fn a_stage_failure_record_is_stored_as_stage_reason_and_cause() {
+    fn a_stage_failure_record_is_stored_as_stage_reason_cause_and_patch() {
         let record = StageFailureRecord {
             stage: "security".into(),
             reason: "why".into(),
             cause: StageStopCause::OutOfTime,
+            patch_index: Some(2),
         };
         assert_eq!(
             serde_json::to_value(&record).unwrap(),
+            serde_json::json!({"stage": "security", "reason": "why", "cause": "out_of_time",
+                               "patch_index": 2})
+        );
+        let unplaced = StageFailureRecord {
+            patch_index: None,
+            ..record
+        };
+        assert_eq!(
+            serde_json::to_value(&unplaced).unwrap(),
             serde_json::json!({"stage": "security", "reason": "why", "cause": "out_of_time"})
         );
+    }
+
+    /// A daemon row written before the record named its patch still reads
+    /// as a record; one written before the cause existed does not, and its
+    /// readers fall back to its `cancelled` flag.
+    #[test]
+    fn a_stage_failure_record_reads_rows_of_older_builds() {
+        let daemon_row: StageFailureRecord = serde_json::from_value(serde_json::json!(
+            {"stage": "security", "reason": "why", "cause": "interrupted"}
+        ))
+        .unwrap();
+        assert_eq!(daemon_row.patch_index, None);
+        assert_eq!(daemon_row.cause, StageStopCause::Interrupted);
+        assert!(
+            serde_json::from_value::<StageFailureRecord>(serde_json::json!(
+                {"stage": "security", "reason": "why", "cancelled": true}
+            ))
+            .is_err()
+        );
+    }
+
+    /// A reported entry reads as itself when it is a record, and as an
+    /// `error` stand-in naming its stage otherwise, with the error to log:
+    /// an unreadable entry must still count as a stage that did not finish.
+    #[test]
+    fn an_unreadable_stage_failure_reads_as_a_failed_stage() {
+        let entry = serde_json::json!({"stage": "goal", "reason": "why", "cause": "cancelled"});
+        let (record, error) = StageFailureRecord::read_reported(&entry);
+        assert!(error.is_none());
+        assert_eq!(record.cause, StageStopCause::Cancelled);
+        assert_eq!(record.reason, "why");
+
+        for (entry, stage, patch_index) in [
+            (
+                serde_json::json!({"stage": "goal", "reason": "why"}),
+                "goal",
+                None,
+            ),
+            (
+                serde_json::json!({"stage": "goal", "cause": "nonsense", "patch_index": 3}),
+                "goal",
+                Some(3),
+            ),
+            (serde_json::json!(42), "unknown", None),
+        ] {
+            let (record, error) = StageFailureRecord::read_reported(&entry);
+            assert!(error.is_some(), "{entry}");
+            assert_eq!(record.stage, stage, "{entry}");
+            assert_eq!(record.cause, StageStopCause::Error, "{entry}");
+            assert_eq!(record.patch_index, patch_index, "{entry}");
+            assert!(
+                record
+                    .reason
+                    .starts_with("the report of this stage was unreadable"),
+                "{entry}: {}",
+                record.reason
+            );
+        }
     }
 
     /// A stalled stage is either waiting on the model or grinding through git,

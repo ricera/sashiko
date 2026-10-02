@@ -54,37 +54,48 @@ pub struct ReviewQuery {
     pub after_seq: Option<i64>,
 }
 
-/// One message of a running review's conversation, as `live_log` serves it.
+/// One message of a review's conversation log, with the stage it belongs
+/// to: the shape of every entry of a stored `reviews.logs`, whichever path
+/// wrote it, and of the worker output's `history`.
 ///
-/// A superset of a finished-log entry: the message's own fields, flattened,
-/// plus where it sits. One renderer therefore draws both logs, and fields it
-/// does not know about are ignored. A review that did not finish keeps these
-/// entries, under a header saying so, as its final log, because its worker
-/// returned no history of its own.
+/// A review's log has two writers. A worker that returns a review sends its
+/// history, and the daemon keeps the conversation it streamed for an attempt
+/// that ended without one. Both store this shape, so a reader of the column
+/// meets one kind of entry. Only the message and its stage are kept: the
+/// stream's own bookkeeping (a live entry's `seq` and `created_at`) says where
+/// an entry sat in a poll, which means nothing once the log is final.
+///
+/// Rows written before every entry carried its stage are plain messages, and
+/// read as entries with no stage, because both stage fields are optional and
+/// left out of the JSON when absent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LiveLogEntry {
-    /// Position in the review's conversation. It only grows for one review
-    /// row: a rerun of the row continues past the last run's seqs, so a page
-    /// holding a cursor from one run cannot mistake another run's entries
-    /// for what follows it.
-    pub seq: i64,
-    /// The stage the message belongs to, by name; `None` for the system
-    /// message. Stages run concurrently, so the stream interleaves what the
-    /// finished log groups by stage, and the page marks each live entry with
-    /// its stage so a reader can tell the conversations apart.
+pub struct ReviewLogEntry {
+    /// The stage the message belongs to, by name; `None` for a message that
+    /// belongs to no stage, such as the system prompt or the header of a log
+    /// kept from a review that did not finish. Stages run concurrently, so a
+    /// streamed conversation interleaves them, and the page marks each entry
+    /// with its stage so a reader can tell the conversations apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage: Option<String>,
     /// The project's short label for `stage`, set by the daemon as it is for
     /// activity entries; `None` for an unknown stage or no stage. The page
     /// shows it in place of the name when present.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stage_label: Option<String>,
-    /// Unix time the daemon stored it.
-    pub created_at: i64,
     #[serde(flatten)]
     pub message: crate::ai::AiMessage,
 }
 
-impl LiveLogEntry {
+impl ReviewLogEntry {
+    /// An entry for `message`, belonging to `stage`, not yet labelled.
+    pub fn new(stage: Option<&str>, message: crate::ai::AiMessage) -> Self {
+        Self {
+            stage: stage.map(str::to_string),
+            stage_label: None,
+            message,
+        }
+    }
+
     /// Sets `stage_label` to the project's short label for `stage`.
     ///
     /// Done by the daemon, as it is for activity entries, because the labels
@@ -95,6 +106,37 @@ impl LiveLogEntry {
             .as_deref()
             .and_then(|s| crate::workflows::stage_short_label(project, s))
             .map(str::to_string);
+    }
+}
+
+/// One message of a running review's conversation, as `live_log` serves it.
+///
+/// A stored log entry plus where it sits in the stream. One renderer
+/// therefore draws both logs, and fields it does not know about are ignored.
+/// A review that did not finish keeps the `entry` part of each, under a
+/// header saying so, as its final log, because its worker returned no history
+/// of its own.
+///
+/// An entry of no stage leaves `stage` and `stage_label` out of the JSON, as
+/// a stored entry does, where builds before the one-shape change sent them as
+/// `null`; a client treats a missing key as no stage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveLogEntry {
+    /// Position in the review's conversation. It only grows for one review
+    /// row: a rerun of the row continues past the last run's seqs, so a page
+    /// holding a cursor from one run cannot mistake another run's entries
+    /// for what follows it.
+    pub seq: i64,
+    /// Unix time the daemon stored it.
+    pub created_at: i64,
+    #[serde(flatten)]
+    pub entry: ReviewLogEntry,
+}
+
+impl LiveLogEntry {
+    /// Sets the entry's `stage_label`; see [`ReviewLogEntry::label_stage`].
+    pub fn label_stage(&mut self, project: crate::project::ProjectId) {
+        self.entry.label_stage(project);
     }
 }
 
@@ -453,23 +495,27 @@ mod tests {
         assert!(!resp.finished);
     }
 
-    /// The live log entry is the finished-log message with its position added,
+    fn tool_message() -> crate::ai::AiMessage {
+        crate::ai::AiMessage {
+            role: crate::ai::AiRole::Tool,
+            content: Some("out".to_string()),
+            thought: None,
+            thought_signature: None,
+            tool_calls: None,
+            tool_call_id: Some("c0".to_string()),
+        }
+    }
+
+    /// The live log entry is the stored-log entry with its position added,
     /// so the page renders both with the same code.
     #[test]
     fn test_a_live_log_entry_is_a_message_with_its_position() {
+        let mut stored = ReviewLogEntry::new(Some("goal"), tool_message());
+        stored.stage_label = Some("Goal".to_string());
         let entry = LiveLogEntry {
             seq: 3,
-            stage: Some("goal".to_string()),
-            stage_label: Some("Goal".to_string()),
             created_at: 100,
-            message: crate::ai::AiMessage {
-                role: crate::ai::AiRole::Tool,
-                content: Some("out".to_string()),
-                thought: None,
-                thought_signature: None,
-                tool_calls: None,
-                tool_call_id: Some("c0".to_string()),
-            },
+            entry: stored.clone(),
         };
         let value = serde_json::to_value(&entry).unwrap();
         assert_eq!(value["role"], "tool");
@@ -477,7 +523,57 @@ mod tests {
         assert_eq!(value["tool_call_id"], "c0");
         assert_eq!(value["seq"], 3);
         assert_eq!(value["stage"], "goal");
-        let back: LiveLogEntry = serde_json::from_value(value).unwrap();
+        let back: LiveLogEntry = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(back, entry);
+
+        // The stored part is the live entry without its place in the stream.
+        let mut without_position = value;
+        if let Some(fields) = without_position.as_object_mut() {
+            fields.remove("seq");
+            fields.remove("created_at");
+        }
+        assert_eq!(serde_json::to_value(&stored).unwrap(), without_position);
+    }
+
+    /// A stored log entry holds the message and its stage, and nothing of the
+    /// stream it may have come from; one with no stage is the bare message.
+    #[test]
+    fn test_a_stored_log_entry_is_a_message_with_its_stage() {
+        let mut staged = ReviewLogEntry::new(Some("goal"), tool_message());
+        staged.label_stage(crate::project::ProjectId::Linux);
+        let value = serde_json::to_value(&staged).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["content", "role", "stage", "stage_label", "tool_call_id"]
+        );
+        assert_eq!(
+            serde_json::to_value(ReviewLogEntry::new(None, tool_message())).unwrap(),
+            serde_json::to_value(tool_message()).unwrap(),
+            "a message of no stage is stored as the message alone"
+        );
+    }
+
+    /// Rows written by older builds read as entries: a worker's history held
+    /// bare messages, and a promoted live log held live entries, whose stream
+    /// fields are ignored.
+    #[test]
+    fn test_a_stored_log_entry_reads_rows_of_older_builds() {
+        let bare: ReviewLogEntry =
+            serde_json::from_value(serde_json::to_value(tool_message()).unwrap()).unwrap();
+        assert_eq!(bare, ReviewLogEntry::new(None, tool_message()));
+
+        let promoted: ReviewLogEntry = serde_json::from_value(serde_json::json!({
+            "seq": 4, "stage": "goal", "stage_label": "Goal", "created_at": 100,
+            "role": "tool", "content": "out", "tool_call_id": "c0",
+        }))
+        .unwrap();
+        let mut expected = ReviewLogEntry::new(Some("goal"), tool_message());
+        expected.stage_label = Some("Goal".to_string());
+        assert_eq!(promoted, expected);
     }
 }
