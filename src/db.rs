@@ -79,11 +79,22 @@ const RESUBMITTABLE_STATUSES_SQL: &str =
 #[cfg(feature = "server")]
 const EMBARGO_RELEASED_STATUSES_SQL: &str = "('Reviewed', 'Partial')";
 
-/// The patch verdicts of a review that ran out of time. Each is final when
-/// a patchset is processed again, and each is cleared by a rerun or a
-/// resubmission, which ask for the patch to be reviewed again.
+/// The patch verdicts that are final when a patchset is processed again, as
+/// after a restart: a review that ran out of time (`Partial`, `TimedOut`)
+/// and a review that failed for good (`Failed`). Each is cleared by a rerun
+/// or a resubmission, which ask for the patch to be reviewed again.
+///
+/// `Failed` is held by the patch status, not by the review row, because the
+/// row of an attempt that reached the model keeps an interaction with what
+/// it was billed, so the row cannot tell a final failure from a passing one.
+/// Reviewing such a patch again after a restart would spend another token
+/// budget, or another deadline, on a review that already used one up.
 #[cfg(feature = "server")]
-const DEADLINE_OUTCOMES: [PatchOutcome; 2] = [PatchOutcome::Partial, PatchOutcome::TimedOut];
+const HELD_OUTCOMES: [PatchOutcome; 3] = [
+    PatchOutcome::Partial,
+    PatchOutcome::TimedOut,
+    PatchOutcome::Failed,
+];
 
 /// The unspaced spelling of Failed To Apply. No writer uses it today, but the
 /// resubmittable statuses have always accepted it, so a row that carries it
@@ -2212,15 +2223,16 @@ impl Database {
     /// not be reviewed again when its patchset is processed again, as
     /// after a daemon restart.
     ///
-    /// A patch whose review ran out of time is final as the `Partial` or
-    /// `TimedOut` its status holds: reviewing it again from scratch would
-    /// spend another whole deadline on a review that has shown it does not
-    /// fit in one. The patch status is read, not the review row, because the
-    /// row is history that outlives a rerun, while a rerun or a resubmission
-    /// clears the patch status (see [`Self::clear_deadline_outcomes`]).
+    /// A patch is final as the `Partial`, `TimedOut` or `Failed` its status
+    /// holds (see [`HELD_OUTCOMES`]): reviewing it again from scratch would
+    /// spend another whole deadline or token budget on a review that has
+    /// shown it does not fit in one. The patch status is read, not the
+    /// review row, because the row is history that outlives a rerun, while a
+    /// rerun or a resubmission clears the patch status (see
+    /// [`Self::clear_held_outcomes`]).
     ///
-    /// A patch is final as `Failed` when it has a failed review row that
-    /// never reached the model (no interaction), so the failure stays
+    /// A patch is also final as `Failed` when it has a failed review row
+    /// that never reached the model (no interaction), so the failure stays
     /// visible instead of being retried on every restart.
     pub async fn prior_final_outcome(
         &self,
@@ -2239,7 +2251,7 @@ impl Database {
             None => None,
         };
         drop(rows);
-        if let Some(held) = DEADLINE_OUTCOMES
+        if let Some(held) = HELD_OUTCOMES
             .into_iter()
             .find(|outcome| status.as_deref() == Some(outcome.as_str()))
         {
@@ -9291,10 +9303,11 @@ impl Database {
                 .await?;
         }
 
-        // 4. Patches whose review ran out of time are reviewed again. The
-        // count is not raised for a Partial patchset, so the patches that
-        // already have a full review are not reviewed again with them.
-        self.clear_deadline_outcomes(id).await?;
+        // 4. Patches whose review ran out of time or failed for good are
+        // reviewed again. The count is not raised for a Partial patchset, so
+        // the patches that already have a full review are not reviewed again
+        // with them.
+        self.clear_held_outcomes(id).await?;
 
         // 5. Delete associated tool usages and findings for failed reviews that block retrying
         self.conn
@@ -9326,16 +9339,17 @@ impl Database {
         Ok(())
     }
 
-    /// Returns the patches of a patchset whose review ran out of time to
-    /// "not yet reviewed", so the restart guard of [`Self::prior_final_outcome`]
-    /// lets them be reviewed again. Their review rows and findings are kept,
-    /// as a `Reviewed` review's are.
-    async fn clear_deadline_outcomes(&self, patchset_id: i64) -> Result<()> {
-        let [partial, timed_out] = DEADLINE_OUTCOMES.map(PatchOutcome::as_str);
+    /// Returns the patches of a patchset that hold a final verdict
+    /// ([`HELD_OUTCOMES`]) to "not yet reviewed", so the restart guard of
+    /// [`Self::prior_final_outcome`] lets them be reviewed again. Their
+    /// review rows, findings and interactions are kept, as a `Reviewed`
+    /// review's are.
+    async fn clear_held_outcomes(&self, patchset_id: i64) -> Result<()> {
+        let [partial, timed_out, failed] = HELD_OUTCOMES.map(PatchOutcome::as_str);
         self.conn
             .execute(
-                "UPDATE patches SET status = NULL WHERE patchset_id = ? AND status IN (?, ?)",
-                libsql::params![patchset_id, partial, timed_out],
+                "UPDATE patches SET status = NULL WHERE patchset_id = ? AND status IN (?, ?, ?)",
+                libsql::params![patchset_id, partial, timed_out, failed],
             )
             .await?;
         Ok(())
@@ -9447,8 +9461,9 @@ impl Database {
                         libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
                     ).await?;
                     // A resubmission asks for a new review, so a patch that
-                    // ran out of time must not be skipped as already final.
-                    self.clear_deadline_outcomes(id).await?;
+                    // ran out of time or failed must not be skipped as
+                    // already final.
+                    self.clear_held_outcomes(id).await?;
                 }
                 self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
                     .await?;
@@ -13225,10 +13240,13 @@ mod tests {
             let stored: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
             assert_eq!(stored, outcome.as_str());
 
-            // A patch that ran out of time keeps its verdict on the patch
-            // itself. Any other patch status with no failed review behind it
-            // is not a prior final outcome: that rule reads review rows.
-            let held = matches!(outcome, PatchOutcome::Partial | PatchOutcome::TimedOut);
+            // A patch that ran out of time or failed keeps its verdict on
+            // the patch itself. Any other patch status with no failed review
+            // behind it is not a prior final outcome.
+            let held = matches!(
+                outcome,
+                PatchOutcome::Partial | PatchOutcome::TimedOut | PatchOutcome::Failed
+            );
             assert_eq!(
                 db.prior_final_outcome(ps_id, patch_id).await.unwrap(),
                 held.then_some(outcome),
