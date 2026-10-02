@@ -66,11 +66,63 @@ struct ReviewContext {
 enum PatchResult {
     Success,
     /// The review ran out of time, and the findings of the stages that
-    /// finished were stored. The patchset still counts this as a failed
-    /// patch, so a series with a salvaged patch ends Failed.
+    /// finished were stored. The patchset ends Partial unless another patch
+    /// failed.
     Partial,
     ReviewFailed,
     Cancelled,
+}
+
+/// How the patches of one patchset run ended.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PatchsetTally {
+    /// Patches with no review to show: a failure, a timeout, an exceeded
+    /// budget, an error, or a review task that panicked.
+    failed: usize,
+    /// Patches whose review was salvaged when it ran out of time.
+    partial: usize,
+}
+
+impl PatchsetTally {
+    /// Counts the result of one patch's review. A skipped or reviewed patch
+    /// adds nothing. A cancelled one adds nothing either, because the
+    /// patchset's Cancelled status outranks any final status written here.
+    fn record(&mut self, result: &Result<PatchResult>) {
+        match result {
+            Ok(PatchResult::Success | PatchResult::Cancelled) => {}
+            Ok(PatchResult::Partial) => self.partial += 1,
+            Ok(PatchResult::ReviewFailed) | Err(_) => self.failed += 1,
+        }
+    }
+
+    /// Adds the tally of a review task. A task that panicked counts as one
+    /// failed patch, because the patch it was reviewing has no review.
+    fn absorb_task(&mut self, task: std::result::Result<Self, tokio::task::JoinError>) {
+        match task {
+            Ok(tally) => {
+                self.failed += tally.failed;
+                self.partial += tally.partial;
+            }
+            Err(e) => {
+                error!("Review worker tokio task crashed/panicked: {}", e);
+                self.failed += 1;
+            }
+        }
+    }
+
+    /// The patchset's status, unless it was cancelled meanwhile. A failed
+    /// patch outranks a partial one, so Partial always means that every
+    /// patch which was not skipped has a review and at least one of them is
+    /// incomplete.
+    fn final_status(&self) -> ReviewStatus {
+        if self.failed > 0 {
+            ReviewStatus::Failed
+        } else if self.partial > 0 {
+            ReviewStatus::Partial
+        } else {
+            ReviewStatus::Reviewed
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -568,6 +620,62 @@ impl Reviewer {
             .await
     }
 
+    /// Writes the patchset's final status from `tally` and returns it, or
+    /// returns `None` when the patchset was cancelled meanwhile, whose status
+    /// is kept.
+    ///
+    /// Only a Reviewed patchset queues its forge comment and is released from
+    /// its embargo at once. A Partial or Failed one has a patch without a full
+    /// review, so announcing it now would present an incomplete review as a
+    /// finished one.
+    async fn finish_patchset(
+        ctx: &ReviewContext,
+        patchset: &PatchsetRow,
+        diffs: &[(i64, i64, String, String, String, i64, String)],
+        tally: PatchsetTally,
+    ) -> Option<ReviewStatus> {
+        let patchset_id = patchset.id;
+        let current_status = ctx.db.get_patchset_status(patchset_id).await.ok().flatten();
+        if current_status.as_deref() == Some(ReviewStatus::Cancelled.as_str()) {
+            info!(
+                "Patchset {} was cancelled during review, preserving status",
+                patchset_id
+            );
+            return None;
+        }
+
+        let final_status = tally.final_status();
+        if let Err(e) = ctx
+            .db
+            .update_patchset_status(patchset_id, final_status.as_str())
+            .await
+        {
+            warn!(
+                "Failed to update patchset {} status to {}: {}",
+                patchset_id, final_status, e
+            );
+        }
+        if final_status != ReviewStatus::Reviewed {
+            return Some(final_status);
+        }
+
+        if let Err(e) = Self::queue_forge_pr_comment(ctx, patchset, diffs).await {
+            error!(
+                "Failed to queue forge PR comment for patchset {}: {}",
+                patchset_id, e
+            );
+        }
+        if patchset.embargo_until.is_some()
+            && let Err(e) = Self::release_patchset_results(ctx, patchset).await
+        {
+            error!(
+                "Failed to release clean patchset {} immediately: {}",
+                patchset_id, e
+            );
+        }
+        Some(final_status)
+    }
+
     async fn review_patchset_task(ctx: ReviewContext, patchset: PatchsetRow) {
         let patchset_id = patchset.id;
         if ctx
@@ -860,9 +968,6 @@ impl Reviewer {
             }
 
             // 2. Run Reviews
-            let mut review_success = true; // Optimistic
-            let mut failed_patches = 0;
-
             let mut valid_jobs = Vec::new();
 
             for (patch_id, index, diff, _subj, _auth, _date, _msg_id) in &diffs {
@@ -966,7 +1071,7 @@ impl Reviewer {
                     let worktree_path_clone = worktree_path.clone();
 
                     let handle = tokio::spawn(async move {
-                        let mut failed = 0;
+                        let mut tally = PatchsetTally::default();
                         loop {
                             if ctx_clone
                                 .db
@@ -1001,19 +1106,18 @@ impl Reviewer {
                                 )
                                 .await
                                 {
-                                    Ok(PatchResult::Success) => {}
                                     Ok(PatchResult::Cancelled) => {
                                         queue.lock().await.clear();
                                         break;
                                     }
-                                    _ => failed += 1,
+                                    result => tally.record(&result),
                                 }
                             } else {
                                 break;
                             }
                         }
                         drop(permit);
-                        failed
+                        tally
                     });
                     handles.push(handle);
 
@@ -1029,7 +1133,7 @@ impl Reviewer {
             }
 
             // Main worker loop uses the existing worktree
-            let mut main_failed = 0;
+            let mut tally = PatchsetTally::default();
             loop {
                 if ctx
                     .db
@@ -1064,31 +1168,19 @@ impl Reviewer {
                     )
                     .await
                     {
-                        Ok(PatchResult::Success) => {}
                         Ok(PatchResult::Cancelled) => {
                             valid_jobs_queue.lock().await.clear();
                             break;
                         }
-                        _ => main_failed += 1,
+                        result => tally.record(&result),
                     }
                 } else {
                     break;
                 }
             }
-            failed_patches += main_failed;
 
             for handle in handles {
-                match handle.await {
-                    Ok(failed) => failed_patches += failed,
-                    Err(e) => {
-                        error!("Review worker tokio task crashed/panicked: {}", e);
-                        failed_patches += 1;
-                    }
-                }
-            }
-
-            if failed_patches > 0 {
-                review_success = false;
+                tally.absorb_task(handle.await);
             }
 
             // Cleanup worktree here since we kept it alive for reuse
@@ -1099,30 +1191,8 @@ impl Reviewer {
                 );
             }
 
-            let current_status = ctx.db.get_patchset_status(patchset_id).await.ok().flatten();
-            if current_status.as_deref() == Some(ReviewStatus::Cancelled.as_str()) {
-                info!(
-                    "Patchset {} was cancelled during review, preserving status",
-                    patchset_id
-                );
-            } else {
-                let final_status = if review_success {
-                    ReviewStatus::Reviewed.as_str().to_string()
-                } else {
-                    ReviewStatus::Failed.as_str().to_string()
-                };
-
-                if let Err(e) = ctx
-                    .db
-                    .update_patchset_status(patchset_id, &final_status)
-                    .await
-                {
-                    warn!(
-                        "Failed to update patchset {} status to {}: {}",
-                        patchset_id, final_status, e
-                    );
-                }
-
+            if let Some(final_status) = Self::finish_patchset(&ctx, &patchset, &diffs, tally).await
+            {
                 let elapsed = carried_seconds + patchset_review_started.elapsed().as_secs();
                 // A superseded run's total belongs to a review that has been
                 // restarted; the newer run records its own.
@@ -1138,24 +1208,6 @@ impl Reviewer {
                     crate::activity::format_duration(elapsed),
                     final_status
                 );
-
-                if review_success {
-                    if let Err(e) = Self::queue_forge_pr_comment(&ctx, &patchset, &diffs).await {
-                        error!(
-                            "Failed to queue forge PR comment for patchset {}: {}",
-                            patchset_id, e
-                        );
-                    }
-
-                    if patchset.embargo_until.is_some()
-                        && let Err(e) = Self::release_patchset_results(&ctx, &patchset).await
-                    {
-                        error!(
-                            "Failed to release clean patchset {} immediately: {}",
-                            patchset_id, e
-                        );
-                    }
-                }
             }
         } else {
             // No baseline found
@@ -7112,6 +7164,107 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         );
     }
 
+    /// The patchset's status follows the rule of the design's §3.11: a
+    /// failed patch outranks a partial one, a partial one outranks a full
+    /// review, and skipped or cancelled patches are neutral.
+    #[test]
+    fn a_patchset_is_partial_only_when_every_patch_has_a_review() {
+        use PatchResult::{Cancelled, Partial, ReviewFailed, Success};
+
+        let tally = |results: Vec<Result<PatchResult>>| {
+            let mut tally = PatchsetTally::default();
+            results.iter().for_each(|result| tally.record(result));
+            tally.final_status()
+        };
+        let cases: Vec<(&str, Vec<Result<PatchResult>>, ReviewStatus)> = vec![
+            ("no patch to review", vec![], ReviewStatus::Reviewed),
+            (
+                "all reviewed or skipped",
+                vec![Ok(Success), Ok(Success)],
+                ReviewStatus::Reviewed,
+            ),
+            (
+                "four reviewed, one partial",
+                vec![
+                    Ok(Success),
+                    Ok(Success),
+                    Ok(Success),
+                    Ok(Success),
+                    Ok(Partial),
+                ],
+                ReviewStatus::Partial,
+            ),
+            (
+                "four reviewed, one timed out",
+                vec![
+                    Ok(Success),
+                    Ok(Success),
+                    Ok(Success),
+                    Ok(Success),
+                    Ok(ReviewFailed),
+                ],
+                ReviewStatus::Failed,
+            ),
+            (
+                "three reviewed, one partial, one failed",
+                vec![
+                    Ok(Success),
+                    Ok(Partial),
+                    Ok(Success),
+                    Ok(ReviewFailed),
+                    Ok(Success),
+                ],
+                ReviewStatus::Failed,
+            ),
+            (
+                "processed again after a restart, one patch already partial",
+                vec![Ok(Success), Ok(Success), Ok(Partial)],
+                ReviewStatus::Partial,
+            ),
+            (
+                "a partial patch and an error",
+                vec![Ok(Partial), Err(anyhow!("worker failed to start"))],
+                ReviewStatus::Failed,
+            ),
+            (
+                "a cancelled patch adds nothing",
+                vec![Ok(Partial), Ok(Cancelled)],
+                ReviewStatus::Partial,
+            ),
+        ];
+        for (case, results, expected) in cases {
+            assert_eq!(tally(results), expected, "{case}");
+        }
+    }
+
+    /// Stands in for a review task that panics before it returns a tally.
+    fn panicking_review() -> PatchsetTally {
+        panic!("a review task panicked")
+    }
+
+    /// A review task's tally is added to the patchset's, and a task that
+    /// panicked counts as a failed patch, which outranks a partial one.
+    #[tokio::test]
+    async fn a_review_task_that_panicked_fails_the_patchset() {
+        let mut tally = PatchsetTally::default();
+        tally.absorb_task(Ok(PatchsetTally {
+            failed: 0,
+            partial: 2,
+        }));
+        assert_eq!(tally.final_status(), ReviewStatus::Partial);
+
+        let panicked = tokio::spawn(async { panicking_review() }).await;
+        tally.absorb_task(panicked);
+        assert_eq!(
+            tally,
+            PatchsetTally {
+                failed: 1,
+                partial: 2
+            }
+        );
+        assert_eq!(tally.final_status(), ReviewStatus::Failed);
+    }
+
     /// A mock worker that reports `lines` and then runs `then`: the shell
     /// that ends its run.
     fn worker_reporting_then(lines: &[String], then: &str) -> String {
@@ -7205,8 +7358,8 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         ctx: ReviewContext,
         patchset_id: i64,
         patch_id: i64,
-        /// Holds the worker script.
-        _dir: tempfile::TempDir,
+        /// Holds the worker scripts.
+        dir: tempfile::TempDir,
     }
 
     impl WorkerFixture {
@@ -7273,23 +7426,34 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 ctx,
                 patchset_id,
                 patch_id,
-                _dir: dir,
+                dir,
             })
         }
 
         /// Reviews the patch once, as the patchset's run would.
         async fn review(&self) -> Result<PatchResult> {
+            self.review_part(&self.ctx, self.patch_id, 1).await
+        }
+
+        /// Reviews part `index` of the patchset once with `ctx`, as the
+        /// patchset's run would.
+        async fn review_part(
+            &self,
+            ctx: &ReviewContext,
+            patch_id: i64,
+            index: i64,
+        ) -> Result<PatchResult> {
             // The message ids let a stored review queue its notifications,
             // so a test can see whether it did.
             let input_payload = json!({
                 "message_id": "msg_id_1",
-                "patches": [{"index": 1, "message_id": "msg_id_p1"}],
+                "patches": [{"index": index, "message_id": Self::message_id(index)}],
             });
             Reviewer::process_patch_review(
-                &self.ctx,
+                ctx,
                 self.patchset_id,
-                self.patch_id,
-                1,
+                patch_id,
+                index,
                 "HEAD",
                 None,
                 &input_payload,
@@ -7300,6 +7464,57 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 None,
             )
             .await
+        }
+
+        /// The message id of part `index`.
+        fn message_id(index: i64) -> String {
+            format!("msg_id_p{index}")
+        }
+
+        /// Adds part `index` to the patchset, with a message of its own, and
+        /// returns the new patch's id.
+        async fn add_patch(&self, index: i64) -> Result<i64> {
+            let db = &self.ctx.db;
+            let thread_id = count(
+                db,
+                "SELECT thread_id FROM patchsets WHERE id = ?",
+                self.patchset_id,
+            )
+            .await?;
+            let message_id = Self::message_id(index);
+            db.create_message(
+                &message_id,
+                thread_id,
+                None,
+                "Author",
+                "Subject",
+                1000,
+                "Body",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await?;
+            db.create_patch(
+                self.patchset_id,
+                &message_id,
+                u32::try_from(index)?,
+                Self::DIFF,
+            )
+            .await
+        }
+
+        /// The fixture's context with `script` as its worker, so one part
+        /// of the patchset can be reviewed by a different worker.
+        fn with_worker(&self, name: &str, script: &str) -> Result<ReviewContext> {
+            let bin_path = self.dir.path().join(name);
+            std::fs::write(&bin_path, script)?;
+            std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+            Ok(ReviewContext {
+                worker_program: Some(bin_path),
+                ..self.ctx.clone()
+            })
         }
     }
 
@@ -7826,6 +8041,298 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             Some("Partial")
         );
         assert_eq!(queued_notifications(&run).await?, (0, 0));
+        Ok(())
+    }
+
+    /// `output` as the worker's output for part `index` instead of part 1.
+    fn for_part(output: &str, index: i64) -> Result<String> {
+        let mut output: Value = serde_json::from_str(output)?;
+        output["patches"][0]["index"] = json!(index);
+        Ok(output.to_string())
+    }
+
+    /// A two-part patchset whose first part was reviewed by `first_worker`
+    /// under `configure` and whose second part got a full review, unless
+    /// `with_second` gave it another worker, finished as its run finishes it.
+    /// The patchset has a pull request, so a forge comment is queued if the
+    /// finish allows one.
+    struct TwoPartRun {
+        final_status: Option<ReviewStatus>,
+        fixture: WorkerFixture,
+        /// The context that reviews the second part with its own worker.
+        second_ctx: ReviewContext,
+        first: i64,
+        second: i64,
+    }
+
+    impl TwoPartRun {
+        async fn new(first_worker: &str, configure: impl FnOnce(&mut Settings)) -> Result<Self> {
+            let reviewed = for_part(&reviewed_output(json!([])), 2)?;
+            let reviewing = worker_reporting_then(&[], &format!("echo '{reviewed}'\n"));
+            Self::with_second(first_worker, &reviewing, configure).await
+        }
+
+        /// As `new`, but the second part is reviewed by `second_worker`,
+        /// which must report its output for part 2.
+        async fn with_second(
+            first_worker: &str,
+            second_worker: &str,
+            configure: impl FnOnce(&mut Settings),
+        ) -> Result<Self> {
+            let fixture =
+                WorkerFixture::new(first_worker, Arc::new(MockProvider), configure).await?;
+            let second = fixture.add_patch(2).await?;
+            let second_ctx = fixture.with_worker("second_worker", second_worker)?;
+            let mut run = Self {
+                final_status: None,
+                first: fixture.patch_id,
+                fixture,
+                second_ctx,
+                second,
+            };
+            run.final_status = run.process().await?;
+            Ok(run)
+        }
+
+        /// Reviews both parts and finishes the patchset with their tally, as
+        /// one run of the patchset does, and returns what the finish returned.
+        async fn process(&self) -> Result<Option<ReviewStatus>> {
+            let mut tally = PatchsetTally::default();
+            tally.record(&self.fixture.review().await);
+            tally.record(
+                &self
+                    .fixture
+                    .review_part(&self.second_ctx, self.second, 2)
+                    .await,
+            );
+
+            let patchset: PatchsetRow = serde_json::from_value(json!({
+                "id": self.fixture.patchset_id,
+                "message_id": "msg_id_1",
+                "mailing_lists": [],
+                "subsystems": [],
+                "mr_url": "https://github.com/owner/repo/pull/7",
+                "mr_number": 7,
+            }))?;
+            let diffs: Vec<(i64, i64, String, String, String, i64, String)> =
+                [(self.first, 1), (self.second, 2)]
+                    .into_iter()
+                    .map(|(id, index)| {
+                        (
+                            id,
+                            index,
+                            WorkerFixture::DIFF.to_string(),
+                            format!("part {index}"),
+                            "Author".to_string(),
+                            1000,
+                            WorkerFixture::message_id(index),
+                        )
+                    })
+                    .collect();
+            Ok(Reviewer::finish_patchset(&self.fixture.ctx, &patchset, &diffs, tally).await)
+        }
+
+        /// Processes the patchset again as a daemon restart does: the
+        /// restart puts the patchset that was being reviewed back to
+        /// Pending, and its run then goes through every patch once more.
+        async fn process_after_restart(&self) -> Result<Option<ReviewStatus>> {
+            let db = &self.fixture.ctx.db;
+            db.update_patchset_status(self.fixture.patchset_id, ReviewStatus::InReview.as_str())
+                .await?;
+            db.reset_reviewing_status().await?;
+            self.process().await
+        }
+
+        async fn stored_status(&self) -> Result<Option<String>> {
+            self.fixture
+                .ctx
+                .db
+                .get_patchset_status(self.fixture.patchset_id)
+                .await
+        }
+
+        async fn emails_for(&self, patch_id: i64) -> Result<i64> {
+            count(
+                &self.fixture.ctx.db,
+                "SELECT COUNT(*) FROM email_outbox WHERE patch_id = ?",
+                patch_id,
+            )
+            .await
+        }
+
+        async fn forge_comments(&self) -> Result<i64> {
+            count(
+                &self.fixture.ctx.db,
+                "SELECT COUNT(*) FROM forge_outbox WHERE patchset_id = ?",
+                self.fixture.patchset_id,
+            )
+            .await
+        }
+    }
+
+    /// A patchset with one Reviewed and one salvaged patch ends Partial. Its
+    /// Reviewed patch is emailed as soon as it is reviewed, the salvaged one
+    /// is not, and no forge comment presents the series as fully reviewed.
+    #[tokio::test]
+    async fn test_a_patchset_with_a_salvaged_patch_ends_partial() -> Result<()> {
+        let cut_short = json!([{
+            "stage": "security",
+            "reason": "cut short",
+            "cause": crate::workflow::StageStopCause::CutShort,
+        }]);
+        let salvaging = worker_winding_down(
+            &stage_reaching("security", 3),
+            &format!("echo '{}'\n", reviewed_output(cut_short)),
+        );
+
+        let run = TwoPartRun::new(&salvaging, out_of_time_with_salvage).await?;
+        assert_eq!(run.final_status, Some(ReviewStatus::Partial));
+        assert_eq!(run.stored_status().await?.as_deref(), Some("Partial"));
+        assert_eq!(
+            run.emails_for(run.first).await?,
+            0,
+            "nothing leaves a Partial review"
+        );
+        assert!(
+            run.emails_for(run.second).await? > 0,
+            "the Reviewed patch is emailed"
+        );
+        assert_eq!(
+            run.forge_comments().await?,
+            0,
+            "no forge comment for a Partial series"
+        );
+        Ok(())
+    }
+
+    /// A patch that timed out with nothing salvaged has no review, so its
+    /// patchset ends Failed, not Partial, and queues no forge comment.
+    #[tokio::test]
+    async fn test_a_patchset_with_a_timed_out_patch_ends_failed() -> Result<()> {
+        let never_answering = worker_reporting_then(&stage_reaching("security", 1), "cat\n");
+
+        let run = TwoPartRun::new(&never_answering, |s| s.review.timeout_seconds = 1).await?;
+        assert_eq!(
+            patch_status(&run.fixture.ctx.db, run.first)
+                .await?
+                .as_deref(),
+            Some("TimedOut")
+        );
+        assert_eq!(run.final_status, Some(ReviewStatus::Failed));
+        assert_eq!(run.stored_status().await?.as_deref(), Some("Failed"));
+        assert_eq!(run.forge_comments().await?, 0);
+        Ok(())
+    }
+
+    /// A patchset with a salvaged patch and a timed-out patch, processed
+    /// again as after a restart, reviews neither patch again: both keep their
+    /// status and their single review row, and the patchset ends Failed
+    /// again, because the guard still counts the timed-out patch as failed.
+    #[tokio::test]
+    async fn test_a_restarted_patchset_with_a_timed_out_patch_ends_failed_again() -> Result<()> {
+        let cut_short = json!([{"stage": "security", "reason": "r", "cause": "cut_short"}]);
+        let salvaging = worker_winding_down(
+            &stage_reaching("security", 1),
+            &format!("echo '{}'\n", reviewed_output(cut_short)),
+        );
+        let stopped = for_part(&error_output("stopped", Some("out_of_time")), 2)?;
+        let timing_out = worker_winding_down(
+            &stage_reaching("security", 1),
+            &format!("echo '{stopped}'\n"),
+        );
+
+        let run =
+            TwoPartRun::with_second(&salvaging, &timing_out, out_of_time_with_salvage).await?;
+        assert_eq!(run.final_status, Some(ReviewStatus::Failed));
+
+        assert_eq!(
+            run.process_after_restart().await?,
+            Some(ReviewStatus::Failed)
+        );
+        assert_eq!(run.stored_status().await?.as_deref(), Some("Failed"));
+        let db = &run.fixture.ctx.db;
+        for (patch_id, status) in [(run.first, "Partial"), (run.second, "TimedOut")] {
+            let reviews = review_rows(db, patch_id).await?;
+            assert_eq!(reviews.len(), 1, "patch {patch_id} was reviewed again");
+            assert_eq!(patch_status(db, patch_id).await?.as_deref(), Some(status));
+        }
+        assert_eq!(run.forge_comments().await?, 0);
+        Ok(())
+    }
+
+    /// A patchset whose only incomplete patch was salvaged, processed again
+    /// as after a restart, reviews no patch again and ends Partial again: it
+    /// is not upgraded to Reviewed, so it still announces nothing.
+    #[tokio::test]
+    async fn test_a_restarted_patchset_with_a_salvaged_patch_ends_partial_again() -> Result<()> {
+        let cut_short = json!([{"stage": "security", "reason": "r", "cause": "cut_short"}]);
+        let salvaging = worker_winding_down(
+            &stage_reaching("security", 1),
+            &format!("echo '{}'\n", reviewed_output(cut_short)),
+        );
+
+        let run = TwoPartRun::new(&salvaging, out_of_time_with_salvage).await?;
+        assert_eq!(run.final_status, Some(ReviewStatus::Partial));
+        let emailed = run.emails_for(run.second).await?;
+
+        assert_eq!(
+            run.process_after_restart().await?,
+            Some(ReviewStatus::Partial)
+        );
+        assert_eq!(run.stored_status().await?.as_deref(), Some("Partial"));
+        let db = &run.fixture.ctx.db;
+        for (patch_id, status) in [(run.first, "Partial"), (run.second, "Reviewed")] {
+            let reviews = review_rows(db, patch_id).await?;
+            assert_eq!(reviews.len(), 1, "patch {patch_id} was reviewed again");
+            assert_eq!(patch_status(db, patch_id).await?.as_deref(), Some(status));
+        }
+        assert_eq!(run.emails_for(run.second).await?, emailed, "emailed twice");
+        assert_eq!(run.forge_comments().await?, 0);
+        Ok(())
+    }
+
+    /// A fully reviewed patchset is the only one that queues its forge
+    /// comment, which shows the comment is withheld, not merely absent, from
+    /// the Partial and Failed ones.
+    #[tokio::test]
+    async fn test_a_fully_reviewed_patchset_queues_its_forge_comment() -> Result<()> {
+        let reviewing =
+            worker_reporting_then(&[], &format!("echo '{}'\n", reviewed_output(json!([]))));
+
+        let run = TwoPartRun::new(&reviewing, |_| {}).await?;
+        assert_eq!(run.final_status, Some(ReviewStatus::Reviewed));
+        assert_eq!(run.stored_status().await?.as_deref(), Some("Reviewed"));
+        assert_eq!(run.forge_comments().await?, 1);
+        Ok(())
+    }
+
+    /// A patchset cancelled while its patches ran keeps its status: the
+    /// finish writes nothing over it and announces nothing.
+    #[tokio::test]
+    async fn test_a_cancelled_patchset_keeps_its_status_at_the_finish() -> Result<()> {
+        let fixture =
+            WorkerFixture::new("#!/bin/sh\nexit 1\n", Arc::new(MockProvider), |_| {}).await?;
+        let db = &fixture.ctx.db;
+        db.update_patchset_status(fixture.patchset_id, ReviewStatus::Cancelled.as_str())
+            .await?;
+        let patchset: PatchsetRow = serde_json::from_value(json!({
+            "id": fixture.patchset_id,
+            "mailing_lists": [],
+            "subsystems": [],
+        }))?;
+        let tally = PatchsetTally {
+            failed: 0,
+            partial: 1,
+        };
+
+        let finished = Reviewer::finish_patchset(&fixture.ctx, &patchset, &[], tally).await;
+        assert_eq!(finished, None);
+        assert_eq!(
+            db.get_patchset_status(fixture.patchset_id)
+                .await?
+                .as_deref(),
+            Some("Cancelled")
+        );
         Ok(())
     }
 
