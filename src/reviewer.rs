@@ -15,8 +15,8 @@
 use crate::ai::backoff_provider::{ReviewDeadline, ReviewTimedOut};
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, AiResponse, RemoteAiErrorPayload, classify_ai_error,
-    create_provider_cached,
+    AiErrorClass, AiProvider, AiRequest, AiResponse, IpcEnvelope, IpcMessageType,
+    RemoteAiErrorPayload, classify_ai_error, create_provider_cached,
 };
 use crate::baseline::{BaselineRegistry, BaselineResolution, CommitId, extract_files_from_diff};
 use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
@@ -3318,7 +3318,7 @@ async fn run_review_tool_with_cmd(
                                                 .scope(ctx_tag, provider_clone.generate_content(req.clone()))
                                                 .await;
 
-                                            let reply = match resp_payload {
+                                            match resp_payload {
                                                 Ok(p) => {
                                                     if let Some(usage) = &p.usage {
                                                         let cached = usage.cached_tokens.unwrap_or(0);
@@ -3330,18 +3330,7 @@ async fn run_review_tool_with_cmd(
                                                             let err_msg = format!("Token budget exceeded: {} uncached input + output tokens used > {} limit", current_total, token_budget);
 
                                                             let payload = RemoteAiErrorPayload::new(err_msg.clone(), AiErrorClass::Fatal);
-                                                            let reply = json!({
-                                                                "type": "error",
-                                                                "tx_id": tx_id,
-                                                                "payload": payload
-                                                            });
-                                                            let mut reply_str = serde_json::to_string(&reply).unwrap();
-                                                            reply_str.push('\n');
-                                                            {
-                                                                let mut writer = stdin_clone.lock().await;
-                                                                let _ = writer.write_all(reply_str.as_bytes()).await;
-                                                                let _ = writer.flush().await;
-                                                            }
+                                                            write_ipc_reply(&stdin_clone, IpcMessageType::Error, tx_id, &payload).await;
 
                                                             let _ = abort_tx_clone.send(ReviewError::BudgetExceeded(err_msg).into()).await;
                                                             return;
@@ -3352,18 +3341,7 @@ async fn run_review_tool_with_cmd(
                                                             let err_msg = format!("Output token budget exceeded: {} output tokens used > {} limit", current_output, output_budget);
 
                                                             let payload = RemoteAiErrorPayload::new(err_msg.clone(), AiErrorClass::Fatal);
-                                                            let reply = json!({
-                                                                "type": "error",
-                                                                "tx_id": tx_id,
-                                                                "payload": payload
-                                                            });
-                                                            let mut reply_str = serde_json::to_string(&reply).unwrap();
-                                                            reply_str.push('\n');
-                                                            {
-                                                                let mut writer = stdin_clone.lock().await;
-                                                                let _ = writer.write_all(reply_str.as_bytes()).await;
-                                                                let _ = writer.flush().await;
-                                                            }
+                                                            write_ipc_reply(&stdin_clone, IpcMessageType::Error, tx_id, &payload).await;
 
                                                             let _ = abort_tx_clone.send(ReviewError::BudgetExceeded(err_msg).into()).await;
                                                             return;
@@ -3379,45 +3357,13 @@ async fn run_review_tool_with_cmd(
                                                     )
                                                     .await;
 
-                                                    Some(json!({
-                                                        "type": "ai_response",
-                                                        "tx_id": tx_id,
-                                                        "payload": p
-                                                    }))
+                                                    write_ipc_reply(&stdin_clone, IpcMessageType::AiResponse, tx_id, &p).await;
                                                 }
                                                 Err(e) => {
                                                     let class = classify_ai_error(&e);
                                                     let message = e.to_string();
                                                     let payload = RemoteAiErrorPayload::new(message, class);
-                                                    let reply = json!({
-                                                        "type": "error",
-                                                        "tx_id": tx_id,
-                                                        "payload": payload
-                                                    });
-
-                                                    let mut reply_str = serde_json::to_string(&reply).unwrap();
-                                                    reply_str.push('\n');
-                                                    {
-                                                        let mut writer = stdin_clone.lock().await;
-                                                        if let Err(e) = writer.write_all(reply_str.as_bytes()).await {
-                                                            error!("Failed to write AI response to child: {}", e);
-                                                        }
-                                                        let _ = writer.flush().await;
-                                                    }
-
-                                                    None
-                                                }
-                                            };
-
-                                            if let Some(reply) = reply {
-                                                let mut reply_str = serde_json::to_string(&reply).unwrap();
-                                                reply_str.push('\n');
-                                                {
-                                                    let mut writer = stdin_clone.lock().await;
-                                                    if let Err(e) = writer.write_all(reply_str.as_bytes()).await {
-                                                        error!("Failed to write AI response to child: {}", e);
-                                                    }
-                                                    let _ = writer.flush().await;
+                                                    write_ipc_reply(&stdin_clone, IpcMessageType::Error, tx_id, &payload).await;
                                                 }
                                             }
                                         });
@@ -3665,6 +3611,35 @@ async fn run_review_tool_with_cmd(
         }
         Err(e) => Err(e),
     }
+}
+
+/// Writes one reply to a worker's stdin.
+///
+/// The line is built by [`IpcEnvelope::line`], the same envelope type the
+/// worker's reader parses, so the daemon cannot write a kind the worker does
+/// not know. A reply that cannot be written is logged and dropped, because a
+/// worker whose stdin is gone has already exited and the review's own outcome
+/// reports that. A reply that cannot be encoded is logged and dropped rather
+/// than panicking the daemon's task; the payloads are plain data, so this is
+/// not expected to happen.
+async fn write_ipc_reply(
+    stdin: &tokio::sync::Mutex<tokio::process::ChildStdin>,
+    msg_type: IpcMessageType,
+    tx_id: u64,
+    payload: &impl Serialize,
+) {
+    let line = match IpcEnvelope::line(msg_type, tx_id, payload) {
+        Ok(line) => line,
+        Err(e) => {
+            error!("Failed to encode the reply for tx_id {}: {}", tx_id, e);
+            return;
+        }
+    };
+    let mut writer = stdin.lock().await;
+    if let Err(e) = writer.write_all(line.as_bytes()).await {
+        error!("Failed to write AI response to child: {}", e);
+    }
+    let _ = writer.flush().await;
 }
 
 /// Replaces the review's early reference record with the worker's final one,
