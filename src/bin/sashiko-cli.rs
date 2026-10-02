@@ -1506,6 +1506,25 @@ async fn fetch_activity_summary(
     }
 }
 
+/// Whether `show --watch` stops polling a patchset in this status. Partial is
+/// finished: a review that ran out of time is not resumed, so watching it any
+/// longer would poll for ever.
+fn is_watch_terminal(status: &str) -> bool {
+    matches!(
+        status,
+        "Reviewed" | "Partial" | "Failed" | "Error" | "Cancelled" | "Embargoed" | "Failed To Apply"
+    )
+}
+
+/// Whether a finished patchset in this status has a review log to show. A
+/// Partial patchset has one: its salvaged review kept its conversation.
+fn has_review_log(status: &str) -> bool {
+    matches!(
+        status,
+        "Reviewed" | "Partial" | "Failed" | "Failed To Apply"
+    )
+}
+
 async fn handle_show(
     client: &Client,
     base_url: &str,
@@ -1546,10 +1565,7 @@ async fn handle_show(
             let mut details: Value = resp.json().await?;
             let status = details["status"].as_str().unwrap_or("").to_string();
 
-            let is_terminal = matches!(
-                status.as_str(),
-                "Reviewed" | "Failed" | "Error" | "Cancelled" | "Embargoed" | "Failed To Apply"
-            );
+            let is_terminal = is_watch_terminal(&status);
 
             if watch && status != last_status {
                 if matches!(format, OutputFormat::Text) {
@@ -1582,7 +1598,7 @@ async fn handle_show(
             let numeric_id = details["id"].to_string();
 
             let mut review_data = None;
-            if status == "Reviewed" || status == "Failed" || status == "Failed To Apply" {
+            if has_review_log(&status) {
                 let review_url = format!("{}/api/review_log?patchset_id={}", base_url, numeric_id);
                 let review_resp = client.get(&review_url).send().await?;
 
@@ -2947,6 +2963,26 @@ mod tests {
             (serde_json::json!({}), "failed"),
         ] {
             assert_eq!(stage_failure_label(&failure), expected, "{failure}");
+        }
+    }
+
+    /// `show --watch` stops on a Partial patchset and shows its review log,
+    /// as it does for a Reviewed one, and keeps polling one still in review.
+    #[test]
+    fn test_watch_stops_on_a_partial_patchset() {
+        for (status, terminal, log) in [
+            ("Reviewed", true, true),
+            ("Partial", true, true),
+            ("Failed", true, true),
+            ("Failed To Apply", true, true),
+            ("Cancelled", true, false),
+            ("Embargoed", true, false),
+            ("In Review", false, false),
+            ("Pending", false, false),
+            ("Fetching", false, false),
+        ] {
+            assert_eq!(is_watch_terminal(status), terminal, "{status}");
+            assert_eq!(has_review_log(status), log, "{status}");
         }
     }
 

@@ -970,7 +970,9 @@ async fn get_activity(State(state): State<Arc<AppState>>) -> Json<crate::api::Ac
 
 /// Statuses in which a patchset still has work outstanding. Persisted activity
 /// is only an explanation for a patchset in one of these: one that has
-/// finished has nothing left to explain, whatever rows outlived it.
+/// finished has nothing left to explain, whatever rows outlived it. Every
+/// other status is finished, `Partial` included: a review that ran out of
+/// time is not resumed.
 ///
 /// Status alone is enough only while nothing moves a stranded patchset to a
 /// terminal status at startup. The fork's stranded-fetch sweep (not ported)
@@ -2906,7 +2908,7 @@ mod tests {
         let (ps, _, _) = reviewed(&db, "fin").await;
         db.update_patchset_status(ps, "In Review").await.unwrap();
         assert!(!patchset_activity(addr, ps).await.finished);
-        for status in ["Reviewed", "Failed", "Skipped"] {
+        for status in ["Reviewed", "Partial", "Failed", "Skipped"] {
             db.update_patchset_status(ps, status).await.unwrap();
             assert!(patchset_activity(addr, ps).await.finished, "{status}");
         }

@@ -213,7 +213,7 @@ for _ in $(seq 1 120); do
         fi
     fi
 
-    case "$STATUS" in Reviewed|Failed|Cancelled|"Failed To Apply"|Skipped) break ;; esac
+    case "$STATUS" in Reviewed|Partial|Failed|Cancelled|"Failed To Apply"|Skipped) break ;; esac
     sleep 2
 done
 
