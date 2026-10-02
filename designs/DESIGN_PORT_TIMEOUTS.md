@@ -733,16 +733,48 @@ separate cleanup.
 its own review row, so the timings never mix attempts, and on a failed row
 they answer "which stage used up the time".
 
+They list every stage that ran, not only the ones that finished. A stage
+that did not run to completion keeps its elapsed seconds and its turns up to
+the moment it stopped, and is marked with what stopped it:
+
+```rust
+pub struct StageTiming {
+    pub stage: String, pub seconds: u64, pub turns: u64,
+    /// `None` for a stage that ran to completion; left out of the JSON then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_by: Option<StageStopCause>,
+}
+```
+
+Without this the one stage the timings left out was the one that used up
+the time: an end-to-end run killed deduplication at the hard limit after
+about 18 s, and that time survived only inside its failure reason's text.
+The clock of a stage stops where the stage stops: at the worker's
+`StageFailed` for a failure it reports, and in `settle` for a stage the
+worker left running, which measures once so the timing and the reason give
+the same time. Because a running stage has no final time until then, the
+daemon writes the timings in `settle_attempt`, after `settle`, rather than
+when the I/O loop returns. Each stage is one timing whatever it went
+through: a stage that wound down and finished is listed once, with
+`stopped_by: cut_short`, never as a finished timing and a stopped one. A
+stage that stopped without ever reporting a start has no timing, as a
+finish with no start never had. Every timing with `stopped_by` has a
+matching entry in `stopped()` with the same cause.
+
 **`StageTracker`** (`activity.rs:1419-1490`) gains typed per-stage state, so
 the daemon knows which stages are still running without reading registry
 rows back:
 
 ```rust
+/// How far a stage got.
+struct StageRun { seconds: u64, turns: u64 }
+
 enum TrackedStage {
     Running { key: ActivityKey, started: Instant, turns: u64 },
     /// `cut_short` comes from `StageFinished { cut_short }` (§3.6).
-    Done { timing: StageTiming, cut_short: bool },
-    Failed { reason: String, cause: StageStopCause },
+    Done { run: StageRun, cut_short: bool },
+    /// `run` is `None` when the stage never reported a start.
+    Failed { reason: String, cause: StageStopCause, run: Option<StageRun> },
 }
 ```
 
@@ -750,9 +782,11 @@ enum TrackedStage {
   routing `StageFailed` through `ProgressUpdate::Set`.
 - `fn settle(&mut self, cause: StageStopCause) -> Vec<StageFailureRecord>`
   switches every `Running` stage's live row to
-  `Phase::StageFailed { cause, reason }` and returns the records. The reason
-  is "still running when the review stopped, after {format_elapsed} and {N}
-  turn(s)". `Done` and `Failed` rows are left alone.
+  `Phase::StageFailed { cause, reason }`, keeps the time it ran, and returns
+  the records. The reason is "still running when the review stopped, after
+  {format_elapsed} and {N} turn(s)". `Done` and `Failed` rows are left alone.
+- `fn timings(&self) -> Vec<StageTiming>` returns every `Done` stage and
+  every `Failed` stage with a `run`, each with its `stopped_by` as above.
 - `fn stopped(&self) -> Vec<StageFailureRecord>` returns every stage that
   did not run to completion: each `Failed` stage with its own cause, and
   each `Done { cut_short: true }` stage with cause `CutShort` and the reason
@@ -1067,6 +1101,12 @@ only JSON content moves.
 
 - `reviews.stage_failures` entries become
   `{stage, reason, cause, patch_index?}` instead of `{stage, reason, cancelled}`.
+- `reviews.stage_durations` entries gain `stopped_by` (a `StageStopCause`)
+  for a stage that did not run to completion (§3.9). A finished stage's
+  entry is unchanged, `{stage, seconds, turns}`, so rows written before it
+  read as finished. The page joins a duration with `stopped_by` to its
+  stage's failure as one stopped row showing the time it ran, and never
+  shows or counts it as done; the CLI prints the cause label after it.
 - Readers (the UI and the CLI `print_coverage_warning`,
   `bin/sashiko-cli.rs:1202-1229`) fall back to `cancelled` when `cause` is
   missing: `cause ?? (cancelled ? 'stopped' : 'error')`. A legacy
@@ -1141,7 +1181,9 @@ on any list route or CLI command, so there is no filter to extend.
   gives "stopped". `Phase::StageFailed`'s description text in `activity.rs`
   uses the same labels.
 - A recorded stage that appears in both `stage_durations` and
-  `stage_failures(cut_short)` is shown as one row: "cut short after Xs".
+  `stage_failures(cut_short)` is shown as one row: "cut short after Xs". Its
+  duration carries `stopped_by: cut_short` (§3.9), which is how the page
+  joins the two; the same join gives any stopped stage its time.
 - The live `StageDone { cut_short }` uses the same wording.
 - A Partial review card adds, under the coverage banner: "Any findings below
   come only from the stages that finished."
@@ -1256,7 +1298,10 @@ salvage_seconds = 1800
 - **Tracker.** `stages_left_mid_turn_stop_claiming_to_be_running`: `Running`
   stages are settled with the given cause, and `Done`/`Failed` are untouched.
   `stopped()` includes a `Done { cut_short: true }` stage with cause
-  `CutShort`.
+  `CutShort`. `timings()` lists every stage that ran: a settled stage and a
+  stage whose failure the worker reported keep the time they ran up to the
+  stop, with `stopped_by`, and a cut-short stage is one timing. A finished
+  timing's JSON is unchanged and an old one reads as finished.
 - **PatchOutcome.** `as_str` round-trip, and the existing SQL gate tests are
   unchanged. `prior_final_outcome` returns `Partial` and `TimedOut` for those
   patch statuses and keeps today's answer for a Failed row with no
@@ -1302,8 +1347,9 @@ salvage_seconds = 1800
   ends `Failed`.
 - `test_timeout_is_typed_when_the_worker_never_salvages`: expect
   `ReviewTimedOut` by downcast, the live log promoted with its header,
-  unfinished stages written with `out_of_time`, timings written, patch
-  `TimedOut`, and a single attempt.
+  unfinished stages written with `out_of_time`, timings written (the
+  killed stage's with `stopped_by: out_of_time`), patch `TimedOut`, and a
+  single attempt.
 - New: after `wind_down` the worker prints an error output whose patch
   carries `review_stopped_by: "out_of_time"` and streams a `stage_failed`
   with cause `out_of_time` first. Expect `TimedOut`, the tracker's stage
