@@ -128,6 +128,24 @@ impl FromStr for ReviewStatus {
 }
 
 impl ReviewStatus {
+    /// Every status, in declaration order. Tests iterate it to check that a
+    /// rule holds for each status, so a status added later is checked too.
+    /// The `position` match in this file's tests is exhaustive and requires
+    /// each variant to name its slot here, so a new variant fails to compile
+    /// the tests until it is listed.
+    #[cfg(test)]
+    pub(crate) const ALL: [ReviewStatus; 9] = [
+        ReviewStatus::Incomplete,
+        ReviewStatus::Pending,
+        ReviewStatus::InReview,
+        ReviewStatus::Cancelled,
+        ReviewStatus::Skipped,
+        ReviewStatus::Reviewed,
+        ReviewStatus::Partial,
+        ReviewStatus::Failed,
+        ReviewStatus::FailedToApply,
+    ];
+
     pub fn as_str(&self) -> &'static str {
         match self {
             ReviewStatus::Incomplete => "Incomplete",
@@ -218,20 +236,9 @@ mod tests {
         PatchOutcome::Cancelled,
     ];
 
-    /// Every status, in declaration order. `position` matches exhaustively,
-    /// so a new variant does not compile until it is listed here too.
-    const ALL_STATUSES: [ReviewStatus; 9] = [
-        ReviewStatus::Incomplete,
-        ReviewStatus::Pending,
-        ReviewStatus::InReview,
-        ReviewStatus::Cancelled,
-        ReviewStatus::Skipped,
-        ReviewStatus::Reviewed,
-        ReviewStatus::Partial,
-        ReviewStatus::Failed,
-        ReviewStatus::FailedToApply,
-    ];
-
+    /// The slot each status takes in `ReviewStatus::ALL`. The match is
+    /// exhaustive, so a new variant must state its slot here, and the test
+    /// below fails until `ALL` lists it in that slot.
     fn position(status: ReviewStatus) -> usize {
         match status {
             ReviewStatus::Incomplete => 0,
@@ -248,7 +255,7 @@ mod tests {
 
     #[test]
     fn every_review_status_reads_back_as_itself() {
-        for (index, status) in ALL_STATUSES.into_iter().enumerate() {
+        for (index, status) in ReviewStatus::ALL.into_iter().enumerate() {
             assert_eq!(position(status), index, "{status:?} is listed out of place");
             assert_eq!(status.to_string(), status.as_str(), "{status:?}");
             assert_eq!(ReviewStatus::from_str(status.as_str()), Ok(status));

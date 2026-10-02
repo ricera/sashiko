@@ -70,6 +70,15 @@ const CLOSED_TO_NEW_PARTS_SQL: &str = "(status = 'Cancelled'
 const RESUBMITTABLE_STATUSES_SQL: &str =
     "('Partial', 'Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply')";
 
+/// The patchset statuses an embargo holds back and releases when it ends, as
+/// an SQL list for `status IN` tests. They are the finished reviews that
+/// [`shown_under_embargo`] masks as Embargoed, and a test below checks that
+/// the two agree, so a status is never hidden by an embargo that cannot
+/// release it. A Partial patchset is released at `embargo_until` only,
+/// never early, because [`CLEAN_PATCHSET_PREDICATE`] is false for it.
+#[cfg(feature = "server")]
+const EMBARGO_RELEASED_STATUSES_SQL: &str = "('Reviewed', 'Partial')";
+
 /// The patch verdicts of a review that ran out of time. Each is final when
 /// a patchset is processed again, and each is cleared by a rerun or a
 /// resubmission, which ask for the patch to be reviewed again.
@@ -8634,6 +8643,8 @@ impl Database {
         Ok(patchsets)
     }
 
+    /// The embargoed patchsets due for release at `now`: a Reviewed or
+    /// Partial patchset whose embargo has ended, or a clean one early.
     pub async fn get_releasable_embargoed_patchsets(
         &self,
         now: i64,
@@ -8642,7 +8653,7 @@ impl Database {
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters, p.embargo_until, p.slug, p.mr_url, p.mr_title, p.mr_number
              FROM patchsets p
-             WHERE p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+             WHERE p.status IN {EMBARGO_RELEASED_STATUSES_SQL} AND p.embargo_until IS NOT NULL
              AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
              AND (
                  p.embargo_until <= ?
@@ -8791,10 +8802,14 @@ impl Database {
         }
     }
 
+    /// Claims the release of a patchset that is still due for it, under the
+    /// same conditions as [`Self::get_releasable_embargoed_patchsets`], so
+    /// two release passes running at once do not both send it.
     pub async fn claim_patchset_embargo_release(&self, id: i64, now: i64) -> Result<bool> {
         let sql = format!(
             "UPDATE patchsets AS p SET embargo_release_started_at = ?
-             WHERE p.id = ? AND p.status = 'Reviewed' AND p.embargo_until IS NOT NULL
+             WHERE p.id = ? AND p.status IN {EMBARGO_RELEASED_STATUSES_SQL}
+               AND p.embargo_until IS NOT NULL
                AND (p.embargo_release_started_at IS NULL OR p.embargo_release_started_at <= ?)
                AND (p.embargo_until <= ? OR ({CLEAN_PATCHSET_PREDICATE}))"
         );
@@ -12149,6 +12164,149 @@ mod tests {
             );
         }
         assert_eq!(shown_under_embargo(None, true), None);
+    }
+
+    /// The statuses an embargo releases are exactly the ones it masks, so no
+    /// status is shown as Embargoed by an embargo that can never end it.
+    /// The statuses come from `ReviewStatus::ALL`, so a status added later is
+    /// checked too, followed by the stored values that no variant spells.
+    #[tokio::test]
+    async fn test_an_embargo_releases_the_statuses_it_masks() {
+        let db = setup_db().await;
+        let unspelled = [
+            LEGACY_FAILED_TO_APPLY,
+            PatchOutcome::TimedOut.as_str(),
+            "Fetching",
+        ];
+        let statuses = ReviewStatus::ALL
+            .iter()
+            .map(|status| status.as_str())
+            .chain(unspelled);
+        for status in statuses {
+            let mut rows = db
+                .conn
+                .query(
+                    &format!("SELECT ? IN {EMBARGO_RELEASED_STATUSES_SQL}"),
+                    libsql::params![status],
+                )
+                .await
+                .unwrap();
+            let released = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() != 0;
+            let masked =
+                shown_under_embargo(Some(status.to_string()), true).as_deref() == Some("Embargoed");
+            assert_eq!(released, masked, "{status}");
+        }
+    }
+
+    /// An embargoed Partial patchset is released when its embargo ends and
+    /// not a second before: its Partial patch keeps it from counting as
+    /// clean, even though its Reviewed patch has no findings. The release
+    /// sends the Reviewed review only, and the same series Failed is never
+    /// released, which shows the status is what lets the Partial one go.
+    #[tokio::test]
+    async fn test_an_embargoed_partial_patchset_is_released_when_its_embargo_ends() {
+        let db = setup_db().await;
+        let (ps_id, first) = one_part_series(&db, "msg_partial_release", 74000).await;
+        let thread_id: i64 = db
+            .conn
+            .query(
+                "SELECT thread_id FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        db.create_message(
+            "msg_partial_release_2",
+            thread_id,
+            None,
+            "Author <author@example.com>",
+            "Part 2",
+            74001,
+            "body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let second = db
+            .create_patch(ps_id, "msg_partial_release_2", 2, "diff")
+            .await
+            .unwrap();
+        let reviewed = db
+            .create_review(ps_id, Some(first), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(reviewed, "Reviewed", "ok", Some("s"), None, Some("i"), None)
+            .await
+            .unwrap();
+        finished_review_with_a_finding(&db, ps_id, second, "Partial").await;
+        db.update_patch_status(first, PatchOutcome::Reviewed)
+            .await
+            .unwrap();
+        db.update_patch_status(second, PatchOutcome::Partial)
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_id, "Partial").await.unwrap();
+        let until = chrono::Utc::now().timestamp() + 3600;
+        db.set_patchset_embargo_until(ps_id, until).await.unwrap();
+
+        let due_at = |now: i64| {
+            let db = db.clone();
+            async move {
+                db.get_releasable_embargoed_patchsets(now, 10)
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|patchset| patchset.id == ps_id)
+            }
+        };
+
+        assert!(!is_clean_patchset(&db, ps_id).await);
+        let list = db.get_patchsets(10, 0, None, None).await.unwrap();
+        assert_eq!(list[0].status.as_deref(), Some("Embargoed"));
+        assert!(
+            !due_at(until - 1).await,
+            "released before its embargo ended"
+        );
+        assert!(
+            !db.claim_patchset_embargo_release(ps_id, until - 1)
+                .await
+                .unwrap()
+        );
+
+        assert!(due_at(until).await, "not released when its embargo ended");
+        assert!(
+            db.claim_patchset_embargo_release(ps_id, until)
+                .await
+                .unwrap()
+        );
+        let released: Vec<i64> = db
+            .get_completed_reviews_for_release(ps_id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(released, vec![reviewed], "only the Reviewed review is sent");
+
+        db.clear_patchset_embargo_release_claim(ps_id)
+            .await
+            .unwrap();
+        db.update_patchset_status(ps_id, "Failed").await.unwrap();
+        assert!(!due_at(until + 1).await, "a Failed patchset was released");
+        assert!(
+            !db.claim_patchset_embargo_release(ps_id, until + 1)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
