@@ -2024,7 +2024,7 @@ impl Reviewer {
                 ctx.settings.ai.no_ai,
                 Self::patchset_cancelled(ctx, patchset_id).await,
             );
-            let conversation = Self::settle_attempt(ctx, review_id, &mut stages, &end).await;
+            let conversation = Self::settle_attempt(ctx, review_id, index, &mut stages, &end).await;
             let trace = AttemptTrace {
                 conversation,
                 tokens,
@@ -2210,10 +2210,12 @@ impl Reviewer {
     /// Settling always runs, because it is also what stops a killed worker's
     /// stage rows claiming to be mid-turn. When the worker returned a review,
     /// its own list of stage failures and its own history are the record, and
-    /// nothing is still running in practice.
+    /// nothing is still running in practice. `patch_index` is the reviewed
+    /// patch's index in its series, which the stored stage failures carry.
     async fn settle_attempt(
         ctx: &ReviewContext,
         review_id: i64,
+        patch_index: i64,
         stages: &mut crate::activity::StageTracker,
         end: &AttemptEnd,
     ) -> Option<String> {
@@ -2230,7 +2232,7 @@ impl Reviewer {
         if end.has_worker_review() {
             return None;
         }
-        Self::record_unfinished_attempt(ctx, review_id, stages).await
+        Self::record_unfinished_attempt(ctx, review_id, patch_index, stages).await
     }
 
     /// Writes the daemon's record of an attempt with no review from the
@@ -2245,10 +2247,11 @@ impl Reviewer {
     async fn record_unfinished_attempt(
         ctx: &ReviewContext,
         review_id: i64,
+        patch_index: i64,
         stages: &crate::activity::StageTracker,
     ) -> Option<String> {
         let project = ctx.settings.project.kind.unwrap_or_default();
-        Self::store_stopped_stages(ctx, review_id, project, stages).await;
+        Self::store_stage_failures(ctx, review_id, patch_index, stages.stopped()).await;
         match promoted_live_log(&ctx.db, review_id, project).await {
             Ok(log) => log,
             Err(e) => {
@@ -2293,25 +2296,28 @@ impl Reviewer {
         }
     }
 
-    /// Writes the stages of an unfinished attempt that did not run to
-    /// completion, in pipeline order.
+    /// Writes `failures`, the stages of review `review_id` that did not run
+    /// to completion, as its `stage_failures`. Writes nothing when there are
+    /// none.
     ///
-    /// Taken from the stage tracker, which saw every stage failure the worker
-    /// reported as well as the stages settled when it stopped.
-    async fn store_stopped_stages(
+    /// The one writer of the column. The worker's list for a review it
+    /// returned and the stage tracker's for an attempt that ended without one
+    /// (every stage failure the worker reported, and the stages settled when
+    /// it stopped) both come through here, so a reader meets one shape
+    /// whichever wrote the row: see [`stored_stage_failures`].
+    async fn store_stage_failures(
         ctx: &ReviewContext,
         review_id: i64,
-        project: crate::project::ProjectId,
-        stages: &crate::activity::StageTracker,
+        patch_index: i64,
+        failures: Vec<crate::activity::StageFailureRecord>,
     ) {
-        let mut failures = stages.stopped();
         if failures.is_empty() {
             return;
         }
-        failures.sort_by_cached_key(|f| pipeline_position(project, &f.stage));
-        let stored = match serde_json::to_string(&failures) {
+        let project = ctx.settings.project.kind.unwrap_or_default();
+        let stored = match stored_stage_failures(failures, project, patch_index) {
             Ok(json) => ctx.db.set_review_stage_failures(review_id, &json).await,
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         };
         if let Err(e) = stored {
             warn!(
@@ -2403,7 +2409,8 @@ impl Reviewer {
         trace: AttemptTrace,
     ) -> (Option<String>, Option<String>) {
         let interaction_id = Self::record_interaction(ctx, review_id, output, trace.tokens).await;
-        let history = output.and_then(worker_history_log);
+        let project = ctx.settings.project.kind.unwrap_or_default();
+        let history = output.and_then(|o| worker_history_log(o, project));
         (interaction_id, trace.conversation.or(history))
     }
 
@@ -2418,7 +2425,8 @@ impl Reviewer {
         relayed: AttemptTokens,
     ) -> (Option<String>, Option<String>) {
         let interaction_id = Self::record_interaction(ctx, review_id, Some(output), relayed).await;
-        (interaction_id, worker_history_log(output))
+        let project = ctx.settings.project.kind.unwrap_or_default();
+        (interaction_id, worker_history_log(output, project))
     }
 
     /// Stores an attempt's token counts as an AI interaction, and returns
@@ -2485,30 +2493,46 @@ impl Reviewer {
     }
 
     /// Records incomplete coverage the worker reported for a review it
-    /// returned. Written before anything else touches the review row, so a
-    /// partial review can never be presented as a complete one.
-    async fn store_worker_stage_failures(ctx: &ReviewContext, review_id: i64, output: &Value) {
-        let failures = reported_stage_failures(output);
+    /// returned, of the patch at `patch_index`. Written before anything else
+    /// touches the review row, so a partial review can never be presented as
+    /// a complete one.
+    ///
+    /// Stored typed, as [`incomplete_stages`] reads them to decide whether
+    /// the attempt was a salvage. An entry that does not read as a stage
+    /// failure is still a stage that did not finish, so it is stored as the
+    /// stand-in [`crate::activity::StageFailureRecord::read_reported`] makes
+    /// of it, and logged.
+    async fn store_worker_stage_failures(
+        ctx: &ReviewContext,
+        review_id: i64,
+        patch_index: i64,
+        output: &Value,
+    ) {
+        let mut failures = Vec::new();
+        for reported in reported_stage_failures(output) {
+            let (failure, error) = crate::activity::StageFailureRecord::read_reported(reported);
+            if let Some(e) = error {
+                warn!(
+                    "Review {}: a stage failure the worker reported does not read as one \
+                     ({}), stored as a failed stage: {}",
+                    review_id, e, reported
+                );
+            }
+            failures.push(failure);
+        }
         if failures.is_empty() {
             return;
         }
-        let stages: Vec<&str> = failures
-            .iter()
-            .filter_map(|f| f["stage"].as_str())
-            .collect();
         warn!(
             "Review {} completed with {} incomplete stage(s): {:?}",
             review_id,
             failures.len(),
-            stages
+            failures
+                .iter()
+                .map(|f| f.stage.as_str())
+                .collect::<Vec<_>>()
         );
-        let _ = ctx
-            .db
-            .set_review_stage_failures(
-                review_id,
-                &serde_json::Value::Array(failures.to_vec()).to_string(),
-            )
-            .await;
+        Self::store_stage_failures(ctx, review_id, patch_index, failures).await;
     }
 
     /// Stores an attempt in which the worker returned a review for the patch,
@@ -2520,7 +2544,7 @@ impl Reviewer {
         output: &Value,
         relayed: AttemptTokens,
     ) -> Result<AttemptVerdict> {
-        Self::store_worker_stage_failures(ctx, review_id, output).await;
+        Self::store_worker_stage_failures(ctx, review_id, patch.index, output).await;
         let (interaction_id, logs) =
             Self::record_worker_output(ctx, review_id, output, relayed).await;
 
@@ -2609,7 +2633,7 @@ impl Reviewer {
             patch.index,
             stopped.iter().map(|s| s.stage.as_str()).collect::<Vec<_>>()
         );
-        Self::store_worker_stage_failures(ctx, review_id, output).await;
+        Self::store_worker_stage_failures(ctx, review_id, patch.index, output).await;
         let (interaction_id, logs) =
             Self::record_worker_output(ctx, review_id, output, relayed).await;
         Self::store_review_findings(ctx, review_id, &output["review"]).await?;
@@ -3094,9 +3118,9 @@ impl AttemptEnd {
     }
 }
 
-/// The stage failures the worker reported with its review, in the stored
-/// `{stage, reason, cause}` shape: the review's own list, or else the
-/// output's top-level one.
+/// The stage failures the worker reported with its review, untyped: the
+/// review's own list, or else the output's top-level one. Read through
+/// [`incomplete_stages`], which types them as the stored shape.
 fn reported_stage_failures(output: &Value) -> &[Value] {
     output
         .get("review")
@@ -3107,13 +3131,33 @@ fn reported_stage_failures(output: &Value) -> &[Value] {
 }
 
 /// The stages the worker reported as not run to completion, typed. An
-/// entry that does not read as a stage failure is left out: it cannot say
-/// what stopped its stage, and the raw list is stored as it came anyway.
+/// entry that does not read as a stage failure is kept as the stand-in
+/// [`crate::activity::StageFailureRecord::read_reported`] makes of it.
 fn incomplete_stages(output: &Value) -> Vec<crate::activity::StageFailureRecord> {
     reported_stage_failures(output)
         .iter()
-        .filter_map(|f| serde_json::from_value(f.clone()).ok())
+        .map(|f| crate::activity::StageFailureRecord::read_reported(f).0)
         .collect()
+}
+
+/// `failures` as the `reviews.stage_failures` column stores them: in the
+/// project's pipeline order, each marked with `patch_index`, the reviewed
+/// patch's index in its series.
+///
+/// Every row goes through here, whichever path wrote it, so the column has
+/// one shape. The worker's records already name the patch when it reviewed a
+/// series; the daemon sets it on every record all the same, because it
+/// spawned the worker for that one patch and the tracker's records name none.
+fn stored_stage_failures(
+    mut failures: Vec<crate::activity::StageFailureRecord>,
+    project: crate::project::ProjectId,
+    patch_index: i64,
+) -> Result<String> {
+    for failure in &mut failures {
+        failure.patch_index = Some(patch_index);
+    }
+    failures.sort_by_cached_key(|f| pipeline_position(project, &f.stage));
+    Ok(serde_json::to_string(&failures)?)
 }
 
 /// Whether an attempt that returned a review is a salvage: the worker was
@@ -3180,16 +3224,12 @@ async fn promoted_live_log(
     review_id: i64,
     project: crate::project::ProjectId,
 ) -> Result<Option<String>> {
-    let mut entries = db.get_review_log_entries(review_id, None).await?;
+    let entries = db.get_review_log_entries(review_id, None).await?;
     if entries.is_empty() {
         return Ok(None);
     }
-    for entry in &mut entries {
-        entry.label_stage(project);
-    }
     let capped = db.review_live_log_span(review_id).await?.capped;
-    let log = unfinished_log(entries, capped)?;
-    Ok(Some(serde_json::to_string_pretty(&log)?))
+    stored_log(unfinished_log(entries, capped), project).map(Some)
 }
 
 /// The final log of a review that did not finish, built from what it
@@ -3198,9 +3238,13 @@ async fn promoted_live_log(
 /// A system message heads it, so a reader does not take the conversation for
 /// the whole review. The entries keep their stage: stages run concurrently, so
 /// the stream interleaves their conversations, and the page tells them apart
-/// by it as it does in the live view. Each entry is a finished-log message
-/// plus where it sat, so the page draws it with the same renderer.
-fn unfinished_log(entries: Vec<crate::api::LiveLogEntry>, capped: bool) -> Result<Value> {
+/// by it as it does in the live view. Each keeps only its stored-log part: the
+/// stream's `seq` and `created_at` placed it in a poll, and a finished log is
+/// not polled.
+fn unfinished_log(
+    entries: Vec<crate::api::LiveLogEntry>,
+    capped: bool,
+) -> Vec<crate::api::ReviewLogEntry> {
     let cap_note = if capped {
         format!(", capped at {} entries", crate::db::MAX_LIVE_LOG_ENTRIES)
     } else {
@@ -3216,11 +3260,76 @@ fn unfinished_log(entries: Vec<crate::api::LiveLogEntry>, capped: bool) -> Resul
         tool_calls: None,
         tool_call_id: None,
     };
-    let mut log = vec![serde_json::to_value(header)?];
-    for entry in entries {
-        log.push(serde_json::to_value(entry)?);
+    std::iter::once(crate::api::ReviewLogEntry::new(None, header))
+        .chain(entries.into_iter().map(|live| live.entry))
+        .collect()
+}
+
+/// The worker output's history as a review's log, or `None` when it has
+/// none.
+///
+/// Read as [`crate::api::ReviewLogEntry`] values, the shape the worker writes,
+/// and stored through [`stored_log`] as a promoted live log is, so a review's
+/// log has one shape whichever path wrote it. An entry that does not read as
+/// a message is kept as a system stand-in that says so, never left out: the
+/// review map's log_start and log_end index this array, so dropping one would
+/// point every later stage at the wrong messages.
+fn worker_history_log(output: &Value, project: crate::project::ProjectId) -> Option<String> {
+    let history = output.get("history")?.as_array()?;
+    let mut unreadable = 0usize;
+    let entries: Vec<crate::api::ReviewLogEntry> = history
+        .iter()
+        .map(|m| {
+            serde_json::from_value(m.clone()).unwrap_or_else(|e| {
+                unreadable = unreadable.saturating_add(1);
+                crate::api::ReviewLogEntry::new(
+                    m.get("stage").and_then(Value::as_str),
+                    crate::ai::AiMessage {
+                        role: crate::ai::AiRole::System,
+                        content: Some(format!("[This log entry was unreadable: {e}]")),
+                        thought: None,
+                        thought_signature: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                )
+            })
+        })
+        .collect();
+    if unreadable > 0 {
+        warn!(
+            "Kept {} of {} entries of the worker's history as stand-ins: they do not read as messages",
+            unreadable,
+            history.len()
+        );
     }
-    Ok(Value::Array(log))
+    match stored_log(entries, project) {
+        Ok(log) => Some(log),
+        Err(e) => {
+            warn!("Failed to render the worker's history as a log: {}", e);
+            None
+        }
+    }
+}
+
+/// `entries` as the `reviews.logs` column stores them: each labelled with
+/// the project's short label for its stage, thought signatures scrubbed, as
+/// a JSON array.
+///
+/// Both writers of the column, the worker's history and the daemon's
+/// promoted live log, go through here, so their entries cannot drift apart.
+/// Thought signatures are opaque provider state, not conversation, and are
+/// scrubbed through tool-call arguments too.
+fn stored_log(
+    mut entries: Vec<crate::api::ReviewLogEntry>,
+    project: crate::project::ProjectId,
+) -> Result<String> {
+    for entry in &mut entries {
+        entry.label_stage(project);
+    }
+    let mut log = serde_json::to_value(entries)?;
+    crate::ai::scrub_thought_signatures(&mut log);
+    Ok(serde_json::to_string_pretty(&log)?)
 }
 
 /// Where `stage` sits in the project's pipeline, as a sort key: stages the
@@ -4194,16 +4303,6 @@ impl StoredTokens {
             cached: output["tokens_cached"].as_u64().unwrap_or(0),
         })
     }
-}
-
-/// The worker output's history rendered as a review's log, with thought
-/// signatures scrubbed, or `None` when it has none.
-fn worker_history_log(output: &Value) -> Option<String> {
-    output.get("history").and_then(|h| {
-        let mut scrubbed = h.clone();
-        crate::ai::scrub_thought_signatures(&mut scrubbed);
-        serde_json::to_string_pretty(&scrubbed).ok()
-    })
 }
 
 /// Where the token counts stored for an attempt came from.
@@ -5615,7 +5714,13 @@ mod tests {
         let entries = run.db.get_review_log_entries(run.review_id, None).await?;
         let seen: Vec<(i64, Option<&str>, Option<&str>)> = entries
             .iter()
-            .map(|e| (e.seq, e.stage.as_deref(), e.message.content.as_deref()))
+            .map(|e| {
+                (
+                    e.seq,
+                    e.entry.stage.as_deref(),
+                    e.entry.message.content.as_deref(),
+                )
+            })
             .collect();
         assert_eq!(
             seen,
@@ -5626,8 +5731,11 @@ mod tests {
             ],
             "the earlier run's entry is gone and this run starts past its seq"
         );
-        assert_eq!(entries[2].message, call, "the message is stored whole");
-        assert_eq!(entries[0].message.role, AiRole::System);
+        assert_eq!(
+            entries[2].entry.message, call,
+            "the message is stored whole"
+        );
+        assert_eq!(entries[0].entry.message.role, AiRole::System);
 
         let mut rows = run
             .db
@@ -5727,6 +5835,7 @@ mod tests {
                 stage: stage(),
                 reason: "Failed to generate valid response".to_string(),
                 cause: crate::workflow::StageStopCause::Error,
+                patch_index: None,
             }]
         );
         Ok(())
@@ -8541,6 +8650,171 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .collect()
     }
 
+    /// The stored stage failures and log of the one review row a worker
+    /// running `script` leaves, as JSON.
+    async fn stored_record(script: &str) -> Result<(Value, Value)> {
+        let run = review_patch_with_worker(script, |s| s.review.max_retries = 0).await?;
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        let [review] = reviews.as_slice() else {
+            return Err(anyhow!("expected one review row, got {}", reviews.len()));
+        };
+        let logs = review["logs"]
+            .as_str()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or(Value::Null);
+        Ok((review["stage_failures"].clone(), logs))
+    }
+
+    /// The review map's log bounds index the stored log, so an entry of the
+    /// worker's history that does not read as a message is kept as a
+    /// stand-in rather than dropped, and the log stays as long as the
+    /// history.
+    #[test]
+    fn test_a_stored_worker_log_keeps_one_entry_per_history_entry() -> Result<()> {
+        let output = json!({"history": [
+            {"role": "system", "content": "system prompt"},
+            {"stage": "goal", "role": "assistant", "content": "first"},
+            42,
+            {"stage": "goal", "role": "assistant", "content": "second"},
+        ]});
+        let log = worker_history_log(&output, crate::project::ProjectId::Linux)
+            .ok_or_else(|| anyhow!("a history is stored"))?;
+        let log: Vec<Value> = serde_json::from_str(&log)?;
+        assert_eq!(log.len(), 4, "{log:?}");
+        assert_eq!(log[1]["content"], "first");
+        assert_eq!(log[2]["role"], "system");
+        assert!(
+            log[2]["content"]
+                .as_str()
+                .is_some_and(|c| c.contains("unreadable")),
+            "{log:?}"
+        );
+        assert_eq!(log[3]["content"], "second");
+        Ok(())
+    }
+
+    /// The two writers of a review row's record store one shape. A worker
+    /// that returns its review writes the stage failures and the history it
+    /// reports; the daemon writes them from what it tracked and streamed for
+    /// an attempt that ended without one. The same attempt, recorded either
+    /// way, must read the same: each failure names its patch, and each log
+    /// entry is the message with its stage and label, without the stream's
+    /// `seq` and `created_at`.
+    #[tokio::test]
+    async fn test_both_writers_store_one_shape() -> Result<()> {
+        use crate::activity::ProgressWire;
+
+        let mut lines = stage_reaching("security", 1);
+        lines.push(progress(
+            1,
+            ProgressWire::StageFailed {
+                stage: "security".into(),
+                reason: "provider unavailable".into(),
+                cause: crate::workflow::StageStopCause::Error,
+            },
+        ));
+        lines.push(streamed(None, "system prompt"));
+        lines.push(streamed(Some("goal"), "looking"));
+
+        // As the worker writes them: the series' failure list names the
+        // patch, and the history marks each message with its stage.
+        let mut finished: Value = serde_json::from_str(&reviewed_output(json!([{
+            "stage": "security",
+            "reason": "provider unavailable",
+            "cause": "error",
+            "patch_index": 1,
+        }])))?;
+        finished["history"] = json!([
+            {"role": "system", "content": "system prompt"},
+            {"stage": "goal", "role": "assistant", "content": "looking"},
+        ]);
+        let worker = worker_reporting_then(&lines, &format!("echo '{finished}'\n"));
+        let daemon =
+            worker_reporting_then(&lines, &format!("echo '{}'\n", error_output("boom", None)));
+
+        let (worker_failures, worker_log) = stored_record(&worker).await?;
+        let (daemon_failures, daemon_log) = stored_record(&daemon).await?;
+
+        let expected_failures = json!([{
+            "stage": "security",
+            "reason": "provider unavailable",
+            "cause": "error",
+            "patch_index": 1,
+        }]);
+        assert_eq!(worker_failures, expected_failures, "the worker's record");
+        assert_eq!(daemon_failures, expected_failures, "the daemon's record");
+
+        let goal_label =
+            crate::workflows::stage_short_label(crate::project::ProjectId::Linux, "goal")
+                .ok_or_else(|| anyhow!("goal has a label"))?;
+        let expected_log = json!([
+            {"role": "system", "content": "system prompt"},
+            {"stage": "goal", "stage_label": goal_label, "role": "assistant", "content": "looking"},
+        ]);
+        assert_eq!(worker_log, expected_log, "the worker's history");
+        let daemon_log = daemon_log.as_array().cloned().unwrap_or_default();
+        assert_eq!(
+            daemon_log.first().map(|h| &h["content"]),
+            Some(&json!(UNFINISHED_LOG_HEADER)),
+            "the daemon's log says the review did not finish"
+        );
+        assert_eq!(
+            Value::Array(daemon_log[1..].to_vec()),
+            expected_log,
+            "the daemon's promoted log"
+        );
+        Ok(())
+    }
+
+    /// The worker's stage failures are stored the way the daemon stores its
+    /// own: in pipeline order, each naming the reviewed patch whatever the
+    /// worker wrote, and an entry that does not read as a stage failure kept
+    /// as a failed stage rather than dropped, so the review is never stored
+    /// as complete.
+    #[tokio::test]
+    async fn test_worker_stage_failures_are_stored_for_the_patch_in_order() -> Result<()> {
+        let output = reviewed_output(json!([
+            {"stage": "security", "reason": "provider unavailable", "cause": "error"},
+            {"stage": "goal", "reason": "out of time", "cause": "out_of_time", "patch_index": 7},
+            {"stage": "locking", "reason": "no cause"},
+            42,
+        ]));
+        let script = worker_reporting_then(&[], &format!("echo '{output}'\n"));
+        let (failures, _) = stored_record(&script).await?;
+
+        let stored: Vec<(String, String, Option<i64>)> = failures
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|f| {
+                (
+                    f["stage"].as_str().unwrap_or_default().to_string(),
+                    f["cause"].as_str().unwrap_or_default().to_string(),
+                    f["patch_index"].as_i64(),
+                )
+            })
+            .collect();
+        let expected: Vec<(String, String, Option<i64>)> = [
+            ("goal", "out_of_time"),
+            ("locking", "error"),
+            ("security", "error"),
+            ("unknown", "error"),
+        ]
+        .into_iter()
+        .map(|(stage, cause)| (stage.to_string(), cause.to_string(), Some(1)))
+        .collect();
+        assert_eq!(stored, expected, "{failures}");
+        for unreadable in [1, 3] {
+            let reason = failures[unreadable]["reason"].as_str().unwrap_or_default();
+            assert!(
+                reason.starts_with("the report of this stage was unreadable"),
+                "{reason}"
+            );
+        }
+        Ok(())
+    }
+
     /// A worker whose review fails reports it in an output, not an error, and
     /// that output carries no stage list. The row must still say which stages
     /// stopped and how far each got, and the attempt is retried as before.
@@ -10175,28 +10449,31 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
     }
 
     /// A promoted log opens with a header saying the review did not finish,
-    /// and keeps each entry whole, with its stage, in the order streamed.
+    /// and keeps each entry whole, with its stage, in the order streamed,
+    /// but not the stream's own `seq` and `created_at`.
     #[test]
     fn an_unfinished_log_is_headed_and_keeps_each_entry_whole() -> Result<()> {
         use crate::ai::{AiMessage, AiRole};
 
         let entry = |seq: i64, stage: Option<&str>, content: &str| crate::api::LiveLogEntry {
             seq,
-            stage: stage.map(str::to_string),
-            stage_label: stage.map(|s| format!("label of {s}")),
             created_at: 100 + seq,
-            message: AiMessage {
-                role: AiRole::User,
-                content: Some(content.to_string()),
-                thought: None,
-                thought_signature: None,
-                tool_calls: None,
-                tool_call_id: None,
+            entry: crate::api::ReviewLogEntry {
+                stage: stage.map(str::to_string),
+                stage_label: stage.map(|s| format!("label of {s}")),
+                message: AiMessage {
+                    role: AiRole::User,
+                    content: Some(content.to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
             },
         };
         let entries = vec![entry(3, None, "first"), entry(4, Some("goal"), "second")];
 
-        let log = unfinished_log(entries.clone(), false)?;
+        let log = serde_json::to_value(unfinished_log(entries.clone(), false))?;
         let log = log.as_array().cloned().unwrap_or_default();
         assert_eq!(log.len(), 3);
         assert_eq!(
@@ -10204,20 +10481,24 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             json!({"role": "system", "content": UNFINISHED_LOG_HEADER})
         );
         for (stored, entry) in log[1..].iter().zip(&entries) {
-            let back: crate::api::LiveLogEntry = serde_json::from_value(stored.clone())?;
-            assert_eq!(&back, entry, "the entry is stored whole");
+            let back: crate::api::ReviewLogEntry = serde_json::from_value(stored.clone())?;
+            assert_eq!(&back, &entry.entry, "the entry is stored whole");
+            assert!(
+                stored.get("seq").is_none() && stored.get("created_at").is_none(),
+                "the stream's bookkeeping is not part of a stored log: {stored}"
+            );
         }
         assert_eq!(log[2]["role"], "user", "the message's fields stay flat");
         assert_eq!(log[2]["stage_label"], "label of goal");
 
-        let capped = unfinished_log(entries, true)?;
+        let capped = unfinished_log(entries, true);
         assert_eq!(
-            capped[0]["content"],
-            format!(
+            capped[0].message.content,
+            Some(format!(
                 "[The review did not finish. This is the conversation streamed while it ran, \
                  capped at {} entries.]",
                 crate::db::MAX_LIVE_LOG_ENTRIES
-            ),
+            )),
             "a capped stream says it is not the whole conversation"
         );
         Ok(())

@@ -3105,6 +3105,20 @@ mod tests {
                 "stopped",
             ),
             (serde_json::json!({}), "failed"),
+            // A whole stored entry, as either writer stores it, with the
+            // fields the API adds beside it. Only `cause` decides the label,
+            // so this and the next case pin that the stored shape and an
+            // older daemon row without `patch_index` keep reading the same.
+            (
+                serde_json::json!({"stage": "security", "reason": "r", "cause": "out_of_time",
+                                   "patch_index": 2, "order": 3, "stage_label": "Security"}),
+                "stopped: out of time",
+            ),
+            // A daemon row written before the record named its patch.
+            (
+                serde_json::json!({"stage": "security", "reason": "r", "cause": "interrupted"}),
+                "still running when the review stopped",
+            ),
         ] {
             assert_eq!(stage_failure_label(&failure), expected, "{failure}");
         }

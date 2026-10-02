@@ -18,8 +18,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-use crate::ai::AiMessage;
 use crate::ai::session::{SessionStopped, StopCause};
+use crate::api::ReviewLogEntry;
 
 use super::events::WorkflowEvent;
 use super::graph::{Workflow, WorkflowStep};
@@ -46,7 +46,13 @@ pub struct WorkflowOutcome {
     pub tokens_in: u32,
     pub tokens_out: u32,
     pub tokens_cached: u32,
-    pub history: Vec<AiMessage>,
+    /// Every stage's conversation, each message marked with the stage it
+    /// belongs to: the shape a review's stored log keeps, so the log a worker
+    /// returns and the one the daemon keeps from the stream agree.
+    ///
+    /// One entry per message, so each StageRunRecord's
+    /// history_start..history_end still indexes this vector.
+    pub history: Vec<ReviewLogEntry>,
     pub stage_runs: Vec<StageRunRecord>,
     pub early_exit: bool,
     pub early_exit_reason: Option<&'static str>,
@@ -239,7 +245,12 @@ fn record_stage_outcome(
     outcome.tokens_cached = outcome
         .tokens_cached
         .saturating_add(stage_outcome.tokens_cached);
-    outcome.history.extend(stage_outcome.history);
+    outcome.history.extend(
+        stage_outcome
+            .history
+            .into_iter()
+            .map(|message| ReviewLogEntry::new(Some(stage_name), message)),
+    );
     let history_end = outcome.history.len();
     outcome.stage_runs.push(StageRunRecord {
         name: stage_name.to_string(),
@@ -938,6 +949,17 @@ mod tests {
         assert_eq!(outcome.stage_runs[2].history_start, 2);
         assert_eq!(outcome.stage_runs[2].history_end, 4);
         assert_eq!(outcome.history.len(), 4);
+        // Tagging is one entry per message, so each stage's recorded bounds
+        // still cover exactly its own messages.
+        for run in &outcome.stage_runs {
+            assert!(
+                outcome.history[run.history_start..run.history_end]
+                    .iter()
+                    .all(|e| e.stage.as_deref() == Some(run.name.as_str())),
+                "{} owns its history slice",
+                run.name
+            );
+        }
     }
 
     #[tokio::test]
@@ -992,6 +1014,17 @@ mod tests {
         assert_eq!(wf.outcome.tokens_in, 40);
         assert_eq!(wf.outcome.tokens_out, 20);
         assert!(!wf.outcome.history.is_empty());
+        // Tagging is one entry per message, so each stage's recorded bounds
+        // still cover exactly its own messages.
+        for run in &wf.outcome.stage_runs {
+            assert!(
+                wf.outcome.history[run.history_start..run.history_end]
+                    .iter()
+                    .all(|e| e.stage.as_deref() == Some(run.name.as_str())),
+                "{} owns its history slice",
+                run.name
+            );
+        }
     }
 
     #[tokio::test]
