@@ -587,6 +587,8 @@ async fn test_stats_reviews_and_tools_endpoints() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["total_reviews"], 1005);
     assert_eq!(body["total_failures"], 5);
+    assert_eq!(body["total_partial"], 0);
+
     let reviews = body["reviews"].as_array().unwrap();
     assert_eq!(reviews.len(), 1);
     let group = &reviews[0];
