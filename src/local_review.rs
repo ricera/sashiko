@@ -184,9 +184,12 @@ pub enum ProgressEvent {
         turn: usize,
         max_turns: usize,
     },
+    /// A stage finished. `cut_short` is set when the review ran out of time
+    /// while it gathered evidence, so its output covers less than a full run.
     AiReviewStageFinished {
         patch_index: i64,
         stage: String,
+        cut_short: bool,
     },
     /// A stage stopped without finishing. Distinct from
     /// [`ProgressEvent::AiReviewStageFinished`] because the two mean opposite
@@ -715,9 +718,14 @@ fn to_wire(event: &ProgressEvent) -> Option<(i64, crate::activity::ProgressWire)
                 max_turns,
             },
         ),
-        ProgressEvent::AiReviewStageFinished { patch_index, stage } => {
-            (patch_index, ProgressWire::StageFinished { stage })
-        }
+        ProgressEvent::AiReviewStageFinished {
+            patch_index,
+            stage,
+            cut_short,
+        } => (
+            patch_index,
+            ProgressWire::StageFinished { stage, cut_short },
+        ),
         ProgressEvent::AiReviewStageFailed {
             patch_index,
             stage,
@@ -799,8 +807,12 @@ fn from_worker_progress(
             turn,
             max_turns,
         },
-        WorkerProgressEvent::StageFinished { stage } => {
-            ProgressEvent::AiReviewStageFinished { patch_index, stage }
+        WorkerProgressEvent::StageFinished { stage, cut_short } => {
+            ProgressEvent::AiReviewStageFinished {
+                patch_index,
+                stage,
+                cut_short,
+            }
         }
         WorkerProgressEvent::StageFailed {
             stage,
@@ -1318,7 +1330,7 @@ async fn review_patch_attempts(
         );
 
         let tools = Arc::new(tools);
-        let mut worker = Worker::new(
+        let worker = Worker::new(
             provider,
             tools.clone(),
             prompts,
@@ -1334,6 +1346,13 @@ async fn review_patch_attempts(
                 skip_report: options.agent,
             },
         );
+        // Only the daemon sends a wind-down, so only a worker it spawned
+        // listens for one.
+        let mut worker = if reaches_model_through_daemon(ai) {
+            worker.with_wind_down(crate::ai::wind_down_signal())
+        } else {
+            worker
+        };
 
         let p_index = p.index;
         let progress_cb = progress.map(|cb| move |event| cb(from_worker_progress(p_index, event)));
@@ -1424,9 +1443,32 @@ fn combined_review_error(mut errors: Vec<(i64, String)>) -> String {
         .join("; ")
 }
 
+/// What stopped a patch's failed review, if it was not a fault of the review.
+///
+/// The error text keeps only the outermost context, so the daemon cannot read
+/// the reason from it. This reads the typed chain instead: a session the
+/// deadline stopped, or an analysis fan-out in which the deadline stopped any
+/// stage. Any other error, including a consolidation stage that failed on its
+/// own after the deadline, gives `None`.
+fn review_stopped_by(err: &anyhow::Error) -> Option<crate::ai::session::StopCause> {
+    if let Some(stopped) = err.downcast_ref::<crate::ai::session::SessionStopped>() {
+        return Some(stopped.cause);
+    }
+    err.downcast_ref::<crate::workflow::ParallelGroupFailed>()
+        .filter(|group| group.stopped_by_deadline())
+        .map(|_| crate::ai::session::StopCause::OutOfTime)
+}
+
 /// Records a patch whose review failed, so the report does not present it as
-/// reviewed.
-fn mark_patch_review_incomplete(patches: &mut [Value], patch_index: i64, error: &str) {
+/// reviewed. `stopped_by` is written as `review_stopped_by` when the review
+/// was stopped rather than failed, so the daemon can classify the attempt
+/// without reading the error text.
+fn mark_patch_review_incomplete(
+    patches: &mut [Value],
+    patch_index: i64,
+    error: &str,
+    stopped_by: Option<crate::ai::session::StopCause>,
+) {
     if let Some(patch) = patches
         .iter_mut()
         .find(|patch| patch["index"].as_i64() == Some(patch_index))
@@ -1434,6 +1476,9 @@ fn mark_patch_review_incomplete(patches: &mut [Value], patch_index: i64, error: 
     {
         fields.insert("review_status".into(), json!("incomplete"));
         fields.insert("review_error".into(), json!(error));
+        if let Some(cause) = stopped_by {
+            fields.insert("review_stopped_by".into(), json!(cause));
+        }
     }
 }
 
@@ -1718,8 +1763,9 @@ async fn run_worker_in_worktree(
         match result {
             Ok(res) => results.push(res),
             Err(err) => {
+                let stopped_by = review_stopped_by(&err);
                 let err = err.to_string();
-                mark_patch_review_incomplete(&mut patch_results, patch_index, &err);
+                mark_patch_review_incomplete(&mut patch_results, patch_index, &err, stopped_by);
                 review_errors.push((patch_index, err));
             }
         }
@@ -1928,8 +1974,17 @@ pub fn progress_line(event: ProgressEvent) -> Option<String> {
             turn,
             max_turns,
         } => format!("patch {patch_index}: {stage} turn {turn}/{max_turns}"),
-        ProgressEvent::AiReviewStageFinished { patch_index, stage } => {
-            format!("patch {patch_index}: {stage} finished")
+        ProgressEvent::AiReviewStageFinished {
+            patch_index,
+            stage,
+            cut_short,
+        } => {
+            if cut_short {
+                let label = crate::workflow::StageStopCause::CutShort.label();
+                format!("patch {patch_index}: {stage} {label}")
+            } else {
+                format!("patch {patch_index}: {stage} finished")
+            }
         }
         // Without the reason, deliberately. `sashiko-cli local` treats any
         // line containing " turn " as a turn tick, and a provider's error text
@@ -2880,7 +2935,7 @@ mod tests {
     #[test]
     fn patch_status_marks_only_incomplete_reviews() {
         let mut patches = vec![json!({"index": 1}), json!({"index": 2})];
-        mark_patch_review_incomplete(&mut patches, 2, "output truncated");
+        mark_patch_review_incomplete(&mut patches, 2, "output truncated", None);
         assert!(patches[0].get("review_status").is_none());
         assert_eq!(patches[1]["review_status"], "incomplete");
         assert_eq!(patches[1]["review_error"], "output truncated");
@@ -3035,8 +3090,19 @@ mod tests {
                 ProgressEvent::AiReviewStageFinished {
                     patch_index: 1,
                     stage: "locking".to_string(),
+                    cut_short: false,
                 },
                 "patch 1: locking finished",
+            ),
+            // A stage the deadline cut short did finish, but says so in the
+            // words its stored record uses.
+            (
+                ProgressEvent::AiReviewStageFinished {
+                    patch_index: 1,
+                    stage: "locking".to_string(),
+                    cut_short: true,
+                },
+                "patch 1: locking cut short",
             ),
             (
                 ProgressEvent::AiReviewAttempt {
@@ -3233,11 +3299,17 @@ mod tests {
                 },
             ),
             (
+                // Cut short rather than the default, so the hop cannot pass
+                // by writing `false` whatever it was given.
                 ProgressEvent::AiReviewStageFinished {
                     patch_index: 3,
                     stage: stage(),
+                    cut_short: true,
                 },
-                ProgressWire::StageFinished { stage: stage() },
+                ProgressWire::StageFinished {
+                    stage: stage(),
+                    cut_short: true,
+                },
             ),
             (
                 // A cause other than the default, so the hop cannot pass by
@@ -3323,6 +3395,103 @@ mod tests {
                 other => panic!("a stage failure must stay one, got {other:?}"),
             }
         }
+    }
+
+    /// Whether a finished stage was cut short crosses from the worker's event
+    /// to the local one as it was given.
+    #[test]
+    fn test_a_cut_short_stage_survives_the_worker_hop() {
+        for cut_short in [false, true] {
+            match from_worker_progress(
+                4,
+                crate::worker::WorkerProgressEvent::StageFinished {
+                    stage: "locking".to_string(),
+                    cut_short,
+                },
+            ) {
+                ProgressEvent::AiReviewStageFinished {
+                    patch_index,
+                    stage,
+                    cut_short: carried,
+                } => {
+                    assert_eq!(patch_index, 4);
+                    assert_eq!(stage, "locking");
+                    assert_eq!(carried, cut_short);
+                }
+                other => panic!("a finished stage must stay one, got {other:?}"),
+            }
+        }
+    }
+
+    /// The daemon cannot read why a review failed from its error text, which
+    /// keeps only the outermost context. A stop by the deadline is found in
+    /// the typed chain wherever it sits, and nothing else is reported as one.
+    #[test]
+    fn review_stopped_by_reads_the_deadline_from_the_typed_chain() {
+        use crate::ai::session::{SessionStopped, StopCause};
+        use crate::workflow::{ParallelGroupFailed, StageFailure, StageStopCause};
+
+        let stopped = || SessionStopped {
+            cause: StopCause::OutOfTime,
+        };
+        let failure = |stage_name, cause| StageFailure {
+            stage_name,
+            reason: "x".to_string(),
+            cause,
+        };
+
+        // Planning stopped before it spent anything, behind further context.
+        let err = anyhow::Error::new(stopped()).context("workflow failed");
+        assert_eq!(review_stopped_by(&err), Some(StopCause::OutOfTime));
+
+        // A stage that failed on its out-of-time turn.
+        let err = anyhow!("Failed to generate valid response")
+            .context(stopped())
+            .context("review failed");
+        assert_eq!(review_stopped_by(&err), Some(StopCause::OutOfTime));
+
+        // An analysis fan-out the deadline stopped in a later stage, wrapping
+        // the first stage's own error.
+        let err = anyhow!("simulated provider error").context(ParallelGroupFailed {
+            failures: vec![
+                failure("goal", StageStopCause::Error),
+                failure("security", StageStopCause::OutOfTime),
+            ],
+        });
+        assert_eq!(review_stopped_by(&err), Some(StopCause::OutOfTime));
+
+        // A fan-out that failed on its own.
+        let err = anyhow!("simulated provider error").context(ParallelGroupFailed {
+            failures: vec![failure("goal", StageStopCause::Error)],
+        });
+        assert_eq!(review_stopped_by(&err), None);
+
+        // A consolidation stage that failed validation on its own after the
+        // deadline was sent: not interruptible, so never a stop.
+        let err = anyhow!(
+            "Failed to generate valid response after 3 validation attempts. \
+             Last violation: not json"
+        );
+        assert_eq!(review_stopped_by(&err), None);
+    }
+
+    #[test]
+    fn a_patch_the_deadline_stopped_says_so_beside_its_error() {
+        let mut patches = vec![json!({"index": 1}), json!({"index": 2})];
+        mark_patch_review_incomplete(
+            &mut patches,
+            2,
+            "Session stopped: the review ran out of time",
+            Some(crate::ai::session::StopCause::OutOfTime),
+        );
+        mark_patch_review_incomplete(&mut patches, 1, "boom", None);
+        assert_eq!(patches[1]["review_status"], "incomplete");
+        assert_eq!(patches[1]["review_stopped_by"], "out_of_time");
+        assert_eq!(patches[0]["review_status"], "incomplete");
+        assert!(
+            patches[0].get("review_stopped_by").is_none(),
+            "a review that failed on its own carries no stop"
+        );
     }
 
     /// `sashiko-cli local` parses the worker's whole stdout as one JSON

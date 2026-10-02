@@ -902,7 +902,7 @@ Aggregated Dismissed Concerns:
             tools: ToolScope::All,
             max_turns,
             temperature,
-            ..Default::default()
+            ..StagePolicy::consolidation()
         })
         .skip_if(|s| s.all_concerns.is_empty())
         .reduce(|state, out: StageConcernsOutput| {
@@ -946,7 +946,7 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
             tools: ToolScope::All,
             max_turns,
             temperature,
-            ..Default::default()
+            ..StagePolicy::consolidation()
         })
         .skip_if(|s| s.deduplicated_concerns.is_empty())
         .reduce(|state, out: ConflictResolutionOutput| {
@@ -999,7 +999,7 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
             tools: ToolScope::All,
             max_turns,
             temperature,
-            ..Default::default()
+            ..StagePolicy::consolidation()
         })
         .skip_if(|s| s.patch_concerns.is_empty())
         .reduce(|state, out: VerificationOutput| {
@@ -1056,7 +1056,7 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
                 reminder: "Do not quote large blocks of code verbatim. Summarize concisely."
                     .to_string(),
             },
-            ..Default::default()
+            ..StagePolicy::consolidation()
         })
         .skip_if(|s| s.skip_report || s.findings.is_empty())
         .reduce(|state, out: String| {
@@ -1087,7 +1087,7 @@ pub fn summary_stage(
                     "Summarize the change concisely in plain text (including Before: and After: examples if user-visible) without quoting large blocks verbatim."
                         .to_string(),
             },
-            ..Default::default()
+            ..StagePolicy::consolidation()
         })
         .skip_if(|s| s.skip_report)
         .reduce(|state, out: String| {
@@ -1126,6 +1126,52 @@ pub fn build_sashiko_patch_review_workflow_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which stages the review's deadline may stop decides what a salvage
+    /// keeps. The stages that gather concerns stop; the ones that turn
+    /// concerns into findings run on, and a new consolidation stage must
+    /// opt out too, or the wind-down would stop it and leave nothing to
+    /// show.
+    #[test]
+    fn test_only_the_stages_that_gather_concerns_can_be_interrupted() {
+        // The default state resolves every analysis stage.
+        let state = SashikoPatchReviewState::default();
+        let stages = build_sashiko_patch_review_workflow().interruptible_stages(&state);
+
+        let mut not_interruptible: Vec<&str> = stages
+            .iter()
+            .filter(|(_, interruptible)| !interruptible)
+            .map(|(name, _)| *name)
+            .collect();
+        not_interruptible.sort_unstable();
+        let mut expected = vec![
+            "deduplication",
+            "conflict-resolution",
+            "verification",
+            "report",
+            "summary",
+        ];
+        expected.sort_unstable();
+        assert_eq!(not_interruptible, expected);
+
+        for (name, interruptible) in &stages {
+            assert_eq!(
+                *interruptible,
+                consolidation_stage_by_name(name).is_none(),
+                "{name}: only consolidation stages run past the deadline"
+            );
+        }
+        let names: Vec<&str> = stages.iter().map(|(name, _)| *name).collect();
+        for name in ["pre-screen", "planning"] {
+            assert!(names.contains(&name), "{name} is listed");
+        }
+        for def in ANALYSIS_STAGES {
+            assert!(names.contains(&def.name), "{} is listed", def.name);
+        }
+        for def in CONSOLIDATION_STAGES {
+            assert!(names.contains(&def.name), "{} is listed", def.name);
+        }
+    }
 
     #[test]
     fn test_sashiko_analysis_stages_table() {
@@ -1342,6 +1388,7 @@ mod tests {
             tools,
             base_dir: &prompts_dir,
             context_tag: None,
+            wind_down: None,
         };
 
         let mut state = SashikoPatchReviewState {

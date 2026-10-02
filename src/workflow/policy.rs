@@ -60,6 +60,17 @@ pub struct StagePolicy {
     pub tools: ToolScope,
     /// Policy for handling recitation errors.
     pub recitation_policy: RecitationPolicy,
+    /// Whether the review's deadline may stop this stage.
+    ///
+    /// When a review runs out of time, every stage before consolidation is
+    /// safe to stop. Stopping one analysis stage keeps what its siblings
+    /// found, because the analysis stages run as a `BestEffort` fan-out.
+    /// Stopping prescreen or planning loses nothing, because no concerns
+    /// exist yet at that point. The consolidation stages that follow turn
+    /// the gathered concerns into findings, so they set this to false and
+    /// run on after the deadline; stopping them would leave nothing to
+    /// salvage.
+    pub interruptible: bool,
 }
 
 impl Default for StagePolicy {
@@ -76,6 +87,19 @@ impl Default for StagePolicy {
                  quote only short snippets (1-2 lines). Re-emit your JSON output now."
                     .to_string(),
             ),
+            interruptible: true,
+        }
+    }
+}
+
+impl StagePolicy {
+    /// The defaults for a consolidation stage: one that turns the concerns
+    /// the analysis stages gathered into findings, and so runs on after the
+    /// review's deadline (see [`StagePolicy::interruptible`]).
+    pub fn consolidation() -> Self {
+        Self {
+            interruptible: false,
+            ..Self::default()
         }
     }
 }

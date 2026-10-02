@@ -1080,7 +1080,7 @@ Example Output:
             tools: ToolScope::All,
             max_turns,
             temperature,
-            ..Default::default()
+            ..StagePolicy::consolidation()
         })
         .reduce(|state, out: StageConcernsOutput| {
             state.deduplicated_concerns = out.concerns;
@@ -1143,7 +1143,7 @@ Example Output:
             tools: ToolScope::All,
             max_turns,
             temperature,
-            ..Default::default()
+            ..StagePolicy::consolidation()
         })
         .reduce(|state, out: ConflictResolutionOutput| {
             let mut new_concerns = Vec::new();
@@ -1218,7 +1218,7 @@ Example Output:
             tools: ToolScope::All,
             max_turns,
             temperature,
-            ..Default::default()
+            ..StagePolicy::consolidation()
         })
         .reduce(|state, out: VerificationOutput| {
             let mut new_findings = Vec::new();
@@ -1273,7 +1273,7 @@ Return raw text output, not JSON."#
             recitation_policy: RecitationPolicy::FallbackToFreeForm {
                 reminder: "CRITICAL OVERRIDE: Your previous response was blocked by the API recitation filter for quoting the patch diff verbatim. Ignore the diff-quoting instructions in inline-template.md. Do NOT quote any code or diff lines with '>'. Instead, start with the Commit/Author/Subject headers, write the summary, and describe each finding directly by referencing file names, function names, and line numbers in plain prose.".to_string(),
             },
-            ..Default::default()
+            ..StagePolicy::consolidation()
         })
         .skip_if(|s| s.skip_report)
         .reduce(|state, out: String| {
@@ -1329,6 +1329,51 @@ pub fn build_linux_patch_review_workflow_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which stages the review's deadline may stop decides what a salvage
+    /// keeps. The stages that gather concerns stop; the ones that turn
+    /// concerns into findings run on, and a new consolidation stage must
+    /// opt out too, or the wind-down would stop it and leave nothing to
+    /// show.
+    #[test]
+    fn test_only_the_stages_that_gather_concerns_can_be_interrupted() {
+        // The default state resolves every analysis stage.
+        let state = LinuxPatchReviewState::default();
+        let stages = build_linux_patch_review_workflow().interruptible_stages(&state);
+
+        let mut not_interruptible: Vec<&str> = stages
+            .iter()
+            .filter(|(_, interruptible)| !interruptible)
+            .map(|(name, _)| *name)
+            .collect();
+        not_interruptible.sort_unstable();
+        let mut expected = vec![
+            "deduplication",
+            "conflict-resolution",
+            "verification",
+            "report",
+        ];
+        expected.sort_unstable();
+        assert_eq!(not_interruptible, expected);
+
+        for (name, interruptible) in &stages {
+            assert_eq!(
+                *interruptible,
+                consolidation_stage_by_name(name).is_none(),
+                "{name}: only consolidation stages run past the deadline"
+            );
+        }
+        let names: Vec<&str> = stages.iter().map(|(name, _)| *name).collect();
+        for name in ["pre-screen", "planning"] {
+            assert!(names.contains(&name), "{name} is listed");
+        }
+        for def in ANALYSIS_STAGES {
+            assert!(names.contains(&def.name), "{} is listed", def.name);
+        }
+        for def in CONSOLIDATION_STAGES {
+            assert!(names.contains(&def.name), "{} is listed", def.name);
+        }
+    }
 
     #[test]
     fn test_each_stage_declares_whether_it_needs_the_commit_message() {

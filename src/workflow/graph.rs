@@ -65,6 +65,44 @@ impl<S: Send + Sync + 'static> Workflow<S> {
     pub fn builder(name: &'static str) -> WorkflowBuilder<S> {
         WorkflowBuilder::new(name)
     }
+
+    /// Every stage the workflow can run for `state`, with whether the
+    /// review's deadline may stop it, in the order the steps list them.
+    ///
+    /// The dynamic fan-outs are resolved against `state`, so a state that
+    /// selects every stage lists every stage. Both arms of a branch are
+    /// listed, because either may run.
+    #[cfg(test)]
+    pub(crate) fn interruptible_stages(&self, state: &S) -> Vec<(&'static str, bool)> {
+        let entry = |stage: &dyn ExecutableStage<S>| (stage.name(), stage.interruptible());
+        let mut stages = Vec::new();
+        for step in &self.steps {
+            match step {
+                WorkflowStep::Stage(stage) => stages.push(entry(stage.as_ref())),
+                WorkflowStep::Parallel { stages: group, .. } => {
+                    stages.extend(group.iter().map(|stage| entry(stage.as_ref())));
+                }
+                WorkflowStep::DynamicParallel {
+                    planner, resolver, ..
+                } => {
+                    stages.push(entry(planner.as_ref()));
+                    stages.extend(resolver(state).iter().map(|stage| entry(stage.as_ref())));
+                }
+                WorkflowStep::Branch {
+                    then_flow,
+                    else_flow,
+                    ..
+                } => {
+                    stages.extend(then_flow.interruptible_stages(state));
+                    if let Some(flow) = else_flow {
+                        stages.extend(flow.interruptible_stages(state));
+                    }
+                }
+                WorkflowStep::EarlyExitIf { .. } => {}
+            }
+        }
+        stages
+    }
 }
 
 /// Fluent builder for constructing a [`Workflow`].

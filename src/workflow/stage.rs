@@ -22,11 +22,11 @@ use std::sync::Arc;
 
 use crate::ai::{
     AiMessage, AiProvider, AiResponse, AiResponseFormat, AiTool, ErrorAction, LlmSession,
-    SessionRunner, ToolCall, ValidationError,
+    SessionRunner, ToolCall, ValidationError, WindDownSignal,
 };
 use crate::toolbox::ToolBox;
 
-use super::engine::StageStopCause;
+use super::engine::{StageStopCause, stop_cause};
 use super::events::WorkflowEvent;
 use super::output::OutputFormat;
 use super::policy::{RecitationPolicy, StagePolicy, ToolScope};
@@ -39,6 +39,9 @@ pub struct StageOutcome {
     pub tokens_out: u32,
     pub tokens_cached: u32,
     pub history: Vec<AiMessage>,
+    /// The review ran out of time while the stage gathered evidence, so its
+    /// output came from a forced final turn and covers less than a full run.
+    pub cut_short: bool,
 }
 
 /// Execution environment provided to stages during workflow runs.
@@ -47,6 +50,9 @@ pub struct WorkflowEnv<'a> {
     pub tools: Arc<ToolBox>,
     pub base_dir: &'a std::path::Path,
     pub context_tag: Option<String>,
+    /// Set when the review reaches its deadline, so the interruptible stages
+    /// stop. `None` where nothing can send a wind-down.
+    pub wind_down: Option<Arc<WindDownSignal>>,
 }
 
 /// A deferred state mutation function returned after isolated stage execution.
@@ -57,6 +63,10 @@ pub type StateMutation<S> = Box<dyn FnOnce(&mut S) + Send>;
 pub trait ExecutableStage<S: Send + Sync>: Send + Sync {
     /// Returns the human-readable name of the stage.
     fn name(&self) -> &'static str;
+
+    /// Whether the review's deadline may stop this stage
+    /// ([`StagePolicy::interruptible`]).
+    fn interruptible(&self) -> bool;
 
     /// Executes the stage in isolation against immutable state `&S`, returning
     /// execution metrics and a deferred reducer mutation to apply to `&mut S`.
@@ -391,6 +401,10 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         self.name
     }
 
+    fn interruptible(&self) -> bool {
+        self.policy.interruptible
+    }
+
     async fn execute_isolated(
         &self,
         env: &WorkflowEnv<'_>,
@@ -406,6 +420,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                     tokens_in: 0,
                     tokens_out: 0,
                     tokens_cached: 0,
+                    cut_short: false,
                 },
                 Box::new(|_| {}),
             ));
@@ -476,6 +491,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
 
             let runner = SessionRunner::new(env.provider.as_ref())
                 .with_max_turns(self.policy.max_turns)
+                .with_wind_down(env.wind_down.clone(), self.policy.interruptible)
                 .with_max_validation_attempts(self.policy.max_validation_attempts)
                 .with_turn_callback(move |turn, max_turns| {
                     if let Some(cb) = event_cb {
@@ -519,11 +535,8 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
 
             // Reported here rather than by the caller: a failed stage that says
             // nothing leaves its last turn frozen on display, indistinguishable
-            // from one still waiting on the model.
-            //
-            // The cause is always `Error` for now. Upstream cancellation kills
-            // the worker outright, so a stage never observes a cancel, and no
-            // session stops for the deadline until the wind-down exists.
+            // from one still waiting on the model. The cause tells a stage the
+            // deadline stopped from one that failed on its own.
             match runner.run(&mut session).await {
                 Ok(result) => result,
                 Err(e) => {
@@ -531,7 +544,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                         cb(WorkflowEvent::StageFailed {
                             stage_name,
                             reason: format!("{:#}", e),
-                            cause: StageStopCause::Error,
+                            cause: stop_cause(&e),
                         });
                     }
                     return Err(e);
@@ -543,12 +556,14 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         let tokens_out = result.usage.completion_tokens as u32;
         let tokens_cached = result.usage.cached_tokens.unwrap_or(0) as u32;
 
+        let cut_short = result.cut_short;
         if let Some(cb) = event_cb {
             cb(WorkflowEvent::StageFinished {
                 stage_name: self.name,
                 tokens_in,
                 tokens_out,
                 tokens_cached,
+                cut_short,
             });
         }
 
@@ -562,6 +577,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             tokens_out,
             tokens_cached,
             history: result.history,
+            cut_short,
         };
 
         Ok((outcome, mutation))
@@ -713,6 +729,7 @@ mod tests {
             tools: Arc::new(toolbox),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_concurrent")
@@ -744,6 +761,7 @@ mod tests {
             tools: Arc::new(toolbox),
             base_dir: tmp.path(),
             context_tag: Some("[ps:12 p:34] ".to_string()),
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("conflict-resolution")
@@ -800,6 +818,7 @@ mod tests {
             tools: Arc::new(toolbox),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("goal")
@@ -896,6 +915,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, Value> = Stage::builder("turn-cap")
@@ -960,6 +980,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, Value> = Stage::builder("unrenderable")
@@ -1012,6 +1033,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_dup")
@@ -1056,6 +1078,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_dup_turns")
@@ -1100,6 +1123,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_dup_gap")
@@ -1142,6 +1166,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_batch")
@@ -1174,6 +1199,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("tool_error")
@@ -1247,6 +1273,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("report")
@@ -1320,6 +1347,7 @@ mod tests {
             tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let stage: Stage<EmptyState, String> = Stage::builder("truncated")
@@ -1347,5 +1375,150 @@ mod tests {
             seen[1].messages.len(),
             "an unchanged request would be cut off again at the same limit"
         );
+    }
+
+    /// Answers with a tool call while tools are offered, setting the
+    /// wind-down as it does, and with a verdict once they are withheld.
+    struct DeadlineDuringFirstTurnProvider {
+        signal: Arc<crate::ai::WindDownSignal>,
+        seen: Mutex<Vec<AiRequest>>,
+    }
+
+    #[async_trait]
+    impl AiProvider for DeadlineDuringFirstTurnProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            let offered_tools = request.tools.is_some();
+            self.seen.lock().unwrap().push(request);
+            if offered_tools {
+                self.signal.request();
+                return Ok(AiResponse {
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_0".to_string(),
+                        function_name: "git_read_files".to_string(),
+                        arguments: json!({ "files": [{ "path": "a" }] }),
+                        thought_signature: None,
+                    }]),
+                    usage: None,
+                    truncated: false,
+                });
+            }
+            Ok(AiResponse {
+                content: Some("{}".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "deadline".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    /// A stage the deadline reaches after it gathered evidence finishes with
+    /// its verdict, and says it was cut short both in its outcome and in the
+    /// event that the live row and the stored record are built from.
+    #[tokio::test]
+    async fn a_stage_the_deadline_reaches_mid_run_finishes_cut_short() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signal = Arc::new(crate::ai::WindDownSignal::default());
+        let provider = Arc::new(DeadlineDuringFirstTurnProvider {
+            signal: signal.clone(),
+            seen: Mutex::new(Vec::new()),
+        });
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+            wind_down: Some(signal),
+        };
+        let stage: Stage<EmptyState, Value> = Stage::builder("goal")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::json())
+            .reduce(|_: &mut EmptyState, _: Value| {})
+            .build();
+
+        let events: Mutex<Vec<WorkflowEvent>> = Mutex::new(Vec::new());
+        let record = |e: WorkflowEvent| events.lock().unwrap().push(e);
+        let (outcome, _mutation) = stage
+            .execute_isolated(&env, &EmptyState, Some(&record))
+            .await
+            .expect("the evidence gathered so far becomes the verdict");
+
+        assert!(outcome.cut_short);
+        assert_eq!(provider.seen.lock().unwrap().len(), 2);
+        match events.lock().unwrap().last() {
+            Some(WorkflowEvent::StageFinished {
+                stage_name,
+                cut_short,
+                ..
+            }) => {
+                assert_eq!(*stage_name, "goal");
+                assert!(*cut_short);
+            }
+            other => panic!("a cut-short stage still finishes, got {other:?}"),
+        }
+    }
+
+    /// A stage the deadline stops before it spends anything reports the
+    /// deadline as its cause, not a fault of its own.
+    #[tokio::test]
+    async fn a_stage_the_deadline_stops_reports_out_of_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let signal = Arc::new(crate::ai::WindDownSignal::default());
+        signal.request();
+        let env = WorkflowEnv {
+            provider: Arc::new(NeverFinishesProvider),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+            wind_down: Some(signal),
+        };
+        let stage: Stage<EmptyState, Value> = Stage::builder("goal")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::json())
+            .reduce(|_: &mut EmptyState, _: Value| {})
+            .build();
+
+        let events: Mutex<Vec<WorkflowEvent>> = Mutex::new(Vec::new());
+        let record = |e: WorkflowEvent| events.lock().unwrap().push(e);
+        let err = stage
+            .execute_isolated(&env, &EmptyState, Some(&record))
+            .await
+            .err()
+            .expect("the deadline stops an interruptible stage");
+
+        assert!(
+            err.downcast_ref::<crate::ai::session::SessionStopped>()
+                .is_some()
+        );
+        match events.lock().unwrap().last() {
+            Some(WorkflowEvent::StageFailed { cause, .. }) => {
+                assert_eq!(*cause, StageStopCause::OutOfTime);
+            }
+            other => panic!("a stopped stage must report its stop, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stage_reports_whether_its_policy_lets_the_deadline_stop_it() {
+        let build = |policy: StagePolicy| -> Stage<EmptyState, Value> {
+            Stage::builder("goal")
+                .user_prompt(PromptTemplate::new("go"))
+                .output_format(OutputFormat::json())
+                .policy(policy)
+                .build()
+        };
+        assert!(build(StagePolicy::default()).interruptible());
+        assert!(!build(StagePolicy::consolidation()).interruptible());
     }
 }

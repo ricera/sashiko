@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::ai::AiMessage;
+use crate::ai::session::{SessionStopped, StopCause};
 
 use super::events::WorkflowEvent;
 use super::graph::{Workflow, WorkflowStep};
@@ -34,7 +35,8 @@ pub struct WorkflowOutcome {
     pub history: Vec<AiMessage>,
     pub early_exit: bool,
     pub early_exit_reason: Option<&'static str>,
-    /// Stages that did not complete under `BestEffort` while a sibling did.
+    /// Stages that did not complete under `BestEffort` while a sibling did,
+    /// and stages the review's deadline cut short.
     /// Recorded rather than only logged: a review that silently skipped a stage
     /// but presents as complete is worse than one that fails outright, because
     /// nothing signals the missing coverage. A batch where every stage failed is
@@ -93,6 +95,23 @@ impl StageStopCause {
     }
 }
 
+impl From<StopCause> for StageStopCause {
+    fn from(cause: StopCause) -> Self {
+        match cause {
+            StopCause::OutOfTime => Self::OutOfTime,
+        }
+    }
+}
+
+/// Why the stage whose error this is stopped.
+///
+/// A session the deadline stopped says so with a typed [`SessionStopped`],
+/// found anywhere in the error's chain; every other error is the stage's own.
+pub fn stop_cause(err: &anyhow::Error) -> StageStopCause {
+    err.downcast_ref::<SessionStopped>()
+        .map_or(StageStopCause::Error, |stopped| stopped.cause.into())
+}
+
 /// A stage that failed while its siblings kept running.
 #[derive(Debug, Clone)]
 pub struct StageFailure {
@@ -138,6 +157,32 @@ impl std::fmt::Display for ParallelGroupFailed {
     }
 }
 
+impl WorkflowOutcome {
+    /// Adds one finished stage's metrics and history.
+    ///
+    /// A stage the deadline cut short is also listed in `stage_failures`,
+    /// although it finished, because its output covers less than a full run.
+    /// Without that, a review whose analysis wound down would read as one
+    /// with full coverage, and the daemon could not tell it was salvaged.
+    fn absorb(&mut self, stage_name: &'static str, stage: super::stage::StageOutcome) {
+        self.tokens_in += stage.tokens_in;
+        self.tokens_out += stage.tokens_out;
+        self.tokens_cached += stage.tokens_cached;
+        self.history.extend(stage.history);
+        if stage.cut_short {
+            info!(
+                "Stage '{}' was cut short: the review ran out of time",
+                stage_name
+            );
+            self.stage_failures.push(StageFailure {
+                stage_name,
+                reason: CUT_SHORT_REASON.to_string(),
+                cause: StageStopCause::CutShort,
+            });
+        }
+    }
+}
+
 /// The runtime engine that drives workflow execution.
 pub struct WorkflowEngine;
 
@@ -161,10 +206,7 @@ impl WorkflowEngine {
             match step {
                 WorkflowStep::Stage(stage) => {
                     let stage_outcome = stage.execute(env, state, event_cb).await?;
-                    outcome.tokens_in += stage_outcome.tokens_in;
-                    outcome.tokens_out += stage_outcome.tokens_out;
-                    outcome.tokens_cached += stage_outcome.tokens_cached;
-                    outcome.history.extend(stage_outcome.history);
+                    outcome.absorb(stage.name(), stage_outcome);
                 }
 
                 WorkflowStep::Parallel { stages, policy } => {
@@ -178,10 +220,7 @@ impl WorkflowEngine {
                     policy,
                 } => {
                     let planner_outcome = planner.execute(env, state, event_cb).await?;
-                    outcome.tokens_in += planner_outcome.tokens_in;
-                    outcome.tokens_out += planner_outcome.tokens_out;
-                    outcome.tokens_cached += planner_outcome.tokens_cached;
-                    outcome.history.extend(planner_outcome.history);
+                    outcome.absorb(planner.name(), planner_outcome);
 
                     let dynamic_stages = resolver(state);
                     if let Some(cb) = event_cb {
@@ -270,12 +309,9 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                 .map(|stage| stage.execute_isolated(env, state, event_cb));
             let results = futures::future::try_join_all(futures).await?;
 
-            for (stage_outcome, mutation) in results {
+            for (stage, (stage_outcome, mutation)) in stages.iter().zip(results) {
                 mutation(state);
-                outcome.tokens_in += stage_outcome.tokens_in;
-                outcome.tokens_out += stage_outcome.tokens_out;
-                outcome.tokens_cached += stage_outcome.tokens_cached;
-                outcome.history.extend(stage_outcome.history);
+                outcome.absorb(stage.name(), stage_outcome);
             }
         }
 
@@ -292,26 +328,32 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
 
             for (stage, res) in stages.iter().zip(results) {
                 match res {
+                    // A stage cut short still counts as a success: it
+                    // produced output, and its mutation keeps what it found.
+                    // `absorb` records the coverage it lost.
                     Ok((stage_outcome, mutation)) => {
                         successes += 1;
                         mutation(state);
-                        outcome.tokens_in += stage_outcome.tokens_in;
-                        outcome.tokens_out += stage_outcome.tokens_out;
-                        outcome.tokens_cached += stage_outcome.tokens_cached;
-                        outcome.history.extend(stage_outcome.history);
+                        outcome.absorb(stage.name(), stage_outcome);
                     }
                     Err(err) => {
-                        warn!(
-                            "Parallel stage '{}' failed under BestEffort policy: {}",
-                            stage.name(),
-                            err
-                        );
-                        // Every stage error is the stage's own until the
-                        // wind-down gives a session a typed way to stop.
+                        let cause = stop_cause(&err);
+                        if cause.is_deadline() {
+                            info!(
+                                "Parallel stage '{}' stopped: the review ran out of time",
+                                stage.name()
+                            );
+                        } else {
+                            warn!(
+                                "Parallel stage '{}' failed under BestEffort policy: {}",
+                                stage.name(),
+                                err
+                            );
+                        }
                         failures.push(StageFailure {
                             stage_name: stage.name(),
                             reason: format!("{:#}", err),
-                            cause: StageStopCause::Error,
+                            cause,
                         });
                         first_error.get_or_insert(err);
                     }
@@ -426,6 +468,7 @@ mod tests {
             tools,
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let mut state = DummyState::default();
@@ -475,6 +518,7 @@ mod tests {
             tools,
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let mut state = DummyState::default();
@@ -544,6 +588,7 @@ mod tests {
             tools,
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let mut state = DummyState::default();
@@ -598,6 +643,7 @@ mod tests {
             tools,
             base_dir: tmp.path(),
             context_tag: None,
+            wind_down: None,
         };
 
         let mut state = DummyState::default();
@@ -707,5 +753,221 @@ mod tests {
             );
             assert_eq!(cause.is_deadline(), deadline, "{cause:?}");
         }
+    }
+
+    /// Answers its first request with text that fails validation and sets
+    /// the wind-down while doing so, as if the deadline passed during that
+    /// call. Every later request gets a valid answer.
+    struct DeadlineOnFirstCallProvider {
+        signal: Arc<crate::ai::WindDownSignal>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl AiProvider for DeadlineOnFirstCallProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            if first {
+                self.signal.request();
+            }
+            Ok(AiResponse {
+                content: Some(
+                    if first {
+                        "not json"
+                    } else {
+                        r#"{"items": ["late"]}"#
+                    }
+                    .to_string(),
+                ),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "deadline".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    fn concerns_stage(name: &'static str) -> Box<dyn ExecutableStage<DummyState>> {
+        Box::new(
+            Stage::builder(name)
+                .user_prompt(PromptTemplate::new("Analyze"))
+                .output_format(OutputFormat::json())
+                .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                    s.concerns.extend(out.items);
+                })
+                .build(),
+        )
+    }
+
+    /// One analysis stage wound down after its first answer and the other was
+    /// stopped before it spent anything. The group still succeeds, keeps what
+    /// the cut-short stage found, and records both causes.
+    #[tokio::test]
+    async fn best_effort_records_the_stages_the_deadline_stopped() {
+        let signal = Arc::new(crate::ai::WindDownSignal::default());
+        let provider = Arc::new(DeadlineOnFirstCallProvider {
+            signal: signal.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+            wind_down: Some(signal),
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("deadline")
+            .parallel(
+                vec![concerns_stage("goal"), concerns_stage("security")],
+                ParallelPolicy::BestEffort,
+            )
+            .build();
+
+        let outcome = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .expect("a cut-short stage counts as a success");
+
+        assert_eq!(state.concerns, vec!["late".to_string()]);
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "the first answer and the verdict; the stopped stage spent nothing"
+        );
+        let mut causes: Vec<_> = outcome.stage_failures.iter().map(|f| f.cause).collect();
+        // Which stage got the first call depends on polling order, so the
+        // causes are compared in a fixed order rather than by stage.
+        causes.sort_by_key(|c| c.label());
+        assert_eq!(
+            causes,
+            [StageStopCause::CutShort, StageStopCause::OutOfTime],
+            "{outcome:?}"
+        );
+        let cut = outcome
+            .stage_failures
+            .iter()
+            .find(|f| f.cause == StageStopCause::CutShort)
+            .unwrap();
+        assert_eq!(cut.reason, CUT_SHORT_REASON);
+    }
+
+    /// A group the deadline stopped entirely is still an error, typed so the
+    /// worker can tell it apart from a group that failed on its own.
+    #[tokio::test]
+    async fn a_group_the_deadline_stopped_entirely_is_still_an_error() {
+        let provider = Arc::new(MockProvider::single(r#"{"items": ["x"]}"#));
+        let signal = Arc::new(crate::ai::WindDownSignal::default());
+        signal.request();
+        let tmp = tempfile::tempdir().unwrap();
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+            wind_down: Some(signal),
+        };
+
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("deadline")
+            .parallel(
+                vec![concerns_stage("goal"), concerns_stage("security")],
+                ParallelPolicy::BestEffort,
+            )
+            .build();
+
+        let err = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .expect_err("a group with no output is an error");
+        let group = err
+            .downcast_ref::<ParallelGroupFailed>()
+            .expect("the group error is typed");
+        assert!(
+            group
+                .failures
+                .iter()
+                .all(|f| f.cause == StageStopCause::OutOfTime),
+            "{group:?}"
+        );
+        assert!(group.stopped_by_deadline());
+        assert_eq!(stop_cause(&err), StageStopCause::OutOfTime);
+        assert_eq!(provider.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// The deadline counts wherever it stopped a stage of the group: here the
+    /// first stage failed on its own and only the second was stopped.
+    #[tokio::test]
+    async fn a_group_is_stopped_by_the_deadline_when_a_later_stage_was() {
+        let provider = Arc::new(MockProvider::single("__ERROR__"));
+        let signal = Arc::new(crate::ai::WindDownSignal::default());
+        signal.request();
+        let tmp = tempfile::tempdir().unwrap();
+        let env = WorkflowEnv {
+            provider,
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+            wind_down: Some(signal),
+        };
+
+        // Not interruptible, so it reaches the provider and fails there.
+        let own_failure: Box<dyn ExecutableStage<DummyState>> = Box::new(
+            Stage::builder("goal")
+                .user_prompt(PromptTemplate::new("Analyze"))
+                .output_format(OutputFormat::json())
+                .policy(crate::workflow::StagePolicy::consolidation())
+                .reduce(|s: &mut DummyState, out: DummyConcernsOutput| {
+                    s.concerns.extend(out.items);
+                })
+                .build(),
+        );
+        let mut state = DummyState::default();
+        let workflow = Workflow::builder("deadline")
+            .parallel(
+                vec![own_failure, concerns_stage("security")],
+                ParallelPolicy::BestEffort,
+            )
+            .build();
+
+        let err = WorkflowEngine::execute(&workflow, &env, &mut state, None)
+            .await
+            .expect_err("no stage produced anything");
+        let group = err.downcast_ref::<ParallelGroupFailed>().unwrap();
+        let causes: Vec<_> = group.failures.iter().map(|f| f.cause).collect();
+        assert_eq!(causes, [StageStopCause::Error, StageStopCause::OutOfTime]);
+        assert!(group.stopped_by_deadline());
+        assert_eq!(
+            stop_cause(&err),
+            StageStopCause::Error,
+            "the wrapped error is the first stage's own"
+        );
+    }
+
+    #[test]
+    fn stop_cause_reads_a_typed_stop_through_context() {
+        use crate::ai::session::{SessionStopped, StopCause};
+        let stopped = anyhow::Error::new(SessionStopped {
+            cause: StopCause::OutOfTime,
+        });
+        assert_eq!(stop_cause(&stopped), StageStopCause::OutOfTime);
+        let wrapped = anyhow::anyhow!("validation failed")
+            .context(SessionStopped {
+                cause: StopCause::OutOfTime,
+            })
+            .context("stage 'goal'");
+        assert_eq!(stop_cause(&wrapped), StageStopCause::OutOfTime);
+        assert_eq!(
+            stop_cause(&anyhow::anyhow!("simulated fatal provider error")),
+            StageStopCause::Error
+        );
     }
 }

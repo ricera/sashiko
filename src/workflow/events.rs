@@ -75,6 +75,10 @@ pub enum WorkflowEvent {
         tokens_in: u32,
         tokens_out: u32,
         tokens_cached: u32,
+        /// The review ran out of time while the stage gathered evidence, so
+        /// its output came from a forced final turn and covers less than a
+        /// full run.
+        cut_short: bool,
     },
     /// A dynamic fan-out resolved the stages it will run. Emitted whether or
     /// not the planning stage ran, so a skipped planner still reports a plan.
