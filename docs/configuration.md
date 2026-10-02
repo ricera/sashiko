@@ -477,8 +477,9 @@ pass.
 |-----|------|---------|-------------|
 | `concurrency` | integer | -- | Number of concurrent reviews. |
 | `worktree_dir` | string | -- | Directory for git worktrees used during review. |
-| `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). |
-| `max_retries` | integer | `3` | Retry count on transient failures. A review the daemon stops at `timeout_seconds`, `max_total_tokens` or `max_total_output_tokens` is not retried. |
+| `timeout_seconds` | integer | `3600` | Maximum active time per review (seconds). When it passes and `salvage_seconds` is above `0`, the review is asked to wind down. A review whose stages the deadline stopped keeps its findings and is recorded as `Partial`; one that loses no stage to the deadline is recorded as `Reviewed`. A review still running when `salvage_seconds` has passed, or one the deadline stopped before it had a review to return, is recorded as `TimedOut`, as is any review that reaches `timeout_seconds` while `salvage_seconds` is `0`. |
+| `salvage_seconds` | integer | `1800` | Extra seconds a review gets after `timeout_seconds` to finish consolidating what its analysis stages found. The worker is killed when this window has passed too. `0` disables salvage: the worker is killed at `timeout_seconds`. |
+| `max_retries` | integer | `3` | Retry count on transient failures. Timeouts are not retried: a review that reached `timeout_seconds`, however it then ended, is not tried again, and neither is one the daemon stopped at `max_total_tokens` or `max_total_output_tokens`. |
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |
 | `max_files_touched` | integer | `200` | Skip patches touching more files than this. |
 | `ignore_files` | list | `[]` | File patterns to skip during review (e.g. `MAINTAINERS`). |

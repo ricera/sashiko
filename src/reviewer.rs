@@ -65,6 +65,10 @@ struct ReviewContext {
 
 enum PatchResult {
     Success,
+    /// The review ran out of time, and the findings of the stages that
+    /// finished were stored. The patchset still counts this as a failed
+    /// patch, so a series with a salvaged patch ends Failed.
+    Partial,
     ReviewFailed,
     Cancelled,
 }
@@ -1733,8 +1737,13 @@ impl Reviewer {
                 "Patch {}/{} (ID: {}) already ended {} in an earlier run. Skipping to keep it visible.",
                 patchset_id, index, patch_id, outcome
             );
+            // The stored verdict is written back unchanged rather than as
+            // Failed, so a salvaged or timed-out patch still says why.
             let _ = ctx.db.update_patch_status(patch_id, outcome).await;
-            return Ok(PatchResult::ReviewFailed);
+            return Ok(match outcome {
+                PatchOutcome::Partial => PatchResult::Partial,
+                _ => PatchResult::ReviewFailed,
+            });
         }
 
         let files = extract_files_from_diff(diff);
@@ -1860,7 +1869,7 @@ impl Reviewer {
             // Owned here rather than by the run, so what it saw of the stages
             // outlives a run that ended in an error.
             let mut stages = crate::activity::StageTracker::new(ctx.activity.clone());
-            let result = run_review_tool(
+            let run = run_review_tool(
                 ctx.worker_program.as_deref(),
                 patchset_id,
                 input_payload,
@@ -1894,7 +1903,7 @@ impl Reviewer {
                 .await;
 
             let end = AttemptEnd::decide(
-                result,
+                run,
                 index,
                 ctx.settings.ai.no_ai,
                 Self::patchset_cancelled(ctx, patchset_id).await,
@@ -1929,8 +1938,18 @@ impl Reviewer {
     ) -> Result<AttemptVerdict> {
         let (patchset_id, index) = (patch.patchset_id, patch.index);
         let verdict = match end {
-            AttemptEnd::Finished { output } => {
+            AttemptEnd::Finished { output, late } => {
+                if late {
+                    info!(
+                        "Review {} of patch {}/{} finished after it was asked to wind down, \
+                         and the deadline stopped none of its stages; recording it as Reviewed",
+                        review_id, patchset_id, index
+                    );
+                }
                 Self::store_finished_attempt(ctx, patch, review_id, &output).await?
+            }
+            AttemptEnd::Salvaged { output, stopped } => {
+                Self::store_salvaged_attempt(ctx, patch, review_id, &output, &stopped).await?
             }
             AttemptEnd::Cancelled { output } => {
                 info!(
@@ -1947,25 +1966,16 @@ impl Reviewer {
                 .await;
                 AttemptVerdict::Final(PatchResult::Cancelled)
             }
-            AttemptEnd::TimedOut { timeout } => {
-                error!(
-                    "Review {} of patch {}/{} timed out after {} active seconds; \
-                     not retrying",
-                    review_id, patchset_id, index, timeout.active_seconds
-                );
-                Self::fail_review_row(
+            AttemptEnd::TimedOut { timeout, output } => {
+                Self::record_timed_out_attempt(
                     ctx,
+                    patch,
                     review_id,
-                    &format!("Tool error: {}", timeout),
-                    None,
+                    timeout,
+                    output.as_ref(),
                     conversation,
                 )
-                .await;
-                // A review that used up its whole deadline has shown it does
-                // not fit in one, and a retry gets an identical deadline.
-                // Retrying is how one patch came to spend four deadlines and
-                // produce nothing; a rerun is one command away.
-                AttemptVerdict::GiveUp
+                .await
             }
             AttemptEnd::BudgetExceeded { error } => {
                 error!(
@@ -1986,19 +1996,38 @@ impl Reviewer {
                 // attempt has no reason to need fewer tokens.
                 AttemptVerdict::GiveUp
             }
-            AttemptEnd::Failed { reason, output } => {
+            AttemptEnd::Failed {
+                reason,
+                wound_down,
+                output,
+            } => {
                 error!(
                     "Review {} of patch {}/{} failed: {}",
                     review_id, patchset_id, index, reason
                 );
                 Self::fail_review_row(ctx, review_id, &reason, output.as_ref(), conversation).await;
-                // A worker that hits its own deadline also ends here and is
-                // retried, because its timeout reaches the daemon as an
-                // untyped error rather than as a ReviewTimedOut.
-                AttemptVerdict::Retry
+                Self::after_failure(review_id, wound_down)
             }
         };
         Ok(verdict)
+    }
+
+    /// What follows a failed attempt: another attempt, unless the worker had
+    /// been asked to wind down.
+    ///
+    /// An attempt that reached its deadline has shown the review does not fit
+    /// in one, whatever error finally ended it, and a retry would spend
+    /// another whole deadline. Its row keeps the real reason, and a rerun is
+    /// one command away.
+    fn after_failure(review_id: i64, wound_down: bool) -> AttemptVerdict {
+        if !wound_down {
+            return AttemptVerdict::Retry;
+        }
+        info!(
+            "Not retrying review {}: it had already reached its deadline",
+            review_id
+        );
+        AttemptVerdict::GiveUp
     }
 
     /// Whether the patchset has been cancelled. A status that cannot be read
@@ -2167,6 +2196,43 @@ impl Reviewer {
         }
     }
 
+    /// Records an attempt the deadline ended with no review to store, and
+    /// marks the patch `TimedOut`, which also keeps it from being reviewed
+    /// again when its patchset is processed again.
+    ///
+    /// `output` is the worker's output when the worker reported that the
+    /// deadline stopped the patch's review; its error text joins the row's
+    /// reason. A timed-out review is not retried: a review that used up its
+    /// deadline has shown it does not fit in one, and a retry gets an
+    /// identical deadline. Retrying is how one patch came to spend four
+    /// deadlines and produce nothing; a rerun is one command away.
+    async fn record_timed_out_attempt(
+        ctx: &ReviewContext,
+        patch: &PatchUnderReview<'_>,
+        review_id: i64,
+        timeout: ReviewTimedOut,
+        output: Option<&Value>,
+        conversation: Option<String>,
+    ) -> AttemptVerdict {
+        error!(
+            "Review {} of patch {}/{} ran out of time after {} active seconds; not retrying",
+            review_id, patch.patchset_id, patch.index, timeout.active_seconds
+        );
+        let reason = match output.and_then(|o| o["error"].as_str()) {
+            Some(worker_error) => format!("Tool error: {}: {}", timeout, worker_error),
+            None => format!("Tool error: {}", timeout),
+        };
+        Self::fail_review_row(ctx, review_id, &reason, output, conversation).await;
+        if let Err(e) = ctx
+            .db
+            .update_patch_status(patch.patch_id, PatchOutcome::TimedOut)
+            .await
+        {
+            warn!("Failed to mark patch {} as TimedOut: {}", patch.patch_id, e);
+        }
+        AttemptVerdict::Final(PatchResult::ReviewFailed)
+    }
+
     /// The AI interaction and the log a review row keeps of an attempt that
     /// did not store a review: `(interaction_id, logs)`.
     ///
@@ -2235,15 +2301,10 @@ impl Reviewer {
     /// returned. Written before anything else touches the review row, so a
     /// partial review can never be presented as a complete one.
     async fn store_worker_stage_failures(ctx: &ReviewContext, review_id: i64, output: &Value) {
-        let Some(failures) = output
-            .get("review")
-            .and_then(|r| r.get("stage_failures"))
-            .or_else(|| output.get("stage_failures"))
-            .and_then(|f| f.as_array())
-            .filter(|f| !f.is_empty())
-        else {
+        let failures = reported_stage_failures(output);
+        if failures.is_empty() {
             return;
-        };
+        }
         let stages: Vec<&str> = failures
             .iter()
             .filter_map(|f| f["stage"].as_str())
@@ -2258,7 +2319,7 @@ impl Reviewer {
             .db
             .set_review_stage_failures(
                 review_id,
-                &serde_json::Value::Array(failures.clone()).to_string(),
+                &serde_json::Value::Array(failures.to_vec()).to_string(),
             )
             .await;
     }
@@ -2309,30 +2370,18 @@ impl Reviewer {
             }
         }
 
-        let summary = review_content["summary"].as_str().unwrap_or("");
-        let inline_review = output["inline_review"].as_str();
-        if let Err(e) = ctx
-            .db
-            .complete_review(
-                review_id,
-                ReviewStatus::Reviewed.as_str(),
-                "Review completed successfully.",
-                Some(summary),
-                interaction_id.as_deref(),
-                inline_review,
-                logs.as_deref(),
-            )
-            .await
-        {
-            error!("Failed to save review completion: {}", e);
-            let _ = ctx
-                .db
-                .update_patch_status(patch.patch_id, PatchOutcome::Failed)
-                .await;
-            return Ok(AttemptVerdict::Final(PatchResult::ReviewFailed));
+        let row = ReviewRowCompletion {
+            status: ReviewStatus::Reviewed,
+            result: "Review completed successfully.",
+            interaction_id: interaction_id.as_deref(),
+            logs: logs.as_deref(),
+        };
+        if let Some(failed) = Self::finish_review_row(ctx, patch, review_id, output, row).await {
+            return Ok(failed);
         }
 
-        if let Some(inline) = inline_review {
+        if let Some(inline) = output["inline_review"].as_str() {
+            let summary = review_content["summary"].as_str().unwrap_or("");
             Self::notify_reviewed_patch(ctx, patch, review_id, inline, review_content, summary)
                 .await;
         }
@@ -2343,6 +2392,87 @@ impl Reviewer {
             .update_patch_status(patch.patch_id, PatchOutcome::Reviewed)
             .await;
         Ok(AttemptVerdict::Final(PatchResult::Success))
+    }
+
+    /// Stores an attempt the deadline cut short, in which the worker still
+    /// returned a review: the findings of the stages that finished, from
+    /// consolidation stages that were allowed to finish.
+    ///
+    /// The row and the patch are marked `Partial`. Its findings are stored
+    /// as a Reviewed review's are, because they went through the same
+    /// deduplication and verification. Nothing else leaves the row: its
+    /// concerns are not handed to the bug pipeline, which costs more than the
+    /// review that raised them, and no notification is queued, because a
+    /// review known to be incomplete needs its own wording before it is sent.
+    async fn store_salvaged_attempt(
+        ctx: &ReviewContext,
+        patch: &PatchUnderReview<'_>,
+        review_id: i64,
+        output: &Value,
+        stopped: &[crate::activity::StageFailureRecord],
+    ) -> Result<AttemptVerdict> {
+        warn!(
+            "Review {} of patch {}/{} ran out of time; keeping the findings of the stages \
+             that finished. Stopped by the deadline: {:?}",
+            review_id,
+            patch.patchset_id,
+            patch.index,
+            stopped.iter().map(|s| s.stage.as_str()).collect::<Vec<_>>()
+        );
+        Self::store_worker_stage_failures(ctx, review_id, output).await;
+        let (interaction_id, logs) = Self::record_worker_output(ctx, output).await;
+        Self::store_review_findings(ctx, review_id, &output["review"]).await?;
+
+        let row = ReviewRowCompletion {
+            status: ReviewStatus::Partial,
+            result: "Review ran out of time; findings salvaged from the stages that finished",
+            interaction_id: interaction_id.as_deref(),
+            logs: logs.as_deref(),
+        };
+        if let Some(failed) = Self::finish_review_row(ctx, patch, review_id, output, row).await {
+            return Ok(failed);
+        }
+        let _ = ctx
+            .db
+            .update_patch_status(patch.patch_id, PatchOutcome::Partial)
+            .await;
+        Ok(AttemptVerdict::Final(PatchResult::Partial))
+    }
+
+    /// Completes the row of a review the worker returned, with the summary
+    /// and inline review from its `output`. Returns the verdict that ends
+    /// the patch when the row could not be written, having marked the patch
+    /// failed, and `None` when it was written.
+    async fn finish_review_row(
+        ctx: &ReviewContext,
+        patch: &PatchUnderReview<'_>,
+        review_id: i64,
+        output: &Value,
+        row: ReviewRowCompletion<'_>,
+    ) -> Option<AttemptVerdict> {
+        let summary = output["review"]["summary"].as_str().unwrap_or("");
+        let completed = ctx
+            .db
+            .complete_review(
+                review_id,
+                row.status.as_str(),
+                row.result,
+                Some(summary),
+                row.interaction_id,
+                output["inline_review"].as_str(),
+                row.logs,
+            )
+            .await;
+        let e = completed.err()?;
+        error!(
+            "Failed to save the completion of review {} as {}: {}",
+            review_id, row.status, e
+        );
+        let _ = ctx
+            .db
+            .update_patch_status(patch.patch_id, PatchOutcome::Failed)
+            .await;
+        Some(AttemptVerdict::Final(PatchResult::ReviewFailed))
     }
 
     /// Stores the findings of a review the worker returned.
@@ -2576,6 +2706,15 @@ struct PatchUnderReview<'a> {
     embargo_until: Option<i64>,
 }
 
+/// How the row of a review the worker returned is completed: its status,
+/// its result text, and the record of the attempt.
+struct ReviewRowCompletion<'a> {
+    status: ReviewStatus,
+    result: &'a str,
+    interaction_id: Option<&'a str>,
+    logs: Option<&'a str>,
+}
+
 /// How one worker run for a patch ended.
 ///
 /// Decided once, right after the run, so that what is recorded and whether
@@ -2585,10 +2724,25 @@ struct PatchUnderReview<'a> {
 #[derive(Debug)]
 enum AttemptEnd {
     /// The worker returned a review for the patch, or skipped the review as
-    /// it was asked to.
-    Finished { output: Value },
-    /// The review's deadline passed and the worker was killed.
-    TimedOut { timeout: ReviewTimedOut },
+    /// it was asked to, and the deadline stopped none of its stages. `late`
+    /// is set when the worker had been asked to wind down: a review that
+    /// ran late but lost no coverage is an ordinary review.
+    Finished { output: Value, late: bool },
+    /// The worker returned a review for the patch after it was asked to
+    /// wind down, and the deadline stopped at least one of its stages.
+    /// `stopped` lists those stages.
+    Salvaged {
+        output: Value,
+        stopped: Vec<crate::activity::StageFailureRecord>,
+    },
+    /// The deadline ended the review with no review to store: the hard
+    /// limit passed and the worker was killed, or the worker reported that
+    /// the deadline stopped the patch's review. `output` is the worker's
+    /// output in the second case, kept for its token counts and error text.
+    TimedOut {
+        timeout: ReviewTimedOut,
+        output: Option<Value>,
+    },
     /// The daemon stopped the worker because the review used more tokens
     /// than `max_total_tokens` or `max_total_output_tokens` allow. `error` is
     /// the `ReviewError::BudgetExceeded` the I/O loop returned, kept whole so
@@ -2599,10 +2753,13 @@ enum AttemptEnd {
     /// seen: the review is no longer wanted, but the worker's history is
     /// still the full record of what the attempt did.
     Cancelled { output: Option<Value> },
-    /// Any other end with no review for the patch. `output` is the worker's
-    /// output when it returned one, kept for its token counts and history.
+    /// Any other end with no review for the patch. `wound_down` is whether
+    /// the worker had been asked to wind down, which rules out a retry.
+    /// `output` is the worker's output when it returned one, kept for its
+    /// token counts and history.
     Failed {
         reason: String,
+        wound_down: bool,
         output: Option<Value>,
     },
 }
@@ -2615,10 +2772,10 @@ impl AttemptEnd {
     /// patchset is no longer wanted and neither is its result. A review the
     /// worker did return is kept with the cancel, so that the row records the
     /// worker's own history rather than calling a finished review unfinished.
-    fn decide(result: Result<Value>, index: i64, no_ai: bool, cancelled: bool) -> Self {
-        match Self::classify(result, index, no_ai) {
+    fn decide(run: ReviewToolOutcome, index: i64, no_ai: bool, cancelled: bool) -> Self {
+        match Self::classify(run, index, no_ai) {
             end if !cancelled => end,
-            Self::Finished { output } => Self::Cancelled {
+            Self::Finished { output, .. } | Self::Salvaged { output, .. } => Self::Cancelled {
                 output: Some(output),
             },
             Self::Cancelled { output } => Self::Cancelled { output },
@@ -2631,23 +2788,68 @@ impl AttemptEnd {
     /// Classifies what a run of the worker for patch `index` returned.
     /// `no_ai` is whether the AI review was turned off, which makes a null
     /// review the expected answer rather than a failure.
-    fn classify(result: Result<Value>, index: i64, no_ai: bool) -> Self {
+    fn classify(run: ReviewToolOutcome, index: i64, no_ai: bool) -> Self {
+        let ReviewToolOutcome { result, wound_down } = run;
         let output = match result {
             Ok(output) => output,
-            Err(e) => return Self::from_error(e),
+            Err(e) => return Self::from_error(e, wound_down.is_some()),
         };
         match missing_review(&output, index, no_ai) {
-            None => Self::Finished { output },
-            Some(reason) => Self::Failed {
+            None => Self::with_review(output, wound_down.is_some()),
+            Some(reason) => Self::without_review(output, reason, index, wound_down),
+        }
+    }
+
+    /// An attempt whose output holds a review for the patch. It is salvaged
+    /// only when the deadline is what stopped a stage: a stage that failed on
+    /// its own is a coverage gap a Reviewed review already records, and a
+    /// late review that lost nothing to the deadline is an ordinary one.
+    fn with_review(output: Value, wound_down: bool) -> Self {
+        let stages = incomplete_stages(&output);
+        if !is_salvage(wound_down, &stages) {
+            return Self::Finished {
+                output,
+                late: wound_down,
+            };
+        }
+        let stopped = stages
+            .into_iter()
+            .filter(|stage| stage.cause.is_deadline())
+            .collect();
+        Self::Salvaged { output, stopped }
+    }
+
+    /// An attempt whose output holds no review for the patch, for `reason`.
+    ///
+    /// It is a timeout only when the worker says the deadline stopped the
+    /// patch's review, and only after the wind-down was sent. When it ended
+    /// does not decide it: a consolidation stage that failed on its own
+    /// during the salvage window is a failure with its own reason.
+    fn without_review(
+        output: Value,
+        reason: String,
+        index: i64,
+        wound_down: Option<ReviewTimedOut>,
+    ) -> Self {
+        match (wound_down, review_stopped_by(&output, index)) {
+            (Some(timeout), Some(crate::ai::session::StopCause::OutOfTime)) => Self::TimedOut {
+                timeout,
+                output: Some(output),
+            },
+            (wound_down, _) => Self::Failed {
                 reason,
+                wound_down: wound_down.is_some(),
                 output: Some(output),
             },
         }
     }
 
-    fn from_error(e: anyhow::Error) -> Self {
+    fn from_error(e: anyhow::Error, wound_down: bool) -> Self {
         if let Some(timeout) = e.downcast_ref::<ReviewTimedOut>() {
-            return Self::TimedOut { timeout: *timeout };
+            return Self::TimedOut {
+                timeout: *timeout,
+                output: None,
+            };
         }
         match e.downcast_ref::<ReviewError>() {
             Some(ReviewError::Cancelled) => return Self::Cancelled { output: None },
@@ -2656,6 +2858,7 @@ impl AttemptEnd {
         }
         Self::Failed {
             reason: format!("Tool error: {}", e),
+            wound_down,
             output: None,
         }
     }
@@ -2666,9 +2869,10 @@ impl AttemptEnd {
         match self {
             Self::TimedOut { .. } => StageStopCause::OutOfTime,
             Self::Cancelled { .. } => StageStopCause::Cancelled,
-            Self::Finished { .. } | Self::BudgetExceeded { .. } | Self::Failed { .. } => {
-                StageStopCause::Interrupted
-            }
+            Self::Finished { .. }
+            | Self::Salvaged { .. }
+            | Self::BudgetExceeded { .. }
+            | Self::Failed { .. } => StageStopCause::Interrupted,
         }
     }
 
@@ -2678,9 +2882,48 @@ impl AttemptEnd {
     fn has_worker_review(&self) -> bool {
         matches!(
             self,
-            Self::Finished { .. } | Self::Cancelled { output: Some(_) }
+            Self::Finished { .. } | Self::Salvaged { .. } | Self::Cancelled { output: Some(_) }
         )
     }
+}
+
+/// The stage failures the worker reported with its review, in the stored
+/// `{stage, reason, cause}` shape: the review's own list, or else the
+/// output's top-level one.
+fn reported_stage_failures(output: &Value) -> &[Value] {
+    output
+        .get("review")
+        .and_then(|r| r.get("stage_failures"))
+        .or_else(|| output.get("stage_failures"))
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// The stages the worker reported as not run to completion, typed. An
+/// entry that does not read as a stage failure is left out: it cannot say
+/// what stopped its stage, and the raw list is stored as it came anyway.
+fn incomplete_stages(output: &Value) -> Vec<crate::activity::StageFailureRecord> {
+    reported_stage_failures(output)
+        .iter()
+        .filter_map(|f| serde_json::from_value(f.clone()).ok())
+        .collect()
+}
+
+/// Whether an attempt that returned a review is a salvage: the worker was
+/// asked to wind down, and the deadline stopped at least one stage.
+fn is_salvage(wound_down: bool, stages: &[crate::activity::StageFailureRecord]) -> bool {
+    wound_down && stages.iter().any(|stage| stage.cause.is_deadline())
+}
+
+/// Why the worker ended the review of patch `index`, as it reported it on
+/// the patch's entry. Absent when the review failed for any other reason,
+/// and when the field does not read as a known cause.
+fn review_stopped_by(output: &Value, index: i64) -> Option<crate::ai::session::StopCause> {
+    let patch = output["patches"]
+        .as_array()?
+        .iter()
+        .find(|p| p["index"].as_i64() == Some(index))?;
+    serde_json::from_value(patch.get("review_stopped_by")?.clone()).ok()
 }
 
 /// Why the worker's `output` holds no review for patch `index`, or `None`
@@ -2894,10 +3137,13 @@ async fn run_review_tool(
     llm_semaphore: Arc<Semaphore>,
     patch: PatchActivity,
     stages: &mut crate::activity::StageTracker,
-) -> Result<serde_json::Value> {
+) -> ReviewToolOutcome {
     let cmd = match worker_program {
         Some(program) => Command::new(program),
-        None => default_worker_command()?,
+        None => match default_worker_command() {
+            Ok(cmd) => cmd,
+            Err(e) => return ReviewToolOutcome::not_started(e),
+        },
     };
     run_review_tool_with_cmd(
         cmd,
@@ -2999,7 +3245,7 @@ async fn run_review_tool_with_cmd(
     llm_semaphore: Arc<Semaphore>,
     patch: PatchActivity,
     stages: &mut crate::activity::StageTracker,
-) -> Result<serde_json::Value> {
+) -> ReviewToolOutcome {
     let project = settings.project.kind.unwrap_or_default();
     let activity = patch.registry.clone();
     // The limiter and the backoff are the only layers that know a request is
@@ -3093,35 +3339,10 @@ async fn run_review_tool_with_cmd(
     cmd.stderr(Stdio::piped());
     cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn()?;
-
-    if let Some(stderr) = child.stderr.take() {
-        tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                if line.contains(" ERROR ")
-                    || line.starts_with("Error:")
-                    || line.contains("panicked")
-                {
-                    error!("[review-bin] {}", line);
-                } else if line.contains(" WARN ") {
-                    warn!("[review-bin] {}", line);
-                } else {
-                    info!("[review-bin] {}", line);
-                }
-            }
-        });
-    }
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("No stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("No stdout"))?;
+    let (mut child, stdin, stdout) = match spawn_worker(cmd) {
+        Ok(spawned) => spawned,
+        Err(e) => return ReviewToolOutcome::not_started(e),
+    };
 
     let stdin_writer = Arc::new(tokio::sync::Mutex::new(stdin));
 
@@ -3129,12 +3350,13 @@ async fn run_review_tool_with_cmd(
     use std::time::Duration;
     use tokio::time::{timeout, timeout_at};
 
-    // Perform interaction with timeout. There is no salvage window yet, so
-    // the worker is stopped at the soft limit, which is also the hard one.
+    // The worker is asked to wind down at the soft limit and killed at the
+    // hard one, `salvage_seconds` later.
     let deadline = Arc::new(ReviewDeadline::new(
         Duration::from_secs(settings.review.timeout_seconds),
-        Duration::ZERO,
+        Duration::from_secs(settings.review.salvage_seconds),
     ));
+    let mut phase = DeadlinePhase::Running;
 
     // Retry rate-limited and transient failures with the shared limiter rather
     // than an open-coded loop. A review is bounded by its activity deadline
@@ -3204,7 +3426,7 @@ async fn run_review_tool_with_cmd(
             loop {
                 // Read on every pass, because a credited quota-gate wait
                 // moves it later while the loop runs.
-                let current_deadline = deadline.soft();
+                let current_deadline = phase.due(&deadline);
 
                 tokio::select! {
                     Some(err) = abort_rx.recv() => {
@@ -3225,7 +3447,8 @@ async fn run_review_tool_with_cmd(
                         let line_result = match line_res {
                             Ok(res) => res,
                             Err(_) => {
-                                return Err(deadline.timed_out().into());
+                                phase = pass_deadline(phase, &deadline, &stdin_writer, review_id, &mut spawned_tasks)?;
+                                continue;
                             }
                         };
 
@@ -3483,6 +3706,14 @@ async fn run_review_tool_with_cmd(
                 }
             }
 
+            if let (Some(_), DeadlinePhase::WindingDown { since }) = (&final_result, phase) {
+                info!(
+                    "The worker of review {} returned its result {}s after it was asked to wind down",
+                    review_id,
+                    since.elapsed().as_secs()
+                );
+            }
+
             // Return result
             if let Some(res) = final_result {
                 Ok(res)
@@ -3491,6 +3722,10 @@ async fn run_review_tool_with_cmd(
             }
         }
         .await;
+    let wound_down = match phase {
+        DeadlinePhase::Running => None,
+        DeadlinePhase::WindingDown { .. } => Some(deadline.timed_out()),
+    };
 
     // Recorded for every attempt however it ended. Each attempt has its own
     // review row, so the timings of attempts never mix, and on a row that
@@ -3534,10 +3769,18 @@ async fn run_review_tool_with_cmd(
     };
 
     if let Some(timed_out) = timed_out {
-        error!(
-            "Review tool timed out after {} active seconds. Killing process.",
-            timed_out.active_seconds
-        );
+        if timed_out.salvage_seconds > 0 {
+            error!(
+                "Review {} timed out after {} active seconds and did not salvage its \
+                 findings within a further {}s. Killing process.",
+                review_id, timed_out.active_seconds, timed_out.salvage_seconds
+            );
+        } else {
+            error!(
+                "Review {} timed out after {} active seconds. Killing process.",
+                review_id, timed_out.active_seconds
+            );
+        }
         let _ = child.start_kill();
         let _ = timeout(Duration::from_secs(5), child.wait()).await;
     } else if cancelled {
@@ -3607,10 +3850,164 @@ async fn run_review_tool_with_cmd(
                 }
             }
             store_final_reference_repos(&db, review_id, review_index, &json).await;
-            Ok(json)
+            ReviewToolOutcome {
+                result: Ok(json),
+                wound_down,
+            }
         }
-        Err(e) => Err(e),
+        Err(e) => ReviewToolOutcome {
+            result: Err(e),
+            wound_down,
+        },
     }
+}
+
+/// What one run of the review worker returned.
+#[derive(Debug)]
+struct ReviewToolOutcome {
+    /// The worker's output, or why the run produced none.
+    result: Result<Value>,
+    /// Set when the run reached its soft deadline and the worker was asked
+    /// to wind down, whether or not the message reached it. Holds the error
+    /// that reports the deadline, for a worker that then says the deadline
+    /// stopped the patch's review.
+    ///
+    /// Kept beside the result rather than in it, because an attempt that was
+    /// asked to wind down is not retried however it then ended, including in
+    /// an error.
+    wound_down: Option<ReviewTimedOut>,
+}
+
+impl ReviewToolOutcome {
+    /// A run that failed before the worker could be asked anything.
+    fn not_started(e: anyhow::Error) -> Self {
+        Self {
+            result: Err(e),
+            wound_down: None,
+        }
+    }
+}
+
+/// Where a worker run stands against its deadline.
+#[derive(Debug, Clone, Copy)]
+enum DeadlinePhase {
+    /// Before the soft limit: the review runs as normal.
+    Running,
+    /// The worker was asked to wind down at `since`, and is killed at the
+    /// hard limit.
+    WindingDown { since: tokio::time::Instant },
+}
+
+impl DeadlinePhase {
+    /// When the I/O loop must next act on the deadline.
+    fn due(self, deadline: &ReviewDeadline) -> tokio::time::Instant {
+        match self {
+            Self::Running => deadline.soft(),
+            Self::WindingDown { .. } => deadline.hard(),
+        }
+    }
+}
+
+/// Acts on the run's deadline passing in `phase`, and returns the phase
+/// that follows.
+///
+/// At the soft limit, with salvage enabled, the worker is asked to wind down
+/// and the run goes on. At the hard limit, or at the soft one with salvage
+/// disabled, the run ends with the timeout.
+///
+/// The wind-down is written by a task pushed to `spawned`, not awaited here.
+/// A reply writer may hold the worker's stdin while it waits on a pipe the
+/// worker has stopped draining, and waiting for that lock in the I/O loop
+/// would keep the loop from reaching the hard limit or the cancel poll, so
+/// the worker would never be killed.
+fn pass_deadline(
+    phase: DeadlinePhase,
+    deadline: &ReviewDeadline,
+    stdin: &Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
+    review_id: i64,
+    spawned: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> Result<DeadlinePhase, ReviewTimedOut> {
+    let timeout = deadline.timed_out();
+    if matches!(phase, DeadlinePhase::WindingDown { .. }) || deadline.salvage().is_zero() {
+        return Err(timeout);
+    }
+    info!(
+        "Review {} reached its deadline after {}s; asking the worker to wind down within {}s",
+        review_id, timeout.active_seconds, timeout.salvage_seconds
+    );
+    spawned.push(tokio::spawn(send_wind_down(stdin.clone(), review_id)));
+    Ok(DeadlinePhase::WindingDown {
+        since: tokio::time::Instant::now(),
+    })
+}
+
+/// Tells the worker its review has reached its deadline. The message answers
+/// no request, so it carries `tx_id` 0, which the worker's registry never
+/// issues.
+///
+/// A wind-down that cannot be written is logged and not returned: the
+/// worker may have printed its result and exited just before the soft
+/// limit, closing its stdin, and that result is still in the pipe to be read
+/// and classified. Ending the run here would turn a finished review into a
+/// failed attempt.
+async fn send_wind_down(
+    stdin: Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>,
+    review_id: i64,
+) {
+    if let Err(e) = write_wind_down(&stdin).await {
+        warn!(
+            "Failed to ask the worker of review {} to wind down: {}",
+            review_id, e
+        );
+    }
+}
+
+/// Writes the wind-down line to the worker's stdin.
+async fn write_wind_down(stdin: &tokio::sync::Mutex<tokio::process::ChildStdin>) -> Result<()> {
+    let line = IpcEnvelope::line(IpcMessageType::WindDown, 0, &Value::Null)?;
+    write_ipc_line(stdin, &line).await?;
+    Ok(())
+}
+
+/// Starts the worker, forwards its stderr to the daemon's log, and returns
+/// it with its stdin and stdout.
+fn spawn_worker(
+    mut cmd: Command,
+) -> Result<(
+    tokio::process::Child,
+    tokio::process::ChildStdin,
+    tokio::process::ChildStdout,
+)> {
+    let mut child = cmd.spawn()?;
+
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains(" ERROR ")
+                    || line.starts_with("Error:")
+                    || line.contains("panicked")
+                {
+                    error!("[review-bin] {}", line);
+                } else if line.contains(" WARN ") {
+                    warn!("[review-bin] {}", line);
+                } else {
+                    info!("[review-bin] {}", line);
+                }
+            }
+        });
+    }
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("No stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("No stdout"))?;
+    Ok((child, stdin, stdout))
 }
 
 /// Writes one reply to a worker's stdin.
@@ -3635,11 +4032,19 @@ async fn write_ipc_reply(
             return;
         }
     };
-    let mut writer = stdin.lock().await;
-    if let Err(e) = writer.write_all(line.as_bytes()).await {
+    if let Err(e) = write_ipc_line(stdin, &line).await {
         error!("Failed to write AI response to child: {}", e);
     }
-    let _ = writer.flush().await;
+}
+
+/// Writes one whole line to a worker's stdin and flushes it.
+async fn write_ipc_line(
+    stdin: &tokio::sync::Mutex<tokio::process::ChildStdin>,
+    line: &str,
+) -> std::io::Result<()> {
+    let mut writer = stdin.lock().await;
+    writer.write_all(line.as_bytes()).await?;
+    writer.flush().await
 }
 
 /// Replaces the review's early reference record with the worker's final one,
@@ -4483,6 +4888,9 @@ mod tests {
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.review.timeout_seconds = timeout_seconds;
+        // These runs are killed at their deadline, as a run with salvage
+        // disabled is. The salvage window has tests of its own.
+        settings.review.salvage_seconds = 0;
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
@@ -4523,7 +4931,7 @@ mod tests {
         }
 
         let mut stages = crate::activity::StageTracker::new(activity.clone());
-        let result = run_review_tool_with_cmd(
+        let outcome = run_review_tool_with_cmd(
             Command::new(&bin_path),
             ps_id,
             &json!({}),
@@ -4547,7 +4955,7 @@ mod tests {
         )
         .await;
         Ok(MockRun {
-            result,
+            result: outcome.result,
             db,
             review_id,
             patchset_id: ps_id,
@@ -5176,6 +5584,9 @@ sleep 30
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         settings.review.timeout_seconds = 1;
+        // The worker ignores the wind-down, so it is killed at the hard
+        // limit, a second after the soft one.
+        settings.review.salvage_seconds = 1;
 
         let db = Arc::new(Database::new(&settings.database).await?);
         db.migrate().await?;
@@ -5212,7 +5623,7 @@ sleep 30
             .await?;
 
         let completed = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(6),
             run_review_tool_with_cmd(
                 Command::new(&bin_path),
                 ps_id,
@@ -5233,16 +5644,22 @@ sleep 30
         )
         .await;
 
-        let result =
+        let outcome =
             completed.expect("run_review_tool should kill/reap a timed-out child promptly");
+        let timeout = ReviewTimedOut {
+            active_seconds: 1,
+            salvage_seconds: 1,
+        };
+        assert_eq!(
+            outcome.wound_down,
+            Some(timeout),
+            "the worker was asked to wind down first"
+        );
         // The daemon tells a timeout from other failures by its type alone.
-        let err = result.expect_err("the stuck child must time out");
+        let err = outcome.result.expect_err("the stuck child must time out");
         assert_eq!(
             err.downcast_ref::<ReviewTimedOut>(),
-            Some(&ReviewTimedOut {
-                active_seconds: 1,
-                salvage_seconds: 0,
-            }),
+            Some(&timeout),
             "{err}"
         );
         Ok(())
@@ -5761,6 +6178,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             &mut crate::activity::StageTracker::new(crate::activity::ActivityRegistry::new()),
         )
         .await
+        .result
         .map(|_| ())
     }
 
@@ -6365,6 +6783,22 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         Ok(())
     }
 
+    /// A run that returned `result` without being asked to wind down.
+    fn ran(result: Result<Value>) -> ReviewToolOutcome {
+        ReviewToolOutcome {
+            result,
+            wound_down: None,
+        }
+    }
+
+    fn classify_run(result: Result<Value>, index: i64, no_ai: bool) -> AttemptEnd {
+        AttemptEnd::classify(ran(result), index, no_ai)
+    }
+
+    fn decide_run(result: Result<Value>, index: i64, no_ai: bool, cancelled: bool) -> AttemptEnd {
+        AttemptEnd::decide(ran(result), index, no_ai, cancelled)
+    }
+
     /// What a run of the worker returned decides how the attempt ended,
     /// whichever arm of the I/O loop's `Result` it came back in.
     #[test]
@@ -6382,7 +6816,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             output
         };
         let failed = |end: AttemptEnd| match end {
-            AttemptEnd::Failed { reason, output } => (reason, output.is_some()),
+            AttemptEnd::Failed { reason, output, .. } => (reason, output.is_some()),
             other => panic!("expected Failed, got {other:?}"),
         };
 
@@ -6390,19 +6824,19 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             active_seconds: 60,
             salvage_seconds: 0,
         };
-        let end = AttemptEnd::classify(
+        let end = classify_run(
             Err(anyhow::Error::new(timeout).context("while reading the worker")),
             1,
             false,
         );
         assert!(
-            matches!(end, AttemptEnd::TimedOut { timeout: t } if t == timeout),
+            matches!(end, AttemptEnd::TimedOut { timeout: t, output: None } if t == timeout),
             "a timeout behind further context is still a timeout: {end:?}"
         );
         assert_eq!(end.settle_cause(), StageStopCause::OutOfTime);
         assert!(!end.has_worker_review());
 
-        let end = AttemptEnd::classify(Err(ReviewError::Cancelled.into()), 1, false);
+        let end = classify_run(Err(ReviewError::Cancelled.into()), 1, false);
         assert!(
             matches!(end, AttemptEnd::Cancelled { output: None }),
             "{end:?}"
@@ -6410,7 +6844,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert_eq!(end.settle_cause(), StageStopCause::Cancelled);
 
         let budget = ReviewError::BudgetExceeded("1800 tokens used > 1000 limit".into());
-        let end = AttemptEnd::classify(
+        let end = classify_run(
             Err(anyhow::Error::new(budget).context("while reading the worker")),
             1,
             false,
@@ -6423,7 +6857,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert_eq!(end.settle_cause(), StageStopCause::Interrupted);
         assert!(!end.has_worker_review());
 
-        let end = AttemptEnd::classify(Err(anyhow!("worker exited")), 1, false);
+        let end = classify_run(Err(anyhow!("worker exited")), 1, false);
         assert_eq!(end.settle_cause(), StageStopCause::Interrupted);
         assert_eq!(
             failed(end),
@@ -6432,7 +6866,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         // An error output is a failure with the worker's own reason, and keeps
         // the output for its token counts.
-        let end = AttemptEnd::classify(
+        let end = classify_run(
             Ok(applied(
                 json!({"review": {"findings": []}, "error": "boom"}),
             )),
@@ -6445,26 +6879,21 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         let not_applied = json!({"patchset_id": 1, "patches": [{"index": 1, "status": "error"}]});
         assert_eq!(
-            failed(AttemptEnd::classify(Ok(not_applied), 1, false)).0,
+            failed(classify_run(Ok(not_applied), 1, false)).0,
             "Tool failed to return patch status"
         );
         let other_patch = applied(json!({"review": {"findings": []}}));
         assert_eq!(
-            failed(AttemptEnd::classify(Ok(other_patch), 2, false)).0,
+            failed(classify_run(Ok(other_patch), 2, false)).0,
             "Tool failed to return patch status",
             "a result for another patch is no result for this one"
         );
         assert_eq!(
-            failed(AttemptEnd::classify(Ok(applied(json!({}))), 1, false)).0,
+            failed(classify_run(Ok(applied(json!({}))), 1, false)).0,
             "Missing review content"
         );
         assert_eq!(
-            failed(AttemptEnd::classify(
-                Ok(applied(json!({"review": null}))),
-                1,
-                false
-            ))
-            .0,
+            failed(classify_run(Ok(applied(json!({"review": null}))), 1, false)).0,
             "AI returned null response"
         );
 
@@ -6473,7 +6902,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             (applied(json!({"review": null})), true),
             (applied(json!({"review": {"findings": []}})), false),
         ] {
-            let end = AttemptEnd::classify(Ok(output), 1, no_ai);
+            let end = classify_run(Ok(output), 1, no_ai);
             assert!(end.has_worker_review(), "{end:?}");
             assert_eq!(end.settle_cause(), StageStopCause::Interrupted);
         }
@@ -6490,7 +6919,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             "patches": [{"index": 1, "status": "applied"}],
             "review": {"findings": []},
         });
-        let end = AttemptEnd::decide(Ok(reviewed.clone()), 1, false, true);
+        let end = decide_run(Ok(reviewed.clone()), 1, false, true);
         assert!(
             matches!(&end, AttemptEnd::Cancelled { output: Some(o) } if *o == reviewed),
             "{end:?}"
@@ -6498,7 +6927,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert!(end.has_worker_review(), "the worker's own record is kept");
         assert_eq!(end.settle_cause(), StageStopCause::Cancelled);
 
-        let end = AttemptEnd::decide(Ok(reviewed), 1, false, false);
+        let end = decide_run(Ok(reviewed), 1, false, false);
         assert!(matches!(end, AttemptEnd::Finished { .. }), "{end:?}");
 
         let no_review = json!({"patchset_id": 1, "patches": [{"index": 1, "status": "error"}]});
@@ -6513,13 +6942,174 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             Err(ReviewError::BudgetExceeded("over".into()).into()),
             Err(anyhow!("worker exited")),
         ] {
-            let end = AttemptEnd::decide(result, 1, false, true);
+            let end = decide_run(result, 1, false, true);
             assert!(
                 matches!(end, AttemptEnd::Cancelled { output: None }),
                 "{end:?}"
             );
             assert!(!end.has_worker_review(), "{end:?}");
         }
+    }
+
+    /// A review is salvaged only when the worker was asked to wind down and
+    /// the deadline stopped one of its stages. A stage that failed on its own
+    /// is a coverage gap on an ordinary review, late or not, and a late
+    /// review that lost nothing to the deadline is an ordinary review. The
+    /// worker's list is read from the review, else from the top level.
+    #[test]
+    fn a_review_is_salvaged_only_when_the_deadline_stopped_a_stage() {
+        use crate::workflow::StageStopCause;
+
+        let timeout = ReviewTimedOut {
+            active_seconds: 60,
+            salvage_seconds: 30,
+        };
+        let failure = |stage: &str, cause: StageStopCause| json!({"stage": stage, "reason": "r", "cause": cause, "patch_index": 1});
+        let in_review = |failures: Option<Vec<Value>>| {
+            let mut review = json!({"findings": []});
+            if let Some(failures) = failures {
+                review["stage_failures"] = Value::Array(failures);
+            }
+            json!({"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}], "review": review})
+        };
+        let at_top = |failures: Vec<Value>| {
+            json!({
+                "patchset_id": 1,
+                "patches": [{"index": 1, "status": "applied"}],
+                "review": {"findings": []},
+                "stage_failures": failures,
+            })
+        };
+        let error = || failure("security", StageStopCause::Error);
+        let cut_short = || failure("locking", StageStopCause::CutShort);
+        let out_of_time = || failure("memory", StageStopCause::OutOfTime);
+
+        // (output, the stages a salvage reports as stopped by the deadline)
+        let cases: Vec<(Value, Vec<&str>)> = vec![
+            (in_review(None), vec![]),
+            (in_review(Some(vec![])), vec![]),
+            (in_review(Some(vec![error()])), vec![]),
+            (in_review(Some(vec![cut_short()])), vec!["locking"]),
+            (in_review(Some(vec![out_of_time()])), vec!["memory"]),
+            (
+                in_review(Some(vec![error(), cut_short(), out_of_time()])),
+                vec!["locking", "memory"],
+            ),
+            (at_top(vec![error()]), vec![]),
+            (at_top(vec![cut_short()]), vec!["locking"]),
+            // An entry that does not read as a stage failure says nothing
+            // about what stopped its stage.
+            (in_review(Some(vec![json!({"stage": "x"})])), vec![]),
+        ];
+        for (output, deadline_stops) in cases {
+            for wound_down in [None, Some(timeout)] {
+                let run = ReviewToolOutcome {
+                    result: Ok(output.clone()),
+                    wound_down,
+                };
+                let end = AttemptEnd::classify(run, 1, false);
+                assert!(end.has_worker_review(), "{end:?}");
+                match end {
+                    AttemptEnd::Salvaged { stopped, .. } => {
+                        assert!(wound_down.is_some(), "salvaged without a wind-down");
+                        let stages: Vec<&str> = stopped.iter().map(|s| s.stage.as_str()).collect();
+                        assert_eq!(stages, deadline_stops, "{output}");
+                    }
+                    AttemptEnd::Finished { late, .. } => {
+                        assert!(
+                            wound_down.is_none() || deadline_stops.is_empty(),
+                            "a wound-down review the deadline cut short is a salvage: {output}"
+                        );
+                        assert_eq!(late, wound_down.is_some(), "{output}");
+                    }
+                    other => panic!("expected a stored review, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// A worker output with no review is a timeout only when the worker was
+    /// asked to wind down and says the deadline stopped the patch's review.
+    /// Any other failure after the wind-down keeps its own reason, and is
+    /// marked as wound down so it is not retried.
+    #[test]
+    fn a_failure_is_a_timeout_only_when_the_worker_says_so() {
+        use crate::workflow::StageStopCause;
+
+        let timeout = ReviewTimedOut {
+            active_seconds: 60,
+            salvage_seconds: 30,
+        };
+        let error_output = |stopped_by: Option<&str>| {
+            let mut patch = json!({"index": 1, "status": "applied", "review_status": "incomplete"});
+            if let Some(cause) = stopped_by {
+                patch["review_stopped_by"] = json!(cause);
+            }
+            json!({"patchset_id": 1, "patches": [patch], "error": "planning failed", "history": []})
+        };
+        let run = |result: Result<Value>, wound_down: Option<ReviewTimedOut>| {
+            AttemptEnd::classify(ReviewToolOutcome { result, wound_down }, 1, false)
+        };
+
+        let end = run(Ok(error_output(Some("out_of_time"))), Some(timeout));
+        assert!(
+            matches!(&end, AttemptEnd::TimedOut { timeout: t, output: Some(_) } if *t == timeout),
+            "{end:?}"
+        );
+        assert_eq!(end.settle_cause(), StageStopCause::OutOfTime);
+        assert!(!end.has_worker_review(), "the daemon records it");
+
+        let failed = |end: AttemptEnd| match end {
+            AttemptEnd::Failed {
+                reason, wound_down, ..
+            } => (reason, wound_down),
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert_eq!(
+            failed(run(Ok(error_output(None)), Some(timeout))),
+            ("planning failed".to_string(), true),
+            "a failure after the wind-down keeps its reason"
+        );
+        assert_eq!(
+            failed(run(Ok(error_output(Some("out_of_time"))), None)),
+            ("planning failed".to_string(), false),
+            "no wind-down was sent, so the deadline cannot have stopped it"
+        );
+        assert!(
+            failed(run(Ok(error_output(Some("bored"))), Some(timeout))).1,
+            "an unknown cause is no timeout"
+        );
+        assert_eq!(
+            failed(run(Err(anyhow!("worker exited")), Some(timeout))),
+            ("Tool error: worker exited".to_string(), true)
+        );
+        let end = run(Err(anyhow::Error::new(timeout)), Some(timeout));
+        assert!(
+            matches!(end, AttemptEnd::TimedOut { output: None, .. }),
+            "the hard limit passing is a timeout: {end:?}"
+        );
+
+        // A cancel still decides the end, and keeps a salvaged review.
+        let salvaged = json!({
+            "patchset_id": 1,
+            "patches": [{"index": 1, "status": "applied"}],
+            "review": {"findings": [], "stage_failures": [
+                {"stage": "locking", "reason": "r", "cause": "cut_short"}
+            ]},
+        });
+        let end = AttemptEnd::decide(
+            ReviewToolOutcome {
+                result: Ok(salvaged),
+                wound_down: Some(timeout),
+            },
+            1,
+            false,
+            true,
+        );
+        assert!(
+            matches!(end, AttemptEnd::Cancelled { output: Some(_) }),
+            "{end:?}"
+        );
     }
 
     /// A mock worker that reports `lines` and then runs `then`: the shell
@@ -6594,80 +7184,123 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         F: FnOnce(Arc<Database>, i64) -> Fut,
         Fut: std::future::Future<Output = Result<()>>,
     {
-        let temp_dir = tempdir()?;
-        let bin_path = temp_dir.path().join("mock_worker");
-        std::fs::write(&bin_path, script)?;
-        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
-
-        let mut settings = Settings::new()?;
-        settings.database.url = ":memory:".to_string();
-        configure(&mut settings);
-        let db = Arc::new(Database::new(&settings.database).await?);
-        db.migrate().await?;
-        let activity = crate::activity::ActivityRegistry::new();
-        let ctx = ReviewContext {
-            semaphore: Arc::new(Semaphore::new(1)),
-            llm_semaphore: Arc::new(Semaphore::new(56)),
-            db: db.clone(),
-            settings,
-            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None)?),
-            quota_manager: Arc::new(QuotaManager::new()),
-            target_review_count: 1,
-            provider,
-            activity: activity.clone(),
-            worker_program: Some(bin_path),
-        };
-
-        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
-        db.create_message(
-            "msg_id_p1",
-            thread_id,
-            None,
-            "Author",
-            "Subject",
-            1000,
-            "Body",
-            "",
-            "",
-            None,
-            None,
-        )
-        .await?;
-        let patchset_id = db
-            .create_patchset(
-                thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
-                None, false, None, None,
-            )
-            .await?
-            .ok_or_else(|| anyhow!("patchset was not created"))?;
-        let diff = "diff --git a/foo.c b/foo.c\n+int x;";
-        let patch_id = db.create_patch(patchset_id, "msg_id_p1", 1, diff).await?;
-
-        let input_payload = json!({});
-        let review = Reviewer::process_patch_review(
-            &ctx,
-            patchset_id,
-            patch_id,
-            1,
-            "HEAD",
-            None,
-            &input_payload,
-            None,
-            None,
-            None,
-            diff,
-            None,
+        let fixture = WorkerFixture::new(script, provider, configure).await?;
+        let (result, during) = tokio::join!(
+            fixture.review(),
+            during(fixture.ctx.db.clone(), fixture.patchset_id)
         );
-        let (result, during) = tokio::join!(review, during(db.clone(), patchset_id));
         during?;
-        let result = result?;
         Ok(WorkerReview {
-            result,
-            db,
-            activity,
-            patchset_id,
-            patch_id,
+            result: result?,
+            db: fixture.ctx.db.clone(),
+            activity: fixture.ctx.activity.clone(),
+            patchset_id: fixture.patchset_id,
+            patch_id: fixture.patch_id,
         })
+    }
+
+    /// A patchset of one patch, ready to be reviewed by `process_patch_review`
+    /// with a mock worker script, as many times as a test needs.
+    struct WorkerFixture {
+        ctx: ReviewContext,
+        patchset_id: i64,
+        patch_id: i64,
+        /// Holds the worker script.
+        _dir: tempfile::TempDir,
+    }
+
+    impl WorkerFixture {
+        /// The patch's diff.
+        const DIFF: &str = "diff --git a/foo.c b/foo.c\n+int x;";
+
+        /// Salvage is disabled unless `configure` sets it, so a test that
+        /// times a worker out is not held for the default salvage window.
+        async fn new(
+            script: &str,
+            provider: Arc<dyn AiProvider>,
+            configure: impl FnOnce(&mut Settings),
+        ) -> Result<Self> {
+            let dir = tempdir()?;
+            let bin_path = dir.path().join("mock_worker");
+            std::fs::write(&bin_path, script)?;
+            std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+
+            let mut settings = Settings::new()?;
+            settings.database.url = ":memory:".to_string();
+            settings.review.salvage_seconds = 0;
+            configure(&mut settings);
+            let db = Arc::new(Database::new(&settings.database).await?);
+            db.migrate().await?;
+            let ctx = ReviewContext {
+                semaphore: Arc::new(Semaphore::new(1)),
+                llm_semaphore: Arc::new(Semaphore::new(56)),
+                db: db.clone(),
+                settings,
+                baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None)?),
+                quota_manager: Arc::new(QuotaManager::new()),
+                target_review_count: 1,
+                provider,
+                activity: crate::activity::ActivityRegistry::new(),
+                worker_program: Some(bin_path),
+            };
+
+            let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+            db.create_message(
+                "msg_id_p1",
+                thread_id,
+                None,
+                "Author",
+                "Subject",
+                1000,
+                "Body",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await?;
+            let patchset_id = db
+                .create_patchset(
+                    thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                    None, false, None, None,
+                )
+                .await?
+                .ok_or_else(|| anyhow!("patchset was not created"))?;
+            let patch_id = db
+                .create_patch(patchset_id, "msg_id_p1", 1, Self::DIFF)
+                .await?;
+            Ok(Self {
+                ctx,
+                patchset_id,
+                patch_id,
+                _dir: dir,
+            })
+        }
+
+        /// Reviews the patch once, as the patchset's run would.
+        async fn review(&self) -> Result<PatchResult> {
+            // The message ids let a stored review queue its notifications,
+            // so a test can see whether it did.
+            let input_payload = json!({
+                "message_id": "msg_id_1",
+                "patches": [{"index": 1, "message_id": "msg_id_p1"}],
+            });
+            Reviewer::process_patch_review(
+                &self.ctx,
+                self.patchset_id,
+                self.patch_id,
+                1,
+                "HEAD",
+                None,
+                &input_payload,
+                None,
+                None,
+                None,
+                Self::DIFF,
+                None,
+            )
+            .await
+        }
     }
 
     /// Every review row of the patch, oldest first, with its status, result
@@ -6967,7 +7600,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
     /// A review that ran out of time is not tried again, however many retries
     /// remain: an identical attempt gets an identical deadline. The patch
-    /// fails at once, while any other failure is still retried (see
+    /// ends TimedOut at once, while any other failure is still retried (see
     /// `test_an_error_output_records_what_the_attempt_did`).
     #[tokio::test]
     async fn test_a_timed_out_review_is_not_retried() -> Result<()> {
@@ -6986,7 +7619,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert_eq!(reviews[0]["attempt"], 1, "{}", reviews[0]);
         assert_eq!(
             patch_status(&run.db, run.patch_id).await?.as_deref(),
-            Some("Failed")
+            Some("TimedOut")
         );
         Ok(())
     }
@@ -7044,6 +7677,530 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert_eq!(
             patch_status(&run.db, run.patch_id).await?.as_deref(),
             Some("Failed")
+        );
+        Ok(())
+    }
+
+    /// A worker that reports `lines`, waits for the daemon's wind-down, and
+    /// then runs `then`. It exits on any other line, so a test cannot pass
+    /// on a worker that was never asked to wind down.
+    fn worker_winding_down(lines: &[String], then: &str) -> String {
+        worker_reporting_then(
+            lines,
+            &format!(
+                "read -r msg\ncase \"$msg\" in\n  *'\"type\":\"wind_down\"'*) ;;\n  *) exit 3 ;;\nesac\n{then}"
+            ),
+        )
+    }
+
+    /// A worker output for patch 1 with a review: one critical finding, a
+    /// concern, an inline review and its own history, and `stage_failures`
+    /// in the review. It holds no single quote, so a script can echo it.
+    fn reviewed_output(stage_failures: Value) -> String {
+        json!({
+            "patchset_id": 1,
+            "patches": [{"index": 1, "status": "applied"}],
+            "review": {
+                "summary": "the summary",
+                "findings": [{"problem": "use after free", "severity": "Critical"}],
+                "concerns": [{"description": "a concern"}],
+                "stage_failures": stage_failures,
+            },
+            "inline_review": "the inline review",
+            "tokens_in": 5,
+            "tokens_out": 2,
+            "history": [{"role": "assistant", "content": "the worker history"}],
+        })
+        .to_string()
+    }
+
+    /// A worker output for patch 1 whose review failed with `error`, as the
+    /// worker writes it, with `stopped_by` as the patch's review_stopped_by.
+    fn error_output(error: &str, stopped_by: Option<&str>) -> String {
+        let mut patch = json!({
+            "index": 1,
+            "status": "applied",
+            "review_status": "incomplete",
+            "review_error": error,
+        });
+        if let Some(cause) = stopped_by {
+            patch["review_stopped_by"] = json!(cause);
+        }
+        json!({"patchset_id": 1, "patches": [patch], "error": error, "history": []}).to_string()
+    }
+
+    /// How many rows `sql` counts for `id`.
+    async fn count(db: &Database, sql: &str, id: i64) -> Result<i64> {
+        db.conn
+            .query(sql, libsql::params![id])
+            .await?
+            .next()
+            .await?
+            .map_or(Ok(0), |row| row.get::<i64>(0))
+            .map_err(Into::into)
+    }
+
+    /// The email and forge rows queued for the patch and its patchset.
+    async fn queued_notifications(run: &WorkerReview) -> Result<(i64, i64)> {
+        Ok((
+            count(
+                &run.db,
+                "SELECT COUNT(*) FROM email_outbox WHERE patch_id = ?",
+                run.patch_id,
+            )
+            .await?,
+            count(
+                &run.db,
+                "SELECT COUNT(*) FROM forge_outbox WHERE patchset_id = ?",
+                run.patchset_id,
+            )
+            .await?,
+        ))
+    }
+
+    /// Times a worker out after a second with a long salvage window and
+    /// retries to spare, so a test sees both the wind-down and whether the
+    /// attempt is tried again.
+    fn out_of_time_with_salvage(s: &mut Settings) {
+        s.review.timeout_seconds = 1;
+        s.review.salvage_seconds = 30;
+        s.review.max_retries = 2;
+    }
+
+    /// A review that reaches its deadline is asked to wind down, and the
+    /// findings it then returns are kept: the row and the patch are Partial,
+    /// the row keeps the worker's history, nothing is retried, and nothing is
+    /// sent, since only a Reviewed review leaves the server.
+    #[tokio::test]
+    async fn test_timeout_asks_worker_to_salvage_its_findings() -> Result<()> {
+        use crate::workflow::StageStopCause;
+
+        let cut_short = json!([{
+            "stage": "security",
+            "reason": "cut short: the review ran out of time; its findings so far were kept",
+            "cause": StageStopCause::CutShort,
+        }]);
+        let script = worker_winding_down(
+            &stage_reaching("security", 3),
+            &format!("echo '{}'\n", reviewed_output(cut_short)),
+        );
+
+        let run = review_patch_with_worker(&script, out_of_time_with_salvage).await?;
+        assert!(matches!(run.result, PatchResult::Partial));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1, "a salvage is not retried: {reviews:?}");
+        let review = &reviews[0];
+        assert_eq!(review["status"], "Partial", "{review}");
+        assert_eq!(
+            review["result"],
+            "Review ran out of time; findings salvaged from the stages that finished"
+        );
+        assert_eq!(review["summary"], "the summary", "{review}");
+        assert_eq!(review["inline_review"], "the inline review", "{review}");
+        assert_eq!(review["tokens_in"], 5, "{review}");
+        assert_eq!(
+            recorded_log(review),
+            vec![(None, "the worker history".to_string())]
+        );
+        assert_eq!(
+            recorded_failures(review)
+                .into_iter()
+                .map(|(stage, cause, _)| (stage, cause))
+                .collect::<Vec<_>>(),
+            vec![("security".to_string(), "cut_short".to_string())]
+        );
+        let review_id = review["id"].as_i64().unwrap_or_default();
+        assert_eq!(
+            count(
+                &run.db,
+                "SELECT COUNT(*) FROM findings WHERE review_id = ?",
+                review_id
+            )
+            .await?,
+            1,
+            "the salvaged finding is stored"
+        );
+        assert_eq!(
+            patch_status(&run.db, run.patch_id).await?.as_deref(),
+            Some("Partial")
+        );
+        assert_eq!(queued_notifications(&run).await?, (0, 0));
+        Ok(())
+    }
+
+    /// A review that ran late but lost nothing to the deadline is an
+    /// ordinary review: Reviewed, and its notifications are queued. A stage
+    /// that failed on its own is a coverage gap, not a salvage.
+    #[tokio::test]
+    async fn test_a_late_review_that_lost_nothing_is_reviewed() -> Result<()> {
+        let own_failure = json!([{"stage": "security", "reason": "provider", "cause": "error"}]);
+        let script = worker_winding_down(
+            &stage_reaching("security", 3),
+            &format!("echo '{}'\n", reviewed_output(own_failure)),
+        );
+
+        let run = review_patch_with_worker(&script, out_of_time_with_salvage).await?;
+        assert!(matches!(run.result, PatchResult::Success));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["status"], "Reviewed", "{}", reviews[0]);
+        assert_eq!(
+            patch_status(&run.db, run.patch_id).await?.as_deref(),
+            Some("Reviewed")
+        );
+        let (emails, _) = queued_notifications(&run).await?;
+        assert!(emails > 0, "a Reviewed review is sent as before");
+        Ok(())
+    }
+
+    /// A worker that ignores the wind-down is killed at the hard limit. The
+    /// timeout is typed, the row keeps the streamed conversation, timings and
+    /// the stage the deadline stopped, the patch is TimedOut, and there is
+    /// one attempt only.
+    #[tokio::test]
+    async fn test_timeout_is_typed_when_the_worker_never_salvages() -> Result<()> {
+        let stdin_dir = tempdir()?;
+        let stdin_copy = stdin_dir.path().join("stdin");
+        let mut lines = stage_reaching("goal", 1);
+        lines.push(progress(
+            1,
+            crate::activity::ProgressWire::StageFinished {
+                stage: "goal".into(),
+                cut_short: false,
+            },
+        ));
+        lines.extend(stage_reaching("security", 2));
+        lines.push(streamed(Some("security"), "still tracing"));
+        let script = worker_reporting_then(
+            &lines,
+            // Not exec'd: the shell keeps the worker's stdout open while
+            // cat copies its stdin, so the run does not end on an early EOF.
+            &format!("cat > '{}'\n", stdin_copy.display()),
+        );
+
+        let run = review_patch_with_worker(&script, |s| {
+            s.review.timeout_seconds = 1;
+            s.review.salvage_seconds = 1;
+            s.review.max_retries = 2;
+        })
+        .await?;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+
+        let received = std::fs::read_to_string(&stdin_copy)?;
+        assert!(
+            received.contains(r#""type":"wind_down""#),
+            "the worker was asked to wind down: {received}"
+        );
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1, "one attempt only: {reviews:?}");
+        let review = &reviews[0];
+        assert_eq!(review["status"], "Failed");
+        assert_eq!(
+            review["result"],
+            "Tool error: Review tool timed out (active time exceeded)"
+        );
+        let failures = recorded_failures(review);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            (failures[0].0.as_str(), failures[0].1.as_str()),
+            ("security", "out_of_time")
+        );
+        assert_eq!(recorded_timings(review), vec![("goal".to_string(), 1)]);
+        assert_eq!(
+            recorded_log(review),
+            promoted(&[(Some("security"), "still tracing")])
+        );
+        assert_eq!(
+            patch_status(&run.db, run.patch_id).await?.as_deref(),
+            Some("TimedOut")
+        );
+        Ok(())
+    }
+
+    /// With salvage disabled the worker is killed at the deadline and is
+    /// never sent a wind-down.
+    #[tokio::test]
+    async fn test_without_salvage_no_wind_down_is_sent() -> Result<()> {
+        let stdin_dir = tempdir()?;
+        let stdin_copy = stdin_dir.path().join("stdin");
+        let script = worker_reporting_then(
+            &stage_reaching("security", 1),
+            // Not exec'd: the shell keeps the worker's stdout open while
+            // cat copies its stdin, so the run does not end on an early EOF.
+            &format!("cat > '{}'\n", stdin_copy.display()),
+        );
+
+        let run = review_patch_with_worker(&script, |s| {
+            s.review.timeout_seconds = 1;
+            s.review.salvage_seconds = 0;
+        })
+        .await?;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+        assert_eq!(std::fs::read_to_string(&stdin_copy)?, "");
+        assert_eq!(
+            patch_status(&run.db, run.patch_id).await?.as_deref(),
+            Some("TimedOut")
+        );
+        Ok(())
+    }
+
+    /// A worker the deadline stopped before it had a review says so on the
+    /// patch. The attempt is a timeout with the worker's reason added, the
+    /// stage failures the worker streamed are stored, the streamed
+    /// conversation replaces the output's empty history, and it is not
+    /// retried.
+    #[tokio::test]
+    async fn test_a_worker_stopped_by_the_deadline_is_a_timeout() -> Result<()> {
+        use crate::activity::ProgressWire;
+        use crate::workflow::StageStopCause;
+
+        let mut lines = stage_reaching("security", 1);
+        lines.push(streamed(Some("security"), "reading the driver"));
+        let after = [
+            progress(
+                1,
+                ProgressWire::StageFailed {
+                    stage: "security".into(),
+                    reason: "Session stopped: the review ran out of time".into(),
+                    cause: StageStopCause::OutOfTime,
+                },
+            ),
+            error_output("All parallel stages failed", Some("out_of_time")),
+        ];
+        let then: String = after.iter().map(|l| format!("echo '{l}'\n")).collect();
+        let script = worker_winding_down(&lines, &then);
+
+        let run = review_patch_with_worker(&script, out_of_time_with_salvage).await?;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1, "a timeout is not retried: {reviews:?}");
+        let review = &reviews[0];
+        assert_eq!(review["status"], "Failed");
+        assert_eq!(
+            review["result"],
+            "Tool error: Review tool timed out (active time exceeded): All parallel stages failed"
+        );
+        let failures = recorded_failures(review);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert_eq!(
+            (failures[0].0.as_str(), failures[0].1.as_str()),
+            ("security", "out_of_time")
+        );
+        assert_eq!(
+            recorded_log(review),
+            promoted(&[(Some("security"), "reading the driver")])
+        );
+        assert_eq!(
+            patch_status(&run.db, run.patch_id).await?.as_deref(),
+            Some("TimedOut")
+        );
+        Ok(())
+    }
+
+    /// A failure after the wind-down that the worker does not put down to
+    /// the deadline keeps its own reason, but is not retried: the attempt
+    /// has already shown the review does not fit in its deadline.
+    #[tokio::test]
+    async fn test_a_failure_after_the_wind_down_is_not_retried() -> Result<()> {
+        let mut lines = stage_reaching("verification", 1);
+        lines.push(streamed(Some("verification"), "checking the finding"));
+        let script = worker_winding_down(
+            &lines,
+            &format!("echo '{}'\n", error_output("validation failed", None)),
+        );
+
+        let run = review_patch_with_worker(&script, out_of_time_with_salvage).await?;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1, "not retried: {reviews:?}");
+        let review = &reviews[0];
+        assert_eq!(review["status"], "Failed");
+        assert_eq!(review["result"], "validation failed");
+        assert_eq!(
+            recorded_failures(review)
+                .into_iter()
+                .map(|(stage, cause, _)| (stage, cause))
+                .collect::<Vec<_>>(),
+            vec![("verification".to_string(), "interrupted".to_string())]
+        );
+        assert_eq!(
+            recorded_log(review),
+            promoted(&[(Some("verification"), "checking the finding")])
+        );
+        assert_eq!(
+            patch_status(&run.db, run.patch_id).await?.as_deref(),
+            Some("Failed")
+        );
+        Ok(())
+    }
+
+    /// A worker that printed its result and closed its input just before the
+    /// deadline cannot be sent the wind-down. That failed write is logged
+    /// and the result the worker wrote is still read, so a finished review
+    /// is not turned into a failed one.
+    #[tokio::test]
+    async fn test_a_wind_down_the_worker_cannot_read_is_not_a_failure() -> Result<()> {
+        let script = format!(
+            "#!/bin/sh\nread -r _payload\nexec 0<&-\nsleep 2\necho '{}'\n",
+            reviewed_output(json!([]))
+        );
+
+        let run = review_patch_with_worker(&script, out_of_time_with_salvage).await?;
+        assert!(matches!(run.result, PatchResult::Success));
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["status"], "Reviewed", "{}", reviews[0]);
+        Ok(())
+    }
+
+    /// Answers every request with a reply far larger than a pipe's buffer,
+    /// so a worker that does not read its stdin leaves the reply writer
+    /// blocked while it holds the stdin lock.
+    struct PipeFillingProvider;
+
+    #[async_trait]
+    impl AiProvider for PipeFillingProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            Ok(AiResponse {
+                content: Some("x".repeat(1 << 20)),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// A worker that has stopped reading its stdin, with a reply writer
+    /// blocked on the full pipe, is still killed at the hard limit: the
+    /// wind-down waiting for the stdin lock does not hold up the I/O loop.
+    #[tokio::test]
+    async fn test_a_worker_that_stopped_reading_is_killed_at_the_hard_limit() -> Result<()> {
+        let request = json!({
+            "type": "ai_request",
+            "tx_id": 1,
+            "payload": {"messages": [{"role": "user", "content": "go on"}]},
+        });
+        let script = worker_reporting_then(&[request.to_string()], "exec sleep 30\n");
+
+        let started = Instant::now();
+        let run = tokio::time::timeout(
+            Duration::from_secs(20),
+            review_patch_with_provider(&script, Arc::new(PipeFillingProvider), |s| {
+                s.review.timeout_seconds = 1;
+                s.review.salvage_seconds = 1;
+                s.review.max_retries = 0;
+            }),
+        )
+        .await
+        .map_err(|_| anyhow!("the worker was not killed at the hard limit"))??;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "killed late: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            patch_status(&run.db, run.patch_id).await?.as_deref(),
+            Some("TimedOut")
+        );
+        Ok(())
+    }
+
+    /// A cancel during the salvage window still stops the worker at the
+    /// next poll, rather than waiting for the window to close.
+    #[tokio::test]
+    async fn test_a_cancel_while_winding_down_stops_the_worker() -> Result<()> {
+        let then = format!(
+            "echo '{}'\nexec sleep 30\n",
+            streamed(Some("verification"), "winding down")
+        );
+        let script = worker_winding_down(&stage_reaching("verification", 1), &then);
+
+        let started = Instant::now();
+        let run = review_patch_with_worker_while(
+            &script,
+            Arc::new(MockProvider),
+            out_of_time_with_salvage,
+            cancel_once_streamed,
+        )
+        .await?;
+        assert!(matches!(run.result, PatchResult::Cancelled));
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the cancel did not wait out the salvage window: {:?}",
+            started.elapsed()
+        );
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["status"], "Cancelled", "{}", reviews[0]);
+        assert_eq!(
+            patch_status(&run.db, run.patch_id).await?.as_deref(),
+            Some("Cancelled")
+        );
+        Ok(())
+    }
+
+    /// A patch whose review ran out of time is not reviewed again when its
+    /// patchset is processed again, as after a restart: it keeps its status,
+    /// and a salvaged patch still counts as Partial. A rerun clears it, so
+    /// it is reviewed again.
+    #[tokio::test]
+    async fn test_a_patch_that_ran_out_of_time_is_not_reviewed_again() -> Result<()> {
+        let cut_short = json!([{"stage": "security", "reason": "r", "cause": "cut_short"}]);
+        let salvaging = worker_winding_down(
+            &stage_reaching("security", 1),
+            &format!("echo '{}'\n", reviewed_output(cut_short)),
+        );
+        let fixture =
+            WorkerFixture::new(&salvaging, Arc::new(MockProvider), out_of_time_with_salvage)
+                .await?;
+        let db = fixture.ctx.db.clone();
+        assert!(matches!(fixture.review().await?, PatchResult::Partial));
+        assert!(matches!(fixture.review().await?, PatchResult::Partial));
+        assert_eq!(review_rows(&db, fixture.patch_id).await?.len(), 1);
+        assert_eq!(
+            patch_status(&db, fixture.patch_id).await?.as_deref(),
+            Some("Partial")
+        );
+
+        db.update_patchset_status(fixture.patchset_id, ReviewStatus::Partial.as_str())
+            .await?;
+        db.rerun_patchset(fixture.patchset_id).await?;
+        assert!(matches!(fixture.review().await?, PatchResult::Partial));
+        let reviews = review_rows(&db, fixture.patch_id).await?;
+        assert_eq!(reviews.len(), 2, "a rerun reviews it again: {reviews:?}");
+        assert_eq!(reviews[0]["status"], "Partial", "the first salvage is kept");
+
+        let timing_out = worker_winding_down(
+            &stage_reaching("security", 1),
+            &format!("echo '{}'\n", error_output("stopped", Some("out_of_time"))),
+        );
+        let fixture = WorkerFixture::new(
+            &timing_out,
+            Arc::new(MockProvider),
+            out_of_time_with_salvage,
+        )
+        .await?;
+        let db = fixture.ctx.db.clone();
+        assert!(matches!(fixture.review().await?, PatchResult::ReviewFailed));
+        assert!(matches!(fixture.review().await?, PatchResult::ReviewFailed));
+        assert_eq!(review_rows(&db, fixture.patch_id).await?.len(), 1);
+        assert_eq!(
+            patch_status(&db, fixture.patch_id).await?.as_deref(),
+            Some("TimedOut")
         );
         Ok(())
     }

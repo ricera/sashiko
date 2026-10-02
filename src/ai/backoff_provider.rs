@@ -118,6 +118,12 @@ impl ReviewDeadline {
         self.soft() + self.salvage
     }
 
+    /// The extra time granted after the soft limit; zero when salvage is
+    /// disabled, so the review is stopped at the soft limit.
+    pub fn salvage(&self) -> Duration {
+        self.salvage
+    }
+
     /// Credits a wait at the quota gate by moving both limits later.
     pub fn credit(&self, waited: Duration) {
         *self.lock_soft() += waited;

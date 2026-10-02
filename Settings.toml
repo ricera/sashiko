@@ -237,6 +237,10 @@ repository_path = "third_party/linux"
 concurrency = 16
 worktree_dir = "review_trees"
 timeout_seconds = 7200
+# Extra seconds a review gets after timeout_seconds to finish consolidating
+# what its analysis stages found. 0 disables salvage: the worker is killed
+# at timeout_seconds, as before.
+salvage_seconds = 1800
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]
 

@@ -70,6 +70,12 @@ const CLOSED_TO_NEW_PARTS_SQL: &str = "(status = 'Cancelled'
 const RESUBMITTABLE_STATUSES_SQL: &str =
     "('Partial', 'Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply')";
 
+/// The patch verdicts of a review that ran out of time. Each is final when
+/// a patchset is processed again, and each is cleared by a rerun or a
+/// resubmission, which ask for the patch to be reviewed again.
+#[cfg(feature = "server")]
+const DEADLINE_OUTCOMES: [PatchOutcome; 2] = [PatchOutcome::Partial, PatchOutcome::TimedOut];
+
 /// The unspaced spelling of Failed To Apply. No writer uses it today, but the
 /// resubmittable statuses have always accepted it, so a row that carries it
 /// is still treated as a failure to apply.
@@ -2197,6 +2203,13 @@ impl Database {
     /// not be reviewed again when its patchset is processed again, as
     /// after a daemon restart.
     ///
+    /// A patch whose review ran out of time is final as the `Partial` or
+    /// `TimedOut` its status holds: reviewing it again from scratch would
+    /// spend another whole deadline on a review that has shown it does not
+    /// fit in one. The patch status is read, not the review row, because the
+    /// row is history that outlives a rerun, while a rerun or a resubmission
+    /// clears the patch status (see [`Self::clear_deadline_outcomes`]).
+    ///
     /// A patch is final as `Failed` when it has a failed review row that
     /// never reached the model (no interaction), so the failure stays
     /// visible instead of being retried on every restart.
@@ -2205,6 +2218,25 @@ impl Database {
         patchset_id: i64,
         patch_id: i64,
     ) -> Result<Option<PatchOutcome>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE id = ? AND patchset_id = ?",
+                libsql::params![patch_id, patchset_id],
+            )
+            .await?;
+        let status = match rows.next().await? {
+            Some(row) => row.get::<Option<String>>(0)?,
+            None => None,
+        };
+        drop(rows);
+        if let Some(held) = DEADLINE_OUTCOMES
+            .into_iter()
+            .find(|outcome| status.as_deref() == Some(outcome.as_str()))
+        {
+            return Ok(Some(held));
+        }
+
         let mut rows = self.conn
             .query(
                 "SELECT 1 FROM reviews WHERE patchset_id = ? AND patch_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
@@ -9244,7 +9276,12 @@ impl Database {
                 .await?;
         }
 
-        // 4. Delete associated tool usages and findings for failed reviews that block retrying
+        // 4. Patches whose review ran out of time are reviewed again. The
+        // count is not raised for a Partial patchset, so the patches that
+        // already have a full review are not reviewed again with them.
+        self.clear_deadline_outcomes(id).await?;
+
+        // 5. Delete associated tool usages and findings for failed reviews that block retrying
         self.conn
             .execute(
                 "DELETE FROM tool_usages WHERE review_id IN (
@@ -9263,7 +9300,7 @@ impl Database {
             )
             .await?;
 
-        // 5. Delete failed reviews that block retrying (infra failures)
+        // 6. Delete failed reviews that block retrying (infra failures)
         self.conn
             .execute(
                 "DELETE FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
@@ -9271,6 +9308,21 @@ impl Database {
             )
             .await?;
 
+        Ok(())
+    }
+
+    /// Returns the patches of a patchset whose review ran out of time to
+    /// "not yet reviewed", so the restart guard of [`Self::prior_final_outcome`]
+    /// lets them be reviewed again. Their review rows and findings are kept,
+    /// as a `Reviewed` review's are.
+    async fn clear_deadline_outcomes(&self, patchset_id: i64) -> Result<()> {
+        let [partial, timed_out] = DEADLINE_OUTCOMES.map(PatchOutcome::as_str);
+        self.conn
+            .execute(
+                "UPDATE patches SET status = NULL WHERE patchset_id = ? AND status IN (?, ?)",
+                libsql::params![patchset_id, partial, timed_out],
+            )
+            .await?;
         Ok(())
     }
 
@@ -9379,6 +9431,9 @@ impl Database {
                         "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
                         libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
                     ).await?;
+                    // A resubmission asks for a new review, so a patch that
+                    // ran out of time must not be skipped as already final.
+                    self.clear_deadline_outcomes(id).await?;
                 }
                 self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
                     .await?;
@@ -12994,6 +13049,8 @@ mod tests {
 
         for outcome in [
             PatchOutcome::Reviewed,
+            PatchOutcome::Partial,
+            PatchOutcome::TimedOut,
             PatchOutcome::Failed,
             PatchOutcome::Skipped,
             PatchOutcome::Cancelled,
@@ -13010,10 +13067,25 @@ mod tests {
             let stored: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
             assert_eq!(stored, outcome.as_str());
 
-            // The guard's rule reads review rows only: a patch status with no
-            // failed review behind it is not a prior final outcome.
-            assert_eq!(db.prior_final_outcome(ps_id, patch_id).await.unwrap(), None);
+            // A patch that ran out of time keeps its verdict on the patch
+            // itself. Any other patch status with no failed review behind it
+            // is not a prior final outcome: that rule reads review rows.
+            let held = matches!(outcome, PatchOutcome::Partial | PatchOutcome::TimedOut);
+            assert_eq!(
+                db.prior_final_outcome(ps_id, patch_id).await.unwrap(),
+                held.then_some(outcome),
+                "{outcome:?}"
+            );
         }
+
+        // The patch status is only read for its own patchset.
+        db.update_patch_status(patch_id, PatchOutcome::Partial)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.prior_final_outcome(ps_id + 1, patch_id).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -13465,6 +13537,146 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let status: String = row.get(0).unwrap();
         assert_eq!(status, "Failed");
+    }
+
+    /// A rerun of a Partial patchset reviews again only the patches whose
+    /// review ran out of time. It does not raise the review count, which
+    /// would review every fully reviewed patch again too, and it keeps the
+    /// salvaged review and its findings as history.
+    #[tokio::test]
+    async fn test_rerun_of_a_partial_patchset_clears_only_the_deadline_outcomes() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("root", "Subject", 100).await.unwrap();
+        for msg in ["msg_cl", "msg_p1", "msg_p2", "msg_p3"] {
+            db.create_message(
+                msg, thread_id, None, "Author", "Subject", 100, "", "", "", None, None,
+            )
+            .await
+            .unwrap();
+        }
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                Some("msg_cl"),
+                "msg_cl",
+                "Subject",
+                "Author",
+                100,
+                3,
+                3,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let reviewed = db.create_patch(ps_id, "msg_p1", 1, "diff").await.unwrap();
+        let partial = db.create_patch(ps_id, "msg_p2", 2, "diff").await.unwrap();
+        let timed_out = db.create_patch(ps_id, "msg_p3", 3, "diff").await.unwrap();
+        db.update_patch_status(reviewed, PatchOutcome::Reviewed)
+            .await
+            .unwrap();
+        db.update_patch_status(partial, PatchOutcome::Partial)
+            .await
+            .unwrap();
+        db.update_patch_status(timed_out, PatchOutcome::TimedOut)
+            .await
+            .unwrap();
+        let salvaged = db
+            .create_review(ps_id, Some(partial), "p", "m", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            salvaged,
+            ReviewStatus::Partial.as_str(),
+            "Review ran out of time",
+            Some("summary"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_finding(Finding {
+            review_id: salvaged,
+            severity: Severity::Critical,
+            severity_explanation: None,
+            problem: "salvaged finding".to_string(),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, ReviewStatus::Partial.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.prior_final_outcome(ps_id, partial).await.unwrap(),
+            Some(PatchOutcome::Partial)
+        );
+
+        db.rerun_patchset(ps_id).await.unwrap();
+
+        let target: i64 = db
+            .conn
+            .query(
+                "SELECT target_review_count FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(target, 1, "a Partial patchset keeps its review count");
+        for (patch, expected) in [
+            (reviewed, Some("Reviewed")),
+            (partial, None),
+            (timed_out, None),
+        ] {
+            let status: Option<String> = db
+                .conn
+                .query(
+                    "SELECT status FROM patches WHERE id = ?",
+                    libsql::params![patch],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap();
+            assert_eq!(status.as_deref(), expected, "patch {patch}");
+            assert_eq!(db.prior_final_outcome(ps_id, patch).await.unwrap(), None);
+        }
+        let review = db.get_review_details(salvaged).await.unwrap().unwrap();
+        assert_eq!(review["status"], "Partial", "the salvaged review is kept");
+        let findings: i64 = db
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM findings WHERE review_id = ?",
+                libsql::params![salvaged],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap();
+        assert_eq!(findings, 1, "and so are its findings");
     }
 
     #[tokio::test]
@@ -17011,10 +17223,14 @@ mod tests {
             .unwrap();
         assert_eq!(ps_id, ps_created);
 
-        db.create_patch(ps_id, sha, 1, "diff-v1").await.unwrap();
+        let patch_id = db.create_patch(ps_id, sha, 1, "diff-v1").await.unwrap();
 
-        // 2. The review ends in the given status
+        // 2. The review ends in the given status, with a patch that ran out
+        // of time, which the resubmission must not leave final.
         db.update_patchset_status(ps_id, status).await.unwrap();
+        db.update_patch_status(patch_id, PatchOutcome::Partial)
+            .await
+            .unwrap();
 
         let det = db
             .get_patchset_details(ps_id, None, None)
@@ -17045,6 +17261,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(det_after_fetch["status"], "Fetching");
+        assert_eq!(
+            db.prior_final_outcome(ps_id, patch_id).await.unwrap(),
+            None,
+            "a resubmitted series reviews its timed-out patch again"
+        );
 
         // 4. Ingestion re-runs create_patchset and create_patch
         let ps_reingested = db
