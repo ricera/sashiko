@@ -149,11 +149,19 @@ impl ReviewStatus {
 ///
 /// The type is narrower than `ReviewStatus` on purpose: it rules out
 /// in-flight values such as `Pending` or `In Review`, which a finished
-/// attempt must never leave on a patch.
+/// attempt must never leave on a patch. It also carries `TimedOut`, a patch
+/// verdict that no review or patchset ever holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchOutcome {
     /// The patch has a full review.
     Reviewed,
+    /// The patch's review ran out of time, and its findings were salvaged
+    /// from the stages that finished, so its coverage is incomplete.
+    Partial,
+    /// The patch's review ran out of time with nothing salvaged. A patch
+    /// verdict only: its review row is an ordinary `Failed`, and no patchset
+    /// ever takes this status, so it is not a `ReviewStatus`.
+    TimedOut,
     /// The patch has no review because its attempts failed.
     Failed,
     /// The patch was deliberately not reviewed.
@@ -168,6 +176,8 @@ impl PatchOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Reviewed => ReviewStatus::Reviewed.as_str(),
+            Self::Partial => ReviewStatus::Partial.as_str(),
+            Self::TimedOut => "TimedOut",
             Self::Failed => ReviewStatus::Failed.as_str(),
             Self::Skipped => ReviewStatus::Skipped.as_str(),
             Self::Cancelled => ReviewStatus::Cancelled.as_str(),
@@ -187,19 +197,24 @@ pub mod logging;
 mod tests {
     use super::*;
 
-    /// The `ReviewStatus` each outcome shares its spelling with. The match
-    /// is exhaustive, so a new outcome must state its counterpart here.
-    fn shared_status(outcome: PatchOutcome) -> ReviewStatus {
+    /// The `ReviewStatus` each outcome shares its spelling with, or `None`
+    /// for an outcome that is a patch verdict only. The match is exhaustive,
+    /// so a new outcome must state its counterpart here.
+    fn shared_status(outcome: PatchOutcome) -> Option<ReviewStatus> {
         match outcome {
-            PatchOutcome::Reviewed => ReviewStatus::Reviewed,
-            PatchOutcome::Failed => ReviewStatus::Failed,
-            PatchOutcome::Skipped => ReviewStatus::Skipped,
-            PatchOutcome::Cancelled => ReviewStatus::Cancelled,
+            PatchOutcome::Reviewed => Some(ReviewStatus::Reviewed),
+            PatchOutcome::Partial => Some(ReviewStatus::Partial),
+            PatchOutcome::TimedOut => None,
+            PatchOutcome::Failed => Some(ReviewStatus::Failed),
+            PatchOutcome::Skipped => Some(ReviewStatus::Skipped),
+            PatchOutcome::Cancelled => Some(ReviewStatus::Cancelled),
         }
     }
 
-    const ALL_OUTCOMES: [PatchOutcome; 4] = [
+    const ALL_OUTCOMES: [PatchOutcome; 6] = [
         PatchOutcome::Reviewed,
+        PatchOutcome::Partial,
+        PatchOutcome::TimedOut,
         PatchOutcome::Failed,
         PatchOutcome::Skipped,
         PatchOutcome::Cancelled,
@@ -252,7 +267,15 @@ mod tests {
     #[test]
     fn a_patch_outcome_is_spelled_like_its_review_status() {
         for outcome in ALL_OUTCOMES {
-            let status = shared_status(outcome);
+            let Some(status) = shared_status(outcome) else {
+                // A patch-only verdict must not be mistaken for any status
+                // a review or a patchset can hold.
+                assert!(
+                    ReviewStatus::from_str(outcome.as_str()).is_err(),
+                    "{outcome:?} reads as a review status"
+                );
+                continue;
+            };
             assert_eq!(outcome.as_str(), status.as_str(), "{outcome:?}");
             assert_eq!(outcome.to_string(), status.to_string(), "{outcome:?}");
             assert_eq!(
@@ -261,5 +284,12 @@ mod tests {
                 "{outcome:?} does not read back as the status it shares"
             );
         }
+    }
+
+    #[test]
+    fn a_timed_out_patch_is_spelled_timed_out() {
+        assert_eq!(PatchOutcome::TimedOut.as_str(), "TimedOut");
+        assert_eq!(PatchOutcome::TimedOut.to_string(), "TimedOut");
+        assert_eq!(PatchOutcome::Partial.as_str(), "Partial");
     }
 }

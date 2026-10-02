@@ -1023,6 +1023,14 @@ pub struct ReviewSettings {
     pub worktree_dir: Option<String>,
     #[serde(default = "default_review_timeout")]
     pub timeout_seconds: u64,
+    /// Extra seconds a review gets after `timeout_seconds` to finish
+    /// consolidating what its analysis stages found. At `timeout_seconds`
+    /// the worker is asked to wind down: the stages that gather concerns
+    /// stop and the ones that turn them into findings finish. The worker is
+    /// killed when this further window has passed too. 0 disables salvage,
+    /// so the worker is killed at `timeout_seconds`.
+    #[serde(default = "default_salvage_seconds")]
+    pub salvage_seconds: u64,
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     #[serde(default = "default_max_lines_changed")]
@@ -1087,6 +1095,13 @@ fn default_max_files_touched() -> usize {
 
 fn default_review_timeout() -> u64 {
     3600
+}
+
+/// Long enough for the consolidation stages of a large review. A shorter
+/// window ends in the same kill that salvage exists to avoid: a 900 s window
+/// once ran out five minutes into conflict resolution and lost everything.
+fn default_salvage_seconds() -> u64 {
+    1800
 }
 
 fn default_max_retries() -> u32 {
@@ -1722,6 +1737,23 @@ mod tests {
         assert!(settings.database.url.is_empty());
         assert!(settings.git.repository_path.is_empty());
         assert!(settings.validate_for_daemon().is_err());
+    }
+
+    /// A review gets its salvage window without asking for it, a deployment
+    /// can pin another length or turn it off, and the repository's own
+    /// settings state the default so an operator sees the key.
+    #[test]
+    fn test_salvage_seconds_defaults_to_half_an_hour() {
+        let section = "concurrency = 4\nworktree_dir = \"trees\"\n";
+        let review: ReviewSettings = toml::from_str(section).unwrap();
+        assert_eq!(review.salvage_seconds, 1800);
+
+        let review: ReviewSettings =
+            toml::from_str(&format!("{section}salvage_seconds = 0\n")).unwrap();
+        assert_eq!(review.salvage_seconds, 0);
+
+        let repo = Settings::from_file("Settings.toml").unwrap();
+        assert_eq!(repo.review.salvage_seconds, 1800);
     }
 
     /// A local review's own reduced shape ignored keys it did not know, so a
