@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Clone)]
 struct ReviewContext {
@@ -1945,7 +1945,7 @@ impl Reviewer {
                     existing_pending_review_id.take(),
                     patch_id,
                     None,
-                    None,
+                    AttemptTrace::default(),
                 )
                 .await;
                 return Ok(PatchResult::Cancelled);
@@ -2017,6 +2017,7 @@ impl Reviewer {
                 .set_review_duration(review_id, review_started.elapsed().as_secs())
                 .await;
 
+            let tokens = run.tokens;
             let end = AttemptEnd::decide(
                 run,
                 index,
@@ -2024,8 +2025,12 @@ impl Reviewer {
                 Self::patchset_cancelled(ctx, patchset_id).await,
             );
             let conversation = Self::settle_attempt(ctx, review_id, &mut stages, &end).await;
+            let trace = AttemptTrace {
+                conversation,
+                tokens,
+            };
 
-            let verdict = Self::conclude_attempt(ctx, &patch, review_id, end, conversation).await?;
+            let verdict = Self::conclude_attempt(ctx, &patch, review_id, end, trace).await?;
 
             match verdict {
                 AttemptVerdict::Final(result) => return Ok(result),
@@ -2042,14 +2047,13 @@ impl Reviewer {
     }
 
     /// Records how an attempt ended on its review row, and decides what
-    /// follows it. `conversation` is what the attempt streamed, given for an
-    /// attempt with no review from the worker; see [`Self::settle_attempt`].
+    /// follows it. `trace` is what the daemon itself saw of the attempt.
     async fn conclude_attempt(
         ctx: &ReviewContext,
         patch: &PatchUnderReview<'_>,
         review_id: i64,
         end: AttemptEnd,
-        conversation: Option<String>,
+        trace: AttemptTrace,
     ) -> Result<AttemptVerdict> {
         let (patchset_id, index) = (patch.patchset_id, patch.index);
         let verdict = match end {
@@ -2061,10 +2065,11 @@ impl Reviewer {
                         review_id, patchset_id, index
                     );
                 }
-                Self::store_finished_attempt(ctx, patch, review_id, &output).await?
+                Self::store_finished_attempt(ctx, patch, review_id, &output, trace.tokens).await?
             }
             AttemptEnd::Salvaged { output, stopped } => {
-                Self::store_salvaged_attempt(ctx, patch, review_id, &output, &stopped).await?
+                Self::store_salvaged_attempt(ctx, patch, review_id, &output, &stopped, trace.tokens)
+                    .await?
             }
             AttemptEnd::Cancelled { output } => {
                 info!(
@@ -2076,7 +2081,7 @@ impl Reviewer {
                     Some(review_id),
                     patch.patch_id,
                     output.as_ref(),
-                    conversation,
+                    trace,
                 )
                 .await;
                 AttemptVerdict::Final(PatchResult::Cancelled)
@@ -2088,7 +2093,7 @@ impl Reviewer {
                     review_id,
                     timeout,
                     output.as_ref(),
-                    conversation,
+                    trace,
                 )
                 .await
             }
@@ -2102,7 +2107,7 @@ impl Reviewer {
                     review_id,
                     &format!("Tool error: {}", error),
                     None,
-                    conversation,
+                    trace,
                 )
                 .await;
                 // The budget caps what one review of a patch may cost. Each
@@ -2120,7 +2125,7 @@ impl Reviewer {
                     "Review {} of patch {}/{} failed: {}",
                     review_id, patchset_id, index, reason
                 );
-                Self::fail_review_row(ctx, review_id, &reason, output.as_ref(), conversation).await;
+                Self::fail_review_row(ctx, review_id, &reason, output.as_ref(), trace).await;
                 Self::after_failure(review_id, wound_down)
             }
         };
@@ -2160,17 +2165,17 @@ impl Reviewer {
 
     /// Marks the attempt's review row, when it has one, and the patch as
     /// cancelled. `output` is the worker's output when it returned a review
-    /// before the cancel was seen, and `conversation` is what the attempt
-    /// streamed when it returned none; see [`Self::attempt_record`].
+    /// before the cancel was seen, and `trace` is what the daemon saw of the
+    /// attempt; see [`Self::attempt_record`].
     async fn mark_attempt_cancelled(
         ctx: &ReviewContext,
         review_id: Option<i64>,
         patch_id: i64,
         output: Option<&Value>,
-        conversation: Option<String>,
+        trace: AttemptTrace,
     ) {
         if let Some(rid) = review_id {
-            let (interaction_id, logs) = Self::attempt_record(ctx, output, conversation).await;
+            let (interaction_id, logs) = Self::attempt_record(ctx, rid, output, trace).await;
             if let Err(e) = ctx
                 .db
                 .complete_review(
@@ -2317,16 +2322,16 @@ impl Reviewer {
     }
 
     /// Marks an attempt's review row Failed with `reason`. `output` is the
-    /// worker's output when it returned one, and `conversation` is what the
-    /// attempt streamed; see [`Self::attempt_record`].
+    /// worker's output when it returned one, and `trace` is what the daemon
+    /// saw of the attempt; see [`Self::attempt_record`].
     async fn fail_review_row(
         ctx: &ReviewContext,
         review_id: i64,
         reason: &str,
         output: Option<&Value>,
-        conversation: Option<String>,
+        trace: AttemptTrace,
     ) {
-        let (interaction_id, logs) = Self::attempt_record(ctx, output, conversation).await;
+        let (interaction_id, logs) = Self::attempt_record(ctx, review_id, output, trace).await;
         if let Err(e) = ctx
             .db
             .complete_review(
@@ -2360,7 +2365,7 @@ impl Reviewer {
         review_id: i64,
         timeout: ReviewTimedOut,
         output: Option<&Value>,
-        conversation: Option<String>,
+        trace: AttemptTrace,
     ) -> AttemptVerdict {
         error!(
             "Review {} of patch {}/{} ran out of time after {} active seconds; not retrying",
@@ -2370,7 +2375,7 @@ impl Reviewer {
             Some(worker_error) => format!("Tool error: {}: {}", timeout, worker_error),
             None => format!("Tool error: {}", timeout),
         };
-        Self::fail_review_row(ctx, review_id, &reason, output, conversation).await;
+        Self::fail_review_row(ctx, review_id, &reason, output, trace).await;
         if let Err(e) = ctx
             .db
             .update_patch_status(patch.patch_id, PatchOutcome::TimedOut)
@@ -2384,49 +2389,65 @@ impl Reviewer {
     /// The AI interaction and the log a review row keeps of an attempt that
     /// did not store a review: `(interaction_id, logs)`.
     ///
-    /// `output` is the worker's output when it returned one; its token counts
-    /// are stored as the interaction. `conversation` is what the attempt
-    /// streamed, which [`Self::settle_attempt`] gives only for an attempt with
-    /// no review from the worker, and is the log when there is one: a worker
-    /// output with no review carries an empty history, so the worker's
-    /// history is the log only in its absence.
+    /// `output` is the worker's output when it returned one. The token counts
+    /// are stored as the interaction, taken from `output` or from `trace` as
+    /// [`attempt_token_counts`] decides. `trace.conversation` is what the
+    /// attempt streamed, which [`Self::settle_attempt`] gives only for an
+    /// attempt with no review from the worker, and is the log when there is
+    /// one: a worker output with no review carries an empty history, so the
+    /// worker's history is the log only in its absence.
     async fn attempt_record(
         ctx: &ReviewContext,
+        review_id: i64,
         output: Option<&Value>,
-        conversation: Option<String>,
+        trace: AttemptTrace,
     ) -> (Option<String>, Option<String>) {
-        let (interaction_id, history) = match output {
-            Some(output) => Self::record_worker_output(ctx, output).await,
-            None => (None, None),
-        };
-        (interaction_id, conversation.or(history))
+        let interaction_id = Self::record_interaction(ctx, review_id, output, trace.tokens).await;
+        let history = output.and_then(worker_history_log);
+        (interaction_id, trace.conversation.or(history))
     }
 
-    /// Stores the worker output's token counts as an AI interaction, and
-    /// renders its history as the review's log. Returns the interaction's id,
-    /// when the output had token counts, and the log.
+    /// Stores the attempt's token counts as an AI interaction, and renders
+    /// the worker output's history as the review's log. Returns the
+    /// interaction's id, when there were counts to store, and the log.
+    /// `relayed` is what the daemon's provider returned to the attempt.
     async fn record_worker_output(
         ctx: &ReviewContext,
+        review_id: i64,
         output: &Value,
+        relayed: AttemptTokens,
     ) -> (Option<String>, Option<String>) {
-        let logs = output.get("history").and_then(|h| {
-            let mut scrubbed = h.clone();
-            crate::ai::scrub_thought_signatures(&mut scrubbed);
-            serde_json::to_string_pretty(&scrubbed).ok()
-        });
+        let interaction_id = Self::record_interaction(ctx, review_id, Some(output), relayed).await;
+        (interaction_id, worker_history_log(output))
+    }
 
-        let Some(tokens_in) = output["tokens_in"].as_u64() else {
-            return (None, logs);
-        };
+    /// Stores an attempt's token counts as an AI interaction, and returns
+    /// its id, or `None` when there are no counts to store.
+    ///
+    /// The counts are the daemon's own count of the replies it relayed,
+    /// `relayed`, whenever it metered one, and otherwise the worker's from
+    /// its `output`; never the sum of both. [`attempt_token_counts`] makes
+    /// the choice. Either way they are stored in the same columns, so cost
+    /// and statistics count an attempt the daemon killed as they count a
+    /// finished one. The row does not record the source, so it is logged.
+    async fn record_interaction(
+        ctx: &ReviewContext,
+        review_id: i64,
+        output: Option<&Value>,
+        relayed: AttemptTokens,
+    ) -> Option<String> {
+        let (tokens, source) = attempt_token_counts(output, relayed)?;
+        Self::log_token_source(review_id, source, relayed);
         let id = generate_interaction_id();
-        let input_ctx = output["input_context"].as_str().unwrap_or("");
-        let output_raw = if let Some(r) = output.get("review") {
-            r.to_string()
-        } else if let Some(e) = output.get("error") {
-            e.to_string()
-        } else {
-            String::new()
+        let input_ctx = output
+            .and_then(|o| o["input_context"].as_str())
+            .unwrap_or("");
+        let output_raw = match output {
+            Some(o) if o.get("review").is_some() => o["review"].to_string(),
+            Some(o) if o.get("error").is_some() => o["error"].to_string(),
+            _ => String::new(),
         };
+        let saturating = |count: u64| u32::try_from(count).unwrap_or(u32::MAX);
         let _ = ctx
             .db
             .create_ai_interaction(AiInteractionParams {
@@ -2437,12 +2458,30 @@ impl Reviewer {
                 model: &ctx.settings.ai.model,
                 input: input_ctx,
                 output: &output_raw,
-                tokens_in: tokens_in as u32,
-                tokens_out: output["tokens_out"].as_u64().unwrap_or(0) as u32,
-                tokens_cached: output["tokens_cached"].as_u64().unwrap_or(0) as u32,
+                tokens_in: saturating(tokens.input),
+                tokens_out: saturating(tokens.output),
+                tokens_cached: saturating(tokens.cached),
             })
             .await;
-        (Some(id), logs)
+        Some(id)
+    }
+
+    /// Logs where a row's token counts came from, and, at info, the calls
+    /// the stored count leaves out because they were still waiting for the
+    /// provider when the run ended: those may be billed all the same.
+    fn log_token_source(review_id: i64, source: TokenSource, relayed: AttemptTokens) {
+        debug!(
+            "Review {}: storing the {:?} token counts ({} of {} relayed call(s) metered)",
+            review_id, source, relayed.calls, relayed.sent
+        );
+        let unanswered = relayed.unanswered();
+        if source == TokenSource::Daemon && unanswered > 0 {
+            info!(
+                "Review {}: {} model call(s) were still waiting for the provider when the \
+                 attempt ended; the stored token counts do not include them",
+                review_id, unanswered
+            );
+        }
     }
 
     /// Records incomplete coverage the worker reported for a review it
@@ -2479,9 +2518,11 @@ impl Reviewer {
         patch: &PatchUnderReview<'_>,
         review_id: i64,
         output: &Value,
+        relayed: AttemptTokens,
     ) -> Result<AttemptVerdict> {
         Self::store_worker_stage_failures(ctx, review_id, output).await;
-        let (interaction_id, logs) = Self::record_worker_output(ctx, output).await;
+        let (interaction_id, logs) =
+            Self::record_worker_output(ctx, review_id, output, relayed).await;
 
         // `AttemptEnd::classify` lets a null review through only when the AI
         // review was turned off.
@@ -2558,6 +2599,7 @@ impl Reviewer {
         review_id: i64,
         output: &Value,
         stopped: &[crate::activity::StageFailureRecord],
+        relayed: AttemptTokens,
     ) -> Result<AttemptVerdict> {
         warn!(
             "Review {} of patch {}/{} ran out of time; keeping the findings of the stages \
@@ -2568,7 +2610,8 @@ impl Reviewer {
             stopped.iter().map(|s| s.stage.as_str()).collect::<Vec<_>>()
         );
         Self::store_worker_stage_failures(ctx, review_id, output).await;
-        let (interaction_id, logs) = Self::record_worker_output(ctx, output).await;
+        let (interaction_id, logs) =
+            Self::record_worker_output(ctx, review_id, output, relayed).await;
         Self::store_review_findings(ctx, review_id, &output["review"]).await?;
 
         let row = ReviewRowCompletion {
@@ -2854,6 +2897,20 @@ struct PatchUnderReview<'a> {
     embargo_until: Option<i64>,
 }
 
+/// What the daemon itself saw of one attempt, kept apart from the worker's
+/// output so that the row of an attempt the worker reported nothing for can
+/// still record it.
+#[derive(Debug, Default)]
+struct AttemptTrace {
+    /// The conversation the attempt streamed, promoted to a final log.
+    /// Given only for an attempt with no review from the worker; see
+    /// [`Reviewer::settle_attempt`].
+    conversation: Option<String>,
+    /// The daemon's count of the attempt's model calls and of the tokens
+    /// its provider returned to them.
+    tokens: AttemptTokens,
+}
+
 /// How the row of a review the worker returned is completed: its status,
 /// its result text, and the record of the attempt.
 struct ReviewRowCompletion<'a> {
@@ -2937,7 +2994,9 @@ impl AttemptEnd {
     /// `no_ai` is whether the AI review was turned off, which makes a null
     /// review the expected answer rather than a failure.
     fn classify(run: ReviewToolOutcome, index: i64, no_ai: bool) -> Self {
-        let ReviewToolOutcome { result, wound_down } = run;
+        let ReviewToolOutcome {
+            result, wound_down, ..
+        } = run;
         let output = match result {
             Ok(output) => output,
             Err(e) => return Self::from_error(e, wound_down.is_some()),
@@ -3502,7 +3561,7 @@ async fn run_review_tool_with_cmd(
 
     let stdin_writer = Arc::new(tokio::sync::Mutex::new(stdin));
 
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use tokio::time::{timeout, timeout_at};
 
@@ -3556,6 +3615,9 @@ async fn run_review_tool_with_cmd(
     }
 
     let mut spawned_tasks = Vec::new();
+    // Outside the run, so the counts survive a run that ends in an error,
+    // including a worker killed before it could report its own.
+    let token_meter = Arc::new(TokenMeter::default());
     let interaction_result =
         async {
             // Send initial payload
@@ -3572,8 +3634,6 @@ async fn run_review_tool_with_cmd(
             let mut final_result: Option<Value> = None;
 
             let ai_started = Arc::new(AtomicBool::new(false));
-            let total_tokens_used = Arc::new(AtomicUsize::new(0));
-            let total_output_tokens_used = Arc::new(AtomicUsize::new(0));
 
             let (abort_tx, mut abort_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
             let mut cancel_interval = tokio::time::interval(Duration::from_secs(2));
@@ -3650,8 +3710,7 @@ async fn run_review_tool_with_cmd(
                                         let provider_clone = provider.clone();
                                         let settings_clone = settings.clone();
                                         let stdin_clone = stdin_writer.clone();
-                                        let total_tokens_used_clone = total_tokens_used.clone();
-                                        let total_output_tokens_used_clone = total_output_tokens_used.clone();
+                                        let token_meter_clone = token_meter.clone();
                                         let abort_tx_clone = abort_tx.clone();
 
                                         let handle = tokio::spawn(async move {
@@ -3693,17 +3752,17 @@ async fn run_review_tool_with_cmd(
                                             }
 
                                             let ctx_tag = req.context_tag.clone().unwrap_or_default();
+                                            token_meter_clone.sent();
                                             let resp_payload = crate::ai::LOG_CONTEXT
                                                 .scope(ctx_tag, provider_clone.generate_content(req.clone()))
                                                 .await;
 
                                             match resp_payload {
                                                 Ok(p) => {
-                                                    if let Some(usage) = &p.usage {
-                                                        let cached = usage.cached_tokens.unwrap_or(0);
-                                                        let uncached_input = usage.prompt_tokens.saturating_sub(cached);
-                                                        let current_total = total_tokens_used_clone.fetch_add(uncached_input + usage.completion_tokens, Ordering::SeqCst) + uncached_input + usage.completion_tokens;
-                                                        let current_output = total_output_tokens_used_clone.fetch_add(usage.completion_tokens, Ordering::SeqCst) + usage.completion_tokens;
+                                                    let used = token_meter_clone.returned(p.usage.as_ref());
+                                                    if p.usage.is_some() {
+                                                        let current_total = used.budgeted();
+                                                        let current_output = used.output;
                                                         let token_budget = settings_clone.review.max_total_tokens;
                                                         if token_budget > 0 && current_total > token_budget {
                                                             let err_msg = format!("Token budget exceeded: {} uncached input + output tokens used > {} limit", current_total, token_budget);
@@ -3739,6 +3798,7 @@ async fn run_review_tool_with_cmd(
                                                     write_ipc_reply(&stdin_clone, IpcMessageType::AiResponse, tx_id, &p).await;
                                                 }
                                                 Err(e) => {
+                                                    token_meter_clone.returned(None);
                                                     let class = classify_ai_error(&e);
                                                     let message = e.to_string();
                                                     let payload = RemoteAiErrorPayload::new(message, class);
@@ -4007,11 +4067,13 @@ async fn run_review_tool_with_cmd(
             ReviewToolOutcome {
                 result: Ok(json),
                 wound_down,
+                tokens: token_meter.totals(),
             }
         }
         Err(e) => ReviewToolOutcome {
             result: Err(e),
             wound_down,
+            tokens: token_meter.totals(),
         },
     }
 }
@@ -4030,6 +4092,11 @@ struct ReviewToolOutcome {
     /// asked to wind down is not retried however it then ended, including in
     /// an error.
     wound_down: Option<ReviewTimedOut>,
+    /// The daemon's count of the run's model calls and of the tokens its
+    /// own provider returned to them. Kept beside the result for the same
+    /// reason: a run killed at its deadline has no output to report its
+    /// tokens in.
+    tokens: AttemptTokens,
 }
 
 impl ReviewToolOutcome {
@@ -4038,7 +4105,185 @@ impl ReviewToolOutcome {
         Self {
             result: Err(e),
             wound_down: None,
+            tokens: AttemptTokens::default(),
         }
+    }
+}
+
+/// The model calls the daemon relayed for one worker run, and the tokens
+/// its own provider returned to them, summed over the replies that reported
+/// usage.
+///
+/// A daemon-spawned worker has no provider of its own: every model call it
+/// makes is relayed through the daemon, which meters each reply before the
+/// worker sees it. So these counts cover every reply the attempt received,
+/// however it ended, including a worker killed before it could report its
+/// own, and they are what the token budget is checked against. A call still
+/// waiting for the provider when the run ended is aborted unanswered, so its
+/// tokens are not here although the provider may bill them; `unanswered`
+/// says how many there were.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct AttemptTokens {
+    /// Model calls the daemon sent to its provider.
+    sent: usize,
+    /// Of those, the calls whose reply, a response or an error, came back
+    /// before the run ended.
+    returned: usize,
+    /// Of those, the responses that reported usage: the ones summed below.
+    calls: usize,
+    /// Input tokens the provider did not serve from its prompt cache.
+    uncached_input: usize,
+    /// Input tokens the provider served from its prompt cache; 0 when it
+    /// reports no cache hits.
+    cached_input: usize,
+    /// Output tokens.
+    output: usize,
+}
+
+impl AttemptTokens {
+    /// Adds one response's usage.
+    fn add(&mut self, usage: &crate::ai::AiUsage) {
+        let cached = usage.cached_tokens.unwrap_or(0);
+        self.calls = self.calls.saturating_add(1);
+        self.uncached_input = self
+            .uncached_input
+            .saturating_add(usage.prompt_tokens.saturating_sub(cached));
+        self.cached_input = self.cached_input.saturating_add(cached);
+        self.output = self.output.saturating_add(usage.completion_tokens);
+    }
+
+    /// Uncached input plus output: what `max_total_tokens` limits, because
+    /// cached input costs a fraction of the rest.
+    fn budgeted(&self) -> usize {
+        self.uncached_input.saturating_add(self.output)
+    }
+
+    /// The calls sent whose reply had not come back when the run ended.
+    fn unanswered(&self) -> usize {
+        self.sent.saturating_sub(self.returned)
+    }
+
+    /// The counts as an AI interaction stores them, which is how the worker
+    /// reports its own: input includes the cached part, and the cached part
+    /// is given again on its own so a reader can subtract it.
+    fn stored(&self) -> StoredTokens {
+        StoredTokens {
+            input: self.uncached_input.saturating_add(self.cached_input) as u64,
+            output: self.output as u64,
+            cached: self.cached_input as u64,
+        }
+    }
+}
+
+/// Token counts as a review row's AI interaction stores them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoredTokens {
+    /// Input tokens, including the cached part.
+    input: u64,
+    output: u64,
+    /// The part of `input` served from the provider's prompt cache.
+    cached: u64,
+}
+
+impl StoredTokens {
+    /// The counts a worker's output reports, or `None` when it reports none.
+    fn reported_in(output: &Value) -> Option<Self> {
+        Some(Self {
+            input: output["tokens_in"].as_u64()?,
+            output: output["tokens_out"].as_u64().unwrap_or(0),
+            cached: output["tokens_cached"].as_u64().unwrap_or(0),
+        })
+    }
+}
+
+/// The worker output's history rendered as a review's log, with thought
+/// signatures scrubbed, or `None` when it has none.
+fn worker_history_log(output: &Value) -> Option<String> {
+    output.get("history").and_then(|h| {
+        let mut scrubbed = h.clone();
+        crate::ai::scrub_thought_signatures(&mut scrubbed);
+        serde_json::to_string_pretty(&scrubbed).ok()
+    })
+}
+
+/// Where the token counts stored for an attempt came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenSource {
+    /// The worker's output: the sums of the usage of its stages that
+    /// finished. Used only when the daemon metered no reply.
+    Worker,
+    /// The daemon's own count of the replies its provider returned to the
+    /// attempt ([`AttemptTokens`]).
+    Daemon,
+}
+
+/// The token counts to store for an attempt, and where they came from.
+/// `output` is the worker's output, when it returned one, and `relayed`
+/// what the daemon's provider returned to the attempt's model calls.
+/// `None` when neither has any counts, so the row's tokens stay unknown
+/// rather than read as zero.
+///
+/// The daemon's count is used whenever it metered a reply with usage, and
+/// the worker's only otherwise; the two are never added, because the
+/// daemon's already holds every call the worker's does. The daemon meters
+/// each reply before relaying it, while the worker's sums leave out what it
+/// never saw or never counted: every stage that did not finish (a failed
+/// stage returns its error before its usage is taken, and a session reports
+/// usage only with a validated answer, so a salvaged review undercounts),
+/// every reply of a patch whose review failed (the worker sums only the
+/// reviews it returned, so its error output reports zero), and the reply
+/// that crossed the token budget, which the worker is sent as an error.
+/// The worker's counts remain for an attempt the daemon metered nothing
+/// for, as a review skipped with the AI turned off, which reports zero.
+fn attempt_token_counts(
+    output: Option<&Value>,
+    relayed: AttemptTokens,
+) -> Option<(StoredTokens, TokenSource)> {
+    if relayed.calls > 0 {
+        return Some((relayed.stored(), TokenSource::Daemon));
+    }
+    output
+        .and_then(StoredTokens::reported_in)
+        .map(|tokens| (tokens, TokenSource::Worker))
+}
+
+/// Counts one worker run's model calls as they are sent and as their
+/// replies arrive, and sums the tokens the replies report. Shared by the
+/// tasks that relay the calls, which run concurrently.
+#[derive(Debug, Default)]
+struct TokenMeter(std::sync::Mutex<AttemptTokens>);
+
+impl TokenMeter {
+    /// Counts a call sent to the provider.
+    fn sent(&self) {
+        let mut tokens = self.lock();
+        tokens.sent = tokens.sent.saturating_add(1);
+    }
+
+    /// Counts a call's reply, and adds its usage when it reported any.
+    /// Returns the run's totals with it.
+    fn returned(&self, usage: Option<&crate::ai::AiUsage>) -> AttemptTokens {
+        let mut tokens = self.lock();
+        tokens.returned = tokens.returned.saturating_add(1);
+        if let Some(usage) = usage {
+            tokens.add(usage);
+        }
+        *tokens
+    }
+
+    /// The run's totals so far.
+    fn totals(&self) -> AttemptTokens {
+        *self.lock()
+    }
+
+    /// The lock is held only to add integers with saturating arithmetic,
+    /// which cannot panic, so it is not poisoned in practice. Were it
+    /// poisoned, the integers it guards would still be valid counts, so they
+    /// are used as they are rather than lost.
+    fn lock(&self) -> std::sync::MutexGuard<'_, AttemptTokens> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -7455,6 +7700,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         ReviewToolOutcome {
             result,
             wound_down: None,
+            tokens: AttemptTokens::default(),
         }
     }
 
@@ -7673,6 +7919,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 let run = ReviewToolOutcome {
                     result: Ok(output.clone()),
                     wound_down,
+                    tokens: AttemptTokens::default(),
                 };
                 let end = AttemptEnd::classify(run, 1, false);
                 assert!(end.has_worker_review(), "{end:?}");
@@ -7715,7 +7962,16 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             json!({"patchset_id": 1, "patches": [patch], "error": "planning failed", "history": []})
         };
         let run = |result: Result<Value>, wound_down: Option<ReviewTimedOut>| {
-            AttemptEnd::classify(ReviewToolOutcome { result, wound_down }, 1, false)
+            let tokens = AttemptTokens::default();
+            AttemptEnd::classify(
+                ReviewToolOutcome {
+                    result,
+                    wound_down,
+                    tokens,
+                },
+                1,
+                false,
+            )
         };
 
         let end = run(Ok(error_output(Some("out_of_time"))), Some(timeout));
@@ -7768,6 +8024,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             ReviewToolOutcome {
                 result: Ok(salvaged),
                 wound_down: Some(timeout),
+                tokens: AttemptTokens::default(),
             },
             1,
             false,
@@ -8535,21 +8792,356 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             "{review}"
         );
         assert_eq!(
+            row_tokens(review),
+            (json!(1000), json!(100), json!(0)),
+            "the call that went over the budget was billed, and the worker \
+             was stopped before it could report it: {review}"
+        );
+        assert_eq!(
             patch_status(&run.db, run.patch_id).await?.as_deref(),
             Some("Failed")
         );
         Ok(())
     }
 
+    /// A patch stopped by its token budget is not reviewed again when its
+    /// patchset is processed again, as after a restart, although its row
+    /// has an interaction holding the daemon's token counts: reviewing it
+    /// again would spend a second budget. A rerun reviews it again, and the
+    /// first row is kept with the tokens it was billed.
+    #[tokio::test]
+    async fn test_a_patch_stopped_by_its_token_budget_is_not_reviewed_again() -> Result<()> {
+        let script = worker_calling_then(1, "read -r _eof\nexit 1\n");
+        let fixture = WorkerFixture::new(&script, billed_provider(), |s| {
+            s.review.max_total_tokens = 500;
+            s.review.max_retries = 2;
+        })
+        .await?;
+        let db = fixture.ctx.db.clone();
+        assert!(matches!(fixture.review().await?, PatchResult::ReviewFailed));
+        assert!(matches!(fixture.review().await?, PatchResult::ReviewFailed));
+        let reviews = review_rows(&db, fixture.patch_id).await?;
+        assert_eq!(reviews.len(), 1, "a second budget was spent: {reviews:?}");
+        assert_eq!(
+            row_tokens(&reviews[0]),
+            (json!(1000), json!(100), json!(200)),
+            "{}",
+            reviews[0]
+        );
+        assert_eq!(
+            patch_status(&db, fixture.patch_id).await?.as_deref(),
+            Some("Failed")
+        );
+
+        db.update_patchset_status(fixture.patchset_id, ReviewStatus::Failed.as_str())
+            .await?;
+        db.rerun_patchset(fixture.patchset_id).await?;
+        assert!(matches!(fixture.review().await?, PatchResult::ReviewFailed));
+        let reviews = review_rows(&db, fixture.patch_id).await?;
+        assert_eq!(reviews.len(), 2, "a rerun reviews it again: {reviews:?}");
+        assert_eq!(
+            row_tokens(&reviews[0]),
+            (json!(1000), json!(100), json!(200)),
+            "the rerun keeps what the first review was billed: {}",
+            reviews[0]
+        );
+        Ok(())
+    }
+
+    /// The `(tokens_in, tokens_out, tokens_cached)` a review row reports.
+    fn row_tokens(review: &Value) -> (Value, Value, Value) {
+        (
+            review["tokens_in"].clone(),
+            review["tokens_out"].clone(),
+            review["tokens_cached"].clone(),
+        )
+    }
+
+    /// A worker that makes `calls` model calls through the daemon, reading
+    /// each reply, and then runs `then`.
+    fn worker_calling_then(calls: usize, then: &str) -> String {
+        let request = json!({"type": "ai_request", "payload": {"messages": [{"role": "user", "content": "go on"}]}});
+        let mut script = String::from("#!/bin/sh\nread -r _payload\n");
+        for _ in 0..calls {
+            script.push_str(&format!("echo '{request}'\nread -r _reply\n"));
+        }
+        script.push_str(then);
+        script
+    }
+
+    /// Each relayed call: 1000 input tokens of which 200 were cached, and
+    /// 100 output tokens.
+    fn billed_provider() -> Arc<dyn AiProvider> {
+        Arc::new(MockProviderWithUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 100,
+            cached_tokens: 200,
+        })
+    }
+
+    /// A worker killed at its deadline reports no tokens, but every call it
+    /// made went through the daemon's provider, so its row stores the
+    /// daemon's count of them rather than none, as a finished row stores
+    /// the worker's: input with the cached part, and the cached part.
+    #[tokio::test]
+    async fn test_a_killed_attempt_keeps_the_tokens_the_daemon_relayed() -> Result<()> {
+        let script = worker_calling_then(2, "exec sleep 30\n");
+
+        let run = review_patch_with_provider(&script, billed_provider(), |s| {
+            s.review.timeout_seconds = 1;
+            s.review.max_retries = 0;
+        })
+        .await?;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1);
+        let review = &reviews[0];
+        assert_eq!(
+            review["result"],
+            "Tool error: Review tool timed out (active time exceeded)"
+        );
+        assert_eq!(
+            row_tokens(review),
+            (json!(2000), json!(200), json!(400)),
+            "{review}"
+        );
+        Ok(())
+    }
+
+    /// A worker output for a patch whose review failed reports zero tokens,
+    /// because the worker sums only the reviews it returned. The daemon's
+    /// count of the calls it relayed is stored instead.
+    #[tokio::test]
+    async fn test_an_error_output_keeps_the_tokens_the_daemon_relayed() -> Result<()> {
+        let mut output: Value = serde_json::from_str(&error_output("boom", None))?;
+        output["tokens_in"] = json!(0);
+        output["tokens_out"] = json!(0);
+        output["tokens_cached"] = json!(0);
+        let script = worker_calling_then(1, &format!("echo '{output}'\n"));
+
+        let run = review_patch_with_provider(&script, billed_provider(), |s| {
+            s.review.max_retries = 0;
+        })
+        .await?;
+        assert!(matches!(run.result, PatchResult::ReviewFailed));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["result"], "boom", "{}", reviews[0]);
+        assert_eq!(
+            row_tokens(&reviews[0]),
+            (json!(1000), json!(100), json!(200)),
+            "{}",
+            reviews[0]
+        );
+        Ok(())
+    }
+
+    /// A finished review stores the daemon's count of the calls it relayed,
+    /// not the worker's own report of the same calls added to it.
+    #[tokio::test]
+    async fn test_a_finished_review_stores_one_count_of_its_calls() -> Result<()> {
+        let output = reviewed_output(json!([]));
+        let script = worker_calling_then(1, &format!("echo '{output}'\n"));
+
+        let run = review_patch_with_provider(&script, billed_provider(), |_| {}).await?;
+        assert!(matches!(run.result, PatchResult::Success));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["status"], "Reviewed", "{}", reviews[0]);
+        assert_eq!(
+            row_tokens(&reviews[0]),
+            (json!(1000), json!(100), json!(200)),
+            "{}",
+            reviews[0]
+        );
+        Ok(())
+    }
+
+    /// A salvaged review's output counts only the stages that finished, so
+    /// it reports less than the calls the daemon relayed for the attempt.
+    /// The row stores the daemon's count, which holds every one of them.
+    #[tokio::test]
+    async fn test_a_salvaged_review_stores_every_call_the_daemon_relayed() -> Result<()> {
+        let cut_short = json!([{"stage": "security", "reason": "r", "cause": "cut_short"}]);
+        let salvaged = reviewed_output(cut_short);
+        let script = worker_calling_then(2, &wind_down_then(&format!("echo '{salvaged}'\n")));
+
+        let run = review_patch_with_provider(&script, billed_provider(), out_of_time_with_salvage)
+            .await?;
+        assert!(matches!(run.result, PatchResult::Partial));
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0]["status"], "Partial", "{}", reviews[0]);
+        assert_eq!(
+            row_tokens(&reviews[0]),
+            (json!(2000), json!(200), json!(400)),
+            "the worker reported 5 in and 2 out: {}",
+            reviews[0]
+        );
+        Ok(())
+    }
+
+    /// The usage `(prompt, completion, cached)` of one model response.
+    fn usage(prompt: usize, completion: usize, cached: Option<usize>) -> crate::ai::AiUsage {
+        crate::ai::AiUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            cached_tokens: cached,
+        }
+    }
+
+    /// The daemon sums each response's usage as the budget reads it, and
+    /// stores it as the worker reports its own.
+    #[test]
+    fn the_daemon_counts_relayed_tokens_as_a_worker_reports_them() {
+        let meter = TokenMeter::default();
+        assert_eq!(meter.totals(), AttemptTokens::default());
+        for reply in [usage(1000, 100, Some(200)), usage(50, 5, None)] {
+            meter.sent();
+            meter.returned(Some(&reply));
+        }
+        let totals = meter.totals();
+        assert_eq!(
+            totals,
+            AttemptTokens {
+                sent: 2,
+                returned: 2,
+                calls: 2,
+                uncached_input: 850,
+                cached_input: 200,
+                output: 105,
+            }
+        );
+        assert_eq!(totals.budgeted(), 955, "cached input is not budgeted");
+        assert_eq!(totals.unanswered(), 0);
+        assert_eq!(
+            totals.stored(),
+            StoredTokens {
+                input: 1050,
+                output: 105,
+                cached: 200,
+            },
+            "stored input includes the cached part, as the worker reports it"
+        );
+    }
+
+    /// A call whose reply had not come back when the run ended is counted
+    /// as unanswered, and a reply without usage, or an error, adds no
+    /// tokens. Neither is in the stored count.
+    #[test]
+    fn the_daemon_counts_the_calls_a_run_left_unanswered() {
+        let meter = TokenMeter::default();
+        for _ in 0..4 {
+            meter.sent();
+        }
+        meter.returned(Some(&usage(1000, 100, None)));
+        meter.returned(None);
+        let totals = meter.returned(None);
+        assert_eq!(totals, meter.totals());
+        assert_eq!((totals.sent, totals.returned, totals.calls), (4, 3, 1));
+        assert_eq!(totals.unanswered(), 1);
+        assert_eq!(
+            totals.stored(),
+            StoredTokens {
+                input: 1000,
+                output: 100,
+                cached: 0,
+            }
+        );
+    }
+
+    /// A row's tokens are the daemon's whenever it metered a reply and the
+    /// worker's otherwise, never the two added, and unknown when neither
+    /// has any.
+    #[test]
+    fn a_rows_tokens_come_from_the_daemon_or_the_worker_never_both() {
+        let relayed = AttemptTokens {
+            sent: 3,
+            returned: 3,
+            calls: 3,
+            uncached_input: 800,
+            cached_input: 200,
+            output: 100,
+        };
+        let unmetered = AttemptTokens {
+            sent: 1,
+            returned: 1,
+            ..AttemptTokens::default()
+        };
+        let from_daemon = Some((relayed.stored(), TokenSource::Daemon));
+        let worker = |input: u64, output: u64, cached: u64| json!({"tokens_in": input, "tokens_out": output, "tokens_cached": cached});
+        let reported = |input, output, cached| {
+            Some((
+                StoredTokens {
+                    input,
+                    output,
+                    cached,
+                },
+                TokenSource::Worker,
+            ))
+        };
+
+        let cases: [(&str, Option<Value>, AttemptTokens, _); 8] = [
+            (
+                "a partial worker report",
+                Some(worker(5, 2, 1)),
+                relayed,
+                from_daemon,
+            ),
+            ("no output", None, relayed, from_daemon),
+            (
+                "output without counts",
+                Some(json!({"error": "boom"})),
+                relayed,
+                from_daemon,
+            ),
+            (
+                "a zero report with relayed calls",
+                Some(worker(0, 0, 0)),
+                relayed,
+                from_daemon,
+            ),
+            (
+                "a worker report and no reply metered",
+                Some(worker(5, 2, 1)),
+                unmetered,
+                reported(5, 2, 1),
+            ),
+            (
+                "a zero report and no calls",
+                Some(worker(0, 0, 0)),
+                AttemptTokens::default(),
+                reported(0, 0, 0),
+            ),
+            ("no output and no reply metered", None, unmetered, None),
+            ("nothing known", None, AttemptTokens::default(), None),
+        ];
+        for (case, output, relayed, expected) in cases {
+            assert_eq!(
+                attempt_token_counts(output.as_ref(), relayed),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
     /// A worker that reports `lines`, waits for the daemon's wind-down, and
     /// then runs `then`. It exits on any other line, so a test cannot pass
     /// on a worker that was never asked to wind down.
     fn worker_winding_down(lines: &[String], then: &str) -> String {
-        worker_reporting_then(
-            lines,
-            &format!(
-                "read -r msg\ncase \"$msg\" in\n  *'\"type\":\"wind_down\"'*) ;;\n  *) exit 3 ;;\nesac\n{then}"
-            ),
+        worker_reporting_then(lines, &wind_down_then(then))
+    }
+
+    /// A script step that waits for the daemon's wind-down and then runs
+    /// `then`. It exits on any other line.
+    fn wind_down_then(then: &str) -> String {
+        format!(
+            "read -r msg\ncase \"$msg\" in\n  *'\"type\":\"wind_down\"'*) ;;\n  *) exit 3 ;;\nesac\n{then}"
         )
     }
 

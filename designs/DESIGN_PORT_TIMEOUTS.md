@@ -631,7 +631,10 @@ real reason.
 "Daemon record" means the attempt has no review from the worker for the
 patch, so the daemon writes the stage failures and the conversation itself
 (§3.9). This is decided by the `AttemptEnd` variant, not by whether the I/O
-loop returned `Err`.
+loop returned `Err`. Every row, with a daemon record or not, stores the
+daemon's own count of the tokens the attempt was billed whenever it relayed
+a call (§3.9), so the row of a killed or budget-stopped attempt now has an
+interaction.
 
 - Timeouts are not retried (D5). A deadline that has already proved too small
   says nothing good about an identical second attempt, and retrying is how
@@ -695,12 +698,25 @@ that came from a worker error output, so both patches would be reviewed again
 from scratch, which D5 forbids. The guard therefore becomes
 `prior_final_outcome(patchset_id, patch_id) -> Option<PatchOutcome>`:
 
-- `Some(Partial)` or `Some(TimedOut)` when `patches.status` is `'Partial'`
-  or `'TimedOut'`. Only the attempt outcomes above write those values, and
-  nothing else overwrites them before a new attempt runs;
+- `Some(Partial)`, `Some(TimedOut)` or `Some(Failed)` when `patches.status`
+  is `'Partial'`, `'TimedOut'` or `'Failed'` (`HELD_OUTCOMES`). Only the
+  attempt outcomes above write those values, and nothing else overwrites
+  them before a new attempt runs;
 - `Some(Failed)` for today's rule (a `Failed`/`FailedToApply` row with no
   interaction);
 - `None` otherwise.
+
+`'Failed'` joined the held patch statuses with the token-count follow-up
+(§3.9). Until then a budget-stopped attempt, and a worker that crashed or
+was wound down without an output, left a `Failed` row with no interaction,
+which today's rule kept final by accident. Once the daemon stores its own
+token count on those rows they have an interaction, and today's rule would
+let a restart review the patch again and spend a second budget (D13) or a
+second deadline (D5). The patch status says the patch ended `Failed` with
+no retry left, whichever row is behind it. It also makes final a patch whose
+last attempt failed through a worker error output after the model was
+reached, which today's rule let a restart review once more; a rerun or a
+resubmission still reviews it again.
 
 The guard reads `patches.status`, not `reviews.status = 'Partial'`, although
 the review row now carries `Partial` too. The review row is history: it keeps
@@ -723,7 +739,8 @@ spelling. The only writer of `ReviewStatus::FailedToApply` (whose string is
 review's. That half of the `IN` list therefore matches only rows the tests
 write with `update_review_status(.., "FailedToApply", ..)` (`db.rs:12687`,
 `12964`). `prior_final_outcome` keeps today's rule byte for byte, so commit
-13 changes no behaviour. Whether the dead literal should go is left to a
+13 changes no behaviour; the token-count follow-up adds the `'Failed'`
+patch status (above). Whether the dead literal should go is left to a
 separate cleanup.
 
 ### 3.9 Recording an attempt however it ended
@@ -817,6 +834,54 @@ For `Finished` and `Salvaged`, the worker's `stage_failures` and `history`
 stay the authority, as today (`:1943-1970`). `settle`'s records are dropped
 there; in practice nothing is still running when the worker returns a review.
 
+**Token counts.** A daemon-spawned worker has no provider of its own: every
+model call it makes is relayed through the daemon's provider. The I/O loop
+therefore counts each call as it is sent and as its reply comes back, and
+sums each response's usage, in a per-attempt `TokenMeter`, the same counter
+the token budget is checked against (§3.10). It lives outside the run, so
+`ReviewToolOutcome.tokens: AttemptTokens { sent, returned, calls,
+uncached_input, cached_input, output }` is filled however the run ended.
+
+Before this, an attempt killed at the hard limit (`TimedOut` from the I/O
+loop), or stopped by the token budget or a cancel, stored no
+`ai_interactions` row, so its `tokens_in`/`tokens_out` read null although it
+had been billed (an end-to-end run showed null tokens after 15 model calls).
+A worker error output was little better: the worker sums only the reviews it
+returned, so the failed patch's output reports zero.
+
+The worker's own counts undercount even when it reports them. They are the
+sums of the usage of its stages that finished: a stage that fails returns
+its error before its usage is taken (`workflow/stage.rs`), and a session
+reports usage only with a validated answer (`ai/session.rs`). So a salvaged
+review leaves out the stages the deadline stopped, a finished review leaves
+out any stage that failed, and the reply that crossed the budget reaches the
+worker as an error. The daemon meters every reply before relaying it, so
+its count holds the worker's and those too.
+
+Every outcome now stores its counts through one choice,
+`attempt_token_counts(output, relayed) -> Option<(StoredTokens,
+TokenSource)>`:
+
+| The daemon's meter | The worker's output | Counts stored | `TokenSource` |
+|---|---|---|---|
+| at least one reply with usage | anything | the daemon's | `Daemon` |
+| no reply with usage | reports `tokens_in` (zeros for a `--no-ai` skip) | the worker's | `Worker` |
+| no reply with usage | none, or no counts | nothing: the row's tokens stay null, not zero | -- |
+
+The two sources are never added, because the daemon's count already holds
+every call the worker's does. The daemon's counts are stored the way the
+worker's are, `tokens_in` including the cached part and `tokens_cached`
+repeating it, so cost and statistics treat a killed attempt as a finished
+one. The interaction row does not record its source; the daemon logs it at
+debug.
+
+A call still waiting for the provider when the run ends is aborted with the
+relay task, so its reply never arrives and its tokens are not in the count,
+although the provider may bill them. For a worker killed at its deadline
+that is usually one call. The meter counts it as sent and not returned, and
+the daemon logs the number at info when it stores its own count, so the gap
+is visible.
+
 **Live log promotion.** `promoted_live_log(db, review_id)`:
 
 - reads `get_review_log_entries(review_id, None)`;
@@ -839,7 +904,10 @@ The live log has the same shape as the finished log (`live_log_message`,
 - **Token budgets** (`reviewer.rs:2948-2996`). Still checked during the
   salvage window. Each attempt still starts with fresh counters
   (`:2817-2818`); what changes is that an attempt stopped by the budget is no
-  longer retried (D13), so a patch spends at most one budget.
+  longer retried (D13), so a patch spends at most one budget, a restart
+  included (§3.8). The two counters become one `TokenMeter`, which also
+  supplies the stored token counts (§3.9). The call that crosses the budget
+  was billed, so it is counted in both.
 - **Activity registry.** `settle` replaces the stale-row problem fixed in
   56de4b78. The patchset guard still clears rows at patchset end.
 - **Live log.** Streaming is unchanged. Entries are cleared at attempt start
@@ -854,12 +922,14 @@ The live log has the same shape as the finished log (`live_log_message`,
   from reviews into it is D14.
 - **Rerun and resubmission.** `rerun_patchset` and the resubmission reset in
   `create_fetching_patchset` already exist on HEAD, so this step makes them
-  clear the `Partial` and `TimedOut` patch statuses that the §3.8 guard
-  reads (§3.11). Without that, a rerun of a Partial patchset would skip its
-  Partial patch and end Partial again having reviewed nothing. Rerun's
+  clear the `Partial`, `TimedOut` and `Failed` patch statuses that the §3.8
+  guard reads (§3.11). Without that, a rerun of a Partial patchset would skip
+  its Partial patch and end Partial again having reviewed nothing. Rerun's
   cleanup still deletes only `Failed` reviews with no interaction
   (`db.rs:9168-9193`), so a Partial review row survives a rerun next to the
-  new review, as `Reviewed` rows do. Port step 7 (`rerun --resume`) builds on
+  new review, as `Reviewed` rows do, and so does the `Failed` row of an
+  attempt the daemon stored a token count for, which keeps what it was
+  billed in the statistics. Port step 7 (`rerun --resume`) builds on
   this and must keep both rules.
 
 ### 3.11 `Partial` at the review, patch and patchset levels
@@ -963,14 +1033,14 @@ embargoed one would hold those emails for ever. Both queries accept
   `create_fetching_patchset` (`db.rs:9288-9292`) list the statuses that may be
   resubmitted. Both gain `Partial`, which keeps today's behaviour: a review
   cut short by its deadline ends `Failed` on HEAD and can be resubmitted. The
-  reset branch also clears the `Partial` and `TimedOut` patch statuses, as
-  rerun does, so a resubmitted `Failed` patchset with a `TimedOut` patch is
-  not skipped by the guard either. The two lists are joined into one SQL
-  constant with a Rust twin and an agreement test, in the style of
-  `CLOSED_TO_NEW_PARTS_SQL`, so they cannot drift (commit 14). `Fetching`
-  stays outside the shared list: the reset branch also resets a `Fetching`
-  patchset, through its own term, while `has_patchset_by_msgid` counts a
-  `Fetching` patchset as already ingested.
+  reset branch also clears the `Partial`, `TimedOut` and `Failed` patch
+  statuses, as rerun does, so a resubmitted `Failed` patchset with a
+  `TimedOut` patch is not skipped by the guard either. The two lists are
+  joined into one SQL constant with a Rust twin and an agreement test, in
+  the style of `CLOSED_TO_NEW_PARTS_SQL`, so they cannot drift (commit 14).
+  `Fetching` stays outside the shared list: the reset branch also resets a
+  `Fetching` patchset, through its own term, while `has_patchset_by_msgid`
+  counts a `Fetching` patchset as already ingested.
 
 **Statistics (D20).** `get_review_stats` counts failures with
 `status LIKE '%failed%' OR LIKE '%error%'` (`db.rs:5099-5110`), so Partial
@@ -995,9 +1065,9 @@ need `--status-partial` (§5).
 | `db.rs:7190-7196` patchset-list severity counts | `r.status IN ('Reviewed', 'Partial')` (D15). |
 | `db.rs:8539`, `8688` embargo release | `p.status IN ('Reviewed', 'Partial')` (D18). |
 | `db.rs:7248`, `7542`, `7631`, `7807`, `7893` embargo masks | Mask `Partial` as `Embargoed` like `Reviewed` (D18), in commit 15. |
-| `db.rs:9130-9196` `rerun_patchset` | Clear `Partial`/`TimedOut` patch statuses; no increment for Partial (D19). |
+| `db.rs:9130-9196` `rerun_patchset` | Clear `Partial`/`TimedOut`/`Failed` patch statuses; no increment for Partial (D19). |
 | `db.rs:9211`, `9222` `has_patchset_by_msgid` | Add `'Partial'` to `NOT IN`, through the shared constant (D19). |
-| `db.rs:9288-9292` `create_fetching_patchset` | Accept `Partial` for reset; clear `Partial`/`TimedOut` patch statuses (D19). |
+| `db.rs:9288-9292` `create_fetching_patchset` | Accept `Partial` for reset; clear `Partial`/`TimedOut`/`Failed` patch statuses (D19). |
 | `db.rs:5099-5110` `get_review_stats` | Add `total_partial` (D20). |
 | `db.rs:2122-2153`, `281-311`, `8709-8721`, `8598-8683` | Comment only: `Partial` is excluded on purpose (§3.8). |
 | `reviewer.rs:61-65` `PatchResult` | Add `Partial`. |
@@ -1051,6 +1121,7 @@ unlisted status as finished, which is right for `Partial`.
 | `ReviewStatus::Partial` | the fork's patch-only `"Partial"` string under a `Failed` review and patchset |
 | `PatchOutcome { Reviewed, Partial, TimedOut, Failed, Skipped, Cancelled }` | raw strings passed to `update_patch_status` (13 call sites in reviewer.rs) |
 | `prior_final_outcome -> Option<PatchOutcome>` | `has_failed_review -> bool` (§3.8) |
+| `reviewer::AttemptTokens`, `TokenMeter`, `StoredTokens`, `TokenSource { Worker, Daemon }` | the two `AtomicUsize` budget counters, and reading token counts only from the worker's output (§3.9) |
 | `PatchResult::Partial` | the fork returning `ReviewFailed` for a salvage |
 | `reviewer::PatchsetTally { failed, partial }` with `final_status() -> ReviewStatus` | the `failed_patches` count and the `review_success` boolean (§3.11) |
 
@@ -1362,7 +1433,18 @@ salvage_seconds = 1800
   retry as today.
 - New: the worker prints its result and exits just before `soft`. The
   `wind_down` write fails, is logged, and the attempt is `Finished`.
-- New: a token-budget abort is not retried and gets the daemon record.
+- New: a token-budget abort is not retried and gets the daemon record,
+  including the tokens of the call that crossed the budget.
+- New: a worker killed at the hard limit after two relayed calls stores the
+  daemon's counts (input with the cached part, output, cached); a worker
+  error output reporting zero stores the daemon's counts; a finished review
+  and a salvaged review store the daemon's counts, not the worker's partial
+  report and not the sum of both. Unit tests cover the meter's sums, its
+  count of unanswered calls, and every row of the §3.9 token-count table.
+- New: a patch stopped by its token budget is not reviewed again when the
+  patchset is processed again (as after a restart), although its row has an
+  interaction; a rerun reviews it again and keeps the first row and its
+  tokens.
 - New: a patchset with a `Partial` patch and a `TimedOut` patch is
   processed again (as after a restart). Neither patch is reviewed again,
   both keep their status, and the patchset ends `Failed` again. With the
