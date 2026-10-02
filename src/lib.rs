@@ -84,6 +84,10 @@ pub enum ReviewStatus {
     Skipped,
     /// The review process completed successfully.
     Reviewed,
+    /// The review ran out of time. Its findings come from the stages that
+    /// finished, so its coverage is incomplete. It is neither a failure nor
+    /// `Reviewed`, so no gate that asks "was this reviewed?" accepts it.
+    Partial,
     /// The review process failed due to an error.
     Failed,
     /// The patchset failed to apply to the baseline.
@@ -99,6 +103,7 @@ impl fmt::Display for ReviewStatus {
             ReviewStatus::Cancelled => write!(f, "Cancelled"),
             ReviewStatus::Skipped => write!(f, "Skipped"),
             ReviewStatus::Reviewed => write!(f, "Reviewed"),
+            ReviewStatus::Partial => write!(f, "Partial"),
             ReviewStatus::Failed => write!(f, "Failed"),
             ReviewStatus::FailedToApply => write!(f, "Failed To Apply"),
         }
@@ -116,6 +121,7 @@ impl FromStr for ReviewStatus {
             "Cancelled" => Ok(ReviewStatus::Cancelled),
             "Skipped" => Ok(ReviewStatus::Skipped),
             "Reviewed" => Ok(ReviewStatus::Reviewed),
+            "Partial" => Ok(ReviewStatus::Partial),
             "Failed" => Ok(ReviewStatus::Failed),
             "Failed To Apply" => Ok(ReviewStatus::FailedToApply),
             _ => Err(()),
@@ -132,6 +138,7 @@ impl ReviewStatus {
             ReviewStatus::Cancelled => "Cancelled",
             ReviewStatus::Skipped => "Skipped",
             ReviewStatus::Reviewed => "Reviewed",
+            ReviewStatus::Partial => "Partial",
             ReviewStatus::Failed => "Failed",
             ReviewStatus::FailedToApply => "Failed To Apply",
         }
@@ -197,6 +204,50 @@ mod tests {
         PatchOutcome::Skipped,
         PatchOutcome::Cancelled,
     ];
+
+    /// Every status, in declaration order. `position` matches exhaustively,
+    /// so a new variant does not compile until it is listed here too.
+    const ALL_STATUSES: [ReviewStatus; 9] = [
+        ReviewStatus::Incomplete,
+        ReviewStatus::Pending,
+        ReviewStatus::InReview,
+        ReviewStatus::Cancelled,
+        ReviewStatus::Skipped,
+        ReviewStatus::Reviewed,
+        ReviewStatus::Partial,
+        ReviewStatus::Failed,
+        ReviewStatus::FailedToApply,
+    ];
+
+    fn position(status: ReviewStatus) -> usize {
+        match status {
+            ReviewStatus::Incomplete => 0,
+            ReviewStatus::Pending => 1,
+            ReviewStatus::InReview => 2,
+            ReviewStatus::Cancelled => 3,
+            ReviewStatus::Skipped => 4,
+            ReviewStatus::Reviewed => 5,
+            ReviewStatus::Partial => 6,
+            ReviewStatus::Failed => 7,
+            ReviewStatus::FailedToApply => 8,
+        }
+    }
+
+    #[test]
+    fn every_review_status_reads_back_as_itself() {
+        for (index, status) in ALL_STATUSES.into_iter().enumerate() {
+            assert_eq!(position(status), index, "{status:?} is listed out of place");
+            assert_eq!(status.to_string(), status.as_str(), "{status:?}");
+            assert_eq!(ReviewStatus::from_str(status.as_str()), Ok(status));
+        }
+    }
+
+    #[test]
+    fn partial_is_spelled_partial() {
+        assert_eq!(ReviewStatus::Partial.as_str(), "Partial");
+        assert_eq!(ReviewStatus::Partial.to_string(), "Partial");
+        assert_eq!(ReviewStatus::from_str("Partial"), Ok(ReviewStatus::Partial));
+    }
 
     #[test]
     fn a_patch_outcome_is_spelled_like_its_review_status() {

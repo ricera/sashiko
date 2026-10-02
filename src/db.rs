@@ -58,7 +58,7 @@ pub struct LiveLogSpan {
 /// answer alike, which a test below checks.
 #[cfg(feature = "server")]
 const CLOSED_TO_NEW_PARTS_SQL: &str = "(status = 'Cancelled'
-      OR (status IN ('Reviewed', 'Failed', 'Failed To Apply')
+      OR (status IN ('Reviewed', 'Partial', 'Failed', 'Failed To Apply')
           AND received_parts >= total_parts))";
 
 /// The patchset statuses that let a series be submitted again, as an SQL
@@ -68,13 +68,32 @@ const CLOSED_TO_NEW_PARTS_SQL: &str = "(status = 'Cancelled'
 /// drift apart.
 #[cfg(feature = "server")]
 const RESUBMITTABLE_STATUSES_SQL: &str =
-    "('Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply')";
+    "('Partial', 'Failed', 'Cancelled', 'Failed To Apply', 'FailedToApply')";
 
 /// The unspaced spelling of Failed To Apply. No writer uses it today, but the
 /// resubmittable statuses have always accepted it, so a row that carries it
 /// is still treated as a failure to apply.
 #[cfg(feature = "server")]
 const LEGACY_FAILED_TO_APPLY: &str = "FailedToApply";
+
+/// The status a list or detail view shows for a patchset or a patch.
+///
+/// While an embargo holds, a finished review is shown as Embargoed, so the
+/// status does not say early how the review went. Partial is masked like
+/// Reviewed for that reason. A failure is shown as it is: it reveals no
+/// findings.
+#[cfg(feature = "server")]
+fn shown_under_embargo(status: Option<String>, is_embargoed: bool) -> Option<String> {
+    let finished_review = matches!(
+        status.as_deref().map(ReviewStatus::from_str),
+        Some(Ok(ReviewStatus::Reviewed | ReviewStatus::Partial))
+    );
+    if is_embargoed && finished_review {
+        Some("Embargoed".to_string())
+    } else {
+        status
+    }
+}
 
 #[cfg(feature = "server")]
 fn get_required_text(row: &libsql::Row, index: i32) -> Result<String> {
@@ -395,6 +414,9 @@ pub enum PatchsetReviewOutcome {
     Incomplete,
 }
 
+/// Whether an embargoed patchset is clean enough to release early. It counts
+/// `Reviewed` reviews only: a `Partial` review is excluded on purpose, so a
+/// patchset whose coverage is incomplete is never released early.
 #[cfg(feature = "server")]
 const CLEAN_PATCHSET_PREDICATE: &str = "
     EXISTS (
@@ -2387,6 +2409,8 @@ impl Database {
             > 0)
     }
 
+    /// Count a patch's full reviews. A `Partial` review is excluded on
+    /// purpose, so it never stands in for a full one in `target_review_count`.
     pub async fn count_successful_reviews(
         &self,
         patchset_id: i64,
@@ -6605,29 +6629,44 @@ impl Database {
     /// waiting, and the part it is waiting for belongs to it.
     ///
     /// A status the review pipeline does not define, such as the Fetching a
-    /// fetch leaves behind, is not terminal.
+    /// fetch leaves behind, is not terminal. Every defined status is listed,
+    /// so a new one cannot be left open, or closed, without a decision here.
     fn is_closed_to_new_parts(status: &str, received_parts: u32, total_parts: u32) -> bool {
         match ReviewStatus::from_str(status) {
             Ok(ReviewStatus::Cancelled) => true,
-            Ok(ReviewStatus::Reviewed | ReviewStatus::Failed | ReviewStatus::FailedToApply) => {
-                received_parts >= total_parts
-            }
-            _ => false,
+            Ok(
+                ReviewStatus::Reviewed
+                | ReviewStatus::Partial
+                | ReviewStatus::Failed
+                | ReviewStatus::FailedToApply,
+            ) => received_parts >= total_parts,
+            Ok(
+                ReviewStatus::Incomplete
+                | ReviewStatus::Pending
+                | ReviewStatus::InReview
+                | ReviewStatus::Skipped,
+            )
+            | Err(()) => false,
         }
     }
 
     /// Report whether a patchset in this status may be submitted again.
     ///
     /// A series whose review failed, was cancelled or did not apply has no
-    /// result worth keeping, so a new submission of it starts over. Every
-    /// other status the review pipeline defines is listed, so that a new
-    /// variant cannot become resubmittable, or stop being so, without a
-    /// decision here.
+    /// result worth keeping, so a new submission of it starts over. A
+    /// Partial series ran out of time before its review was complete, which
+    /// before Partial existed ended Failed, so it may be submitted again as
+    /// well. Every other status the review pipeline defines is listed, so
+    /// that a new variant cannot become resubmittable, or stop being so,
+    /// without a decision here.
     fn is_resubmittable(status: &str) -> bool {
         match ReviewStatus::from_str(status) {
-            Ok(ReviewStatus::Failed | ReviewStatus::Cancelled | ReviewStatus::FailedToApply) => {
-                true
-            }
+            Ok(
+                ReviewStatus::Partial
+                | ReviewStatus::Failed
+                | ReviewStatus::Cancelled
+                | ReviewStatus::FailedToApply,
+            ) => true,
             Ok(
                 ReviewStatus::Incomplete
                 | ReviewStatus::Pending
@@ -7980,10 +8019,7 @@ impl Database {
                         )
                     };
 
-                    let mut status: Option<String> = row.get(2).ok();
-                    if is_embargoed && status.as_deref() == Some("Reviewed") {
-                        status = Some("Embargoed".to_string());
-                    }
+                    let status = shown_under_embargo(row.get(2).ok(), is_embargoed);
 
                     patchsets.push(PatchsetRow {
                         id: row.get(0).unwrap_or_default(),
@@ -8409,10 +8445,8 @@ impl Database {
             while let Ok(Some(p)) = patch_rows.next().await {
                 let p_id: i64 = p.get(0)?;
                 patch_ids.push(p_id);
-                let mut p_status = p.get::<Option<String>>(5).ok().flatten();
-                if is_embargoed && p_status.as_deref() == Some("Reviewed") {
-                    p_status = Some("Embargoed".to_string());
-                }
+                let p_status =
+                    shown_under_embargo(p.get::<Option<String>>(5).ok().flatten(), is_embargoed);
                 patches.push(serde_json::json!({
                     "id": p_id,
                     "message_id": p.get::<String>(1)?,
@@ -8427,10 +8461,7 @@ impl Database {
                 }));
             }
 
-            let mut final_status = status;
-            if is_embargoed && final_status.as_deref() == Some("Reviewed") {
-                final_status = Some("Embargoed".to_string());
-            }
+            let final_status = shown_under_embargo(status, is_embargoed);
 
             let reviews = if is_embargoed {
                 Vec::new()
@@ -8616,10 +8647,8 @@ impl Database {
             while let Ok(Some(p)) = patch_rows.next().await {
                 let p_id: i64 = p.get(0)?;
                 patch_ids.push(p_id);
-                let mut p_status = p.get::<Option<String>>(5).ok().flatten();
-                if is_embargoed && p_status.as_deref() == Some("Reviewed") {
-                    p_status = Some("Embargoed".to_string());
-                }
+                let p_status =
+                    shown_under_embargo(p.get::<Option<String>>(5).ok().flatten(), is_embargoed);
                 patches.push(serde_json::json!({
                     "id": p_id,
                     "message_id": p.get::<String>(1)?,
@@ -8634,10 +8663,7 @@ impl Database {
                 }));
             }
 
-            let mut final_status = status;
-            if is_embargoed && final_status.as_deref() == Some("Reviewed") {
-                final_status = Some("Embargoed".to_string());
-            }
+            let final_status = shown_under_embargo(status, is_embargoed);
 
             let reviews = if is_embargoed {
                 Vec::new()
@@ -9484,6 +9510,9 @@ impl Database {
         Ok(patchsets)
     }
 
+    /// Whether a reviewed patchset is clean, has findings or is incomplete.
+    /// Any status but `Reviewed`, `Partial` included on purpose, is
+    /// `Incomplete`, because only a full review can show a series clean.
     pub async fn get_patchset_review_outcome(
         &self,
         patchset_id: i64,
@@ -9593,6 +9622,8 @@ impl Database {
         Ok(())
     }
 
+    /// The reviews an embargo release sends. A `Partial` review is excluded
+    /// on purpose: a salvaged review never leaves the server.
     pub async fn get_completed_reviews_for_release(
         &self,
         patchset_id: i64,
@@ -13006,6 +13037,257 @@ mod tests {
             .await
             .unwrap();
         assert!(!releasable.iter().any(|patchset| patchset.id == ps_id));
+    }
+
+    /// A one-part series, received in full: its patchset and its patch.
+    async fn one_part_series(db: &Database, msg_id: &str, date: i64) -> (i64, i64) {
+        let author = "Author <author@example.com>";
+        let thread_id = db.create_thread(msg_id, "A subject", date).await.unwrap();
+        db.create_message(
+            msg_id,
+            thread_id,
+            None,
+            author,
+            "A subject",
+            date,
+            "body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id,
+                None,
+                msg_id,
+                "A subject",
+                author,
+                date,
+                1,
+                1,
+                "",
+                "",
+                None,
+                1,
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let patch_id = db.create_patch(ps_id, msg_id, 1, "diff").await.unwrap();
+        (ps_id, patch_id)
+    }
+
+    /// Stores a finished review of a patch with one finding.
+    async fn finished_review_with_a_finding(
+        db: &Database,
+        ps_id: i64,
+        patch_id: i64,
+        status: &str,
+    ) -> i64 {
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(review_id, status, "done", Some("s"), None, Some("i"), None)
+            .await
+            .unwrap();
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::High,
+            severity_explanation: None,
+            problem: format!("A problem found by a {status} review"),
+            preexisting: Some(false),
+            locations: None,
+        })
+        .await
+        .unwrap();
+        review_id
+    }
+
+    async fn is_clean_patchset(db: &Database, ps_id: i64) -> bool {
+        let mut rows = db
+            .conn
+            .query(
+                &format!("SELECT ({CLEAN_PATCHSET_PREDICATE}) FROM patchsets p WHERE p.id = ?"),
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() != 0
+    }
+
+    /// A Partial review is not a review for any gate that asks "was this
+    /// reviewed?": it does not count toward the target, does not make a
+    /// series clean, is not sent on release and does not make the outcome
+    /// known. A Reviewed review of the same patch passes them, which shows
+    /// the gates are the ones saying no.
+    #[tokio::test]
+    async fn test_a_partial_review_passes_no_gate_that_asks_for_a_review() {
+        let db = setup_db().await;
+        let (ps_id, patch_id) = one_part_series(&db, "msg_partial_gates", 72000).await;
+        let review = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review,
+            "Partial",
+            "out of time",
+            Some("s"),
+            None,
+            Some("i"),
+            None,
+        )
+        .await
+        .unwrap();
+        db.update_patchset_status(ps_id, "Partial").await.unwrap();
+
+        assert_eq!(
+            db.count_successful_reviews(ps_id, patch_id, None)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(!is_clean_patchset(&db, ps_id).await);
+        assert!(
+            db.get_completed_reviews_for_release(ps_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Incomplete
+        );
+        // Even under a Reviewed patchset, the Partial review alone does not
+        // complete the patch.
+        db.update_patchset_status(ps_id, "Reviewed").await.unwrap();
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Incomplete
+        );
+
+        let reviewed = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .await
+            .unwrap();
+        db.complete_review(reviewed, "Reviewed", "ok", Some("s"), None, Some("i"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.count_successful_reviews(ps_id, patch_id, None)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(is_clean_patchset(&db, ps_id).await);
+        let released: Vec<i64> = db
+            .get_completed_reviews_for_release(ps_id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(released, vec![reviewed]);
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Clean
+        );
+    }
+
+    /// While an embargo holds, a Partial patchset and a Partial patch are
+    /// shown as Embargoed, as Reviewed ones are, so the status does not say
+    /// early how the review went. A failure is still shown as it is.
+    #[tokio::test]
+    async fn test_an_embargoed_partial_patchset_is_shown_as_embargoed() {
+        let db = setup_db().await;
+        let (ps_id, patch_id) = one_part_series(&db, "msg_partial_mask", 73000).await;
+        finished_review_with_a_finding(&db, ps_id, patch_id, "Partial").await;
+        db.update_patchset_status(ps_id, "Partial").await.unwrap();
+        db.conn
+            .execute(
+                "UPDATE patches SET status = 'Partial' WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await
+            .unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        let shown = |expected: &'static str| {
+            let db = db.clone();
+            async move {
+                let list = db.get_patchsets(10, 0, None, None).await.unwrap();
+                assert_eq!(list[0].status.as_deref(), Some(expected), "list");
+                let details = db
+                    .get_patchset_details(ps_id, None, None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let summary = db
+                    .get_patchset_summary(ps_id, None, None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                for (view, body) in [("details", details), ("summary", summary)] {
+                    assert_eq!(body["status"], expected, "{view} patchset");
+                    assert_eq!(body["patches"][0]["status"], expected, "{view} patch");
+                }
+            }
+        };
+
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+        shown("Embargoed").await;
+
+        db.set_patchset_embargo_until(ps_id, now - 3600)
+            .await
+            .unwrap();
+        shown("Partial").await;
+
+        db.update_patchset_status(ps_id, "Failed").await.unwrap();
+        db.conn
+            .execute(
+                "UPDATE patches SET status = 'Failed' WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await
+            .unwrap();
+        db.set_patchset_embargo_until(ps_id, now + 3600)
+            .await
+            .unwrap();
+        shown("Failed").await;
+    }
+
+    #[test]
+    fn test_only_a_finished_review_is_masked_by_an_embargo() {
+        for (status, masked) in [
+            ("Reviewed", true),
+            ("Partial", true),
+            ("Failed", false),
+            ("Failed To Apply", false),
+            ("Cancelled", false),
+            ("In Review", false),
+            ("Pending", false),
+            ("Fetching", false),
+        ] {
+            let shown = shown_under_embargo(Some(status.to_string()), true);
+            let expected = if masked { "Embargoed" } else { status };
+            assert_eq!(shown.as_deref(), Some(expected), "{status}");
+            assert_eq!(
+                shown_under_embargo(Some(status.to_string()), false).as_deref(),
+                Some(status),
+                "{status} is masked with no embargo"
+            );
+        }
+        assert_eq!(shown_under_embargo(None, true), None);
     }
 
     #[tokio::test]
@@ -17567,12 +17849,45 @@ mod tests {
             !db.has_patchset_by_msgid(sha_fta_patch).await.unwrap(),
             "has_patchset_by_msgid should return false for patch SHA belonging to Failed To Apply patchset"
         );
+
+        // 6. A patchset whose review ran out of time ends Partial, and may be
+        // submitted again as it could when such a review ended Failed.
+        let sha_partial_patch = "d44d44d441234567890abcdef1234567890abcdee";
+        let (ps_partial, _) = one_part_series(&db, sha_partial_patch, 5000).await;
+        db.update_patchset_status(ps_partial, "Partial")
+            .await
+            .unwrap();
+        assert!(
+            !db.has_patchset_by_msgid(sha_partial_patch).await.unwrap(),
+            "has_patchset_by_msgid should return false for patch SHA belonging to Partial patchset"
+        );
+        db.update_patchset_status(ps_partial, "Reviewed")
+            .await
+            .unwrap();
+        assert!(
+            db.has_patchset_by_msgid(sha_partial_patch).await.unwrap(),
+            "the same series counts as ingested once it is Reviewed"
+        );
     }
 
     /// Verify that create_fetching_patchset resets patchsets in 'Failed To Apply'
     /// status to 'Fetching' so that re-submitted patches can transition to 'Pending'.
     #[tokio::test]
     async fn test_failed_to_apply_patchset_resettable_and_reingestible() {
+        resubmission_resets_and_reingests("Failed To Apply").await;
+    }
+
+    /// A series whose review ran out of time ends Partial, and a new
+    /// submission of it starts over as it did when such a review ended
+    /// Failed.
+    #[tokio::test]
+    async fn test_partial_patchset_resettable_and_reingestible() {
+        resubmission_resets_and_reingests("Partial").await;
+    }
+
+    /// Submits a one-part series, ends its review in `status`, submits it
+    /// again and checks it is fetched and queued for review once more.
+    async fn resubmission_resets_and_reingests(status: &str) {
         let db = setup_db().await;
         let sha = "d44d44d441234567890abcdef1234567890abcdef";
         let synthetic_cover = format!("{}@sashiko.local", sha);
@@ -17638,17 +17953,15 @@ mod tests {
 
         db.create_patch(ps_id, sha, 1, "diff-v1").await.unwrap();
 
-        // 2. Mark patchset Failed To Apply during review
-        db.update_patchset_status(ps_id, "Failed To Apply")
-            .await
-            .unwrap();
+        // 2. The review ends in the given status
+        db.update_patchset_status(ps_id, status).await.unwrap();
 
         let det = db
             .get_patchset_details(ps_id, None, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(det["status"], "Failed To Apply");
+        assert_eq!(det["status"], status);
 
         // 3. User re-submits: create_fetching_patchset must reset status to Fetching
         let ps_re_id = db
@@ -20514,6 +20827,7 @@ mod tests {
             "Cancelled",
             "Skipped",
             "Reviewed",
+            "Partial",
             "Failed",
             "Failed To Apply",
             "Fetching",
@@ -20552,6 +20866,130 @@ mod tests {
         }
     }
 
+    /// A series whose review finished is closed to a part that turns up
+    /// afterwards, and to an embargo placed afterwards, whether the review
+    /// was full or only partial. A series still in review takes both, which
+    /// shows the refusal comes from the status.
+    #[tokio::test]
+    async fn test_a_finished_partial_series_refuses_a_late_part_and_an_embargo() {
+        for (status, closed) in [("Reviewed", true), ("Partial", true), ("In Review", false)] {
+            let db = setup_db().await;
+            let author = "Author <a@b.c>";
+            let thread_id = db
+                .create_thread("late_cover", "[PATCH 0/1] Cover", 1000)
+                .await
+                .unwrap();
+            db.create_message(
+                "late_cover",
+                thread_id,
+                None,
+                author,
+                "[PATCH 0/1] Cover",
+                1000,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            db.create_message(
+                "late_1",
+                thread_id,
+                Some("late_cover"),
+                author,
+                "[PATCH 1/1] Part 1",
+                1001,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let ps_id = db
+                .create_patchset(
+                    thread_id,
+                    Some("late_cover"),
+                    "late_1",
+                    "[PATCH 1/1] Part 1",
+                    author,
+                    1001,
+                    1,
+                    1,
+                    "",
+                    "",
+                    None,
+                    1,
+                    None,
+                    true,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            db.create_patch(ps_id, "late_1", 1, "diff 1").await.unwrap();
+            db.update_patchset_status(ps_id, status).await.unwrap();
+
+            // A second part of the same cover letter arrives late.
+            db.create_message(
+                "late_2",
+                thread_id,
+                Some("late_cover"),
+                author,
+                "[PATCH 2/2] Part 2",
+                1002,
+                "",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let late_ps = db
+                .create_patchset(
+                    thread_id,
+                    Some("late_cover"),
+                    "late_2",
+                    "[PATCH 2/2] Part 2",
+                    author,
+                    1002,
+                    2,
+                    1,
+                    "",
+                    "",
+                    None,
+                    2,
+                    None,
+                    true,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(late_ps != ps_id, closed, "{status}: late part joined");
+
+            db.set_patchset_embargo_until_if_non_terminal(ps_id, 999_999)
+                .await
+                .unwrap();
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT embargo_until IS NULL FROM patchsets WHERE id = ?",
+                    libsql::params![ps_id],
+                )
+                .await
+                .unwrap();
+            let not_embargoed = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap() != 0;
+            assert_eq!(not_embargoed, closed, "{status}: embargo placed");
+        }
+    }
+
     /// The ingestion check and the reset to Fetching have to agree on which
     /// series may be submitted again, or a resubmission is either refused as
     /// already ingested or accepted and then never fetched.
@@ -20570,6 +21008,7 @@ mod tests {
             ("Cancelled", true),
             ("Skipped", false),
             ("Reviewed", false),
+            ("Partial", true),
             ("Failed", true),
             ("Failed To Apply", true),
             ("FailedToApply", true),
