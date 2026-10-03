@@ -3869,30 +3869,19 @@ async fn run_review_tool_with_cmd(
                                             match resp_payload {
                                                 Ok(p) => {
                                                     let used = token_meter_clone.returned(p.usage.as_ref());
-                                                    if p.usage.is_some() {
-                                                        let current_total = used.budgeted();
-                                                        let current_output = used.output;
-                                                        let token_budget = settings_clone.review.max_total_tokens;
-                                                        if token_budget > 0 && current_total > token_budget {
-                                                            let err_msg = format!("Token budget exceeded: {} uncached input + output tokens used > {} limit", current_total, token_budget);
-
-                                                            let payload = RemoteAiErrorPayload::new(err_msg.clone(), AiErrorClass::Fatal);
-                                                            write_ipc_reply(&stdin_clone, IpcMessageType::Error, tx_id, &payload).await;
-
-                                                            let _ = abort_tx_clone.send(ReviewError::BudgetExceeded(err_msg).into()).await;
-                                                            return;
-                                                        }
-
-                                                        let output_budget = settings_clone.review.max_total_output_tokens;
-                                                        if output_budget > 0 && current_output > output_budget {
-                                                            let err_msg = format!("Output token budget exceeded: {} output tokens used > {} limit", current_output, output_budget);
-
-                                                            let payload = RemoteAiErrorPayload::new(err_msg.clone(), AiErrorClass::Fatal);
-                                                            write_ipc_reply(&stdin_clone, IpcMessageType::Error, tx_id, &payload).await;
-
-                                                            let _ = abort_tx_clone.send(ReviewError::BudgetExceeded(err_msg).into()).await;
-                                                            return;
-                                                        }
+                                                    if p.usage.is_some()
+                                                        && let Some(err_msg) = budget_overrun(&used, &settings_clone.review)
+                                                    {
+                                                        // The stop is queued before the worker is told,
+                                                        // so it is already waiting by the time the I/O
+                                                        // loop can read anything the worker writes in
+                                                        // answer, its end of stream included, and the
+                                                        // end of the stream takes it in place of that
+                                                        // output (`stream_outcome`).
+                                                        let _ = abort_tx_clone.send(ReviewError::BudgetExceeded(err_msg.clone()).into()).await;
+                                                        let payload = RemoteAiErrorPayload::new(err_msg, AiErrorClass::Fatal);
+                                                        write_ipc_reply(&stdin_clone, IpcMessageType::Error, tx_id, &payload).await;
+                                                        return;
                                                     }
 
                                                     record_tool_calls(
@@ -4054,12 +4043,7 @@ async fn run_review_tool_with_cmd(
                 );
             }
 
-            // Return result
-            if let Some(res) = final_result {
-                Ok(res)
-            } else {
-                Err(anyhow::anyhow!("Review tool finished without valid result"))
-            }
+            stream_outcome(final_result, &mut abort_rx)
         }
         .await;
     let wound_down = match phase {
@@ -4506,6 +4490,51 @@ fn spawn_worker(
         .take()
         .ok_or_else(|| anyhow::anyhow!("No stdout"))?;
     Ok((child, stdin, stdout))
+}
+
+/// Why the tokens an attempt has used so far stop it, or `None` while they
+/// are within both of `review`'s limits. A limit of 0 is disabled.
+fn budget_overrun(
+    used: &AttemptTokens,
+    review: &crate::settings::ReviewSettings,
+) -> Option<String> {
+    let total = used.budgeted();
+    let limit = review.max_total_tokens;
+    if limit > 0 && total > limit {
+        return Some(format!(
+            "Token budget exceeded: {} uncached input + output tokens used > {} limit",
+            total, limit
+        ));
+    }
+    let limit = review.max_total_output_tokens;
+    if limit > 0 && used.output > limit {
+        return Some(format!(
+            "Output token budget exceeded: {} output tokens used > {} limit",
+            used.output, limit
+        ));
+    }
+    None
+}
+
+/// What an attempt comes to once the worker's stream has ended: a stop that
+/// a relayed call queued for the I/O loop and the loop has not taken yet,
+/// such as a token budget stop, else the worker's final result, else an
+/// error for a worker that ended without one.
+///
+/// The loop's `select!` picks at random among the branches that are ready,
+/// so a worker that writes its last output and exits as soon as it reads
+/// the daemon's error reply can have that output or its end of stream
+/// taken first. Taking the queued stop here makes the stop the attempt's
+/// outcome either way, so a budget stop is never mistaken for an ordinary
+/// failure and retried (D13).
+fn stream_outcome(
+    final_result: Option<Value>,
+    stops: &mut tokio::sync::mpsc::Receiver<anyhow::Error>,
+) -> Result<Value> {
+    if let Ok(stop) = stops.try_recv() {
+        return Err(stop);
+    }
+    final_result.ok_or_else(|| anyhow::anyhow!("Review tool finished without valid result"))
 }
 
 /// Writes one reply to a worker's stdin.
@@ -9076,6 +9105,138 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             Some("Failed")
         );
         Ok(())
+    }
+
+    /// A provider that holds the runtime's only thread for `hold` before
+    /// answering, as [`MockProviderWithUsage`] would. A `#[tokio::test]`
+    /// runtime has one thread, so while a call is held the I/O loop cannot
+    /// run, and what the worker writes meanwhile is waiting for it, together
+    /// with any stop queued by an earlier call, when it next runs.
+    struct ThreadHoldingProvider {
+        hold: std::time::Duration,
+        usage: MockProviderWithUsage,
+    }
+
+    #[async_trait]
+    impl AiProvider for ThreadHoldingProvider {
+        async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
+            std::thread::sleep(self.hold);
+            self.usage.generate_content(request).await
+        }
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            self.usage.get_capabilities()
+        }
+    }
+
+    /// A worker that writes its error output and exits as soon as it reads
+    /// the daemon's reply to a call over the token budget is still stopped
+    /// by the budget, and not retried. The worker sends two calls at once:
+    /// the first goes over the budget and queues the stop, and the second
+    /// holds the runtime while the worker answers the first reply and exits,
+    /// so the loop finds the stop, the error output and the end of stream
+    /// all waiting. Its `select!` picks one at random, so the race is run
+    /// several times: before the queued stop was taken at the end of the
+    /// stream, each round lost it about half the time. The decision itself
+    /// is covered without the race by
+    /// `test_a_queued_stop_wins_over_the_final_output`.
+    #[tokio::test]
+    async fn test_a_worker_that_exits_on_its_budget_reply_is_not_retried() -> Result<()> {
+        const ROUNDS: usize = 8;
+        let request = json!({"type": "ai_request", "payload": {"messages": [{"role": "user", "content": "go on"}]}});
+        let failed = error_output("Fatal: Token budget exceeded", None);
+        let script = format!(
+            "#!/bin/sh\nread -r _payload\nprintf '%s\\n%s\\n' '{request}' '{request}'\n\
+             read -r _reply\necho '{failed}'\nexit 1\n"
+        );
+        for round in 0..ROUNDS {
+            let provider = Arc::new(ThreadHoldingProvider {
+                hold: std::time::Duration::from_millis(300),
+                usage: MockProviderWithUsage {
+                    prompt_tokens: 1000,
+                    completion_tokens: 100,
+                    cached_tokens: 200,
+                },
+            });
+            let run = review_patch_with_provider(&script, provider, |s| {
+                s.review.max_total_tokens = 500;
+                s.review.max_retries = 2;
+            })
+            .await?;
+            assert!(matches!(run.result, PatchResult::ReviewFailed));
+            let reviews = review_rows(&run.db, run.patch_id).await?;
+            assert_eq!(
+                reviews.len(),
+                1,
+                "round {round}: a second budget was spent: {reviews:?}"
+            );
+            assert!(
+                reviews[0]["result"]
+                    .as_str()
+                    .is_some_and(|r| r.starts_with("Tool error: Token budget exceeded")),
+                "round {round}: the attempt ended as a budget stop: {}",
+                reviews[0]
+            );
+            assert_eq!(
+                patch_status(&run.db, run.patch_id).await?.as_deref(),
+                Some("Failed")
+            );
+        }
+        Ok(())
+    }
+
+    /// A stop queued for the I/O loop decides the attempt once the stream
+    /// ends, even when the worker's final output was read first, and is
+    /// taken only once. With no stop queued, the attempt keeps the worker's
+    /// result, or fails for a worker that ended without one.
+    #[tokio::test]
+    async fn test_a_queued_stop_wins_over_the_final_output() {
+        let (stops, mut queued) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
+        let output = json!({"patchset_id": 1, "error": "Fatal: Token budget exceeded"});
+        let _ = stops
+            .send(ReviewError::BudgetExceeded("over".into()).into())
+            .await;
+        let stopped = stream_outcome(Some(output.clone()), &mut queued);
+        assert!(
+            stopped
+                .as_ref()
+                .err()
+                .and_then(|e| e.downcast_ref::<ReviewError>())
+                .is_some_and(|e| matches!(e, ReviewError::BudgetExceeded(_))),
+            "{stopped:?}"
+        );
+        assert_eq!(
+            stream_outcome(Some(output.clone()), &mut queued).ok(),
+            Some(output)
+        );
+        let ended = stream_outcome(None, &mut queued);
+        assert!(
+            ended
+                .as_ref()
+                .is_err_and(|e| e.to_string().contains("without valid result")),
+            "{ended:?}"
+        );
+    }
+
+    /// Each limit stops the attempt only once it is passed, and a limit of
+    /// 0 never does.
+    #[test]
+    fn test_budget_overrun_names_the_limit_passed() {
+        let mut review = Settings::new().expect("default settings").review;
+        let used = AttemptTokens {
+            uncached_input: 800,
+            output: 300,
+            ..AttemptTokens::default()
+        };
+        review.max_total_tokens = 1100;
+        review.max_total_output_tokens = 300;
+        assert_eq!(budget_overrun(&used, &review), None);
+        review.max_total_tokens = 1099;
+        assert!(budget_overrun(&used, &review).is_some_and(|m| m.starts_with("Token budget")));
+        review.max_total_tokens = 0;
+        review.max_total_output_tokens = 299;
+        assert!(budget_overrun(&used, &review).is_some_and(|m| m.starts_with("Output token")));
+        review.max_total_output_tokens = 0;
+        assert_eq!(budget_overrun(&used, &review), None);
     }
 
     /// A patch stopped by its token budget is not reviewed again when its
