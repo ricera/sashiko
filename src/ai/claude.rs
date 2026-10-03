@@ -579,6 +579,7 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
                     function_name: name.clone(),
                     arguments: input.clone(),
                     thought_signature: None,
+                    unparsed_arguments: None,
                 });
             }
             ClaudeContent::ToolResult { .. } => {
@@ -1158,6 +1159,7 @@ mod tests {
                 function_name: "git_log".to_string(),
                 arguments: json!({"n": 5}),
                 thought_signature: None,
+                unparsed_arguments: None,
             }]),
             tool_call_id: None,
         }]);

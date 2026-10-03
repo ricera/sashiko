@@ -354,6 +354,7 @@ mod tests {
                         function_name: "read".to_string(),
                         arguments: serde_json::json!({}),
                         thought_signature: None,
+                        unparsed_arguments: None,
                     }]
                 }),
                 usage: None,

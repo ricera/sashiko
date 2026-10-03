@@ -1059,12 +1059,14 @@ mod tests {
                 function_name: "ok_tool".to_string(),
                 arguments: serde_json::json!({}),
                 thought_signature: None,
+                unparsed_arguments: None,
             },
             ToolCall {
                 id: "call_2".to_string(),
                 function_name: "fail".to_string(),
                 arguments: serde_json::json!({}),
                 thought_signature: None,
+                unparsed_arguments: None,
             },
         ];
 
@@ -1144,6 +1146,7 @@ mod tests {
                     function_name: "fail".to_string(),
                     arguments: serde_json::json!({}),
                     thought_signature: None,
+                    unparsed_arguments: None,
                 }]),
                 usage: None,
                 truncated: false,
@@ -1190,6 +1193,7 @@ mod tests {
                     function_name: "ok_tool".to_string(),
                     arguments: serde_json::json!({}),
                     thought_signature: None,
+                    unparsed_arguments: None,
                 }]),
                 usage: None,
                 truncated: false,
@@ -1281,6 +1285,7 @@ mod tests {
                     function_name: "git_grep".to_string(),
                     arguments: serde_json::json!({"pattern": "x"}),
                     thought_signature: None,
+                    unparsed_arguments: None,
                 }]),
                 usage: None,
                 truncated: false,
@@ -1418,6 +1423,7 @@ mod tests {
                 function_name: "git_grep".to_string(),
                 arguments: serde_json::json!({"pattern": "x"}),
                 thought_signature: None,
+                unparsed_arguments: None,
             }]),
             usage: None,
             truncated: false,
@@ -1629,6 +1635,81 @@ mod tests {
         assert_eq!(last_user_text(&requests[1]), OUTPUT_TRUNCATED_FEEDBACK);
     }
 
+    /// An OpenAI-compatible completion cut off while writing a tool call.
+    /// The endpoint sends arguments as text, and text stopped part-way does
+    /// not parse.
+    fn openai_cut_off_tool_call(arguments: &str) -> AiResponse {
+        let completion = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_files", "arguments": arguments}
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4000, "total_tokens": 4010}
+        });
+        let completion = serde_json::from_value(completion).expect("a valid completion");
+        crate::ai::openai::translate_ai_response(completion).expect("a translatable completion")
+    }
+
+    /// A tool call cut off part-way was being written, so it is asked for
+    /// again, shorter, as many times as any other cut-off answer. Read as no
+    /// input, it got the reasoning feedback once and then failed the stage
+    /// with a remedy that did not fit.
+    #[tokio::test]
+    async fn a_tool_call_cut_off_part_way_is_asked_for_again_shorter() {
+        let written = r#"{"paths":["src/very/long/path/one.rs","src/very/lon"#;
+        let provider = RecordingProvider::new(vec![
+            openai_cut_off_tool_call(written),
+            openai_cut_off_tool_call(written),
+            text_answer("done"),
+        ]);
+
+        let res = SessionRunner::new(&provider)
+            .run(&mut DummySession)
+            .await
+            .expect("cut-off tool calls are retried like any cut-off answer");
+        assert_eq!(res.output, "done");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        for retry in &requests[1..] {
+            assert_eq!(last_user_text(retry), OUTPUT_TRUNCATED_FEEDBACK);
+        }
+        assert!(
+            res.history.iter().any(|m| m
+                .tool_calls
+                .iter()
+                .flatten()
+                .any(|c| c.unparsed_arguments.as_deref() == Some(written))),
+            "the log shows what was cut"
+        );
+    }
+
+    /// A tool call with no input still wrote nothing when the endpoint spells
+    /// its arguments as text, so it gets the reasoning feedback.
+    #[tokio::test]
+    async fn an_openai_tool_call_without_input_is_still_spent_on_reasoning() {
+        let provider =
+            RecordingProvider::new(vec![openai_cut_off_tool_call(""), text_answer("done")]);
+
+        SessionRunner::new(&provider)
+            .run(&mut DummySession)
+            .await
+            .expect("one reasoning-only truncation is retried");
+        assert_eq!(
+            last_user_text(&provider.requests()[1]),
+            OUTPUT_TRUNCATED_REASONING_FEEDBACK
+        );
+    }
+
     /// A model that keeps overrunning still has to stop somewhere, and the
     /// error has to say both which bound ran out and what was cut.
     #[tokio::test]
@@ -1830,9 +1911,8 @@ mod tests {
     /// A tool called with no input, whose arguments are `{}`, writes no
     /// arguments, so a truncation whose only output is such calls spent its
     /// budget on reasoning and is asked to reason less, not to write less.
-    /// `null` arguments are left out: on a truncated response they come from
-    /// arguments cut off part-way, a known limitation described in the
-    /// design, not from a call with no input.
+    /// Arguments cut off part-way are not such a call: see
+    /// `a_tool_call_cut_off_part_way_is_asked_for_again_shorter`.
     #[test]
     fn a_truncation_holding_only_calls_without_input_is_spent_on_reasoning() {
         let no_input = |id: &str| ToolCall {
@@ -1840,6 +1920,7 @@ mod tests {
             function_name: "list_files".to_string(),
             arguments: serde_json::json!({}),
             thought_signature: None,
+            unparsed_arguments: None,
         };
         let mut resp = truncated_answer(None, 50);
         resp.tool_calls = Some(vec![no_input("call_1"), no_input("call_2")]);

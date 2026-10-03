@@ -395,6 +395,7 @@ fn parse_tool_call(c: &Value) -> Option<ToolCall> {
         function_name: name,
         arguments: args,
         thought_signature: None,
+        unparsed_arguments: None,
     })
 }
 

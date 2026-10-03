@@ -1200,6 +1200,7 @@ pub(crate) fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiR
                         function_call.args.clone(),
                     ),
                     thought_signature: effective_signature,
+                    unparsed_arguments: None,
                 });
             }
             Part::ThoughtSignature {
@@ -1908,6 +1909,7 @@ mod tests {
                     function_name: "test_tool".to_string(),
                     arguments: json!({"arg1": "val1"}),
                     thought_signature: Some("thought_sig_abc".to_string()),
+                    unparsed_arguments: None,
                 }]),
                 tool_call_id: None,
             }],
@@ -2081,6 +2083,7 @@ mod tests {
                         function_name: "t1".to_string(),
                         arguments: json!({}),
                         thought_signature: Some("s1".to_string()),
+                        unparsed_arguments: None,
                     }]),
                     tool_call_id: None,
                 },

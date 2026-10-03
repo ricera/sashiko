@@ -318,6 +318,7 @@ fn translate_ollama_response(resp: OllamaResponse) -> Result<AiResponse> {
                 function_name: t.function.name,
                 arguments: t.function.arguments,
                 thought_signature: None,
+                unparsed_arguments: None,
             })
             .collect()
     });
@@ -471,6 +472,7 @@ mod tests {
                     function_name: "search".to_string(),
                     arguments: json!({"query": "test"}),
                     thought_signature: None,
+                    unparsed_arguments: None,
                 }]),
                 tool_call_id: None,
             }],
