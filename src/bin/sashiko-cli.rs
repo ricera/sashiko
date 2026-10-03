@@ -27,6 +27,7 @@ use sashiko::project::ProjectId;
 use sashiko::settings::Settings;
 use sashiko::utils::utf8_prefix;
 use sashiko::workflow::StageStopCause;
+use sashiko::{PatchOutcome, ReviewStatus};
 use serde_json::{Value, from_str};
 use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
@@ -1136,17 +1137,11 @@ async fn handle_list(
                 for item in data.items {
                     let status_str = item.status.as_deref().unwrap_or("Unknown");
 
-                    let status_color = match status_str {
-                        "Reviewed" => Color::Green,
-                        "Embargoed" => Color::Magenta,
-                        "Failed" | "Error" | "Failed To Apply" => Color::Red,
-                        "Pending" | "In Review" => Color::Yellow,
-                        "Cancelled" => Color::Red,
-                        _ => Color::White,
-                    };
-
                     print!("{:<10} ", item.id);
-                    print_colored(status_color, &format!("{:<18}", status_str));
+                    print_colored(
+                        patchset_status_color(status_str),
+                        &format!("{:<18}", status_str),
+                    );
 
                     let subject = item.subject.unwrap_or_else(|| "(no subject)".to_string());
                     let subject_display = format_subject(&subject);
@@ -1176,6 +1171,62 @@ async fn handle_list(
     }
 
     Ok(())
+}
+
+/// Whether a status says its review ran out of time: `Partial` kept what the
+/// stages that finished found, and `TimedOut` kept nothing. The spellings are
+/// taken from `PatchOutcome`, the type the daemon writes them from, so the two
+/// cannot drift apart.
+fn ran_out_of_time(status: &str) -> bool {
+    [PatchOutcome::Partial, PatchOutcome::TimedOut]
+        .iter()
+        .any(|outcome| outcome.as_str() == status)
+}
+
+/// The colour a patchset status is listed in. A status that ran out of time
+/// is yellow, between a full review's green and a failure's red, because its
+/// review is neither.
+fn patchset_status_color(status: &str) -> Color {
+    match status {
+        "Reviewed" => Color::Green,
+        "Embargoed" => Color::Magenta,
+        "Failed" | "Error" | "Failed To Apply" | "Cancelled" => Color::Red,
+        "Pending" | "In Review" => Color::Yellow,
+        s if ran_out_of_time(s) => Color::Yellow,
+        _ => Color::White,
+    }
+}
+
+/// The colour a patch status is printed in. Any status not listed prints
+/// green, so a status that ran out of time has its own arm: green would make
+/// a patch whose review stopped early read as fully reviewed.
+fn patch_status_color(status: &str) -> Color {
+    match status {
+        "Failed" | "Failed To Apply" | "Error" => Color::Red,
+        "Embargoed" => Color::Magenta,
+        s if ran_out_of_time(s) => Color::Yellow,
+        _ => Color::Green,
+    }
+}
+
+/// The colour of a review's badge. A Partial review is yellow whether or not
+/// it found issues: its coverage is incomplete, so not finding any does not
+/// make it clean.
+fn review_badge_color(review: &Value) -> Color {
+    let status = review_status(review);
+    if status == Some(ReviewStatus::Partial) || review_has_new_issues(review) {
+        Color::Yellow
+    } else if status == Some(ReviewStatus::Failed) {
+        Color::Red
+    } else {
+        Color::Green
+    }
+}
+
+/// A review's status, or `None` when it is missing or one this build does
+/// not know.
+fn review_status(review: &Value) -> Option<ReviewStatus> {
+    review.get("status")?.as_str()?.parse().ok()
 }
 
 fn format_subject(subject: &str) -> String {
@@ -1214,26 +1265,54 @@ fn find_best_review_for_patch(patch_id: i64, reviews: &[Value]) -> Option<&Value
     find_best_review_for_patch_refs(patch_id, &refs)
 }
 
-fn find_best_review_for_patch_refs<'a>(patch_id: i64, reviews: &[&'a Value]) -> Option<&'a Value> {
-    let mut best: Option<&Value> = None;
-    for r in reviews {
-        if r.get("patch_id").and_then(|id| id.as_i64()) != Some(patch_id) {
-            continue;
-        }
-        let status = r.get("status").and_then(|s| s.as_str());
-        let current_status = best.and_then(|pr| pr.get("status").and_then(|s| s.as_str()));
-        if status == Some("Reviewed") || current_status != Some("Reviewed") {
-            best = Some(r);
-        }
-    }
-    best
+/// How well a review stands for its patch, weakest first, so that the
+/// derived order ranks them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ReviewStanding {
+    /// Any other status: failed, cancelled, or not finished yet.
+    Other,
+    /// The review ran out of time and kept what the stages that finished
+    /// found. It says more about the patch than a failure does, and less
+    /// than a full review.
+    Partial,
+    /// A full review.
+    Reviewed,
 }
 
+impl ReviewStanding {
+    fn of(review: &Value) -> Self {
+        match review_status(review) {
+            Some(ReviewStatus::Reviewed) => Self::Reviewed,
+            Some(ReviewStatus::Partial) => Self::Partial,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The review that stands for a patch: the latest Reviewed one, else the
+/// latest Partial one, else the latest of any status. Every view that shows
+/// one review per patch picks it here, so they all agree.
+///
+/// The server lists reviews oldest first, and `max_by_key` returns the last
+/// of several equal keys, so the latest review of the best standing wins.
+fn find_best_review_for_patch_refs<'a>(patch_id: i64, reviews: &[&'a Value]) -> Option<&'a Value> {
+    reviews
+        .iter()
+        .copied()
+        .filter(|r| r.get("patch_id").and_then(|id| id.as_i64()) == Some(patch_id))
+        .max_by_key(|r| ReviewStanding::of(r))
+}
+
+/// The one-line result of a review. The status is read before the findings,
+/// so that a Partial review with findings never reads as a complete review
+/// that found issues.
 fn review_result_label(review: &Value) -> &str {
-    if review_has_new_issues(review) {
-        "Issues Found"
-    } else {
-        review.get("status").and_then(|s| s.as_str()).unwrap_or("")
+    let has_new_issues = review_has_new_issues(review);
+    match review_status(review) {
+        Some(ReviewStatus::Partial) if has_new_issues => "Partial, Issues Found",
+        Some(ReviewStatus::Partial) => "Partial",
+        _ if has_new_issues => "Issues Found",
+        _ => review.get("status").and_then(|s| s.as_str()).unwrap_or(""),
     }
 }
 
@@ -1258,27 +1337,13 @@ fn print_patch_line(patch: &Value, review: Option<&Value>, show_inline: bool) {
     print!("  [{}] {}", idx, patch["subject"].as_str().unwrap_or(""));
     if !status.is_empty() && status != "Pending" {
         print!(" (");
-        let color = match status {
-            "Failed" | "Failed To Apply" | "Error" => Color::Red,
-            "Embargoed" => Color::Magenta,
-            _ => Color::Green,
-        };
-        print_colored(color, status);
+        print_colored(patch_status_color(status), status);
         print!(")");
     }
 
     if let Some(rev) = review {
-        let has_issues = review_has_new_issues(rev);
-        let rev_status = rev.get("status").and_then(|s| s.as_str()).unwrap_or("");
         print!(" [");
-        let color = if has_issues {
-            Color::Yellow
-        } else if rev_status == "Failed" {
-            Color::Red
-        } else {
-            Color::Green
-        };
-        print_colored(color, review_result_label(rev));
+        print_colored(review_badge_color(rev), review_result_label(rev));
         print!("]");
     }
     println!();
@@ -1306,22 +1371,41 @@ fn print_patch_line(patch: &Value, review: Option<&Value>, show_inline: bool) {
 /// ends, so without this there is no way to see after the fact that a result
 /// took three goes to produce.
 fn print_attempt_note(review: &Value) {
+    if let Some(note) = attempt_note(review) {
+        println!("  ({})", note);
+    }
+}
+
+/// The text of `print_attempt_note`, or `None` when the review carries
+/// neither a duration nor a retry worth noting.
+///
+/// Duration and attempt are stamped on failed and Partial attempts too, so
+/// the wording follows the status, as the web page's does: neither of them
+/// "succeeded", and a Partial review says it stopped because time ran out.
+fn attempt_note(review: &Value) -> Option<String> {
+    let status = review_status(review);
     let attempt = review.get("attempt").and_then(|a| a.as_u64());
     let duration = review.get("duration_seconds").and_then(|d| d.as_u64());
 
     let mut parts = Vec::new();
     if let Some(d) = duration {
-        parts.push(format!("reviewed in {}", format_duration(d)));
+        let d = format_duration(d);
+        parts.push(match status {
+            Some(ReviewStatus::Partial) => format!("stopped after {} (out of time)", d),
+            Some(ReviewStatus::Failed) => format!("failed after {}", d),
+            _ => format!("reviewed in {}", d),
+        });
     }
     // Only worth saying when it took more than one go; annotating every review
     // with "attempt 1" would bury the case worth noticing.
     if let Some(a) = attempt.filter(|a| *a > 1) {
-        parts.push(format!("succeeded on attempt {}", a));
+        parts.push(match status {
+            Some(ReviewStatus::Partial | ReviewStatus::Failed) => format!("on attempt {}", a),
+            _ => format!("succeeded on attempt {}", a),
+        });
     }
 
-    if !parts.is_empty() {
-        println!("  ({})", parts.join(", "));
-    }
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// Warns when a review did not run every stage it was supposed to.
@@ -1909,6 +1993,77 @@ async fn handle_show(
     Ok(())
 }
 
+/// How the patches of a patchset stand, each counted by the review that
+/// stands for it (`find_best_review_for_patch_refs`).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PatchsetSummary {
+    reviewed_clean: usize,
+    reviewed_issues: usize,
+    /// Patches whose review ran out of time and kept what the stages that
+    /// finished found. They are neither reviewed nor still in review.
+    partial: usize,
+    in_review: usize,
+    not_started: usize,
+    failed: usize,
+    /// The newest review of any patch, whichever review stands for it. A
+    /// caller passes it back as `--since`, so a retry newer than the review
+    /// that stands for its patch must not be reported again on every poll.
+    latest_review_id: i64,
+    /// The `(part_index, subject)` of every patch whose Reviewed review found
+    /// new issues, one per `reviewed_issues`. A Partial patch is counted in
+    /// `partial` alone, so it is not listed here; `--issues` lists it with its
+    /// "Partial, Issues Found" label.
+    issues: Vec<(i64, String)>,
+}
+
+impl PatchsetSummary {
+    fn tally(patches: &[Value], reviews: &[&Value]) -> Self {
+        let mut summary = Self::default();
+        for patch in patches {
+            let p_id = patch["id"].as_i64().unwrap_or(0);
+            summary.latest_review_id = summary
+                .latest_review_id
+                .max(latest_review_id_for_patch(p_id, reviews));
+            match find_best_review_for_patch_refs(p_id, reviews) {
+                Some(review) => summary.count(patch, review),
+                None => summary.not_started += 1,
+            }
+        }
+        summary
+    }
+
+    fn count(&mut self, patch: &Value, review: &Value) {
+        let status = review_status(review);
+        let has_new_issues = review_has_new_issues(review);
+        if status == Some(ReviewStatus::Reviewed) && has_new_issues {
+            let idx = patch["part_index"].as_i64().unwrap_or(0);
+            let subject = patch["subject"].as_str().unwrap_or("").to_string();
+            self.issues.push((idx, subject));
+        }
+
+        match status {
+            Some(ReviewStatus::Reviewed) if has_new_issues => self.reviewed_issues += 1,
+            Some(ReviewStatus::Reviewed) => self.reviewed_clean += 1,
+            Some(ReviewStatus::Partial) => self.partial += 1,
+            Some(ReviewStatus::Failed) => self.failed += 1,
+            // "Error" is not a `ReviewStatus` and nothing in this tree writes
+            // it, but the summary has always counted it as a failure.
+            _ if review.get("status").and_then(|s| s.as_str()) == Some("Error") => self.failed += 1,
+            _ => self.in_review += 1,
+        }
+    }
+}
+
+/// The largest review id among a patch's reviews, or 0 when it has none.
+fn latest_review_id_for_patch(patch_id: i64, reviews: &[&Value]) -> i64 {
+    reviews
+        .iter()
+        .filter(|r| r.get("patch_id").and_then(|id| id.as_i64()) == Some(patch_id))
+        .filter_map(|r| r.get("id").and_then(|i| i.as_i64()))
+        .max()
+        .unwrap_or(0)
+}
+
 fn show_summary(
     details: &Value,
     patches: &[Value],
@@ -1919,59 +2074,12 @@ fn show_summary(
     let ps_id = details["id"].as_i64().unwrap_or(0);
     let ps_status = details["status"].as_str().unwrap_or("");
     let total = patches.len();
-
-    let mut reviewed_clean = 0usize;
-    let mut reviewed_issues = 0usize;
-    let mut in_review = 0usize;
-    let mut not_started = 0usize;
-    let mut failed = 0usize;
-    let mut latest_review_id: i64 = 0;
-    let mut issues_list: Vec<(i64, String)> = Vec::new();
-
-    for patch in patches {
-        let p_id = patch["id"].as_i64().unwrap_or(0);
-        let matching: Vec<&&Value> = reviews
-            .iter()
-            .filter(|r| r.get("patch_id").and_then(|id| id.as_i64()) == Some(p_id))
-            .collect();
-
-        if matching.is_empty() {
-            not_started += 1;
-            continue;
-        }
-
-        let best = matching
-            .iter()
-            .filter(|r| r.get("status").and_then(|s| s.as_str()) == Some("Reviewed"))
-            .max_by_key(|r| r.get("id").and_then(|i| i.as_i64()).unwrap_or(0))
-            .or_else(|| matching.last());
-
-        if let Some(rev) = best {
-            let rev_id = rev.get("id").and_then(|i| i.as_i64()).unwrap_or(0);
-            if rev_id > latest_review_id {
-                latest_review_id = rev_id;
-            }
-
-            match rev.get("status").and_then(|s| s.as_str()).unwrap_or("") {
-                "Reviewed" => {
-                    if review_has_new_issues(rev) {
-                        reviewed_issues += 1;
-                        let idx = patch["part_index"].as_i64().unwrap_or(0);
-                        let subject = patch["subject"].as_str().unwrap_or("").to_string();
-                        issues_list.push((idx, subject));
-                    } else {
-                        reviewed_clean += 1;
-                    }
-                }
-                "Failed" | "Error" => failed += 1,
-                _ => in_review += 1,
-            }
-        }
-    }
+    let summary = PatchsetSummary::tally(patches, reviews);
 
     match format {
         OutputFormat::Json => {
-            let issues_json: Vec<Value> = issues_list
+            let issues_json: Vec<Value> = summary
+                .issues
                 .iter()
                 .map(|(idx, subject)| {
                     serde_json::json!({
@@ -1984,12 +2092,13 @@ fn show_summary(
                 "patchset_id": ps_id,
                 "total_patches": total,
                 "status": ps_status,
-                "reviewed_clean": reviewed_clean,
-                "reviewed_issues": reviewed_issues,
-                "in_review": in_review,
-                "not_started": not_started,
-                "failed": failed,
-                "latest_review_id": latest_review_id,
+                "reviewed_clean": summary.reviewed_clean,
+                "reviewed_issues": summary.reviewed_issues,
+                "partial": summary.partial,
+                "in_review": summary.in_review,
+                "not_started": summary.not_started,
+                "failed": summary.failed,
+                "latest_review_id": summary.latest_review_id,
                 "issues": issues_json,
             });
             println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1998,13 +2107,14 @@ fn show_summary(
             println!("PS {} ({} patches) — Status: {}", ps_id, total, ps_status);
             println!(
                 "  Reviewed:    {:>3}  (clean: {}, issues: {})",
-                reviewed_clean + reviewed_issues,
-                reviewed_clean,
-                reviewed_issues
+                summary.reviewed_clean + summary.reviewed_issues,
+                summary.reviewed_clean,
+                summary.reviewed_issues
             );
-            println!("  In Review:   {:>3}", in_review);
-            println!("  Not Started: {:>3}", not_started);
-            println!("  Failed:      {:>3}", failed);
+            println!("  Partial:     {:>3}", summary.partial);
+            println!("  In Review:   {:>3}", summary.in_review);
+            println!("  Not Started: {:>3}", summary.not_started);
+            println!("  Failed:      {:>3}", summary.failed);
 
             // Time spent reviewing, not time since submission: a patchset can
             // sit in the queue for a while before a worker picks it up.
@@ -2015,19 +2125,18 @@ fn show_summary(
                 println!("  Review Time: {:>3}", format_duration(secs));
             }
 
-            if !issues_list.is_empty() && !opts.issues {
+            if !summary.issues.is_empty() && !opts.issues {
                 println!("\nIssues Found:");
-                for (idx, subject) in &issues_list {
+                for (idx, subject) in &summary.issues {
                     println!("  [{}] {}", idx, subject);
                 }
             }
 
             if opts.issues {
                 println!();
-                let all_reviews: Vec<&Value> = reviews.to_vec();
                 for patch in patches {
                     let p_id = patch["id"].as_i64().unwrap_or(0);
-                    if let Some(rev) = find_best_review_for_patch_refs(p_id, &all_reviews)
+                    if let Some(rev) = find_best_review_for_patch_refs(p_id, reviews)
                         && review_has_new_issues(rev)
                     {
                         print_patch_line(patch, Some(rev), opts.inline);
@@ -3160,6 +3269,164 @@ mod tests {
             assert_eq!(is_watch_terminal(status), terminal, "{status}");
             assert_eq!(has_review_log(status), log, "{status}");
         }
+    }
+
+    /// A review row as `/api/patch` lists it, with one new finding when
+    /// `issues` is set.
+    fn review(id: i64, patch_id: i64, status: &str, issues: bool) -> Value {
+        let findings = if issues {
+            json!([{ "severity": "High", "preexisting": false }])
+        } else {
+            json!([])
+        };
+        json!({
+            "id": id,
+            "patch_id": patch_id,
+            "status": status,
+            "output": json!({ "findings": findings }).to_string(),
+        })
+    }
+
+    /// The label reads the status first: a Partial review is never labelled
+    /// as a complete review that found issues, and every other status keeps
+    /// the label it had.
+    #[test]
+    fn test_a_partial_review_is_labelled_partial_first() {
+        for (status, issues, expected) in [
+            ("Partial", true, "Partial, Issues Found"),
+            ("Partial", false, "Partial"),
+            ("Reviewed", true, "Issues Found"),
+            ("Reviewed", false, "Reviewed"),
+            ("Failed", false, "Failed"),
+            ("In Review", false, "In Review"),
+        ] {
+            let r = review(1, 1, status, issues);
+            assert_eq!(review_result_label(&r), expected, "{status} {issues}");
+        }
+    }
+
+    /// Partial and TimedOut are yellow wherever a status is printed, so that
+    /// neither reads as a full review, and a Partial review's badge is yellow
+    /// even when it found nothing.
+    #[test]
+    fn test_statuses_that_ran_out_of_time_are_yellow() {
+        for status in ["Partial", "TimedOut"] {
+            assert_eq!(patchset_status_color(status), Color::Yellow, "{status}");
+            assert_eq!(patch_status_color(status), Color::Yellow, "{status}");
+        }
+        assert_eq!(patchset_status_color("Reviewed"), Color::Green);
+        assert_eq!(patch_status_color("Reviewed"), Color::Green);
+        assert_eq!(patch_status_color("Failed"), Color::Red);
+
+        for (status, issues, expected) in [
+            ("Partial", false, Color::Yellow),
+            ("Partial", true, Color::Yellow),
+            ("Reviewed", false, Color::Green),
+            ("Reviewed", true, Color::Yellow),
+            ("Failed", false, Color::Red),
+        ] {
+            let r = review(1, 1, status, issues);
+            assert_eq!(review_badge_color(&r), expected, "{status} {issues}");
+        }
+    }
+
+    /// A patch is shown by its latest Reviewed review, else its latest
+    /// Partial one, else its latest review of any status, and never by
+    /// another patch's review.
+    #[test]
+    fn test_the_best_review_prefers_reviewed_then_partial_then_latest() {
+        let id_of_best = |rows: &[Value]| {
+            let refs: Vec<&Value> = rows.iter().collect();
+            find_best_review_for_patch_refs(7, &refs).and_then(|r| r["id"].as_i64())
+        };
+        // Each patch's reviews as (id, status), oldest first, and the id of
+        // the review expected to stand for it.
+        type Case<'a> = (&'a [(i64, &'a str)], Option<i64>);
+        let cases: [Case; 6] = [
+            (&[(1, "Failed"), (2, "Partial"), (3, "Failed")], Some(2)),
+            (&[(1, "Reviewed"), (2, "Partial")], Some(1)),
+            (&[(1, "Partial"), (2, "Reviewed"), (3, "Partial")], Some(2)),
+            (&[(1, "Partial"), (2, "Partial")], Some(2)),
+            (&[(1, "Failed"), (2, "Cancelled")], Some(2)),
+            (&[], None),
+        ];
+        for (statuses, expected) in cases {
+            let mut rows: Vec<Value> = statuses
+                .iter()
+                .map(|(id, status)| review(*id, 7, status, false))
+                .collect();
+            // Another patch's Reviewed review is never chosen.
+            rows.push(review(99, 8, "Reviewed", false));
+            assert_eq!(id_of_best(&rows), expected, "{statuses:?}");
+        }
+    }
+
+    /// `show --summary` counts a patch by the same review every other view
+    /// shows for it, counts a Partial patch on its own rather than as in
+    /// review, lists only Reviewed patches under issues so the list matches
+    /// `reviewed_issues`, and reports the newest review id even when it is a
+    /// retry that does not stand for its patch.
+    #[test]
+    fn test_the_summary_counts_partial_patches_on_their_own() {
+        let patch = |id: i64| json!({ "id": id, "part_index": id, "subject": format!("p{id}") });
+        let patches: Vec<Value> = (1..=6).map(patch).collect();
+        let rows = [
+            review(10, 1, "Reviewed", false),
+            review(11, 2, "Reviewed", true),
+            // A later failed retry does not hide the salvaged review.
+            review(12, 3, "Partial", true),
+            review(16, 3, "Failed", false),
+            review(14, 4, "Failed", false),
+            review(15, 5, "In Review", false),
+        ];
+        let refs: Vec<&Value> = rows.iter().collect();
+
+        let summary = PatchsetSummary::tally(&patches, &refs);
+
+        assert_eq!(
+            summary,
+            PatchsetSummary {
+                reviewed_clean: 1,
+                reviewed_issues: 1,
+                partial: 1,
+                in_review: 1,
+                not_started: 1,
+                failed: 1,
+                latest_review_id: 16,
+                issues: vec![(2, "p2".to_string())],
+            }
+        );
+    }
+
+    /// A Partial review says it stopped because it ran out of time, and
+    /// neither a Partial nor a failed review claims to have succeeded.
+    #[test]
+    fn test_the_attempt_note_follows_the_status() {
+        let note = |status: &str, attempt: u64| {
+            attempt_note(&json!({
+                "status": status,
+                "duration_seconds": 90,
+                "attempt": attempt,
+            }))
+        };
+        let d = format_duration(90);
+        assert_eq!(
+            note("Partial", 1),
+            Some(format!("stopped after {d} (out of time)"))
+        );
+        assert_eq!(
+            note("Partial", 2),
+            Some(format!("stopped after {d} (out of time), on attempt 2"))
+        );
+        assert_eq!(
+            note("Failed", 2),
+            Some(format!("failed after {d}, on attempt 2"))
+        );
+        assert_eq!(
+            note("Reviewed", 2),
+            Some(format!("reviewed in {d}, succeeded on attempt 2"))
+        );
+        assert_eq!(attempt_note(&json!({ "status": "Reviewed" })), None);
     }
 
     #[test]
