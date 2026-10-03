@@ -680,7 +680,7 @@ interaction.
   arm would reopen a finished Partial series to late parts and to a new
   embargo), with its SQL twin `CLOSED_TO_NEW_PARTS_SQL` (`db.rs:60-62`). Two
   would hang: `sashiko-cli show --watch` (`bin/sashiko-cli.rs:1536-1539`) and
-  `scripts/verify_live_log.sh:216`. The resubmittable statuses and the
+  `scripts/verify_live_log.sh:274`. The resubmittable statuses and the
   embargo release are decisions (D18, D19).
 - The patchset's final status is no longer binary. A Partial patch makes the
   patchset Partial unless another patch failed (§3.11, D17). The forge
@@ -1149,7 +1149,7 @@ need `--status-partial` (§5).
 | `bin/sashiko-cli.rs:1770-1774` `show_summary` best review | Its own choice (the latest `Reviewed`, else `matching.last()`) is replaced by a call to `find_best_review_for_patch_refs(p_id, reviews)`, so the summary picks the same Reviewed > Partial > latest review as every other view. |
 | `bin/sashiko-cli.rs:1176-1196` attempt note | `Partial`: "stopped after X (out of time)", no "succeeded". |
 | `bin/sashiko-cli.rs:1769-1795` `show_summary` counters | A `partial` counter in text and JSON (counted as "in review" today). |
-| `scripts/verify_live_log.sh:216` | Add `Partial` to the terminal `case` pattern (the loop spins to its timeout otherwise). Line 192 only reads the status. |
+| `scripts/verify_live_log.sh:274` | Add `Partial` to the terminal `case` pattern (the loop spins to its timeout otherwise). Line 250 only reads the status. |
 | `static/index.html` eight theme blocks, `:717-747`, `:848-863` | `--status-partial`, `.status-Partial`, `.status-dot.status-Partial` (§5). |
 | `static/index.html:4166-4222` per-patch summary table | A `Partial` review renders its finding badges with a "partial" tag (it shows "In progress..." today). Precedence Reviewed > Partial > errors. |
 | `static/index.html:4571-4596` `renderReviewCard` | `partial` joins `showDetails`; its own wording (§5). |
@@ -1578,6 +1578,18 @@ salvage_seconds = 1800
 - `cargo test --all-features --test integration_tests -- --ignored`, which
   includes `test_activity_endpoint_reports_live_work`.
 - `./scripts/verify_stage_progress_ui.sh` and `./scripts/verify_live_log.sh`.
+  The live-log script checks that every stored stage is text, using
+  `group_concat(DISTINCT typeof(stage))` over the entries that have one.
+  While the opening system message, stored with no stage, is the only
+  entry, that aggregate is SQL NULL. The script's query helper prints a
+  NULL as an empty string, as it does for no row, so the check reads it as
+  nothing to check yet; a stage stored as anything but text still fails.
+  Before this the helper printed `None`, and an end-to-end run failed
+  about once in twelve when it sampled the table in that window. The
+  script first runs a self-test on a small database it builds (also on
+  its own with `--self-test`, which needs only python3): no entries and a
+  stageless entry pass, a stage stored as a number fails, and a NULL
+  prints as an empty string.
 - `make check-pr RANGE=2a7e748b1680..HEAD`, then
   `sashiko review --project sashiko --agent` on each commit.
 - Manual: in `/tmp/sashiko-demo`, use a stub model with

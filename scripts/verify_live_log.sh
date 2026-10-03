@@ -8,7 +8,9 @@
 # rows are cleared once the review finishes.
 #
 # Needs a debug build (cargo build), python3, curl and the kernel checkout at
-# third_party/linux to review its HEAD.
+# third_party/linux to review its HEAD. It first checks its own query helper
+# and stage check on a small database; --self-test stops after that, and
+# needs only python3.
 #
 # Safety rules:
 #   - Only ever kill PIDs this script started and recorded itself, and only
@@ -49,16 +51,72 @@ trap cleanup EXIT
 
 fail() { echo "FAIL: $*"; [ -f "$WORKDIR/daemon.log" ] && tail -20 "$WORKDIR/daemon.log"; exit 1; }
 
-query() {
-    python3 - "$WORKDIR/t.db" "$1" <<'PYEOF'
+# Prints the first column of the first row SQL returns from database DB. An
+# SQL NULL prints as an empty line, the same as no row at all, because every
+# caller tests for "nothing there" with an empty string and Python would
+# otherwise print NULL as the word None.
+query_db() {
+    python3 - "$1" "$2" <<'PYEOF'
 import sqlite3, sys
 c = sqlite3.connect(sys.argv[1])
-try:
-    print(next(c.execute(sys.argv[2]))[0])
-except StopIteration:
-    print("")
+row = next(c.execute(sys.argv[2]), None)
+print("" if row is None or row[0] is None else row[0])
 PYEOF
 }
+
+query() { query_db "$WORKDIR/t.db" "$1"; }
+
+# The kinds of value the stored stages have, comma-separated. Rows with no
+# stage are left out because the opening system message is stored with none;
+# when those are the only rows so far, the aggregate is NULL and query_db
+# prints an empty string.
+STAGE_KINDS_SQL="SELECT group_concat(DISTINCT typeof(stage)) FROM review_log_entries WHERE stage IS NOT NULL"
+
+# Fails unless every stored stage is a name. An empty list of kinds means no
+# entry has a stage yet, which is nothing to check rather than a failure.
+check_stage_kinds() {
+    case "$1" in
+        ''|text) return 0 ;;
+        *) echo "stage stored as $1, not text"; return 1 ;;
+    esac
+}
+
+# Checks query_db and check_stage_kinds against a database built here, so a
+# change that lets a log with no stage yet fail the run, or lets a stage
+# stored as a number pass, is caught without starting a daemon.
+self_test() {
+    local db="$WORKDIR/self-test.db" out
+    put() {
+        python3 -c 'import sqlite3, sys
+c = sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()' "$db" "$1" \
+            || fail "self-test: could not run: $1"
+    }
+    expect_stage_check() {
+        local want="$1" label="$2" kinds
+        kinds=$(query_db "$db" "$STAGE_KINDS_SQL")
+        if check_stage_kinds "$kinds" >/dev/null; then out=pass; else out=fail; fi
+        [ "$out" = "$want" ] \
+            || fail "self-test: $label: stage check gave $out on kinds '$kinds', want $want"
+    }
+
+    put "CREATE TABLE review_log_entries (id INTEGER PRIMARY KEY, stage)"
+    expect_stage_check pass "an empty table"
+    put "INSERT INTO review_log_entries (stage) VALUES (NULL)"
+    [ -z "$(query_db "$db" "SELECT stage FROM review_log_entries")" ] \
+        || fail "self-test: query_db printed a NULL as text"
+    expect_stage_check pass "only a system message with no stage"
+    put "INSERT INTO review_log_entries (stage) VALUES ('Analysis')"
+    expect_stage_check pass "a stage stored as a name"
+    put "INSERT INTO review_log_entries (stage) VALUES (3)"
+    expect_stage_check fail "a stage stored as a number beside a name"
+    put "DELETE FROM review_log_entries WHERE stage = 'Analysis'"
+    expect_stage_check fail "a stage stored as a number only"
+    rm -f "$db"
+    echo "PASS: self-test of the query helper and the stage check"
+}
+
+self_test
+[ "${1:-}" = "--self-test" ] && exit 0
 
 # ------------------------------------------------------- stub OpenAI-ish model
 # Answers slowly so the review stays in flight long enough to observe, and
@@ -192,8 +250,8 @@ for _ in $(seq 1 120); do
     STATUS=$(query "SELECT status FROM patchsets ORDER BY id DESC LIMIT 1")
 
     if [ "$COUNT" -gt 0 ]; then
-        KINDS=$(query "SELECT group_concat(DISTINCT typeof(stage)) FROM review_log_entries WHERE stage IS NOT NULL")
-        case "$KINDS" in ''|text) ;; *) fail "stage stored as $KINDS, not text" ;; esac
+        KINDS=$(query "$STAGE_KINDS_SQL")
+        WHY=$(check_stage_kinds "$KINDS") || fail "$WHY"
     fi
 
     if [ "$COUNT" -gt 0 ] && [ "$LIVE_SEEN" -eq 0 ]; then
