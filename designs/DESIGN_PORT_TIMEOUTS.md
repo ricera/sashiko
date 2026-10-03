@@ -957,6 +957,19 @@ it, draws exactly as the live view drew the same conversation.
   included (§3.8). The two counters become one `TokenMeter`, which also
   supplies the stored token counts (§3.9). The call that crosses the budget
   was billed, so it is counted in both.
+
+  The relayed call that crosses the budget queues the stop for the I/O loop
+  and then replies to the worker with a fatal error. The stop is queued
+  first, so it is already waiting by the time the loop can read anything
+  the worker writes in answer. The loop's `select!` picks at random among
+  ready branches, though, and a worker that prints its error output and
+  exits as soon as it reads the reply can have that output, or its end of
+  stream, taken before the stop. So when the stream ends, the loop takes a
+  stop that is still queued and returns it in place of the worker's output
+  (`stream_outcome`). The attempt is then `BudgetExceeded` however the
+  race went, and never an ordinary `Failed` that would be retried and spend
+  a second budget (D13). Before this, an end-to-end run found such an
+  attempt classified `Failed` and retried.
 - **Activity registry.** `settle` replaces the stale-row problem fixed in
   56de4b78. The patchset guard still clears rows at patchset end.
 - **Live log.** Streaming is unchanged. Entries are cleared at attempt start
@@ -1529,6 +1542,14 @@ salvage_seconds = 1800
   `wind_down` write fails, is logged, and the attempt is `Finished`.
 - New: a token-budget abort is not retried and gets the daemon record,
   including the tokens of the call that crossed the budget.
+- New: a worker that prints its error output and exits as soon as it reads
+  the budget reply, while the loop is held up so that the queued stop, the
+  output and the end of stream are all waiting together, ends
+  `BudgetExceeded` with one attempt. The race is random, so the test runs
+  it several rounds. A unit test covers the same decision without the race:
+  `stream_outcome` returns a queued stop in place of a final result it was
+  given, takes it only once, and otherwise keeps the result. Another covers
+  which budget limit `budget_overrun` names.
 - New: a worker killed at the hard limit after two relayed calls stores the
   daemon's counts (input with the cached part, output, cached); a worker
   error output reporting zero stores the daemon's counts; a finished review
