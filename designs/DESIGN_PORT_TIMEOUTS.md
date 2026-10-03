@@ -169,6 +169,42 @@ arguments).{remedy}
 lower effort rather than asking for less." when both counts are 0, and ""
 otherwise.
 
+Both counts are of characters (Unicode scalar values, not bytes), measured by
+`OutputTruncated::from_response` (§3.3) so the log line and the error agree:
+
+- `answer_chars` is the length of the response's `content`, 0 when it has
+  none.
+- `tool_arg_chars` is a sum over every tool call in the response. A call
+  whose arguments are the empty object `{}` or JSON `null` adds 0, not the 2
+  or 4 characters of that JSON. Any other call adds the length of its
+  arguments re-serialised as compact JSON (`serde_json::Value::to_string`),
+  braces, quotes and escapes included and whitespace the model wrote
+  excluded. Only `{}` and `null` are treated as empty: `""` and `[]` add 2.
+
+`{}` is a tool called with no input. Such a call costs a handful of tokens,
+so a truncation whose only output is such calls spent its budget on
+reasoning. Counting their JSON would hide that and give the answer-length
+remedy, which cannot help.
+
+`null` does not mean the same thing. Only a response with `truncated` set
+is measured, and the CLI backends never set it (`claude_cli.rs`,
+`copilot_cli.rs`), so a CLI call that leaves out its arguments never reaches
+this count. On the truncation path, `null` comes from the OpenAI and vLLM
+clients, which replace an arguments string that does not parse as JSON with
+`null` (`openai.rs` and `vllm.rs`, `translate_ai_response`). A response cut
+off at `finish_reason = "length"` while writing a tool call has exactly such
+a string, for example `{"path":"src/very/lon`, so its `null` stands for
+arguments the model was part-way through writing.
+
+**Known limitation.** That case is counted as 0 and therefore wrongly
+treated as spent on reasoning: §3.3 sends
+`OUTPUT_TRUNCATED_REASONING_FEEDBACK`, and a second such truncation in the
+turn fails with the "raise max_tokens or lower effort" remedy, although the
+model wrote arguments and asking for less is the remedy that fits. The
+behaviour comes from commit 2 and is left as a follow-up code change: keep
+the length of the raw arguments string when parsing fails, or stop treating
+`null` on a truncated response as empty.
+
 Thinking blocks are not counted. Opus 5 sends them empty while still billing
 for them, so counting them would make every truncation look like a long
 answer. Other providers keep their existing warnings.
@@ -197,12 +233,15 @@ impl OutputTruncated {
 }
 ```
 
-`SessionRunner` builds it from the response it already holds: the length of
-`content` and the summed length of every tool call's arguments. Thinking
-blocks are not counted, for the reason given in §3.2. The message reuses
-`truncation_remedy`, so the log line and the error say the same thing. For
-that reason `truncation_remedy` lives in `ai/mod.rs` from commit 2 on, not
-in `claude.rs`.
+`SessionRunner` builds it with `OutputTruncated::from_response` from the
+response it already holds: the character count of `content`, and the summed
+character count of every tool call's arguments as compact JSON, where a call
+whose arguments are `{}` or `null` counts as 0 (the full rule, and the known
+limitation for `null`, are in §3.2). Thinking blocks are not counted, for
+the reason given in §3.2. The message reuses `truncation_remedy`, so the
+log line and the error say the same thing. For that reason
+`truncation_remedy` lives in `ai/mod.rs` from commit 2 on, not in
+`claude.rs`.
 
 **Routing.** A truncated response is a *successful* response, so it never
 reaches the provider-error arm by itself. When `resp.truncated` is set
@@ -241,7 +280,7 @@ per-turn bound of `max_provider_error_retries`:
 | What the truncated answer contained | Action |
 |---|---|
 | Some answer text or tool arguments | `RetryWithFeedback(OUTPUT_TRUNCATED_FEEDBACK)` |
-| Nothing (`spent_on_reasoning()`) and `!reasoning_retried` | `RetryWithFeedback(OUTPUT_TRUNCATED_REASONING_FEEDBACK)`; sets `reasoning_retried` |
+| Nothing, including only tool calls whose arguments are `{}` or `null` (`spent_on_reasoning()`), and `!reasoning_retried` | `RetryWithFeedback(OUTPUT_TRUNCATED_REASONING_FEEDBACK)`; sets `reasoning_retried` |
 | Nothing, and `reasoning_retried` | `Fail`. Asking for less cannot help: the remedy in the error tells the operator to raise `max_tokens` or lower `effort` |
 
 The runner calls it directly. The fork routed truncation through
@@ -1404,6 +1443,12 @@ salvage_seconds = 1800
   `VertexClaudeRequest`. Replace the three tests that pinned the nesting
   (`claude.rs:886-907`).
 - **Diagnostics.** `a_truncation_that_wrote_nothing_points_at_the_budget_not_the_answer`.
+  The §3.2 counting rule: `tool_argument_chars_sums_every_call`,
+  `a_tool_call_without_arguments_counts_as_nothing_written`,
+  `only_an_empty_object_or_null_counts_as_no_arguments`, and in the
+  session `a_truncation_holding_only_calls_without_input_is_spent_on_reasoning`
+  (`{}` calls only; the `null` limitation of §3.2 is deliberately not
+  pinned by a test).
 - **Cache.** `a_truncated_response_is_not_cached` (2 provider calls, then a
   cached whole answer). A seeded truncated entry is served as a miss.
 - **Session.**

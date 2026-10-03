@@ -1450,6 +1450,33 @@ mod tests {
         }
     }
 
+    /// Only `{}` and `null` count as no arguments. Every other value is
+    /// measured as compact JSON, so whitespace the model wrote is not counted
+    /// and an empty string or array still counts as the 2 characters of its
+    /// JSON, which keeps such a truncation on the answer-length remedy.
+    #[test]
+    fn only_an_empty_object_or_null_counts_as_no_arguments() {
+        let parsed: serde_json::Value =
+            serde_json::from_str("{ \"p\" :  \"a\" }").expect("valid JSON");
+        let cases = [
+            (parsed, 9),
+            (json!(""), 2),
+            (json!([]), 2),
+            (json!({"q": "\""}), 10),
+        ];
+        for (arguments, chars) in cases {
+            let calls = [read_files_call("a", arguments.clone())];
+            assert_eq!(tool_argument_chars(&calls), chars, "input {arguments}");
+            assert_eq!(truncation_remedy(0, chars), "", "input {arguments}");
+        }
+        let mixed = [
+            read_files_call("a", json!({})),
+            read_files_call("b", serde_json::Value::Null),
+            read_files_call("c", json!({"q": 1})),
+        ];
+        assert_eq!(tool_argument_chars(&mixed), 7);
+    }
+
     #[tokio::test]
     async fn test_a_run_that_caches_through_the_daemon_does_not_cache_again() {
         let mut settings = Settings::new().expect("Failed to load settings");

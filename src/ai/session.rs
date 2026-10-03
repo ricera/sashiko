@@ -1827,6 +1827,31 @@ mod tests {
         assert_eq!(provider.requests().len(), 8);
     }
 
+    /// A tool called with no input, whose arguments are `{}`, writes no
+    /// arguments, so a truncation whose only output is such calls spent its
+    /// budget on reasoning and is asked to reason less, not to write less.
+    /// `null` arguments are left out: on a truncated response they come from
+    /// arguments cut off part-way, a known limitation described in the
+    /// design, not from a call with no input.
+    #[test]
+    fn a_truncation_holding_only_calls_without_input_is_spent_on_reasoning() {
+        let no_input = |id: &str| ToolCall {
+            id: id.to_string(),
+            function_name: "list_files".to_string(),
+            arguments: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let mut resp = truncated_answer(None, 50);
+        resp.tool_calls = Some(vec![no_input("call_1"), no_input("call_2")]);
+
+        let truncated = OutputTruncated::from_response(&resp);
+        assert!(truncated.spent_on_reasoning(), "{truncated:?}");
+        assert_eq!(
+            truncation_action(&truncated, &TurnTruncations::default()),
+            ErrorAction::RetryWithFeedback(OUTPUT_TRUNCATED_REASONING_FEEDBACK.to_string())
+        );
+    }
+
     #[test]
     fn truncation_action_follows_what_the_answer_wrote() {
         let wrote = OutputTruncated {
