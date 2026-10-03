@@ -13222,7 +13222,9 @@ mod tests {
     /// reviewed?": it does not count toward the target, does not make a
     /// series clean, is not sent on release and does not make the outcome
     /// known. A Reviewed review of the same patch passes them, which shows
-    /// the gates are the ones saying no.
+    /// the gates are the ones saying no. The outcome also stays unknown
+    /// while the patchset itself is Partial, even once every patch has its
+    /// Reviewed review.
     #[tokio::test]
     async fn test_a_partial_review_passes_no_gate_that_asks_for_a_review() {
         let db = setup_db().await;
@@ -13294,6 +13296,16 @@ mod tests {
         assert_eq!(
             db.get_patchset_review_outcome(ps_id).await.unwrap(),
             PatchsetReviewOutcome::Clean
+        );
+
+        // The same Reviewed review under a Partial patchset leaves the outcome
+        // unknown. Every patch now meets its target, so only the
+        // patchset-status gate can say no here, and this case fails if that
+        // gate accepts Partial.
+        db.update_patchset_status(ps_id, "Partial").await.unwrap();
+        assert_eq!(
+            db.get_patchset_review_outcome(ps_id).await.unwrap(),
+            PatchsetReviewOutcome::Incomplete
         );
     }
 

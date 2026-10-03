@@ -656,8 +656,11 @@ interaction.
     the salvaged review never leaves the server (D6).
   - `get_patchset_review_outcome` (`db.rs:8614`): any patchset status other
     than Reviewed gives `PatchsetReviewOutcome::Incomplete`, which is the
-    right answer for Partial. It has no production caller today; only the
-    embargo tests call it (`db.rs:11717`, `11757`, `11833`).
+    right answer for Partial. With every patch holding a `Reviewed` review
+    and no `--no-ai` skip, the patchset-status check is the only part that
+    says no, so the gate test covers that case on its own. It has no
+    production caller today; only the embargo tests call it
+    (`db.rs:11717`, `11757`, `11833`).
 
   Each of these gets a one-line comment saying `Partial` is excluded on
   purpose, so a later edit does not "fix" it. The one `'Reviewed'` filter
@@ -1471,7 +1474,12 @@ salvage_seconds = 1800
   `count_successful_reviews` is 0; the patchset is not clean under
   `CLEAN_PATCHSET_PREDICATE` (extend the embargo tests at
   `db.rs:11539-11846`); `get_completed_reviews_for_release` omits the
-  review; `get_patchset_review_outcome` is `Incomplete`.
+  review; `get_patchset_review_outcome` is `Incomplete`. That last check
+  alone does not reach the patchset-status gate, because the patch's
+  missing `Reviewed` review already makes the outcome `Incomplete`; a
+  second case gives the patch a `Reviewed` review, sets the patchset back
+  to `Partial` and asserts the outcome is still `Incomplete`, so widening
+  the gate to accept `Partial` fails the test.
 - **Embargo (D18).** An embargoed Partial patchset is released at
   `embargo_until` and not before; the release emails the Reviewed patches
   only; the list and details show `Embargoed` until then.
