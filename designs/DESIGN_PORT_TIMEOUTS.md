@@ -176,34 +176,45 @@ Both counts are of characters (Unicode scalar values, not bytes), measured by
   none.
 - `tool_arg_chars` is a sum over every tool call in the response. A call
   whose arguments are the empty object `{}` or JSON `null` adds 0, not the 2
-  or 4 characters of that JSON. Any other call adds the length of its
-  arguments re-serialised as compact JSON (`serde_json::Value::to_string`),
-  braces, quotes and escapes included and whitespace the model wrote
-  excluded. Only `{}` and `null` are treated as empty: `""` and `[]` add 2.
+  or 4 characters of that JSON, unless the call kept `unparsed_arguments`
+  (below). Any other call adds the length of its arguments re-serialised as
+  compact JSON (`serde_json::Value::to_string`), braces, quotes and escapes
+  included and whitespace the model wrote excluded. Among parsed values,
+  only `{}` and `null` are treated as empty: the JSON string `""` and `[]`
+  add 2.
+- A call whose arguments arrived as text that does not parse as JSON adds
+  the length of that text, without the blank space around it.
+- A call whose arguments arrived as blank text (empty or only blank space),
+  before any parsing, is a call with no input: it becomes `null` with
+  nothing kept and adds 0.
 
 `{}` is a tool called with no input. Such a call costs a handful of tokens,
 so a truncation whose only output is such calls spent its budget on
 reasoning. Counting their JSON would hide that and give the answer-length
 remedy, which cannot help.
 
-`null` does not mean the same thing. Only a response with `truncated` set
-is measured, and the CLI backends never set it (`claude_cli.rs`,
-`copilot_cli.rs`), so a CLI call that leaves out its arguments never reaches
-this count. On the truncation path, `null` comes from the OpenAI and vLLM
-clients, which replace an arguments string that does not parse as JSON with
-`null` (`openai.rs` and `vllm.rs`, `translate_ai_response`). A response cut
-off at `finish_reason = "length"` while writing a tool call has exactly such
-a string, for example `{"path":"src/very/lon`, so its `null` stands for
-arguments the model was part-way through writing.
+Arguments cut off part-way are not such a call. The OpenAI and vLLM clients
+receive arguments as a JSON string and parse it
+(`ToolCall::from_argument_text`, used by `translate_ai_response` in
+`openai.rs` and `vllm.rs`). A response cut off at `finish_reason =
+"length"` while writing a tool call has a string that stops part-way, for
+example `{"path":"src/very/lon`, which does not parse. The call's
+`arguments` are then `null`, as the tools have always received them, and
+the text is kept in `ToolCall.unparsed_arguments` (serde default, omitted
+when absent, so stored conversations and the stdio protocol are unchanged).
+The count measures that text, so such a truncation gets
+`OUTPUT_TRUNCATED_FEEDBACK` like any answer that had started, and the
+conversation log shows what was cut. Blank text is a call with no input:
+it becomes `null` with nothing kept and adds 0, as `"{}"` and `"null"` do.
 
-**Known limitation.** That case is counted as 0 and therefore wrongly
-treated as spent on reasoning: §3.3 sends
-`OUTPUT_TRUNCATED_REASONING_FEEDBACK`, and a second such truncation in the
-turn fails with the "raise max_tokens or lower effort" remedy, although the
-model wrote arguments and asking for less is the remedy that fits. The
-behaviour comes from commit 2 and is left as a follow-up code change: keep
-the length of the raw arguments string when parsing fails, or stop treating
-`null` on a truncated response as empty.
+The other providers that set `truncated` receive arguments already parsed,
+so there is no text to keep. Claude and Vertex Claude return `tool_use.input`
+as a JSON value; a partial object counts as written, but a cut-off block
+returned with `input` `null` or `{}` still counts as 0, because nothing in
+the response says how much was written. Gemini and Vertex Gemini return
+`functionCall.args` as an object, with the same consequence. Bedrock,
+Ollama and the CLI backends never set `truncated`, so their calls are never
+measured.
 
 Thinking blocks are not counted. Opus 5 sends them empty while still billing
 for them, so counting them would make every truncation look like a long
@@ -236,8 +247,9 @@ impl OutputTruncated {
 `SessionRunner` builds it with `OutputTruncated::from_response` from the
 response it already holds: the character count of `content`, and the summed
 character count of every tool call's arguments as compact JSON, where a call
-whose arguments are `{}` or `null` counts as 0 (the full rule, and the known
-limitation for `null`, are in §3.2). Thinking blocks are not counted, for
+whose arguments are `{}` or `null` counts as 0 unless it kept the text of
+arguments cut off part-way, which counts as written (the full rule is in
+§3.2). Thinking blocks are not counted, for
 the reason given in §3.2. The message reuses `truncation_remedy`, so the
 log line and the error say the same thing. For that reason
 `truncation_remedy` lives in `ai/mod.rs` from commit 2 on, not in
@@ -280,7 +292,7 @@ per-turn bound of `max_provider_error_retries`:
 | What the truncated answer contained | Action |
 |---|---|
 | Some answer text or tool arguments | `RetryWithFeedback(OUTPUT_TRUNCATED_FEEDBACK)` |
-| Nothing, including only tool calls whose arguments are `{}` or `null` (`spent_on_reasoning()`), and `!reasoning_retried` | `RetryWithFeedback(OUTPUT_TRUNCATED_REASONING_FEEDBACK)`; sets `reasoning_retried` |
+| Nothing, including only tool calls with no input (`{}`, `null` or blank text) (`spent_on_reasoning()`), and `!reasoning_retried` | `RetryWithFeedback(OUTPUT_TRUNCATED_REASONING_FEEDBACK)`; sets `reasoning_retried` |
 | Nothing, and `reasoning_retried` | `Fail`. Asking for less cannot help: the remedy in the error tells the operator to raise `max_tokens` or lower `effort` |
 
 The runner calls it directly. The fork routed truncation through
@@ -1208,6 +1220,7 @@ unlisted status as finished, which is right for `Partial`.
 | New type | Replaces |
 |---|---|
 | `ai::OutputTruncated { answer_chars, tool_arg_chars }` (error) | the `bail!` string at `session.rs:411` and the dead `ReviewError::OutputTruncated`; the counts decide the retry (§3.3) |
+| `ai::ToolCall.unparsed_arguments: Option<String>` | `null` standing for both a call with no input and arguments cut off part-way (§3.2) |
 | `ai::session::FinalTurn { TurnBudget, OutOfTime }` | the `is_final_turn` boolean recomputed each turn |
 | `ai::session::SessionStopped { cause: StopCause }` (error) | the fork's `SESSION_WOUND_DOWN` string and `contains` |
 | `ai::WindDownSignal` | the fork's process-global `CancellationToken` (`tokio-util` is server-only) |
@@ -1446,9 +1459,15 @@ salvage_seconds = 1800
   The §3.2 counting rule: `tool_argument_chars_sums_every_call`,
   `a_tool_call_without_arguments_counts_as_nothing_written`,
   `only_an_empty_object_or_null_counts_as_no_arguments`, and in the
-  session `a_truncation_holding_only_calls_without_input_is_spent_on_reasoning`
-  (`{}` calls only; the `null` limitation of §3.2 is deliberately not
-  pinned by a test).
+  session `a_truncation_holding_only_calls_without_input_is_spent_on_reasoning`.
+  Arguments cut off part-way: `argument_text_is_kept_only_when_it_does_not_parse`
+  and `arguments_cut_off_part_way_count_as_written` (`ai/mod.rs`),
+  `a_tool_call_cut_off_part_way_counts_as_written` (`openai.rs`, `vllm.rs`),
+  `a_tool_call_without_input_still_counts_as_nothing_written` (`openai.rs`),
+  and in the session `a_tool_call_cut_off_part_way_is_asked_for_again_shorter`
+  (two cut-off OpenAI-compatible calls in a row each get
+  `OUTPUT_TRUNCATED_FEEDBACK`) and
+  `an_openai_tool_call_without_input_is_still_spent_on_reasoning`.
 - **Cache.** `a_truncated_response_is_not_cached` (2 provider calls, then a
   cached whole answer). A seeded truncated entry is served as a miss.
 - **Session.**

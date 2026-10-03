@@ -560,16 +560,7 @@ fn translate_vllm_response(resp: VllmResponse) -> Result<AiResponse> {
 
     let tool_calls = choice.message.tool_calls.map(|tc| {
         tc.into_iter()
-            .map(|t| {
-                let arguments: Value =
-                    serde_json::from_str(&t.function.arguments).unwrap_or(serde_json::Value::Null);
-                ToolCall {
-                    id: t.id,
-                    function_name: t.function.name,
-                    arguments,
-                    thought_signature: None,
-                }
-            })
+            .map(|t| ToolCall::from_argument_text(t.id, t.function.name, &t.function.arguments))
             .collect()
     });
 
@@ -895,6 +886,7 @@ mod tests {
                     function_name: "test_tool".to_string(),
                     arguments: json!({"arg1": "val1"}),
                     thought_signature: None,
+                    unparsed_arguments: None,
                 }]),
                 tool_call_id: None,
             }],
@@ -1093,6 +1085,37 @@ mod tests {
         assert_eq!(ai_resp.content, None);
         assert_eq!(ai_resp.thought, Some("cut off".to_string()));
 
+        Ok(())
+    }
+
+    /// vLLM sends arguments as text too, so a call cut off part-way at the
+    /// output limit is measured by what it wrote, not read as no input.
+    #[test]
+    fn a_tool_call_cut_off_part_way_counts_as_written() -> Result<()> {
+        let call_with = |arguments: &str| VllmToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: VllmToolCallFunction {
+                name: "read_files".to_string(),
+                arguments: arguments.to_string(),
+            },
+        };
+        let measure = |arguments: &str| -> Result<crate::ai::OutputTruncated> {
+            let mut message = assistant_message(None);
+            message.tool_calls = Some(vec![call_with(arguments)]);
+            let ai_resp = translate_vllm_response(response_with_message(message, "length"))?;
+            assert!(ai_resp.truncated);
+            Ok(crate::ai::OutputTruncated::from_response(&ai_resp))
+        };
+
+        let written = r#"{"paths":["src/very/lon"#;
+        let cut = measure(written)?;
+        assert_eq!(cut.tool_arg_chars, written.chars().count());
+        assert!(!cut.spent_on_reasoning(), "{cut:?}");
+
+        for empty in ["", "{}"] {
+            assert!(measure(empty)?.spent_on_reasoning(), "arguments {empty:?}");
+        }
         Ok(())
     }
 

@@ -3439,6 +3439,7 @@ mod tests {
                 function_name: "git_grep".to_string(),
                 arguments: serde_json::json!({"pattern": "spin_lock"}),
                 thought_signature: None,
+                unparsed_arguments: None,
             }]),
             tool_call_id: None,
         }

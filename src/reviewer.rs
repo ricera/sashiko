@@ -5524,6 +5524,7 @@ mod tests {
             function_name: "git_grep".to_string(),
             arguments: json!({"pattern": "spin_lock"}),
             thought_signature: None,
+            unparsed_arguments: None,
         }]);
         let lines = vec![
             progress(
@@ -7208,6 +7209,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 function_name: "git_grep".to_string(),
                 arguments: json!({"pattern": "foo"}),
                 thought_signature: None,
+                unparsed_arguments: None,
             }]),
             usage: None,
             truncated: true,

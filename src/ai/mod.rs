@@ -69,6 +69,43 @@ pub struct ToolCall {
     /// Optional thought signature from the AI model (required by some providers like Gemini).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    /// The arguments text exactly as the model wrote it, kept only when it
+    /// did not parse as JSON, in which case `arguments` is `null`.
+    ///
+    /// Providers that send arguments as a string, such as OpenAI-compatible
+    /// endpoints and vLLM, send a cut-off string when the response stops at
+    /// the output limit part-way through a call. `null` alone would then read
+    /// as a call with no input, so the text is kept to show that the model
+    /// was writing (see `tool_argument_chars`), and the conversation log
+    /// shows what was cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unparsed_arguments: Option<String>,
+}
+
+impl ToolCall {
+    /// Builds a call from arguments the provider sent as JSON text.
+    ///
+    /// Blank text is a call with no input, so it becomes `null` with nothing
+    /// kept. Text that does not parse also becomes `null`, as the tools have
+    /// always received it, but is kept in `unparsed_arguments`, because on a
+    /// truncated response it is the start of arguments the model was writing.
+    pub(crate) fn from_argument_text(id: String, function_name: String, text: &str) -> Self {
+        let (arguments, unparsed_arguments) = if text.trim().is_empty() {
+            (serde_json::Value::Null, None)
+        } else {
+            match serde_json::from_str(text) {
+                Ok(arguments) => (arguments, None),
+                Err(_) => (serde_json::Value::Null, Some(text.to_string())),
+            }
+        };
+        Self {
+            id,
+            function_name,
+            arguments,
+            thought_signature: None,
+            unparsed_arguments,
+        }
+    }
 }
 
 /// Definition of the expected response format from the AI.
@@ -189,16 +226,24 @@ pub struct AiResponse {
 /// as 0 rather than as the 2 or 4 characters of its JSON. Such a call costs a
 /// handful of tokens, so a truncation that produced only that spent its budget
 /// on reasoning, and the remedy has to say so rather than ask for less.
+///
+/// Arguments cut off part-way do count. A provider that sends arguments as
+/// text turns a cut-off string into `null` because it does not parse, and
+/// keeps the text in `unparsed_arguments`; that text is counted as written,
+/// so a long but unfinished call gets the answer-length remedy.
 pub(crate) fn tool_argument_chars(tool_calls: &[ToolCall]) -> usize {
-    tool_calls
-        .iter()
-        .map(|call| written_argument_chars(&call.arguments))
-        .sum()
+    tool_calls.iter().map(written_argument_chars).sum()
 }
 
 /// Counts the characters of one call's arguments, 0 when it has none.
-fn written_argument_chars(arguments: &serde_json::Value) -> usize {
-    match arguments {
+///
+/// Text that did not parse is counted as written, without the blank space
+/// around it, because it cannot be re-serialised as compact JSON.
+fn written_argument_chars(call: &ToolCall) -> usize {
+    if let Some(text) = &call.unparsed_arguments {
+        return text.trim().chars().count();
+    }
+    match &call.arguments {
         serde_json::Value::Null => 0,
         serde_json::Value::Object(fields) if fields.is_empty() => 0,
         written => written.to_string().chars().count(),
@@ -1252,6 +1297,7 @@ mod tests {
             function_name: "read_files".to_string(),
             arguments,
             thought_signature: None,
+            unparsed_arguments: None,
         }
     }
 
@@ -1279,6 +1325,46 @@ mod tests {
             assert!(
                 truncation_remedy(0, tool_argument_chars(&calls)).contains("went on reasoning")
             );
+        }
+    }
+
+    /// Arguments a provider sent as text become JSON, with blank text read as
+    /// no input and text that does not parse kept as the model wrote it.
+    #[test]
+    fn argument_text_is_kept_only_when_it_does_not_parse() {
+        let call = |text: &str| ToolCall::from_argument_text("a".into(), "read_files".into(), text);
+        for blank in ["", "  "] {
+            assert_eq!(call(blank).arguments, serde_json::Value::Null);
+            assert_eq!(call(blank).unparsed_arguments, None, "text {blank:?}");
+        }
+        assert_eq!(call(r#"{"q":1}"#).arguments, json!({"q": 1}));
+        assert_eq!(call(r#"{"q":1}"#).unparsed_arguments, None);
+
+        let cut = call(r#"{"paths":["src/very/lon"#);
+        assert_eq!(cut.arguments, serde_json::Value::Null);
+        assert_eq!(
+            cut.unparsed_arguments.as_deref(),
+            Some(r#"{"paths":["src/very/lon"#)
+        );
+    }
+
+    /// Arguments cut off part-way were being written, so they count as the
+    /// text the model wrote, although they parse to nothing. Counted as 0,
+    /// a long but unfinished call was taken for a budget spent on reasoning.
+    /// A call with no input still counts as 0 however its text spells it.
+    #[test]
+    fn arguments_cut_off_part_way_count_as_written() {
+        let call = |text: &str| ToolCall::from_argument_text("a".into(), "read_files".into(), text);
+        let cut = [call(r#" {"paths":["src/very/lon"#)];
+        assert_eq!(
+            tool_argument_chars(&cut),
+            23,
+            "the blank before it is not counted"
+        );
+        assert_eq!(truncation_remedy(0, tool_argument_chars(&cut)), "");
+
+        for empty in ["", " ", "{}", "null"] {
+            assert_eq!(tool_argument_chars(&[call(empty)]), 0, "text {empty:?}");
         }
     }
 

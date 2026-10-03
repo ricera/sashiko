@@ -195,6 +195,7 @@ pub(crate) fn live_log_message(msg: &AiMessage) -> AiMessage {
                         function_name: c.function_name.clone(),
                         arguments,
                         thought_signature: None,
+                        unparsed_arguments: None,
                     }
                 })
                 .collect()
@@ -2329,6 +2330,7 @@ mod tests {
                     "nested": [{"thought_signature": "opaque", "y": "z"}],
                 }),
                 thought_signature: Some("opaque".to_string()),
+                unparsed_arguments: None,
             }]),
             tool_call_id: None,
         };
@@ -2372,6 +2374,7 @@ mod tests {
                 function_name: "git_ls".to_string(),
                 arguments: json!({ "path": "." }),
                 thought_signature: Some("opaque".to_string()),
+                unparsed_arguments: None,
             }]),
             tool_call_id: None,
         };

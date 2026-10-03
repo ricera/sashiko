@@ -619,6 +619,7 @@ mod tests {
                         function_name: "git_read_files".to_string(),
                         arguments: json!({ "files": [{ "path": path }] }),
                         thought_signature: None,
+                        unparsed_arguments: None,
                     })
                     .collect(),
                 calling_turns: 1,
@@ -638,6 +639,7 @@ mod tests {
                         function_name: "concurrency_probe".to_string(),
                         arguments: json!({ "n": i }),
                         thought_signature: None,
+                        unparsed_arguments: None,
                     })
                     .collect(),
                 calling_turns: 1,
@@ -885,6 +887,7 @@ mod tests {
                     function_name: "git_read_files".to_string(),
                     arguments: json!({ "files": [{ "path": "a" }] }),
                     thought_signature: None,
+                    unparsed_arguments: None,
                 }]),
                 usage: None,
                 truncated: false,
@@ -1400,6 +1403,7 @@ mod tests {
                         function_name: "git_read_files".to_string(),
                         arguments: json!({ "files": [{ "path": "a" }] }),
                         thought_signature: None,
+                        unparsed_arguments: None,
                     }]),
                     usage: None,
                     truncated: false,

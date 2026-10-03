@@ -528,7 +528,7 @@ fn translate_ai_request(
     })
 }
 
-fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
+pub(crate) fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
     let choice = resp
         .choices
         .into_iter()
@@ -538,16 +538,7 @@ fn translate_ai_response(resp: OpenAiResponse) -> Result<AiResponse> {
     let content = choice.message.content;
     let tool_calls = choice.message.tool_calls.map(|tc| {
         tc.into_iter()
-            .map(|t| {
-                let arguments: Value =
-                    serde_json::from_str(&t.function.arguments).unwrap_or(serde_json::Value::Null);
-                ToolCall {
-                    id: t.id,
-                    function_name: t.function.name,
-                    arguments,
-                    thought_signature: None,
-                }
-            })
+            .map(|t| ToolCall::from_argument_text(t.id, t.function.name, &t.function.arguments))
             .collect()
     });
 
@@ -800,6 +791,7 @@ mod tests {
                     function_name: "test_tool".to_string(),
                     arguments: json!({"arg1": "val1"}),
                     thought_signature: None,
+                    unparsed_arguments: None,
                 }]),
                 tool_call_id: None,
             }],
@@ -929,6 +921,7 @@ mod tests {
                         function_name: "t1".to_string(),
                         arguments: json!({}),
                         thought_signature: None,
+                        unparsed_arguments: None,
                     }]),
                     tool_call_id: None,
                 },
@@ -1303,6 +1296,60 @@ mod tests {
         assert_eq!(usage.cached_tokens, None);
         assert_eq!(usage.prompt_tokens, 2048);
 
+        Ok(())
+    }
+
+    /// A completion cut off at the output limit while writing one tool call,
+    /// whose arguments string therefore stops part-way and does not parse.
+    fn cut_off_tool_call_response(arguments: &str) -> OpenAiResponse {
+        serde_json::from_value(json!({
+            "choices": [{
+                "index": 0,
+                "finish_reason": "length",
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_files", "arguments": arguments}
+                    }]
+                }
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4000, "total_tokens": 4010}
+        }))
+        .expect("a valid completion")
+    }
+
+    /// A tool call cut off part-way was being written, so the truncation is
+    /// measured by the text it wrote and is not taken for a budget spent on
+    /// reasoning, although the cut-off arguments parse to nothing.
+    #[test]
+    fn a_tool_call_cut_off_part_way_counts_as_written() -> Result<()> {
+        let written = r#"{"paths":["src/very/long/path/one.rs","src/very/lon"#;
+        let ai_resp = translate_ai_response(cut_off_tool_call_response(written))?;
+        assert!(ai_resp.truncated);
+        let call = &ai_resp.tool_calls.as_deref().unwrap_or_default()[0];
+        assert_eq!(call.arguments, Value::Null, "the tools still get null");
+        assert_eq!(call.unparsed_arguments.as_deref(), Some(written));
+
+        let cut = crate::ai::OutputTruncated::from_response(&ai_resp);
+        assert_eq!(cut.tool_arg_chars, written.chars().count());
+        assert!(!cut.spent_on_reasoning(), "{cut:?}");
+        Ok(())
+    }
+
+    /// A call with no input wrote nothing, whether the endpoint spells its
+    /// arguments as an empty string or as an empty object.
+    #[test]
+    fn a_tool_call_without_input_still_counts_as_nothing_written() -> Result<()> {
+        for empty in ["", "{}"] {
+            let ai_resp = translate_ai_response(cut_off_tool_call_response(empty))?;
+            let call = &ai_resp.tool_calls.as_deref().unwrap_or_default()[0];
+            assert_eq!(call.unparsed_arguments, None, "arguments {empty:?}");
+            let cut = crate::ai::OutputTruncated::from_response(&ai_resp);
+            assert!(cut.spent_on_reasoning(), "arguments {empty:?}: {cut:?}");
+        }
         Ok(())
     }
 

@@ -387,6 +387,7 @@ fn translate_response(
                         function_name: tu.name().to_string(),
                         arguments: args,
                         thought_signature: None,
+                        unparsed_arguments: None,
                     });
                 }
                 _ => {}
@@ -621,6 +622,7 @@ mod tests {
                 function_name: "git_log".to_string(),
                 arguments: json!({"n": 5}),
                 thought_signature: None,
+                unparsed_arguments: None,
             }]),
             tool_call_id: None,
         }]);
@@ -713,6 +715,7 @@ mod tests {
                     function_name: "git_log".to_string(),
                     arguments: json!({}),
                     thought_signature: None,
+                    unparsed_arguments: None,
                 }]),
                 ..message(AiRole::Assistant, "looking", None)
             },
