@@ -1270,16 +1270,19 @@ mod tests {
         Ok(())
     }
 
-    /// A call with no input wrote nothing, whether the endpoint spells its
-    /// arguments as an empty string or as an empty object.
+    /// A call with no input adds no argument text, whether the endpoint
+    /// spells its arguments as an empty string or as an empty object. The
+    /// call itself was written, so the truncation is not taken for a budget
+    /// spent on reasoning.
     #[test]
-    fn a_tool_call_without_input_still_counts_as_nothing_written() -> Result<()> {
+    fn a_tool_call_without_input_adds_no_argument_text_but_is_written() -> Result<()> {
         for empty in ["", "{}"] {
             let ai_resp = translate_ai_response(cut_off_tool_call_response(empty))?;
             let call = &ai_resp.tool_calls.as_deref().unwrap_or_default()[0];
             assert_eq!(call.unparsed_arguments, None, "arguments {empty:?}");
             let cut = crate::ai::OutputTruncated::from_response(&ai_resp);
-            assert!(cut.spent_on_reasoning(), "arguments {empty:?}: {cut:?}");
+            assert_eq!(cut.tool_arg_chars, 0, "arguments {empty:?}");
+            assert!(!cut.spent_on_reasoning(), "arguments {empty:?}: {cut:?}");
         }
         Ok(())
     }

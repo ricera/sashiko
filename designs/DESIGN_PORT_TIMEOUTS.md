@@ -2,8 +2,9 @@
 
 Status: approved 2026-10-01. Every recommended option in §8 is accepted,
 including D17 (a): a series with a patch that failed or timed out with
-nothing salvaged is Failed, not Partial. Revised after the
-first critique round (incident record, worker error outputs, restart guard,
+nothing salvaged is Failed, not Partial. D21 (a), any tool call in a
+truncated answer counts as written, is a user decision of 2026-10-03.
+Revised after the first critique round (incident record, worker error outputs, restart guard,
 truncation budgets, commit split). Revised again after review of D6:
 `Partial` is now a `ReviewStatus` used by the salvaged review row, its patch
 and the patchset, instead of a patch-only status under a `Failed` review and
@@ -161,16 +162,22 @@ pub struct OutputConfig {
 ```
 Claude response truncated at max_tokens after {usage.output_tokens} output
 tokens ({answer_chars} chars of answer, {tool_arg_chars} chars of tool
-arguments).{remedy}
+arguments in {tool_calls} tool calls).{remedy}
 ```
 
-`fn truncation_remedy(answer_chars, tool_arg_chars) -> &'static str` returns
-" Nothing was written, so the budget went on reasoning: raise max_tokens or
-lower effort rather than asking for less." when both counts are 0, and ""
-otherwise.
+"tool calls" is singular when there is exactly one ("in 1 tool call").
 
-Both counts are of characters (Unicode scalar values, not bytes), measured by
-`OutputTruncated::from_response` (§3.3) so the log line and the error agree:
+`fn truncation_remedy(&OutputTruncated) -> &'static str` returns
+" Nothing was written, so the budget went on reasoning: raise max_tokens or
+lower effort rather than asking for less." when
+`OutputTruncated::spent_on_reasoning()` holds (no answer text and no tool
+call, §3.3), and "" otherwise. It decides from the same predicate as the
+retry, so the log line, the error and the feedback never disagree.
+
+The counts are measured by `OutputTruncated::from_response` (§3.3) so the
+log line and the error agree. `tool_calls` is the number of tool calls in
+the response, whatever their arguments. The two others are of characters
+(Unicode scalar values, not bytes):
 
 - `answer_chars` is the length of the response's `content`, 0 when it has
   none.
@@ -188,13 +195,14 @@ Both counts are of characters (Unicode scalar values, not bytes), measured by
   before any parsing, is a call with no input: it becomes `null` with
   nothing kept and adds 0.
 
-`{}` is a tool called with no input. Such a call costs a handful of tokens,
-so a truncation whose only output is such calls spent its budget on
-reasoning. Counting their JSON would hide that and give the answer-length
-remedy, which cannot help.
+`{}` is a tool called with no input, so no argument text was written and
+the count says 0 rather than the 2 characters of its JSON. The count is
+diagnostic only: it does not decide whether the response wrote anything.
+Any tool call does, whatever its arguments (§3.3, D21), because a call cut
+off part-way can arrive in exactly this shape (below).
 
-Arguments cut off part-way are not such a call. The OpenAI and vLLM clients
-receive arguments as a JSON string and parse it
+Arguments cut off part-way are counted where their text survives. The
+OpenAI and vLLM clients receive arguments as a JSON string and parse it
 (`ToolCall::from_argument_text`, used by `translate_ai_response` in
 `openai.rs` and `vllm.rs`). A response cut off at `finish_reason =
 "length"` while writing a tool call has a string that stops part-way, for
@@ -202,19 +210,22 @@ example `{"path":"src/very/lon`, which does not parse. The call's
 `arguments` are then `null`, as the tools have always received them, and
 the text is kept in `ToolCall.unparsed_arguments` (serde default, omitted
 when absent, so stored conversations and the stdio protocol are unchanged).
-The count measures that text, so such a truncation gets
-`OUTPUT_TRUNCATED_FEEDBACK` like any answer that had started, and the
-conversation log shows what was cut. Blank text is a call with no input:
+The count measures that text, so the log line says how much argument text
+was written, and the conversation log shows what was cut. Like any
+truncation that holds a tool call, it gets `OUTPUT_TRUNCATED_FEEDBACK`. Blank text is a call with no input:
 it becomes `null` with nothing kept and adds 0, as `"{}"` and `"null"` do.
 
 The other providers that set `truncated` receive arguments already parsed,
 so there is no text to keep. Claude and Vertex Claude return `tool_use.input`
-as a JSON value; a partial object counts as written, but a cut-off block
-returned with `input` `null` or `{}` still counts as 0, because nothing in
-the response says how much was written. Gemini and Vertex Gemini return
-`functionCall.args` as an object, with the same consequence. Bedrock,
-Ollama and the CLI backends never set `truncated`, so their calls are never
-measured.
+as a JSON value, and a block cut off at `max_tokens` arrives with `input`
+`{}` or `null`. Gemini and Vertex Gemini return `functionCall.args` as an
+object, with the same shape. Such a call adds 0 argument characters, so for
+these providers `tool_arg_chars` is a lower bound and cannot tell a call
+with no input from one cut off part-way. This does not affect the retry:
+the call is counted in `tool_calls`, and any tool call makes the
+answer written (D21), so it gets `OUTPUT_TRUNCATED_FEEDBACK` on every
+provider. Bedrock, Ollama and the CLI backends never set `truncated`, so
+their calls are never measured.
 
 Thinking blocks are not counted. Opus 5 sends them empty while still billing
 for them, so counting them would make every truncation look like a long
@@ -232,25 +243,39 @@ them without parsing text:
 /// A response the provider cut off at its output limit.
 #[derive(Debug, thiserror::Error)]
 #[error("LLM output was truncated by provider (e.g. hit max tokens) after \
-         {answer_chars} chars of answer and {tool_arg_chars} chars of tool arguments.{}",
-        truncation_remedy(*.answer_chars, *.tool_arg_chars))]
-pub struct OutputTruncated { pub answer_chars: usize, pub tool_arg_chars: usize }
+         {answer_chars} chars of answer and {tool_arg_chars} chars of tool \
+         arguments in {}.{}",
+        tool_calls_phrase(*.tool_calls), truncation_remedy(self))]
+pub struct OutputTruncated {
+    pub answer_chars: usize,
+    pub tool_arg_chars: usize,
+    pub tool_calls: usize,
+}
 
 impl OutputTruncated {
     /// Nothing visible was written: the budget went on reasoning.
     pub fn spent_on_reasoning(&self) -> bool {
-        self.answer_chars == 0 && self.tool_arg_chars == 0
+        self.answer_chars == 0 && self.tool_calls == 0
     }
 }
 ```
 
 `SessionRunner` builds it with `OutputTruncated::from_response` from the
-response it already holds: the character count of `content`, and the summed
+response it already holds: the character count of `content`, the summed
 character count of every tool call's arguments as compact JSON, where a call
 whose arguments are `{}` or `null` counts as 0 unless it kept the text of
-arguments cut off part-way, which counts as written (the full rule is in
-§3.2). Thinking blocks are not counted, for
-the reason given in §3.2. The message reuses `truncation_remedy`, so the
+arguments cut off part-way (the full rule is in §3.2), and the number of
+tool calls. Thinking blocks are not counted, for
+the reason given in §3.2.
+
+Whether the answer was written is decided by answer text and the number of
+tool calls, not by `tool_arg_chars` (D21). A truncated response that holds
+any tool call was writing when the limit hit, whatever the call's argument
+length: on Claude and Gemini a call cut off part-way arrives with `{}` or
+`null` input and adds 0 characters, so the argument count cannot tell it
+from a call with no input. Only a response with no answer text and no tool
+call spent its budget on reasoning. `tool_arg_chars` stays in the log line
+and the error, where it tells the operator how much argument text survived. The message reuses `truncation_remedy`, so the
 log line and the error say the same thing. For that reason
 `truncation_remedy` lives in `ai/mod.rs` from commit 2 on, not in
 `claude.rs`.
@@ -291,9 +316,9 @@ per-turn bound of `max_provider_error_retries`:
 
 | What the truncated answer contained | Action |
 |---|---|
-| Some answer text or tool arguments | `RetryWithFeedback(OUTPUT_TRUNCATED_FEEDBACK)` |
-| Nothing, including only tool calls with no input (`{}`, `null` or blank text) (`spent_on_reasoning()`), and `!reasoning_retried` | `RetryWithFeedback(OUTPUT_TRUNCATED_REASONING_FEEDBACK)`; sets `reasoning_retried` |
-| Nothing, and `reasoning_retried` | `Fail`. Asking for less cannot help: the remedy in the error tells the operator to raise `max_tokens` or lower `effort` |
+| Some answer text, or any tool call, including one whose input is `{}`, `null` or blank text (D21) | `RetryWithFeedback(OUTPUT_TRUNCATED_FEEDBACK)` |
+| No answer text and no tool call (`spent_on_reasoning()`), and `!reasoning_retried` | `RetryWithFeedback(OUTPUT_TRUNCATED_REASONING_FEEDBACK)`; sets `reasoning_retried` |
+| No answer text and no tool call, and `reasoning_retried` | `Fail`. Asking for less cannot help: the remedy in the error tells the operator to raise `max_tokens` or lower `effort` |
 
 The runner calls it directly. The fork routed truncation through
 `LlmSession::handle_provider_error`, which forced both the trait default
@@ -1219,7 +1244,7 @@ unlisted status as finished, which is right for `Partial`.
 
 | New type | Replaces |
 |---|---|
-| `ai::OutputTruncated { answer_chars, tool_arg_chars }` (error) | the `bail!` string at `session.rs:411` and the dead `ReviewError::OutputTruncated`; the counts decide the retry (§3.3) |
+| `ai::OutputTruncated { answer_chars, tool_arg_chars, tool_calls }` (error) | the `bail!` string at `session.rs:411` and the dead `ReviewError::OutputTruncated`; `answer_chars` and `tool_calls` decide the retry (§3.3, D21) |
 | `ai::ToolCall.unparsed_arguments: Option<String>` | `null` standing for both a call with no input and arguments cut off part-way (§3.2) |
 | `ai::session::FinalTurn { TurnBudget, OutOfTime }` | the `is_final_turn` boolean recomputed each turn |
 | `ai::session::SessionStopped { cause: StopCause }` (error) | the fork's `SESSION_WOUND_DOWN` string and `contains` |
@@ -1457,17 +1482,26 @@ salvage_seconds = 1800
   (`claude.rs:886-907`).
 - **Diagnostics.** `a_truncation_that_wrote_nothing_points_at_the_budget_not_the_answer`.
   The §3.2 counting rule: `tool_argument_chars_sums_every_call`,
-  `a_tool_call_without_arguments_counts_as_nothing_written`,
+  `a_tool_call_without_arguments_counts_no_argument_text_but_is_written`,
   `only_an_empty_object_or_null_counts_as_no_arguments`, and in the
-  session `a_truncation_holding_only_calls_without_input_is_spent_on_reasoning`.
+  session `a_truncation_holding_only_calls_without_input_was_written`.
   Arguments cut off part-way: `argument_text_is_kept_only_when_it_does_not_parse`
   and `arguments_cut_off_part_way_count_as_written` (`ai/mod.rs`),
   `a_tool_call_cut_off_part_way_counts_as_written` (`openai.rs`, `vllm.rs`),
-  `a_tool_call_without_input_still_counts_as_nothing_written` (`openai.rs`),
-  and in the session `a_tool_call_cut_off_part_way_is_asked_for_again_shorter`
-  (two cut-off OpenAI-compatible calls in a row each get
-  `OUTPUT_TRUNCATED_FEEDBACK`) and
-  `an_openai_tool_call_without_input_is_still_spent_on_reasoning`.
+  `a_tool_call_without_input_adds_no_argument_text_but_is_written`
+  (`openai.rs`), and in the session
+  `a_tool_call_cut_off_part_way_is_asked_for_again_shorter` (two cut-off
+  OpenAI-compatible calls in a row each get `OUTPUT_TRUNCATED_FEEDBACK`) and
+  `an_openai_tool_call_without_input_is_asked_for_again_shorter`.
+  Any tool call is writing (D21):
+  `a_truncation_holding_a_tool_call_with_empty_input_is_not_blamed_on_reasoning`
+  (`claude.rs`, the log line for `input` `{}` and `null`), and in the
+  session `a_claude_tool_call_with_empty_input_is_asked_for_again_shorter`
+  (two Claude `tool_use` cut-offs in a row with `input` `{}`, then `null`,
+  each get `OUTPUT_TRUNCATED_FEEDBACK` and the session succeeds) and
+  `a_claude_truncation_with_only_thinking_is_retried_once_then_fails` (no
+  answer text and no tool call gets `OUTPUT_TRUNCATED_REASONING_FEEDBACK`
+  once, then the stage fails with the remedy).
 - **Cache.** `a_truncated_response_is_not_cached` (2 provider calls, then a
   cached whole answer). A seeded truncated entry is served as a miss.
 - **Session.**
@@ -2078,3 +2112,28 @@ it; the success rate is Reviewed over all finished reviews.
 other finished statuses), and the change is visible rather than shown only
 as a fall in the failure count. (b) overstates coverage; (c) is the label
 the user found too strong.
+
+**D21. A truncated answer that holds a tool call with empty input.** User
+decision, 2026-10-03, closing the limitation recorded with b2e5750ad542.
+Claude and Gemini return a tool call cut off at the output limit with
+input `{}` or `null`, which counted as 0 characters of arguments. The
+truncation was then read as spent on reasoning: it got
+`OUTPUT_TRUNCATED_REASONING_FEEDBACK`, and a second one in the same turn
+failed the stage with the "raise max_tokens" remedy, although the model had
+been writing. Counting the raw argument text fixed this for
+OpenAI-compatible and vLLM endpoints only; Claude and Gemini send no text
+to count.
+- (a) Any tool call makes the truncated answer written, whatever its
+  argument length, on every provider. Only an answer with no answer text
+  and no tool call is spent on reasoning. `OutputTruncated` carries the
+  number of tool calls, and the character counts stay as they are for the
+  log line and the error.
+- (b) Keep deciding from `tool_arg_chars`, so a call with `{}` or `null`
+  input stays spent on reasoning.
+
+*Decided (a).* The model was writing when the limit hit, so the ordinary
+"answer again, shorter" retry fits. A call with genuinely no input costs a
+handful of tokens, so treating it as written at worst gives the
+shorter-answer feedback to a response that mostly reasoned, which still
+asks the model to keep reasoning to its conclusions; the opposite mistake
+fails a stage that was making progress.

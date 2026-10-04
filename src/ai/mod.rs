@@ -75,8 +75,8 @@ pub struct ToolCall {
     /// Providers that send arguments as a string, such as OpenAI-compatible
     /// endpoints and vLLM, send a cut-off string when the response stops at
     /// the output limit part-way through a call. `null` alone would then read
-    /// as a call with no input, so the text is kept to show that the model
-    /// was writing (see `tool_argument_chars`), and the conversation log
+    /// as a call with no input, so the text is kept to show how much the
+    /// model wrote (see `tool_argument_chars`), and the conversation log
     /// shows what was cut.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unparsed_arguments: Option<String>,
@@ -321,20 +321,20 @@ pub struct AiResponse {
 
 /// Counts the characters of every tool call's serialised arguments.
 ///
-/// A truncated response is measured by what it wrote, and a half-written tool
-/// call is writing just as answer text is, so both counts are needed to tell a
-/// long answer from one that never started.
+/// The count tells an operator how much of a truncated response went into
+/// tool arguments. It does not decide whether the response wrote anything:
+/// any tool call at all means it did (see `OutputTruncated::spent_on_reasoning`).
 ///
 /// Arguments are measured as the JSON text the model wrote, braces and quotes
 /// included. A call with no arguments, whose input is `{}` or `null`, counts
-/// as 0 rather than as the 2 or 4 characters of its JSON. Such a call costs a
-/// handful of tokens, so a truncation that produced only that spent its budget
-/// on reasoning, and the remedy has to say so rather than ask for less.
+/// as 0 rather than as the 2 or 4 characters of its JSON, because no argument
+/// text was written. Claude and Gemini also return a call cut off part-way
+/// with such an input, so 0 here is a lower bound for them.
 ///
-/// Arguments cut off part-way do count. A provider that sends arguments as
-/// text turns a cut-off string into `null` because it does not parse, and
-/// keeps the text in `unparsed_arguments`; that text is counted as written,
-/// so a long but unfinished call gets the answer-length remedy.
+/// Arguments cut off part-way are counted where the text survives. A provider
+/// that sends arguments as text turns a cut-off string into `null` because it
+/// does not parse, and keeps the text in `unparsed_arguments`; that text is
+/// counted.
 pub(crate) fn tool_argument_chars(tool_calls: &[ToolCall]) -> usize {
     tool_calls.iter().map(written_argument_chars).sum()
 }
@@ -362,16 +362,26 @@ fn written_argument_chars(call: &ToolCall) -> usize {
 /// a larger allowance or a lower `effort` can. A response that had started
 /// writing needs no remedy here, because its length is the thing to act on.
 ///
-/// The counts are of emitted text, not of thinking: models that omit their
-/// reasoning by default, Opus 5 among them, send empty thinking blocks while
-/// still billing for them, so counting them would make every truncation look
-/// like a long answer.
-pub(crate) fn truncation_remedy(answer_chars: usize, tool_arg_chars: usize) -> &'static str {
-    if answer_chars == 0 && tool_arg_chars == 0 {
+/// What counts as writing is decided by `OutputTruncated::spent_on_reasoning`,
+/// so this remedy and the session's retry never disagree. Thinking is not
+/// writing: models that omit their reasoning by default, Opus 5 among them,
+/// send empty thinking blocks while still billing for them, so counting them
+/// would make every truncation look like a long answer.
+pub(crate) fn truncation_remedy(truncated: &OutputTruncated) -> &'static str {
+    if truncated.spent_on_reasoning() {
         " Nothing was written, so the budget went on reasoning: raise max_tokens \
          or lower effort rather than asking for less."
     } else {
         ""
+    }
+}
+
+/// Names `count` tool calls with the right number, for the truncation lines.
+pub(crate) fn tool_calls_phrase(count: usize) -> String {
+    if count == 1 {
+        "1 tool call".to_string()
+    } else {
+        format!("{count} tool calls")
     }
 }
 
@@ -386,14 +396,17 @@ pub(crate) fn truncation_remedy(answer_chars: usize, tool_arg_chars: usize) -> &
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[error(
     "LLM output was truncated by provider (e.g. hit max tokens) after {answer_chars} chars \
-     of answer and {tool_arg_chars} chars of tool arguments.{}",
-    truncation_remedy(*.answer_chars, *.tool_arg_chars)
+     of answer and {tool_arg_chars} chars of tool arguments in {}.{}",
+    tool_calls_phrase(*.tool_calls),
+    truncation_remedy(self)
 )]
 pub struct OutputTruncated {
     /// Characters of answer text written before the cut.
     pub answer_chars: usize,
     /// Characters of tool-call arguments written before the cut.
     pub tool_arg_chars: usize,
+    /// Tool calls the response held, whatever their arguments.
+    pub tool_calls: usize,
 }
 
 impl OutputTruncated {
@@ -401,18 +414,27 @@ impl OutputTruncated {
     ///
     /// Thinking is not counted, for the reason given on `truncation_remedy`.
     pub fn from_response(response: &AiResponse) -> Self {
+        let tool_calls = response.tool_calls.as_deref().unwrap_or_default();
         Self {
             answer_chars: response
                 .content
                 .as_deref()
                 .map_or(0, |answer| answer.chars().count()),
-            tool_arg_chars: tool_argument_chars(response.tool_calls.as_deref().unwrap_or_default()),
+            tool_arg_chars: tool_argument_chars(tool_calls),
+            tool_calls: tool_calls.len(),
         }
     }
 
     /// Nothing visible was written: the budget went on reasoning.
+    ///
+    /// Any tool call means the model was writing when the limit hit, however
+    /// short its arguments. Claude and Gemini return a call cut off part-way
+    /// with `{}` or `null` input, which reads exactly like a call with no
+    /// input, so the argument count cannot tell the two apart; the call
+    /// itself is the evidence. Such an answer is asked for again, shorter,
+    /// rather than told to stop reasoning.
     pub fn spent_on_reasoning(&self) -> bool {
-        self.answer_chars == 0 && self.tool_arg_chars == 0
+        self.answer_chars == 0 && self.tool_calls == 0
     }
 }
 
@@ -1405,17 +1427,27 @@ mod tests {
     /// up the budget are billed but never shown.
     #[test]
     fn a_truncation_that_wrote_nothing_points_at_the_budget_not_the_answer() {
+        let cut = |answer_chars, tool_arg_chars, tool_calls| OutputTruncated {
+            answer_chars,
+            tool_arg_chars,
+            tool_calls,
+        };
         assert!(
-            truncation_remedy(0, 0).contains("went on reasoning"),
+            truncation_remedy(&cut(0, 0, 0)).contains("went on reasoning"),
             "an empty response means the allowance was spent before the answer began"
         );
         // Either kind of output means the answer had started, so the length of
         // what it was writing is the thing to act on.
-        assert_eq!(truncation_remedy(1200, 0), "");
+        assert_eq!(truncation_remedy(&cut(1200, 0, 0)), "");
         assert_eq!(
-            truncation_remedy(0, 800),
+            truncation_remedy(&cut(0, 800, 1)),
             "",
             "a half-written tool call is still the answer having started"
+        );
+        assert_eq!(
+            truncation_remedy(&cut(0, 0, 1)),
+            "",
+            "a tool call whose input arrived empty was still being written"
         );
     }
 
@@ -1438,10 +1470,15 @@ mod tests {
             OutputTruncated {
                 answer_chars: 5,
                 tool_arg_chars: 7,
+                tool_calls: 1,
             }
         );
         assert!(!cut.spent_on_reasoning());
-        assert!(cut.to_string().ends_with("7 chars of tool arguments."));
+        assert!(
+            cut.to_string()
+                .ends_with("7 chars of tool arguments in 1 tool call."),
+            "{cut}"
+        );
 
         let nothing = OutputTruncated::from_response(&AiResponse {
             content: None,
@@ -1450,7 +1487,9 @@ mod tests {
         });
         assert!(nothing.spent_on_reasoning());
         assert!(
-            nothing.to_string().ends_with(truncation_remedy(0, 0)),
+            nothing
+                .to_string()
+                .ends_with(&format!("in 0 tool calls.{}", truncation_remedy(&nothing))),
             "{nothing}"
         );
         assert!(matches!(
@@ -1482,17 +1521,26 @@ mod tests {
         assert_eq!(tool_argument_chars(&calls), 16);
     }
 
-    /// A call that received no arguments wrote none, so a truncation whose
-    /// only output is such a call still reads as having spent its budget on
-    /// reasoning, and gets that remedy.
+    /// A call whose input is `{}` or `null` wrote no argument text, so the
+    /// count says 0. The call itself was still written, and Claude and Gemini
+    /// return a call cut off part-way in exactly that shape, so a truncation
+    /// holding one is not taken for a budget spent on reasoning.
     #[test]
-    fn a_tool_call_without_arguments_counts_as_nothing_written() {
+    fn a_tool_call_without_arguments_counts_no_argument_text_but_is_written() {
         for empty in [json!({}), serde_json::Value::Null] {
-            let calls = [read_files_call("a", empty.clone())];
-            assert_eq!(tool_argument_chars(&calls), 0, "input {empty}");
-            assert!(
-                truncation_remedy(0, tool_argument_chars(&calls)).contains("went on reasoning")
-            );
+            let response = AiResponse {
+                content: None,
+                thought: None,
+                thought_signature: None,
+                tool_calls: Some(vec![read_files_call("a", empty.clone())]),
+                usage: None,
+                truncated: true,
+            };
+            let cut = OutputTruncated::from_response(&response);
+            assert_eq!(cut.tool_arg_chars, 0, "input {empty}");
+            assert_eq!(cut.tool_calls, 1, "input {empty}");
+            assert!(!cut.spent_on_reasoning(), "input {empty}: {cut:?}");
+            assert_eq!(truncation_remedy(&cut), "", "input {empty}");
         }
     }
 
@@ -1517,9 +1565,9 @@ mod tests {
     }
 
     /// Arguments cut off part-way were being written, so they count as the
-    /// text the model wrote, although they parse to nothing. Counted as 0,
-    /// a long but unfinished call was taken for a budget spent on reasoning.
-    /// A call with no input still counts as 0 however its text spells it.
+    /// text the model wrote, although they parse to nothing, and the log line
+    /// shows how much was cut. A call with no input still counts as 0 however
+    /// its text spells it.
     #[test]
     fn arguments_cut_off_part_way_count_as_written() {
         let call = |text: &str| ToolCall::from_argument_text("a".into(), "read_files".into(), text);
@@ -1529,7 +1577,6 @@ mod tests {
             23,
             "the blank before it is not counted"
         );
-        assert_eq!(truncation_remedy(0, tool_argument_chars(&cut)), "");
 
         for empty in ["", " ", "{}", "null"] {
             assert_eq!(tool_argument_chars(&[call(empty)]), 0, "text {empty:?}");
@@ -1539,7 +1586,7 @@ mod tests {
     /// Only `{}` and `null` count as no arguments. Every other value is
     /// measured as compact JSON, so whitespace the model wrote is not counted
     /// and an empty string or array still counts as the 2 characters of its
-    /// JSON, which keeps such a truncation on the answer-length remedy.
+    /// JSON.
     #[test]
     fn only_an_empty_object_or_null_counts_as_no_arguments() {
         let parsed: serde_json::Value =
@@ -1553,7 +1600,6 @@ mod tests {
         for (arguments, chars) in cases {
             let calls = [read_files_call("a", arguments.clone())];
             assert_eq!(tool_argument_chars(&calls), chars, "input {arguments}");
-            assert_eq!(truncation_remedy(0, chars), "", "input {arguments}");
         }
         let mixed = [
             read_files_call("a", json!({})),

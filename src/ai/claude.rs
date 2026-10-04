@@ -648,19 +648,21 @@ pub fn translate_ai_response(resp: &ClaudeResponse) -> Result<AiResponse> {
 ///
 /// The output count says how much of the budget was used, which tells whether
 /// the configured max_tokens was the limit reached: a gateway in front of the
-/// API can lower it. The character counts say where that budget went, which
-/// decides the remedy (see truncation_remedy). They are taken from the
-/// translated response, whose answer holds only text blocks, so thinking is
-/// never counted as writing.
+/// API can lower it. The counts say where that budget went, and whether
+/// anything was written decides the remedy (see truncation_remedy). They are
+/// taken from the translated response, whose answer holds only text blocks,
+/// so thinking is never counted as writing. Tool calls are counted apart from
+/// their argument text, because a call cut off part-way arrives with empty
+/// input and adds no argument characters, yet was being written.
 fn truncation_warning(output_tokens: u32, response: &AiResponse) -> String {
-    let crate::ai::OutputTruncated {
-        answer_chars,
-        tool_arg_chars,
-    } = crate::ai::OutputTruncated::from_response(response);
+    let truncated = crate::ai::OutputTruncated::from_response(response);
     format!(
         "Claude response truncated at max_tokens after {output_tokens} output tokens \
-         ({answer_chars} chars of answer, {tool_arg_chars} chars of tool arguments).{}",
-        crate::ai::truncation_remedy(answer_chars, tool_arg_chars)
+         ({} chars of answer, {} chars of tool arguments in {}).{}",
+        truncated.answer_chars,
+        truncated.tool_arg_chars,
+        crate::ai::tool_calls_phrase(truncated.tool_calls),
+        crate::ai::truncation_remedy(&truncated)
     )
 }
 
@@ -1364,7 +1366,8 @@ mod tests {
         let warning = truncation_warning(resp.usage.output_tokens, &ai_resp);
         assert!(
             warning.contains(
-                "after 32000 output tokens (0 chars of answer, 0 chars of tool arguments)."
+                "after 32000 output tokens (0 chars of answer, 0 chars of tool arguments \
+                 in 0 tool calls)."
             ),
             "{warning}"
         );
@@ -1397,8 +1400,33 @@ mod tests {
         assert_eq!(
             warning,
             "Claude response truncated at max_tokens after 32000 output tokens \
-             (8 chars of answer, 9 chars of tool arguments)."
+             (8 chars of answer, 9 chars of tool arguments in 1 tool call)."
         );
+        Ok(())
+    }
+
+    /// Claude returns a tool call cut off at max_tokens with its input empty,
+    /// so the call adds no argument characters. It was still being written,
+    /// so the line counts it and does not blame reasoning, which would tell
+    /// the operator to change a budget that was not the problem.
+    #[test]
+    fn a_truncation_holding_a_tool_call_with_empty_input_is_not_blamed_on_reasoning() -> Result<()>
+    {
+        for input in [json!({}), serde_json::Value::Null] {
+            let resp = truncated_response(vec![ClaudeContent::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "read_files".to_string(),
+                input: input.clone(),
+            }]);
+            let ai_resp = translate_ai_response(&resp)?;
+            let warning = truncation_warning(resp.usage.output_tokens, &ai_resp);
+            assert_eq!(
+                warning,
+                "Claude response truncated at max_tokens after 32000 output tokens \
+                 (0 chars of answer, 0 chars of tool arguments in 1 tool call).",
+                "input {input}"
+            );
+        }
         Ok(())
     }
 
