@@ -257,10 +257,11 @@ impl TurnTruncations {
 
 /// Decides what to do about a truncated answer, given the turn's earlier ones.
 ///
-/// An answer that wrote something is asked for again, shorter. One that wrote
-/// nothing is asked once to stop deliberating; a second such answer in the
-/// same turn fails, because asking again resends the whole history to no
-/// purpose, and the error names the setting to change instead.
+/// An answer that wrote something, answer text or any tool call, is asked for
+/// again, shorter. One that wrote nothing is asked once to stop deliberating;
+/// a second such answer in the same turn fails, because asking again resends
+/// the whole history to no purpose, and the error names the setting to
+/// change instead.
 fn truncation_action(truncated: &OutputTruncated, so_far: &TurnTruncations) -> ErrorAction {
     if !truncated.spent_on_reasoning() {
         ErrorAction::RetryWithFeedback(OUTPUT_TRUNCATED_FEEDBACK.to_string())
@@ -1507,9 +1508,8 @@ mod tests {
     }
 
     /// A tool call cut off part-way was being written, so it is asked for
-    /// again, shorter, as many times as any other cut-off answer. Read as no
-    /// input, it got the reasoning feedback once and then failed the stage
-    /// with a remedy that did not fit.
+    /// again, shorter, as many times as any other cut-off answer, and the log
+    /// keeps the text that was cut.
     #[tokio::test]
     async fn a_tool_call_cut_off_part_way_is_asked_for_again_shorter() {
         let written = r#"{"paths":["src/very/long/path/one.rs","src/very/lon"#;
@@ -1540,20 +1540,98 @@ mod tests {
         );
     }
 
-    /// A tool call with no input still wrote nothing when the endpoint spells
-    /// its arguments as text, so it gets the reasoning feedback.
+    /// A tool call whose arguments text is blank adds no argument characters,
+    /// but the call was written, so the answer is asked for again, shorter.
     #[tokio::test]
-    async fn an_openai_tool_call_without_input_is_still_spent_on_reasoning() {
-        let provider =
-            RecordingProvider::new(vec![openai_cut_off_tool_call(""), text_answer("done")]);
+    async fn an_openai_tool_call_without_input_is_asked_for_again_shorter() {
+        let provider = RecordingProvider::new(vec![
+            openai_cut_off_tool_call(""),
+            openai_cut_off_tool_call(""),
+            text_answer("done"),
+        ]);
 
         SessionRunner::new(&provider)
             .run(&mut DummySession)
             .await
-            .expect("one reasoning-only truncation is retried");
+            .expect("cut-off tool calls are retried like any cut-off answer");
+        for retry in &provider.requests()[1..] {
+            assert_eq!(last_user_text(retry), OUTPUT_TRUNCATED_FEEDBACK);
+        }
+    }
+
+    /// A Claude response cut off at max_tokens, translated as the client
+    /// translates it. `content` holds the response's content blocks.
+    fn claude_cut_off(content: serde_json::Value) -> AiResponse {
+        let response = serde_json::json!({
+            "id": "msg_cut",
+            "content": content,
+            "stop_reason": "max_tokens",
+            "usage": {"input_tokens": 10, "output_tokens": 4000}
+        });
+        let response = serde_json::from_value(response).expect("a valid Claude response");
+        crate::ai::claude::translate_ai_response(&response).expect("a translatable response")
+    }
+
+    /// Claude returns a tool call cut off at max_tokens with its input `{}`
+    /// or `null`, so no argument text survives. The model was writing that
+    /// call, so it is asked for again, shorter, as often as any cut-off
+    /// answer. Read as spent on reasoning, it got feedback that did not fit,
+    /// and a second such cut-off failed the stage.
+    #[tokio::test]
+    async fn a_claude_tool_call_with_empty_input_is_asked_for_again_shorter() {
+        for input in [serde_json::json!({}), serde_json::Value::Null] {
+            let cut = || {
+                claude_cut_off(serde_json::json!([
+                    {"type": "thinking", "thinking": "", "signature": "sig"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_files", "input": input}
+                ]))
+            };
+            let provider = RecordingProvider::new(vec![cut(), cut(), text_answer("done")]);
+
+            let res = SessionRunner::new(&provider)
+                .run(&mut DummySession)
+                .await
+                .unwrap_or_else(|e| panic!("input {input}: {e:#}"));
+            assert_eq!(res.output, "done", "input {input}");
+
+            let requests = provider.requests();
+            assert_eq!(requests.len(), 3, "input {input}");
+            for retry in &requests[1..] {
+                assert_eq!(
+                    last_user_text(retry),
+                    OUTPUT_TRUNCATED_FEEDBACK,
+                    "input {input}"
+                );
+            }
+        }
+    }
+
+    /// A Claude response cut off with no answer text and no tool call, only
+    /// thinking, spent its limit on reasoning: it is asked once to act on
+    /// what it has, and a second such response fails the stage.
+    #[tokio::test]
+    async fn a_claude_truncation_with_only_thinking_is_retried_once_then_fails() {
+        let cut = || {
+            claude_cut_off(serde_json::json!([
+                {"type": "thinking", "thinking": "Let me weigh it.", "signature": "sig"}
+            ]))
+        };
+        let provider = RecordingProvider::new(vec![cut(), cut(), text_answer("never reached")]);
+
+        let err = match SessionRunner::new(&provider).run(&mut DummySession).await {
+            Err(e) => e,
+            Ok(_) => panic!("a second reasoning-only truncation must fail"),
+        };
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
         assert_eq!(
-            last_user_text(&provider.requests()[1]),
+            last_user_text(&requests[1]),
             OUTPUT_TRUNCATED_REASONING_FEEDBACK
+        );
+        assert!(
+            err.to_string().contains("raise max_tokens or lower effort"),
+            "{err}"
         );
     }
 
@@ -1714,6 +1792,7 @@ mod tests {
             Some(&OutputTruncated {
                 answer_chars: 0,
                 tool_arg_chars: 0,
+                tool_calls: 0,
             })
         );
         assert!(
@@ -1756,12 +1835,11 @@ mod tests {
     }
 
     /// A tool called with no input, whose arguments are `{}`, writes no
-    /// arguments, so a truncation whose only output is such calls spent its
-    /// budget on reasoning and is asked to reason less, not to write less.
-    /// Arguments cut off part-way are not such a call: see
-    /// `a_tool_call_cut_off_part_way_is_asked_for_again_shorter`.
+    /// argument text, but the calls themselves were written, and a call cut
+    /// off part-way looks the same on Claude and Gemini. So the truncation
+    /// is asked to write less, not to reason less.
     #[test]
-    fn a_truncation_holding_only_calls_without_input_is_spent_on_reasoning() {
+    fn a_truncation_holding_only_calls_without_input_was_written() {
         let no_input = |id: &str| ToolCall {
             id: id.to_string(),
             function_name: "list_files".to_string(),
@@ -1773,10 +1851,12 @@ mod tests {
         resp.tool_calls = Some(vec![no_input("call_1"), no_input("call_2")]);
 
         let truncated = OutputTruncated::from_response(&resp);
-        assert!(truncated.spent_on_reasoning(), "{truncated:?}");
+        assert_eq!(truncated.tool_arg_chars, 0);
+        assert_eq!(truncated.tool_calls, 2);
+        assert!(!truncated.spent_on_reasoning(), "{truncated:?}");
         assert_eq!(
             truncation_action(&truncated, &TurnTruncations::default()),
-            ErrorAction::RetryWithFeedback(OUTPUT_TRUNCATED_REASONING_FEEDBACK.to_string())
+            ErrorAction::RetryWithFeedback(OUTPUT_TRUNCATED_FEEDBACK.to_string())
         );
     }
 
@@ -1785,10 +1865,17 @@ mod tests {
         let wrote = OutputTruncated {
             answer_chars: 10,
             tool_arg_chars: 0,
+            tool_calls: 0,
+        };
+        let called = OutputTruncated {
+            answer_chars: 0,
+            tool_arg_chars: 0,
+            tool_calls: 1,
         };
         let nothing = OutputTruncated {
             answer_chars: 0,
             tool_arg_chars: 0,
+            tool_calls: 0,
         };
         let fresh = TurnTruncations::default();
         let after_reasoning = TurnTruncations {
@@ -1806,6 +1893,13 @@ mod tests {
             retry(OUTPUT_TRUNCATED_FEEDBACK),
             "an answer that wrote something is always worth asking for again"
         );
+        for so_far in [fresh, after_reasoning] {
+            assert_eq!(
+                truncation_action(&called, &so_far),
+                retry(OUTPUT_TRUNCATED_FEEDBACK),
+                "a tool call is writing, whatever its arguments"
+            );
+        }
         assert_eq!(
             truncation_action(&nothing, &fresh),
             retry(OUTPUT_TRUNCATED_REASONING_FEEDBACK)

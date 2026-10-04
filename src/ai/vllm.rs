@@ -1089,7 +1089,8 @@ mod tests {
     }
 
     /// vLLM sends arguments as text too, so a call cut off part-way at the
-    /// output limit is measured by what it wrote, not read as no input.
+    /// output limit is measured by what it wrote, not read as no input. A
+    /// call with no input adds no argument text but was still written.
     #[test]
     fn a_tool_call_cut_off_part_way_counts_as_written() -> Result<()> {
         let call_with = |arguments: &str| VllmToolCall {
@@ -1114,7 +1115,9 @@ mod tests {
         assert!(!cut.spent_on_reasoning(), "{cut:?}");
 
         for empty in ["", "{}"] {
-            assert!(measure(empty)?.spent_on_reasoning(), "arguments {empty:?}");
+            let cut = measure(empty)?;
+            assert_eq!(cut.tool_arg_chars, 0, "arguments {empty:?}");
+            assert!(!cut.spent_on_reasoning(), "arguments {empty:?}: {cut:?}");
         }
         Ok(())
     }
