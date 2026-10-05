@@ -682,7 +682,8 @@ pub fn create_provider_from_ai(ai: &AiSettings) -> Result<Arc<dyn AiProvider>> {
                 base_url,
                 thinking,
                 effort,
-            )))
+                ai.api_timeout_secs,
+            )?))
         }
         "stdio-claude" => Ok(Arc::new(claude::StdioClaudeClient::new())),
         #[cfg(feature = "bedrock")]

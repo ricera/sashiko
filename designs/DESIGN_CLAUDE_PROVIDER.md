@@ -103,7 +103,45 @@ max_tokens = 4096                  # Max output tokens per request
 base_url = "https://..."           # Override API endpoint
 thinking = "enabled"               # "enabled" or "adaptive"
 effort = "high"                    # "low", "medium", "high"
+
+[ai]
+api_timeout_secs = 300             # Minimum per-request deadline
 ```
+
+### Request deadline
+
+Each request has a deadline, set once on the HTTP client by
+`ClaudeClient::new`:
+
+```text
+deadline = max(api_timeout_secs, max_tokens / 10 + 120) seconds
+```
+
+- Without a deadline a stalled connection parks the stage inside
+  `generate_content` until the review deadline ends the whole review, holding
+  an LLM slot the whole time. A local review would hang forever. The turn cap
+  cannot help: it is checked between round trips.
+- Thinking tokens are output tokens, so `max_tokens`, not the difficulty of
+  the question, bounds how long a legitimate response can take. 10 tokens a
+  second is a pessimistic output rate, about an order of magnitude below a
+  healthy connection, so the estimate only errs towards waiting longer.
+- 120 s is the allowance for the first token, which on a large uncached
+  prompt is not instant.
+- `api_timeout_secs` can raise the deadline but never lower it below that
+  floor. A lower deadline would abandon a full-length response while it was
+  still arriving and turn it into a retry. The client logs at info when the
+  floor raised the configured value. At the defaults (300 s, 4096 tokens) the
+  deadline is 529 s.
+- The floor has no cap. A large `max_tokens` (128k gives 12,920 s) can give a
+  deadline longer than `review.timeout_seconds`, and the review deadline then
+  stays in charge. A cap would cut off the long answers the floor exists for.
+- A deadline that passes is a transport failure (see Error Handling), so the
+  request is retried within the stage instead of ending it.
+- The deadline is not part of `cache_identity`, because it does not change
+  what a response contains.
+- A failure to build the HTTP client is returned from `ClaudeClient::new`, and
+  so from `create_provider_from_ai`. It is never replaced by a client with no
+  deadline.
 
 ## Error Handling
 
@@ -160,6 +198,13 @@ Tests are in `src/ai/claude.rs` and `src/ai/claude_cli.rs`:
   200 whose body stops short of its length are each a `Transport` error that
   names the cause from the source chain, and a request reqwest cannot build
   is an untyped Fatal error
+- Request deadline: the default `api_timeout_secs` is raised to the output
+  allowance (529 s for 4096 tokens), a longer configured value is kept, and
+  zero settings still get the 120 s first-token allowance
+- Deadline on the wire: with tokio's clock paused, a client from
+  `ClaudeClient::new` sends to a server that reads the request and never
+  answers, and the request is abandoned exactly at `request_timeout` as a
+  `Transport` error naming "operation timed out"
 
 Tests in `src/ai/mod.rs` cover the raw `reqwest::Error` rule: a refused
 connection is Transient, bare and under `.context(..)` applied to the send
