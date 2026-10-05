@@ -166,6 +166,11 @@ pub enum ClaudeError {
     AuthenticationError(String),
     #[error("API error {0}: {1}")]
     ApiError(reqwest::StatusCode, String),
+    /// The request or its response body failed on the wire: a refused or
+    /// reset connection, a TLS failure or a deadline. The request may well
+    /// succeed when sent again, so it is retried rather than ending the stage.
+    #[error("Transport error, retry after {1:?}: {0}")]
+    Transport(String, Duration),
 }
 
 impl ClassifyAiError for ClaudeError {
@@ -177,6 +182,9 @@ impl ClassifyAiError for ClaudeError {
             ClaudeError::OverloadedError(retry_after) => AiErrorClass::Transient {
                 retry_after: *retry_after,
             },
+            ClaudeError::Transport(_, retry_after) => AiErrorClass::Transient {
+                retry_after: *retry_after,
+            },
             ClaudeError::InvalidRequest(_) => AiErrorClass::Fatal,
             ClaudeError::AuthenticationError(_) => AiErrorClass::Fatal,
             ClaudeError::ApiError(status, _) => {
@@ -184,6 +192,40 @@ impl ClassifyAiError for ClaudeError {
             }
         }
     }
+}
+
+/// Renders a reqwest error with its whole source chain, secrets redacted.
+///
+/// reqwest's own Display names only the error kind and the URL. The cause a
+/// retry warning has to show, such as a refused connection or a DNS or TLS
+/// failure, lives in the source chain, which anyhow's alternate format
+/// appends.
+fn describe_reqwest_error(e: reqwest::Error) -> String {
+    redact_secret(&format!("{:#}", anyhow::Error::from(e)))
+}
+
+/// Types a reqwest failure on the wire as a retryable `Transport` error.
+///
+/// The zero `retry_after` is only a floor: `BackoffProvider` supplies the real
+/// delay with exponential backoff.
+fn transport_error(e: reqwest::Error) -> anyhow::Error {
+    ClaudeError::Transport(describe_reqwest_error(e), Duration::ZERO).into()
+}
+
+/// Types a failed send by whether sending it again can succeed.
+///
+/// A request that could not be built, or a redirect loop, fails the same way
+/// on every attempt, so retrying it only delays the error and it stays an
+/// untyped, Fatal error. Any other send failure is the connection's, not the
+/// request's, and is a `Transport` error.
+fn send_error(e: reqwest::Error) -> anyhow::Error {
+    if e.is_builder() || e.is_redirect() {
+        return anyhow::anyhow!(
+            "Failed to send request to Claude API: {}",
+            describe_reqwest_error(e)
+        );
+    }
+    transport_error(e)
 }
 
 // --- ClaudeClient ---
@@ -279,25 +321,23 @@ impl ClaudeClient {
             );
         }
 
-        let res = match self
+        let res = self
             .client
             .post(&self.base_url)
             .headers(headers)
             .json(body)
             .send()
             .await
-        {
-            Ok(res) => res,
-            Err(e) => {
-                let err_str = redact_secret(&e.to_string());
-                anyhow::bail!("Failed to send request to Claude API: {}", err_str);
-            }
-        };
+            .map_err(send_error)?;
 
         let status = res.status();
 
         if status.is_success() {
-            let body_text = res.text().await?;
+            // The body can fail after the headers arrived, for example when
+            // the connection drops mid-response. That is the same transport
+            // failure as one during send, so it is typed the same way instead
+            // of escaping as a raw reqwest error.
+            let body_text = res.text().await.map_err(transport_error)?;
             let response: ClaudeResponse =
                 serde_json::from_str(&body_text).context("Failed to parse Claude API response")?;
 
@@ -761,7 +801,7 @@ mod tests {
     use super::*;
     use crate::ai::{
         AiErrorClass, AiMessage, AiRequest, AiRole, AiTool, ClassifyAiError, DEFAULT_RETRY_AFTER,
-        ToolCall,
+        ToolCall, classify_ai_error,
     };
     use serde_json::json;
 
@@ -828,6 +868,141 @@ mod tests {
         let err = ClaudeError::InvalidRequest("bad request".to_string());
 
         assert_eq!(err.ai_error_class(), AiErrorClass::Fatal);
+    }
+
+    #[test]
+    fn test_transport_error_classifies_as_transient() {
+        let retry_after = Duration::from_secs(0);
+        let err = ClaudeError::Transport("connection reset".to_string(), retry_after);
+
+        assert_eq!(
+            err.ai_error_class(),
+            AiErrorClass::Transient { retry_after }
+        );
+    }
+
+    /// A client for `base_url` whose key and headers do not come from the
+    /// environment, so a stray ANTHROPIC_API_KEY or ANTHROPIC_CUSTOM_HEADERS
+    /// that is not a valid header value cannot fail the request first.
+    fn client_for(base_url: &str) -> ClaudeClient {
+        ClaudeClient {
+            api_key: "test-key".to_string(),
+            extra_headers: std::collections::HashMap::new(),
+            ..ClaudeClient::new(
+                "claude-opus-4-7".to_string(),
+                false,
+                1024,
+                base_url.to_string(),
+                None,
+                None,
+            )
+        }
+    }
+
+    async fn send_hello(base_url: &str) -> anyhow::Error {
+        client_for(base_url)
+            .generate_content(make_request(vec![AiMessage {
+                role: AiRole::User,
+                content: Some("hello".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }]))
+            .await
+            .expect_err("the request should fail")
+    }
+
+    /// Asserts that `err` is a retryable `ClaudeError::Transport` whose
+    /// message names `cause`, the part of the source chain reqwest's own
+    /// Display leaves out.
+    fn assert_transport_naming(err: &anyhow::Error, cause: &str) {
+        match err.downcast_ref::<ClaudeError>() {
+            Some(ClaudeError::Transport(message, _)) => assert!(
+                message.contains(cause),
+                "Transport message should name {cause:?}, got {message:?}"
+            ),
+            other => panic!("expected ClaudeError::Transport, got {other:?} from {err:#}"),
+        }
+        assert_eq!(
+            classify_ai_error(err),
+            AiErrorClass::Transient {
+                retry_after: Duration::ZERO
+            }
+        );
+    }
+
+    /// A refused connection on send is retried, and the retry warning shows
+    /// why the connection failed rather than only the URL.
+    #[tokio::test]
+    async fn test_refused_connection_is_a_transport_error() {
+        let err = send_hello("http://127.0.0.1:9/v1/messages").await;
+        assert_transport_naming(&err, "tcp connect error");
+    }
+
+    /// A request reqwest refuses to build fails the same way on every
+    /// attempt, so it is not typed as Transport and ends the stage.
+    #[tokio::test]
+    async fn test_unbuildable_request_is_fatal() {
+        let err = send_hello("ftp://127.0.0.1/v1/messages").await;
+        assert!(
+            err.downcast_ref::<ClaudeError>().is_none(),
+            "expected an untyped error, got {err:#}"
+        );
+        assert_eq!(classify_ai_error(&err), AiErrorClass::Fatal);
+    }
+
+    /// Serves one request with a 200 whose body stops short of its declared
+    /// length, as when the connection drops mid-response.
+    async fn spawn_truncating_server() -> std::io::Result<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            // Read the whole request first: closing with unread bytes would
+            // reset the connection and fail the send instead of the body.
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !request_is_complete(&request) {
+                let read = socket.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n{\"id\":")
+                .await?;
+            socket.shutdown().await
+        });
+        Ok(format!("http://{address}/v1/messages"))
+    }
+
+    /// Whether `request` holds the headers and the whole Content-Length body.
+    fn request_is_complete(request: &[u8]) -> bool {
+        let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+        let body_len = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        request.len() >= end + 4 + body_len
+    }
+
+    /// A body that stops arriving after a 200 is the same transport failure
+    /// as one during send, so it is retried too.
+    #[tokio::test]
+    async fn test_truncated_body_is_a_transport_error() {
+        let base_url = spawn_truncating_server()
+            .await
+            .expect("bind a local test server");
+        let err = send_hello(&base_url).await;
+        assert_transport_naming(&err, "end of file before message length reached");
     }
 
     #[test]

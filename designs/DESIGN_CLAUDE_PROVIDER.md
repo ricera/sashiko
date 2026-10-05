@@ -113,6 +113,38 @@ effort = "high"                    # "low", "medium", "high"
 | 529 | OverloadedError | Exponential backoff starting at 5s |
 | 400 | InvalidRequest | No retry |
 | 401/403 | AuthenticationError | No retry |
+| None: send or body read failed | Transport | Exponential backoff, floored at 0s |
+| None: request could not be built, or a redirect failed | Untyped error | No retry |
+
+A transport failure is any error from sending the request, or from reading
+the body of a successful response, other than a builder or redirect error.
+That covers a refused or reset connection, a TLS failure and a request
+deadline. It becomes `ClaudeError::Transport`, which classifies as
+Transient, because the same request may well succeed when sent again. A
+builder error (an unusable URL or header) or a redirect error (a loop or too
+many hops) would fail the same way on every attempt, so it stays an untyped
+error, which classifies as Fatal.
+
+`Transport` carries a `retry_after` of zero. That is a floor, not a delay:
+`BackoffProvider` waits for the larger of it and its own exponential backoff
+with jitter, so a connection reset that clears at once is not held behind a
+fixed wait.
+
+A refused connection is Transient too, so a wrong `base_url`, an absent proxy
+or a TLS misconfiguration is retried rather than failing at once. In the
+daemon the retries run until `review.timeout_seconds`, and the review ends
+`TimedOut` instead of `Failed`. `BackoffProvider` logs a warning on every
+retry, so the cause stays visible. That holds only because the `Transport`
+message carries reqwest's whole source chain, for example "tcp connect
+error: Connection refused": reqwest's own `Display` names only the error kind
+and the URL. The openai, ollama, vllm and gemini clients already treat their
+send errors this way.
+
+`classify_ai_error` also classifies a raw `reqwest::Error` by the same rule,
+after every provider's typed error. anyhow's `downcast_ref` finds it under
+`.context(..)`, so this covers the bare body reads of the Gemini and Vertex
+clients and Vertex's send errors, which would otherwise fall through to
+Fatal.
 
 ## Testing
 
@@ -122,3 +154,13 @@ Tests are in `src/ai/claude.rs` and `src/ai/claude_cli.rs`:
 - Response translation (text, tool calls, thinking, usage with cache)
 - Cache control (applied when enabled, absent when disabled)
 - `build_prompt()` format instructions (with/without tools, with/without JSON format)
+- Error classification: each `ClaudeError` variant, including `Transport` as
+  Transient
+- Transport failures through `generate_content`: a refused connection and a
+  200 whose body stops short of its length are each a `Transport` error that
+  names the cause from the source chain, and a request reqwest cannot build
+  is an untyped Fatal error
+
+Tests in `src/ai/mod.rs` cover the raw `reqwest::Error` rule: a refused
+connection is Transient, bare and under `.context(..)` applied to the send
+`Result` as Vertex applies it, and a builder error is Fatal.

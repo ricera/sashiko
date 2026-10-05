@@ -416,6 +416,27 @@ impl ClassifyAiError for RemoteAiError {
     }
 }
 
+/// A raw reqwest error is a transport failure unless the request itself was
+/// at fault.
+///
+/// A builder error (an unusable URL or header) or a redirect error (a loop or
+/// too many hops) fails the same way on every attempt, so it is Fatal. Every
+/// other reqwest error, such as a refused or reset connection, a TLS failure,
+/// a deadline or a body that stopped arriving, can clear on its own and is
+/// Transient. The zero `retry_after` is a floor under `BackoffProvider`'s
+/// exponential backoff, which supplies the real delay.
+impl ClassifyAiError for reqwest::Error {
+    fn ai_error_class(&self) -> AiErrorClass {
+        if self.is_builder() || self.is_redirect() {
+            AiErrorClass::Fatal
+        } else {
+            AiErrorClass::Transient {
+                retry_after: Duration::ZERO,
+            }
+        }
+    }
+}
+
 pub(crate) fn classify_status_code(status: reqwest::StatusCode) -> Option<AiErrorClass> {
     match status {
         reqwest::StatusCode::TOO_MANY_REQUESTS => Some(AiErrorClass::RateLimit {
@@ -461,6 +482,13 @@ pub fn classify_ai_error(error: &anyhow::Error) -> AiErrorClass {
         return e.ai_error_class();
     }
     if let Some(e) = error.downcast_ref::<vllm::VllmError>() {
+        return e.ai_error_class();
+    }
+    // Last of the typed arms, so a provider's own error type always wins. It
+    // catches the raw reqwest errors a provider lets escape, which anyhow
+    // finds even under .context(..): the bare body reads in the Gemini and
+    // Vertex clients, and Vertex's send errors.
+    if let Some(e) = error.downcast_ref::<reqwest::Error>() {
         return e.ai_error_class();
     }
     AiErrorClass::Fatal
@@ -1250,7 +1278,7 @@ pub(crate) fn start_stdin_reader(
 mod tests {
     use super::*;
     use crate::worker::prompts::ReviewError;
-    use anyhow::anyhow;
+    use anyhow::{Context, anyhow};
     use serde_json::json;
 
     /// A truncation that wrote nothing is a different problem from one that
@@ -1960,6 +1988,61 @@ mod tests {
             anyhow!("Remote AI Error: rate limit exceeded"),
             AiErrorClass::Fatal,
         );
+    }
+
+    /// Sends a request to a port nothing listens on, so the connection is
+    /// refused at once.
+    async fn refused_connection_error() -> reqwest::Error {
+        reqwest::Client::new()
+            .get("http://127.0.0.1:9/")
+            .send()
+            .await
+            .expect_err("connection to 127.0.0.1:9 should be refused")
+    }
+
+    /// A refused connection is retried, not fatal (D15): an endpoint or proxy
+    /// that is restarting refuses connections for a moment, and the retry
+    /// exists for exactly that case.
+    #[tokio::test]
+    async fn test_classify_ai_error_reqwest_transport_is_transient() {
+        assert_ai_error_class(
+            refused_connection_error().await,
+            AiErrorClass::Transient {
+                retry_after: Duration::ZERO,
+            },
+        );
+    }
+
+    /// The Vertex client wraps its send error with context instead of typing
+    /// it. The classifier must still find the reqwest error underneath, so a
+    /// reset connection is no more fatal on Vertex than on Gemini.
+    #[tokio::test]
+    async fn test_classify_ai_error_vertex_shaped_send_error_is_transient() {
+        // Built the way vertex.rs builds it: anyhow::Context on the send
+        // Result, which wraps the reqwest error directly rather than an
+        // anyhow::Error, so anyhow downcasts it through a different path.
+        let err = Err::<(), _>(refused_connection_error().await)
+            .context("Failed to send request to Vertex AI")
+            .unwrap_err();
+        assert_ai_error_class(
+            err,
+            AiErrorClass::Transient {
+                retry_after: Duration::ZERO,
+            },
+        );
+    }
+
+    /// A request reqwest refuses to build fails the same way on every
+    /// attempt, so retrying it would only delay the error.
+    #[tokio::test]
+    async fn test_classify_ai_error_reqwest_builder_error_is_fatal() {
+        let err = reqwest::Client::new()
+            .get("ftp://127.0.0.1/")
+            .send()
+            .await
+            .expect_err("reqwest should reject a non-HTTP scheme");
+        assert!(err.is_builder(), "expected a builder error, got {err:?}");
+        assert_ai_error_class(err, AiErrorClass::Fatal);
     }
 
     #[test]
