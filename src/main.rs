@@ -3043,9 +3043,7 @@ async fn process_parsed_article(
     // Handle ingestion failure
     if let Some(err) = failed_error {
         info!("Handling ingestion failure for {}: {}", article_id, err);
-        if let Err(e) = worker_db.update_patchset_error(&root_msg_id, &err).await {
-            error!("Failed to update patchset error in DB: {}", e);
-        }
+        record_ingestion_failure(worker_db, source, &root_msg_id, &err).await;
         return ProcessStatus::Ingested; // Successfully handled the failure event
     }
 
@@ -3718,6 +3716,39 @@ fn calculate_embargo_hours(
         *delays_to_consider.iter().min().unwrap()
     } else {
         policy.defaults.embargo_hours
+    }
+}
+
+/// Records a failed ingestion on the patchset it was for.
+///
+/// A failed git fetch fails only a placeholder that is still Fetching. A
+/// forge webhook queues a range again even when its review has finished,
+/// and a failure of that second fetch must not overwrite the review.
+#[cfg(feature = "server")]
+async fn record_ingestion_failure(
+    worker_db: &Database,
+    source: MessageSource,
+    root_msg_id: &str,
+    err: &str,
+) {
+    let result = match source {
+        MessageSource::GitFetch => worker_db.fail_fetching_patchset(root_msg_id, err).await,
+        MessageSource::Nntp
+        | MessageSource::ApiInject
+        | MessageSource::ApiFetchThread
+        | MessageSource::GitImport
+        | MessageSource::GitArchive => worker_db
+            .update_patchset_error(root_msg_id, err)
+            .await
+            .map(|()| true),
+    };
+    match result {
+        Ok(true) => {}
+        Ok(false) => info!(
+            "No patchset still fetching for {}; the failure changes nothing",
+            root_msg_id
+        ),
+        Err(e) => error!("Failed to update patchset error in DB: {}", e),
     }
 }
 
@@ -5280,5 +5311,82 @@ mod tests {
             .unwrap();
         assert_eq!(recovered_run, 1);
         supervisor.abort();
+    }
+
+    /// The ingestion failure a git fetch of `article_id` reports.
+    #[cfg(feature = "server")]
+    fn git_fetch_failure(article_id: &str) -> ParsedArticle {
+        ParsedArticle {
+            group: "error".to_string(),
+            article_id: article_id.to_string(),
+            source: MessageSource::GitFetch,
+            metadata: None,
+            patch: None,
+            baseline: None,
+            failed_error: Some("Failed to fetch from remote".to_string()),
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            receipt: None,
+        }
+    }
+
+    /// A failed git fetch fails its forge placeholder while it is Fetching,
+    /// and leaves it alone once its review has finished, as when a webhook
+    /// queues the same range again and the remote cannot be reached.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn test_a_failed_git_fetch_fails_only_a_fetching_placeholder() {
+        let settings = sashiko::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let policy = sashiko::email_policy::EmailPolicyConfig::default();
+        let range =
+            "aaaa000000000000000000000000000000000000..bbbb000000000000000000000000000000000000";
+
+        for (number, finished) in [(7, false), (8, true)] {
+            let article_id = format!("mr-{}-{}", number, range);
+            let ps = db
+                .create_fetching_patchset(
+                    &format!("{}@sashiko.local", article_id),
+                    "Fetching placeholder",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            if finished {
+                db.update_patchset_status(ps, sashiko::ReviewStatus::Reviewed.as_str())
+                    .await
+                    .unwrap();
+            }
+
+            let article = git_fetch_failure(&article_id);
+            assert!(matches!(
+                process_parsed_article(&db, article, None, &policy, &[]).await,
+                ProcessStatus::Ingested
+            ));
+
+            let details = db
+                .get_patchset_details_by_msgid(&article_id, None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            let expected = if finished {
+                sashiko::ReviewStatus::Reviewed
+            } else {
+                sashiko::ReviewStatus::Failed
+            };
+            assert_eq!(details["status"], expected.as_str(), "{}", article_id);
+        }
     }
 }
