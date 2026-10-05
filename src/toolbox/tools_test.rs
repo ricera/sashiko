@@ -1693,4 +1693,32 @@ mod tests {
         assert_eq!(next[crate::toolbox::REVISION_READ_KEY], tip.as_str());
         assert_eq!(next[crate::toolbox::REPO_READ_KEY], "net-next");
     }
+
+    /// The suggestion is computed on the name ToolBox normalized, so padding
+    /// and case do not hide the near miss. A second call fails the same way,
+    /// which shows the error was not cached as if it were a result.
+    #[test]
+    fn unknown_tool_suggests_the_near_miss_after_normalization() {
+        let toolbox = ToolBox::new(PathBuf::from("."), None);
+        let rt = Runtime::new().unwrap();
+
+        for attempt in ["first", "second"] {
+            let err = rt
+                .block_on(toolbox.call("  GIT_GRAY ", json!({})))
+                .expect_err("an unregistered name must not dispatch")
+                .to_string();
+            assert!(
+                err.contains(r#"Tool not found: "git_gray"."#),
+                "{attempt} call must quote the normalized name: {err}"
+            );
+            assert!(
+                err.contains(r#"Did you mean "git_grep"?"#),
+                "{attempt} call must suggest git_grep: {err}"
+            );
+        }
+        assert!(
+            toolbox.cache.read().unwrap().is_empty(),
+            "an unknown tool must leave nothing in the cache"
+        );
+    }
 }
