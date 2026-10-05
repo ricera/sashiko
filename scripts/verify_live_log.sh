@@ -4,13 +4,23 @@
 # Drives a real review through the daemon with a stub AI provider, then asserts
 # that review_log_entries fills up during the run with stage names stored as
 # text, that /api/review serves it as `live_log` in the finished log's message
-# shape, that the public activity route never carries any of it, and that the
-# rows are cleared once the review finishes.
+# shape, that the public activity route never carries any of it, that the
+# rows are cleared once the review finishes, and that the review it drove
+# ended Reviewed, so the run exercised every stage rather than failing early.
 #
-# Needs a debug build (cargo build), python3, curl and the kernel checkout at
-# third_party/linux to review its HEAD. It first checks its own query helper
-# and stage check on a small database; --self-test stops after that, and
-# needs only python3.
+# The commit reviewed is the newest commit of the kernel checkout that is not
+# a merge and that the daemon would send to a worker under the [review]
+# section of the settings it runs with. The daemon skips, without spawning a
+# worker, a patch whose diff is empty, one that touches only files listed in
+# ignore_files, and one above max_lines_changed or max_files_touched. The
+# merge commits a kernel checkout usually has at HEAD have an empty diff, and
+# its newest commits are often MAINTAINERS updates, so reviewing HEAD, or the
+# newest commit that changes a file, would often stream nothing.
+#
+# Needs a debug build (cargo build), git, python3, curl and the kernel
+# checkout at third_party/linux. It first checks its own query helper, stage
+# check and commit choice on a small database and a throwaway repository;
+# --self-test stops after that, and needs only git and python3.
 #
 # Safety rules:
 #   - Only ever kill PIDs this script started and recorded itself, and only
@@ -21,6 +31,11 @@
 #   - `timeout` on every background process is the real backstop.
 
 set -u
+
+# A caller such as a git hook exports these, and they would point every git
+# command below at the caller's repository instead of the one it names.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_PREFIX
 
 PORT=18778
 STUB_PORT=19778
@@ -81,6 +96,124 @@ check_stage_kinds() {
     esac
 }
 
+# How many commits back from HEAD reviewable_commit looks before giving up.
+PICK_LIMIT=50
+
+# Reads the output of git show --format= for one commit on stdin and exits 0
+# when the daemon would send it to a worker under the [review] section of
+# settings file argv[1]. It applies the daemon's own rules to the same text:
+# the files are the a/ paths of the diff --git headers (extract_files_from_diff
+# in baseline.rs), the lines changed are those that start with + or - but not
+# with +++ or --- (the size check in reviewer.rs), and a patch is skipped when
+# it has no file, when every file starts with an ignore_files entry, or when
+# either count is above its limit. A limit the file leaves out takes the
+# default settings.rs gives it, as the daemon's does.
+DAEMON_WOULD_REVIEW_PY='
+import sys, tomllib
+with open(sys.argv[1], "rb") as f:
+    review = tomllib.load(f).get("review", {})
+ignored = review.get("ignore_files", [])
+max_lines = review.get("max_lines_changed", 10000)
+max_files = review.get("max_files_touched", 200)
+files, lines = set(), 0
+for line in sys.stdin.buffer.read().decode("utf-8", "replace").splitlines():
+    if line.startswith("diff --git a/") and " " in line[13:]:
+        files.add(line[13:].split(" ", 1)[0])
+    elif (line.startswith("+") and not line.startswith("+++")) or (
+        line.startswith("-") and not line.startswith("---")
+    ):
+        lines += 1
+if not files:
+    sys.exit("empty diff")
+if all(any(f.startswith(i) for i in ignored) for f in files):
+    sys.exit("touches only ignored files")
+if lines > max_lines or len(files) > max_files:
+    sys.exit(f"exceeds size limits: {lines} lines, {len(files)} files")
+'
+
+# Prints the newest commit reachable from HEAD in repository REPO that is not
+# a merge and that the daemon would review under settings file SETTINGS, and
+# fails when none of the newest PICK_LIMIT commits that are not merges is one.
+reviewable_commit() {
+    local repo="$1" settings="$2" sha
+    for sha in $(git -C "$repo" rev-list --no-merges -n "$PICK_LIMIT" HEAD 2>/dev/null); do
+        if git -C "$repo" show --format= "$sha" \
+            | python3 -c "$DAEMON_WOULD_REVIEW_PY" "$settings" 2>/dev/null; then
+            echo "$sha"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Builds, in the throwaway repository REPO, a history whose HEAD is a merge
+# with an empty diff, as the kernel checkout's usually is, and whose newest
+# commits that are not merges are each skipped by the daemon for a different
+# reason under the settings self_test_commit_choice writes: an empty commit,
+# one touching only ignored files, one a line over max_lines_changed and one
+# a file over max_files_touched. Sets COMMIT_CHOICE_WANT to the one commit
+# below them that the daemon would review. That commit touches MAINTAINERS
+# beside a code file and sits exactly at both limits, so a check that skips
+# any commit touching an ignored file, or treats a limit as exclusive, is
+# caught as well.
+build_commit_choice_repo() {
+    local repo="$1" n=0
+    commit() {
+        local when
+        n=$((n + 1))
+        when=$(printf '2026-01-01T00:00:%02dZ' "$n")
+        GIT_AUTHOR_DATE="$when" GIT_COMMITTER_DATE="$when" \
+            git -C "$repo" -c user.name=sashiko -c user.email=sashiko@example.com \
+            -c commit.gpgsign=false "$@" || fail "self-test: git $1 number $n failed"
+    }
+    # Appends one line to each named file, once per time it is named.
+    change() {
+        local f
+        for f in "$@"; do
+            mkdir -p "$(dirname "$repo/$f")" && echo "$n" >> "$repo/$f" \
+                || fail "self-test: could not change $f"
+        done
+        git -C "$repo" add -A || fail "self-test: git add failed"
+    }
+    git init -q -b main "$repo" || fail "self-test: git init failed"
+    change answer.c MAINTAINERS
+    commit commit -q -m "answer: add the answer"
+    change answer.c answer.c answer.c MAINTAINERS
+    commit commit -q -m "answer: return the right answer"
+    COMMIT_CHOICE_WANT=$(git -C "$repo" rev-parse HEAD)
+    change big.c big.c big.c big.c big.c
+    commit commit -q -m "big: one line over the limit"
+    change a.c b.c MAINTAINERS
+    commit commit -q -m "tree: one file over the limit"
+    change LICENSES/GPL MAINTAINERS
+    commit commit -q -m "LICENSES: only ignored files"
+    git -C "$repo" branch -q side || fail "self-test: branch failed"
+    commit commit -q --allow-empty -m "tracker"
+    git -C "$repo" checkout -q side || fail "self-test: checkout failed"
+    commit commit -q --allow-empty -m "side: nothing"
+    git -C "$repo" checkout -q main || fail "self-test: checkout failed"
+    commit merge -q --no-ff -m "Merge side" side
+}
+
+# Checks reviewable_commit on the history build_commit_choice_repo makes, so
+# a choice of HEAD, of the newest commit that changes a file, or of one the
+# daemon skips for its files or its size is caught without starting a daemon.
+self_test_commit_choice() {
+    local repo="$WORKDIR/self-test-repo" settings="$WORKDIR/self-test.toml" got
+    printf '[review]\n%s\n%s\n%s\n' 'ignore_files = ["MAINTAINERS", "LICENSES/"]' \
+        'max_lines_changed = 4' 'max_files_touched = 2' > "$settings"
+    build_commit_choice_repo "$repo"
+    [ -n "$(git -C "$repo" rev-parse -q --verify HEAD^2)" ] \
+        || fail "self-test: HEAD of the throwaway repository is not a merge"
+    [ -z "$(git -C "$repo" show --format= HEAD)" ] \
+        || fail "self-test: the merge at HEAD has a non-empty diff"
+    got=$(reviewable_commit "$repo" "$settings") || fail "self-test: no reviewable commit found"
+    [ "$got" = "$COMMIT_CHOICE_WANT" ] \
+        || fail "self-test: picked '$(git -C "$repo" log -1 --format=%s "$got")', want the newest commit the daemon would review"
+    rm -rf "$repo" "$settings"
+    echo "PASS: self-test of the commit choice: skips merges, empty commits, ignored files and oversized commits"
+}
+
 # Checks query_db and check_stage_kinds against a database built here, so a
 # change that lets a log with no stage yet fail the run, or lets a stage
 # stored as a number pass, is caught without starting a daemon.
@@ -116,14 +249,29 @@ c = sqlite3.connect(sys.argv[1]); c.execute(sys.argv[2]); c.commit()' "$db" "$1"
 }
 
 self_test
+self_test_commit_choice
 [ "${1:-}" = "--self-test" ] && exit 0
 
 # ------------------------------------------------------- stub OpenAI-ish model
-# Answers slowly so the review stays in flight long enough to observe, and
-# eventually returns the JSON shape a stage expects.
+# Answers slowly so the review stays in flight long enough to observe. Every
+# answer is one object that carries the required field of every JSON stage of
+# the kernel review (pre-screen, planning, the analysis stages, conflict
+# resolution and verification), each empty, as the stub of
+# verify_empty_commit.sh does. A stage reads its own field and ignores the
+# rest, so the review finds nothing and finishes Reviewed. An answer missing
+# a stage's field fails that stage's validation, and a review that fails at
+# its first stage streams too little to check.
 cat > "$WORKDIR/sashiko-stubai.py" <<'PYEOF'
 import json, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+
+ANSWER = {
+    "selected_prompts": [],
+    "relevant_stages": [],
+    "concerns": [],
+    "dismissed_concerns": [],
+    "findings": [],
+}
 
 class H(BaseHTTPRequestHandler):
     def do_POST(self):
@@ -134,7 +282,7 @@ class H(BaseHTTPRequestHandler):
             "id": "stub", "object": "chat.completion", "model": "stub",
             "choices": [{"index": 0, "finish_reason": "stop", "message": {
                 "role": "assistant",
-                "content": json.dumps({"concerns": [], "dismissed_concerns": []}),
+                "content": json.dumps(ANSWER),
             }}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         }).encode()
@@ -160,8 +308,8 @@ echo "stub model listening on $STUB_PORT (pid $STUB_PID)"
 
 # -------------------------------------------------------------------- daemon
 [ -x "$BIN" ] || fail "build first: cargo build"
-HEAD_SHA=$(git -C "$REPO_ROOT/third_party/linux" rev-parse HEAD 2>/dev/null)
-[ -n "$HEAD_SHA" ] || fail "no local kernel checkout to review"
+git -C "$REPO_ROOT/third_party/linux" rev-parse -q --verify HEAD >/dev/null 2>&1 \
+    || fail "no local kernel checkout to review"
 
 # The web UI's static files are read relative to the working directory.
 cp -r "$REPO_ROOT/static" "$WORKDIR/"
@@ -174,6 +322,11 @@ cat >> "$WORKDIR/Settings.toml" <<EOF
 [ai.openai_compat]
 base_url = "http://127.0.0.1:$STUB_PORT/v1"
 EOF
+
+# Chosen under the settings the daemon is about to read, so the skip rules
+# and limits the choice applies are the ones the daemon applies.
+REVIEW_SHA=$(reviewable_commit "$REPO_ROOT/third_party/linux" "$WORKDIR/Settings.toml") \
+    || fail "none of the newest $PICK_LIMIT commits of the kernel checkout that are not merges is one the daemon would review"
 
 # exec, so the recorded PID is the timeout wrapper itself, which passes a
 # SIGTERM on to the daemon.
@@ -199,9 +352,9 @@ for _ in $(seq 1 10); do [ -s "$TOKEN_FILE" ] && break; sleep 1; done
 curl -fsS --max-time 10 -X POST "http://127.0.0.1:$PORT/api/submit" \
     -H 'Content-Type: application/json' \
     -H "Authorization: Bearer $(cat "$TOKEN_FILE")" \
-    -d "{\"type\":\"remote\",\"sha\":\"$HEAD_SHA\"}" >/dev/null \
+    -d "{\"type\":\"remote\",\"sha\":\"$REVIEW_SHA\"}" >/dev/null \
     || fail "submit rejected"
-echo "submitted $HEAD_SHA"
+echo "submitted $REVIEW_SHA, the newest commit that is not a merge and that the daemon would review"
 
 # Checks one /api/review body and the patchset's activity body taken beside
 # it: live_log entries are AiMessages with their position, and none of their
@@ -294,6 +447,16 @@ body = json.load(sys.stdin)
 sys.exit("a finished review still serves live_log" if "live_log" in body else 0)
 ' || fail "live_log outlived the review"
 echo "PASS: a finished review serves no live_log"
+
+# ------------------------------------------------- the review ran to the end
+# The loop above stops at any finished status, and a review that failed at
+# its first stage still streams a few entries, so the checks above pass
+# without this one for a run that never reached the later stages.
+REVIEW_STATUS=$(query "SELECT status FROM reviews WHERE id = ${RID:-0}")
+[ "$REVIEW_STATUS" = "Reviewed" ] \
+    || fail "review $RID ended '${REVIEW_STATUS:-none}', want Reviewed: $(query "SELECT result_description FROM reviews WHERE id = ${RID:-0}")"
+[ "$STATUS" = "Reviewed" ] || fail "patchset ended '${STATUS:-none}', want Reviewed"
+echo "PASS: the review and its patchset ended Reviewed"
 
 echo
 echo "ALL CHECKS PASSED"

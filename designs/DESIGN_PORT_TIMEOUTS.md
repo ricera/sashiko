@@ -756,7 +756,8 @@ interaction.
   arm would reopen a finished Partial series to late parts and to a new
   embargo), with its SQL twin `CLOSED_TO_NEW_PARTS_SQL` (`db.rs:60-62`). Two
   would hang: `sashiko-cli show --watch` (`bin/sashiko-cli.rs:1536-1539`) and
-  `scripts/verify_live_log.sh:274`. The resubmittable statuses and the
+  the terminal `case "$STATUS" in` pattern of
+  `scripts/verify_live_log.sh`. The resubmittable statuses and the
   embargo release are decisions (D18, D19).
 - The patchset's final status is no longer binary. A Partial patch makes the
   patchset Partial unless another patch failed (§3.11, D17). The forge
@@ -1225,7 +1226,7 @@ need `--status-partial` (§5).
 | `bin/sashiko-cli.rs:1770-1774` `show_summary` best review | Its own choice (the latest `Reviewed`, else `matching.last()`) is replaced by a call to `find_best_review_for_patch_refs(p_id, reviews)`, so the summary picks the same Reviewed > Partial > latest review as every other view. |
 | `bin/sashiko-cli.rs:1176-1196` attempt note | `Partial`: "stopped after X (out of time)", no "succeeded". |
 | `bin/sashiko-cli.rs:1769-1795` `show_summary` counters | A `partial` counter in text and JSON (counted as "in review" today). |
-| `scripts/verify_live_log.sh:274` | Add `Partial` to the terminal `case` pattern (the loop spins to its timeout otherwise). Line 250 only reads the status. |
+| `scripts/verify_live_log.sh`, the `case "$STATUS" in` pattern of the watch loop | Add `Partial` to the terminal `case` pattern (the loop spins to its timeout otherwise). The `STATUS=$(query ...)` line above it only reads the status. |
 | `static/index.html` eight theme blocks, `:717-747`, `:848-863` | `--status-partial`, `.status-Partial`, `.status-dot.status-Partial` (§5). |
 | `static/index.html:4166-4222` per-patch summary table | A `Partial` review renders its finding badges with a "partial" tag (it shows "In progress..." today). Precedence Reviewed > Partial > errors. |
 | `static/index.html:4571-4596` `renderReviewCard` | `partial` joins `showDetails`; its own wording (§5). |
@@ -1684,10 +1685,36 @@ salvage_seconds = 1800
   nothing to check yet; a stage stored as anything but text still fails.
   Before this the helper printed `None`, and an end-to-end run failed
   about once in twelve when it sampled the table in that window. The
-  script first runs a self-test on a small database it builds (also on
-  its own with `--self-test`, which needs only python3): no entries and a
+  script reviews the newest commit of `third_party/linux` that is not a
+  merge and that the daemon would send to a worker, looking at most 50
+  such commits back from HEAD. It applies the daemon's own skip rules to
+  `git show --format=` of each commit, under the `[review]` section of
+  the settings the daemon runs with: a diff with no `diff --git` file, a
+  diff whose files all start with an `ignore_files` entry, and one above
+  `max_lines_changed` or `max_files_touched` (counted as
+  `extract_files_from_diff` and the size check in `reviewer.rs` count
+  them) is passed over. It used to review HEAD, which in the kernel
+  checkout is usually a merge with an empty diff; once the daemon
+  skipped a patch whose diff is empty without spawning a worker
+  (4858e5f060b8), nothing was streamed and the script failed. Checking
+  only for a non-empty diff would fail the same way whenever the newest
+  commit is a MAINTAINERS update or a tree-wide change. Its stub
+  model answers every request with one object carrying the required
+  field of every JSON stage, each empty (`selected_prompts`,
+  `relevant_stages`, `concerns`, `dismissed_concerns`, `findings`), as the
+  stub of `scripts/verify_empty_commit.sh` does. Before this it answered
+  only `concerns` and `dismissed_concerns`, so the pre-screen stage failed
+  validation and the review ended Failed, which the script did not notice
+  because it accepted any finished status. It now also requires the
+  review row it sampled and the patchset to end `Reviewed`. The script
+  first runs a self-test (also on its own with `--self-test`, which needs
+  only git and python3): on a small database it builds, no entries and a
   stageless entry pass, a stage stored as a number fails, and a NULL
-  prints as an empty string.
+  prints as an empty string; on a throwaway repository whose HEAD is a
+  merge with an empty diff, above an empty commit, a commit touching only
+  ignored files, one a file over `max_files_touched` and one a line over
+  `max_lines_changed`, the commit chosen is the one below them, which
+  touches MAINTAINERS beside a code file and sits exactly at both limits.
 - `make check-pr RANGE=2a7e748b1680..HEAD`, then
   `sashiko review --project sashiko --agent` on each commit.
 - Manual: in `/tmp/sashiko-demo`, use a stub model with
