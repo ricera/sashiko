@@ -974,13 +974,10 @@ async fn get_activity(State(state): State<Arc<AppState>>) -> Json<crate::api::Ac
 /// other status is finished, `Partial` included: a review that ran out of
 /// time is not resumed.
 ///
-/// Status alone is enough only while nothing moves a stranded patchset to a
-/// terminal status at startup. The fork's stranded-fetch sweep (not ported)
-/// marks such a patchset `Failed` and deliberately keeps its row so the reason
-/// can read "stopped while: fetching ..." (its
-/// `test_sweep_preserves_the_last_activity_for_context`). If that sweep is
-/// ported, a patchset it failed must still be served its preserved row, so this
-/// test has to look at more than the status.
+/// A patchset that the startup sweep failed because a restart stranded its
+/// fetch is finished too, and it has no persisted row: the activity writer
+/// deletes every fetch row at startup. Its `failed_reason` already says where
+/// the fetch stopped, so status alone is the right test.
 const UNFINISHED_PATCHSET_STATUSES: &[&str] = &["Fetching", "Pending", "Incomplete", "In Review"];
 
 /// What one patchset is doing now, or failing that what it was doing when the

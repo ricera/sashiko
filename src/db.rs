@@ -117,6 +117,24 @@ const LEGACY_FAILED_TO_APPLY: &str = "FailedToApply";
 #[cfg(feature = "server")]
 const FETCHING: &str = "Fetching";
 
+/// The failure reason the startup sweep gives a patchset a restart left in
+/// `Fetching`. [`Database::fail_stranded_fetching_patchsets`] appends where
+/// the fetch stopped when the last fetch activity is still on record.
+#[cfg(feature = "server")]
+pub const FETCH_INTERRUPTED_REASON: &str = "Fetch interrupted by daemon restart";
+
+/// [`FETCH_INTERRUPTED_REASON`], followed by the last recorded description
+/// of what the fetch was doing, when there is one.
+#[cfg(feature = "server")]
+fn interrupted_fetch_reason(description: &str) -> String {
+    let description = description.trim();
+    if description.is_empty() {
+        FETCH_INTERRUPTED_REASON.to_string()
+    } else {
+        format!("{FETCH_INTERRUPTED_REASON} while {description}")
+    }
+}
+
 /// The status a list or detail view shows for a patchset or a patch.
 ///
 /// While an embargo holds, a finished review is shown as Embargoed, so the
@@ -8363,7 +8381,11 @@ impl Database {
     /// Removes every persisted fetch row, the ones keyed by commit.
     ///
     /// Only meaningful at startup: a fetch cannot outlive the daemon that ran
-    /// it, so any such row left from a previous run describes nothing.
+    /// it, so any such row left from a previous run describes nothing. The
+    /// activity writer runs the startup sweep,
+    /// [`Database::fail_stranded_fetching_patchsets`], just before this, and
+    /// the sweep copies a stranded fetch's description into its patchset's
+    /// `failed_reason`, which is why deleting the row loses nothing.
     pub async fn delete_fetch_activity(&self) -> Result<()> {
         self.conn
             .execute(
@@ -8385,9 +8407,11 @@ impl Database {
         patchset_id: i64,
     ) -> Result<Vec<crate::api::ActivityEntry>> {
         // Fetch work is keyed by commit, not patchset: FetchRequest carries no
-        // patchset id, so those rows have patchset_id NULL. Without bridging
-        // them, a patchset stranded mid-fetch -- the very case this exists for --
-        // would report no last activity at all.
+        // patchset id, so those rows have patchset_id NULL, and this bridge is
+        // what finds them. It serves a fetch that is still running, or one
+        // that stopped earlier in this run. After a restart the row is gone,
+        // deleted by the activity writer at startup, and the patchset's
+        // failed_reason carries where the fetch stopped instead.
         let commit_key = self
             .get_patchset_fetch_commit(patchset_id)
             .await?
@@ -9629,6 +9653,95 @@ impl Database {
             .await?;
 
         Ok(count_ps + count_rev)
+    }
+
+    /// Fails every patchset a restart left mid-fetch, and returns how many.
+    ///
+    /// Every fetch runs as an in-process task, the FetchAgent for a git
+    /// fetch or the API's spawned task for a thread fetch, so it cannot
+    /// survive a restart, and no time-based transition ever moves a
+    /// `Fetching` patchset on. Each one is failed with
+    /// [`FETCH_INTERRUPTED_REASON`], followed by what its fetch was doing
+    /// when that is still recorded.
+    ///
+    /// A fetch that fails, or runs past the time limit the fetcher puts on
+    /// every git command, already fails its own placeholder through
+    /// `IngestionFailed`. The sweep covers the one way out a time limit
+    /// cannot: the daemon stopping while the placeholder is still `Fetching`.
+    ///
+    /// Assumes one daemon per database, as `reset_reviewing_status` already
+    /// does: with a second daemon this would fail that daemon's live fetches.
+    /// Must run before the fetch activity rows it reads are deleted, so the
+    /// activity writer calls it at startup, just ahead of
+    /// `delete_fetch_activity`, from `ActivityRegistry::with_persistence`.
+    pub async fn fail_stranded_fetching_patchsets(&self) -> Result<u64> {
+        let failed = ReviewStatus::Failed.as_str();
+        let mut swept = 0;
+        for id in self.fetching_patchset_ids().await? {
+            // Where the fetch stopped is context, not the fix: failing to
+            // read it must not leave this or any later patchset in Fetching
+            // until the next restart, so the sweep falls back to the plain
+            // reason.
+            let reason = match self.stranded_fetch_reason(id).await {
+                Ok(reason) => reason,
+                Err(e) => {
+                    warn!("No fetch context for stranded patchset {}: {}", id, e);
+                    FETCH_INTERRUPTED_REASON.to_string()
+                }
+            };
+            // The status guard keeps the sweep from failing a patchset that
+            // left Fetching after the id was read.
+            swept += self
+                .conn
+                .execute(
+                    "UPDATE patchsets SET status = ?, failed_reason = ? WHERE id = ? AND status = ?",
+                    libsql::params![failed, reason, id, FETCHING],
+                )
+                .await?;
+        }
+        Ok(swept)
+    }
+
+    /// The ids of every patchset that is still `Fetching`.
+    async fn fetching_patchset_ids(&self) -> Result<Vec<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM patchsets WHERE status = ?",
+                libsql::params![FETCHING],
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get::<i64>(0)?);
+        }
+        Ok(ids)
+    }
+
+    /// The failure reason for one patchset a restart stranded mid-fetch.
+    ///
+    /// A git fetch's activity is keyed by the commit or range it fetched,
+    /// which `get_patchset_fetch_commit` recovers from the placeholder. A
+    /// thread fetch writes no activity and its placeholder is a bare message
+    /// id, so it gets the plain reason, and so does a git fetch whose
+    /// activity was never persisted.
+    async fn stranded_fetch_reason(&self, patchset_id: i64) -> Result<String> {
+        let Some(commit) = self.get_patchset_fetch_commit(patchset_id).await? else {
+            return Ok(FETCH_INTERRUPTED_REASON.to_string());
+        };
+        let key = crate::activity::ActivityKey::Commit(commit).to_string();
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT description FROM patchset_activity WHERE key = ?",
+                libsql::params![key],
+            )
+            .await?;
+        let description = match rows.next().await? {
+            Some(row) => row.get::<String>(0)?,
+            None => String::new(),
+        };
+        Ok(interrupted_fetch_reason(&description))
     }
 
     pub async fn get_patchset_counts_by_status(
@@ -17223,6 +17336,228 @@ mod tests {
         }
     }
 
+    /// The stored status and failure reason of patchset `id`, read without
+    /// the embargo masking the detail views apply.
+    async fn stored_status_and_reason(db: &Database, id: i64) -> (String, Option<String>) {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, failed_reason FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (row.get(0).unwrap(), row.get(1).unwrap())
+    }
+
+    /// Persists fetch activity for `key` as the activity writer does.
+    async fn record_fetch_activity(db: &Database, key: &str, phase: crate::activity::Phase) {
+        db.upsert_activity(
+            key,
+            None,
+            &serde_json::to_string(&phase).unwrap(),
+            &phase.describe(),
+            1,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_startup_sweep_fails_only_stranded_fetches() {
+        let db = setup_db().await;
+        let stranded = fetching_placeholder(&db, "stranded").await;
+        let mut others = Vec::new();
+        for status in ["Pending", "Incomplete", "In Review"] {
+            let id = fetching_placeholder(&db, &format!("other-{status}")).await;
+            db.update_patchset_status(id, status).await.unwrap();
+            others.push((id, status.to_string(), None));
+        }
+        let failed = fetching_placeholder(&db, "failed").await;
+        db.update_patchset_error("failed@sashiko.local", "Fetch failed")
+            .await
+            .unwrap();
+        others.push((
+            failed,
+            ReviewStatus::Failed.as_str().to_string(),
+            Some("Fetch failed".to_string()),
+        ));
+
+        assert_eq!(db.fail_stranded_fetching_patchsets().await.unwrap(), 1);
+
+        let (status, reason) = stored_status_and_reason(&db, stranded).await;
+        assert_eq!(status, ReviewStatus::Failed.as_str());
+        let reason = reason.unwrap_or_default();
+        assert!(reason.contains("restart"), "{reason}");
+
+        for (id, status, reason) in others {
+            assert_eq!(
+                stored_status_and_reason(&db, id).await,
+                (status.clone(), reason),
+                "{status}"
+            );
+        }
+
+        // Nothing is left to sweep, so a second run changes nothing.
+        assert_eq!(db.fail_stranded_fetching_patchsets().await.unwrap(), 0);
+    }
+
+    /// The activity writer deletes fetch rows at startup, so the sweep copies
+    /// what the fetch was doing into the reason first.
+    #[tokio::test]
+    async fn test_sweep_names_where_the_fetch_stopped() {
+        let db = setup_db().await;
+        let ps = fetching_placeholder(&db, "ctx").await;
+        record_fetch_activity(
+            &db,
+            "commit:ctx",
+            crate::activity::Phase::Fetching {
+                remote: "https://example.com/linux.git".to_string(),
+                commits: 3,
+            },
+        )
+        .await;
+
+        assert_eq!(db.fail_stranded_fetching_patchsets().await.unwrap(), 1);
+
+        let (_, reason) = stored_status_and_reason(&db, ps).await;
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "Fetch interrupted by daemon restart while fetching 3 commit(s) \
+                 from https://example.com/linux.git"
+            )
+        );
+    }
+
+    /// A forge fetch is keyed by the bare range, without the mr-N- prefix
+    /// its placeholder carries.
+    #[tokio::test]
+    async fn test_sweep_finds_a_forge_fetch_activity() {
+        let db = setup_db().await;
+        let ps = db
+            .create_fetching_patchset(
+                "mr-501-aaa..bbb@sashiko.local",
+                "Fetching PR",
+                None,
+                None,
+                Some("https://example.org/pr/501"),
+                Some("Title"),
+                Some(501),
+                None,
+            )
+            .await
+            .unwrap();
+        record_fetch_activity(
+            &db,
+            "commit:aaa..bbb",
+            crate::activity::Phase::GitOp {
+                op: "git remote setup for https://example.org/repo.git".to_string(),
+            },
+        )
+        .await;
+
+        assert_eq!(db.fail_stranded_fetching_patchsets().await.unwrap(), 1);
+
+        let (status, reason) = stored_status_and_reason(&db, ps).await;
+        assert_eq!(status, ReviewStatus::Failed.as_str());
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                "Fetch interrupted by daemon restart while running git remote \
+                 setup for https://example.org/repo.git"
+            )
+        );
+    }
+
+    /// With no activity on record, a git fetch placeholder and a thread
+    /// fetch placeholder, which is a bare message id, both get the plain
+    /// reason.
+    #[tokio::test]
+    async fn test_sweep_without_activity_gives_the_plain_reason() {
+        let db = setup_db().await;
+        let git = fetching_placeholder(&db, "deadbeef").await;
+        let thread = db
+            .create_fetching_patchset(
+                "thread-root@example.com",
+                "Fetching thread...",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(db.fail_stranded_fetching_patchsets().await.unwrap(), 2);
+
+        for ps in [git, thread] {
+            assert_eq!(
+                stored_status_and_reason(&db, ps).await,
+                (
+                    ReviewStatus::Failed.as_str().to_string(),
+                    Some(FETCH_INTERRUPTED_REASON.to_string())
+                ),
+                "patchset {ps}"
+            );
+        }
+    }
+
+    /// The activity description is only context: when reading it fails, the
+    /// sweep still fails every stranded patchset, with the plain reason,
+    /// rather than stopping at the first one.
+    #[tokio::test]
+    async fn test_sweep_survives_a_failed_context_lookup() {
+        let db = setup_db().await;
+        let first = fetching_placeholder(&db, "first").await;
+        let second = fetching_placeholder(&db, "second").await;
+        db.conn
+            .execute("DROP TABLE patchset_activity", ())
+            .await
+            .unwrap();
+
+        assert_eq!(db.fail_stranded_fetching_patchsets().await.unwrap(), 2);
+
+        for ps in [first, second] {
+            assert_eq!(
+                stored_status_and_reason(&db, ps).await,
+                (
+                    ReviewStatus::Failed.as_str().to_string(),
+                    Some(FETCH_INTERRUPTED_REASON.to_string())
+                ),
+                "patchset {ps}"
+            );
+        }
+    }
+
+    /// A swept patchset is Failed, which is resubmittable, so asking for the
+    /// same commit again starts a clean fetch.
+    #[tokio::test]
+    async fn test_swept_fetch_can_be_resubmitted() {
+        let db = setup_db().await;
+        let ps = fetching_placeholder(&db, "again").await;
+        assert_eq!(db.fail_stranded_fetching_patchsets().await.unwrap(), 1);
+
+        assert_eq!(fetching_placeholder(&db, "again").await, ps);
+        assert_eq!(
+            stored_status_and_reason(&db, ps).await,
+            ("Fetching".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn test_interrupted_fetch_reason_ignores_a_blank_description() {
+        assert_eq!(interrupted_fetch_reason(""), FETCH_INTERRUPTED_REASON);
+        assert_eq!(interrupted_fetch_reason("  "), FETCH_INTERRUPTED_REASON);
+        assert_eq!(
+            interrupted_fetch_reason("queued"),
+            "Fetch interrupted by daemon restart while queued"
+        );
+    }
+
     /// Verify that has_patchset_by_msgid returns false for Failed and Cancelled
     /// patchsets so that retry submissions can be re-fetched.
     #[tokio::test]
@@ -22020,7 +22355,7 @@ mod tests {
         };
         assert_eq!(fetch_rows(db.clone()).await, 1);
 
-        let _registry = crate::activity::ActivityRegistry::with_persistence(db.clone());
+        let _registry = crate::activity::ActivityRegistry::with_persistence(db.clone()).await;
         let mut remaining = 1;
         for _ in 0..100 {
             remaining = fetch_rows(db.clone()).await;
@@ -22031,6 +22366,43 @@ mod tests {
         }
         assert_eq!(remaining, 0, "a stale fetch row survived startup");
         assert_eq!(db.get_patchset_activity(4).await.unwrap().len(), 1);
+    }
+
+    /// Starting persistence both fails a stranded fetch and deletes its
+    /// activity row, and the sweep must see the row before the delete does,
+    /// or the reason loses where the fetch stopped. Creating the registry
+    /// returns only once both are done, so no wait is needed.
+    #[tokio::test]
+    async fn test_startup_keeps_fetch_context_while_clearing_fetch_rows() {
+        let db = setup_db().await;
+        let ps = fetching_placeholder(&db, "order").await;
+        record_fetch_activity(
+            &db,
+            "commit:order",
+            crate::activity::Phase::Fetching {
+                remote: "https://example.com/linux.git".to_string(),
+                commits: 2,
+            },
+        )
+        .await;
+
+        let _registry = crate::activity::ActivityRegistry::with_persistence(db.clone()).await;
+
+        assert_eq!(
+            stored_status_and_reason(&db, ps).await,
+            (
+                ReviewStatus::Failed.as_str().to_string(),
+                Some(
+                    "Fetch interrupted by daemon restart while fetching 2 commit(s) \
+                     from https://example.com/linux.git"
+                        .to_string()
+                )
+            )
+        );
+        assert!(
+            db.get_patchset_activity(ps).await.unwrap().is_empty(),
+            "the stranded fetch's activity row survived startup"
+        );
     }
 
     /// Waits for the registry's background writer to catch up.
@@ -22050,7 +22422,7 @@ mod tests {
         use crate::activity::{ActivityKey, ActivityRegistry, Phase, StageWait};
 
         let db = setup_db().await;
-        let registry = ActivityRegistry::with_persistence(db.clone());
+        let registry = ActivityRegistry::with_persistence(db.clone()).await;
         registry.update(
             ActivityKey::Patchset(31),
             Phase::ReviewingPatches { patches: 1 },
@@ -22087,7 +22459,7 @@ mod tests {
         use crate::activity::{ActivityKey, ActivityRegistry, Phase};
 
         let db = setup_db().await;
-        let registry = ActivityRegistry::with_persistence(db.clone());
+        let registry = ActivityRegistry::with_persistence(db.clone()).await;
         registry.update(ActivityKey::Patchset(44), Phase::Queued);
         registry.update(
             ActivityKey::PatchsetPatch {

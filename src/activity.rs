@@ -555,6 +555,30 @@ pub struct ActivitySnapshot {
     pub idle_seconds: u64,
 }
 
+/// Fails the patchsets a restart left mid-fetch, then clears the fetch
+/// activity rows of the previous run.
+///
+/// The order is the point. Fetch rows are keyed by commit with no patchset,
+/// so no patchset view can serve them, and only the fetch batch that wrote
+/// them deletes them; one stranded by a restart would otherwise stay
+/// forever. The sweep, `Database::fail_stranded_fetching_patchsets`, reads
+/// those rows to say in each patchset's `failed_reason` where its fetch
+/// stopped, so it has to run before they are deleted.
+///
+/// Both steps only log a failure: startup must not stop because the
+/// recovery of a previous run's state did not work.
+#[cfg(feature = "server")]
+async fn recover_stranded_fetches(db: &crate::db::Database) {
+    match db.fail_stranded_fetching_patchsets().await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!("Failed {} patchset(s) stranded mid-fetch by a restart", n),
+        Err(e) => tracing::error!("Failed to sweep stranded fetches: {}", e),
+    }
+    if let Err(e) = db.delete_fetch_activity().await {
+        tracing::debug!("Failed to clear stale fetch activity: {}", e);
+    }
+}
+
 /// Tracks what every in-flight unit of work is currently doing.
 #[derive(Debug, Default)]
 pub struct ActivityRegistry {
@@ -583,26 +607,32 @@ impl ActivityRegistry {
     ///
     /// The durable copy exists for one case: the daemon stops while work is in
     /// flight, so nothing is live to report, but the patchset is still sitting in
-    /// `Fetching` or `In Review` and needs to explain itself.
+    /// `In Review` and needs to explain itself. A patchset stranded in
+    /// `Fetching` explains itself through its `failed_reason` instead: the
+    /// writer fails it, in `recover_stranded_fetches`, before it clears the
+    /// fetch rows.
+    ///
+    /// Returns only once that recovery is done. Callers start the API and the
+    /// fetcher after this, so no fetch of this run can be mistaken for a
+    /// stranded one.
     ///
     /// The queue to the writer is unbounded: a sustained database stall grows
     /// it rather than blocking the review, which is the right trade for state
     /// that is advisory. Repeated advances within one activity are throttled by
     /// [`PERSIST_INTERVAL`], so in practice it holds a handful of rows.
     #[cfg(feature = "server")]
-    pub fn with_persistence(db: Arc<crate::db::Database>) -> Arc<Self> {
+    pub async fn with_persistence(db: Arc<crate::db::Database>) -> Arc<Self> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<PersistOp>();
+        let (recovered_tx, recovered_rx) = tokio::sync::oneshot::channel::<()>();
 
         tokio::spawn(async move {
-            // Fetch rows from a previous run are cleared before anything new
-            // is written. They are keyed by commit with no patchset, so no
-            // patchset view can serve them, and only the fetch batch that
-            // wrote them deletes them; one stranded by a restart would
-            // otherwise stay forever. Done by the writer, ahead of its first
-            // op, so it cannot race a fetch this run has already reported.
-            if let Err(e) = db.delete_fetch_activity().await {
-                tracing::debug!("Failed to clear stale fetch activity: {}", e);
-            }
+            // Recovery runs in the writer, ahead of its first op, so its
+            // delete of the previous run's fetch rows cannot race a fetch
+            // this run has already reported.
+            recover_stranded_fetches(&db).await;
+            // The receiver is gone only if the constructor was cancelled,
+            // and then nobody is waiting.
+            let _ = recovered_tx.send(());
             while let Some(op) = rx.recv().await {
                 // Best-effort: activity tracking must never be able to fail work.
                 let result = match op {
@@ -626,6 +656,12 @@ impl ActivityRegistry {
                 }
             }
         });
+
+        // An error means the writer died before recovering; startup goes on
+        // without it, as it does when the sweep itself fails.
+        if recovered_rx.await.is_err() {
+            tracing::error!("Activity writer stopped before recovering stranded fetches");
+        }
 
         Arc::new(Self {
             persist_tx: Some(tx),

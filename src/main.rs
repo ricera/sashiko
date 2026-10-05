@@ -505,7 +505,10 @@ async fn run_daemon(
     // What running fetches and reviews are doing. One registry, written by the
     // fetcher and the reviewer and read by the API, with its last-known state
     // persisted so a restart can still say where interrupted work stopped.
-    let activity = sashiko::activity::ActivityRegistry::with_persistence(db.clone());
+    // Creating it fails the patchsets a restart left mid-fetch, so it must
+    // come before the API and the fetcher: no fetch of this run can then be
+    // mistaken for a stranded one.
+    let activity = sashiko::activity::ActivityRegistry::with_persistence(db.clone()).await;
 
     // Load and initialize authoritative immutable MAINTAINERS index when the
     // reviewed project uses kernel MAINTAINERS.
