@@ -543,10 +543,16 @@ environment scrubbing and `GIT_PROTOCOL_RESTRICTIONS` stay.
     (`e.downcast_ref::<GitTimedOut>()`), the batch does not fall back to
     `fetch_all`. A remote that did not answer a small fetch will not answer
     a larger one. Any other failure keeps the fallback.
-  - When the fetch of an `Added` remote fails, the remote is removed again
-    (`remote remove`, `Local`; a failure is logged and ignored). The next
-    request for that URL is then a first fetch again, with the first-fetch
-    budget, instead of a 300 s retry of a transfer that needed more.
+  - When the fetch of an `Added` remote fails other than by a timeout, the
+    remote is removed again (`remote remove`, `Local`; a failure is logged
+    and ignored). The next request for that URL is then a first fetch
+    again, with the first-fetch budget, instead of a 300 s retry of a
+    transfer that needed more.
+  - When it timed out, the remote is kept. It had the whole first-fetch
+    budget and a fetch does not resume, so a second 1800 s attempt would
+    end the same way. Removing it would give a remote that never answers
+    1800 s on every request, not once; kept, its next request runs under
+    `Fetch`.
   - Either failure then ends the batch's requests through part 1.
   - `BatchMarks`' `Drop` clears the activity row.
 - `is_present`: `Local`. An `Err` is already treated as "missing".
@@ -966,7 +972,7 @@ commit.
 6. **fetcher: bound every git command and kill it when abandoned.** §3.3
    part 2: `GitOp`, `RemoteSetup`, `GitTimedOut`, `run_git`, the low-speed
    limit, no fallback after a timeout, and removing a remote whose first
-   fetch failed. Its tests.
+   fetch failed other than by a timeout. Its tests.
 7. **db: fail fetches a daemon restart stranded.**
    - The sweep, its startup call and the comment updates in `activity.rs`,
      `server.rs` and `db.rs`.
@@ -1055,8 +1061,10 @@ because `output()` already closes it.
 - (a) 300 s per attempt for every fetch, as in the fork.
 - (b) 1800 s per attempt when `ensure_remote` just added the remote, 300 s
   otherwise, as `git_ops::refresh_remote` does. A remote whose first fetch
-  failed is removed again, so its next request is again a first fetch. A
-  timed-out `fetch_commits` does not fall back to `fetch_all`.
+  failed other than by a timeout is removed again, so its next request is
+  again a first fetch; one whose first fetch timed out is kept, so its next
+  request runs under 300 s. A timed-out `fetch_commits` does not fall back
+  to `fetch_all`.
 - (c) One long budget for every fetch, relying on stall detection (D14) to
   end hung remotes early.
 
