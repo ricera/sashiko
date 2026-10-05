@@ -709,6 +709,19 @@ Body";
         assert!(meta.is_patch_or_cover);
     }
 
+    /// The premise of the reviewer's empty-diff skip for mailing-list
+    /// patches: a quilt-style patch, with no `diff --git` line, is still
+    /// stored with a non-empty diff, so the skip never drops it.
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_quilt_patch_without_git_header_keeps_its_diff() {
+        let raw = b"Message-ID: <quilt>\r\nSubject: [PATCH] mm: fix x\r\n\r\nFix x.\n\n--- a/mm/x.c~mm-fix-x\n+++ a/mm/x.c\n@@ -1 +1 @@\n-a\n+b\n";
+        let (_, patch) = parse_email(raw).unwrap();
+        let patch = patch.expect("a quilt-style patch is still a patch");
+        assert!(!patch.diff.trim().is_empty(), "{:?}", patch.diff);
+        assert!(!patch.diff.contains("diff --git"));
+    }
+
     #[cfg(feature = "server")]
     #[test]
     fn test_single_patch_no_diff_ignored() {
