@@ -73,6 +73,41 @@ impl Drop for BatchMarks<'_> {
     }
 }
 
+/// One requested commit or range, with the commits it needs present.
+struct BatchRequest {
+    /// The commit or `base..head` range as it was requested.
+    commit_or_range: String,
+    /// The commit itself, or both ends of a range.
+    endpoints: Vec<String>,
+}
+
+impl BatchRequest {
+    fn new(commit_or_range: String) -> Self {
+        let endpoints = if commit_or_range.contains("..") {
+            let parts: Vec<&str> = commit_or_range.split("..").collect();
+            match parts.as_slice() {
+                [base, head] => [*base, head.trim_start_matches('.')]
+                    .into_iter()
+                    .filter(|endpoint| !endpoint.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            vec![commit_or_range.clone()]
+        };
+        Self {
+            commit_or_range,
+            endpoints,
+        }
+    }
+
+    /// Whether the request needs any of the `missing` commits.
+    fn needs_any(&self, missing: &[String]) -> bool {
+        self.endpoints.iter().any(|e| missing.contains(e))
+    }
+}
+
 impl FetchAgent {
     pub fn new(
         repo_path: PathBuf,
@@ -132,278 +167,279 @@ impl FetchAgent {
             if commits.is_empty() {
                 continue;
             }
+            self.process_batch(url_opt.as_deref(), commits.into_iter().collect())
+                .await;
+        }
+    }
 
-            let commit_list: Vec<String> = commits.into_iter().collect();
-            let url_display = url_opt.as_deref().unwrap_or("local");
-            let marks = BatchMarks {
-                activity: &self.activity,
-                commits: commit_list.clone(),
-            };
-            marks.mark(Phase::GitOp {
-                op: "git rev-parse (checking commit presence)".to_string(),
-            });
+    /// Fetches what one repository's batch is missing, then submits every
+    /// request that can still be served.
+    async fn process_batch(&self, url_opt: Option<&str>, commit_list: Vec<String>) {
+        let marks = BatchMarks {
+            activity: &self.activity,
+            commits: commit_list.clone(),
+        };
+        marks.mark(Phase::GitOp {
+            op: "git rev-parse (checking commit presence)".to_string(),
+        });
 
-            info!(
-                "Processing {} commits for remote {}",
-                commit_list.len(),
-                url_display
-            );
+        info!(
+            "Processing {} commits for remote {}",
+            commit_list.len(),
+            url_opt.unwrap_or("local")
+        );
 
-            // For ranges (base..head), we need to check both endpoints individually
-            let mut commits_to_check = Vec::new();
-            for commit_or_range in &commit_list {
-                if commit_or_range.contains("..") {
-                    let parts: Vec<&str> = commit_or_range.split("..").collect();
-                    if parts.len() == 2 {
-                        let base = parts[0];
-                        let head = parts[1].trim_start_matches('.');
-                        if !base.is_empty() {
-                            commits_to_check.push(base.to_string());
-                        }
-                        if !head.is_empty() {
-                            commits_to_check.push(head.to_string());
-                        }
-                    }
-                } else {
-                    commits_to_check.push(commit_or_range.clone());
-                }
+        let requests: Vec<BatchRequest> = commit_list.into_iter().map(BatchRequest::new).collect();
+        let missing = self.missing_endpoints(&requests).await;
+
+        let requests = match self.fetch_missing(url_opt, &missing, &marks).await {
+            Ok(()) => requests,
+            Err(e) => {
+                error!("{}", e);
+                self.fail_unfetched(requests, &missing, &e.to_string())
+                    .await
             }
+        };
 
-            let mut missing_commits = Vec::new();
-            for commit in &commits_to_check {
-                if !self.is_present(commit).await {
-                    missing_commits.push(commit.clone());
-                }
-            }
-
-            if missing_commits.is_empty() {
-                info!(
-                    "All commits present locally, skipping fetch for {}",
-                    url_display
-                );
-            } else if let Some(url) = url_opt {
-                // Remote fetch logic
-                let remote_name = self.get_remote_name(&url);
-
-                // Check if repo is local (same as self.repo_path)
-                let is_local = {
-                    let url_path = PathBuf::from(&url);
-                    if let (Ok(canon_url), Ok(canon_repo)) = (
-                        std::fs::canonicalize(&url_path),
-                        std::fs::canonicalize(&self.repo_path),
-                    ) {
-                        canon_url == canon_repo
-                    } else {
-                        false
-                    }
-                };
-
-                if is_local {
-                    warn!(
-                        "Repository is local but commits are missing: {:?}. Cannot fetch.",
-                        missing_commits
-                    );
-                    // Do not continue here; let it fall through to Step 3 where it will fail individually
-                } else {
-                    // Redacted: a forge token can ride in the URL, and this is
-                    // served to anyone who can read the patchset.
-                    let remote = redact_secret(&url);
-                    marks.mark(Phase::GitOp {
-                        op: format!("git remote setup for {}", remote),
-                    });
-                    if let Err(e) = self.ensure_remote(&remote_name, &url).await {
-                        error!("Failed to ensure remote {}: {}", url, e);
-                        for commit in &missing_commits {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit.clone(),
-                                    error: format!("Failed to set up remote {}: {}", url, e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                        }
-                        continue;
-                    }
-
-                    // 1. Try optimistic fetch (fetch specific commits)
-                    marks.mark(Phase::Fetching {
-                        remote: remote.clone(),
-                        commits: missing_commits.len(),
-                    });
-                    if let Err(e) = self.fetch_commits(&remote_name, &missing_commits).await {
-                        warn!(
-                            "Optimistic fetch failed for {}: {}. Falling back to full fetch.",
-                            url, e
-                        );
-                        // 2. Fallback: Fetch everything (heads)
-                        marks.mark(Phase::Fetching {
-                            remote: format!("{} (all heads)", remote),
-                            commits: missing_commits.len(),
-                        });
-                        if let Err(e) = self.fetch_all(&remote_name).await {
-                            error!("Full fetch failed for {}: {}", url, e);
-                            for commit in &missing_commits {
-                                let _ = self
-                                    .main_tx
-                                    .send(Event::IngestionFailed {
-                                        article_id: commit.clone(),
-                                        error: format!("Failed to fetch from {}: {}", url, e),
-                                        source: MessageSource::GitFetch,
-                                    })
-                                    .await;
-                            }
-                            continue;
-                        }
-                    }
-                }
+        marks.mark(Phase::GitOp {
+            op: "extracting patch metadata".to_string(),
+        });
+        for request in requests {
+            if request.commit_or_range.contains("..") {
+                self.submit_range(&request.commit_or_range).await;
             } else {
-                // Local repo, but commits are missing
-                warn!(
-                    "Local repository missing commits: {:?}. Cannot fetch.",
-                    missing_commits
-                );
+                self.submit_commit(&request.commit_or_range).await;
             }
+        }
+    }
 
-            // 3. Process each commit or range
-            marks.mark(Phase::GitOp {
-                op: "extracting patch metadata".to_string(),
-            });
-            for commit_or_range in commit_list {
-                if commit_or_range.contains("..") {
-                    // It's a range
-                    let range = &commit_or_range;
+    /// The batch's endpoints that are not in the repository, each checked
+    /// once, in request order. This is the union the batch fetches.
+    async fn missing_endpoints(&self, requests: &[BatchRequest]) -> Vec<String> {
+        let mut checked = HashSet::new();
+        let mut missing = Vec::new();
+        for endpoint in requests.iter().flat_map(|r| &r.endpoints) {
+            if checked.insert(endpoint.as_str()) && !self.is_present(endpoint).await {
+                missing.push(endpoint.clone());
+            }
+        }
+        missing
+    }
 
-                    let shas = match crate::git_ops::resolve_git_range(&self.repo_path, range).await
-                    {
-                        Ok(shas) => shas,
-                        Err(e) => {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: range.clone(),
-                                    error: format!("Failed to resolve git range: {}", e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
-                    let count = shas.len() as u32;
+    /// Brings the missing endpoints in from the batch's remote.
+    ///
+    /// Returns `Ok` without fetching when nothing is missing or there is no
+    /// other repository to fetch from; a request whose commits are still
+    /// absent then fails on its own when it is submitted. An `Err` carries
+    /// the wording that every request needing a missing commit fails with.
+    async fn fetch_missing(
+        &self,
+        url_opt: Option<&str>,
+        missing: &[String],
+        marks: &BatchMarks<'_>,
+    ) -> Result<()> {
+        if missing.is_empty() {
+            info!(
+                "All commits present locally, skipping fetch for {}",
+                url_opt.unwrap_or("local")
+            );
+            return Ok(());
+        }
+        let Some(url) = url_opt else {
+            warn!(
+                "Local repository missing commits: {:?}. Cannot fetch.",
+                missing
+            );
+            return Ok(());
+        };
+        if self.is_own_repo(url) {
+            warn!(
+                "Repository is local but commits are missing: {:?}. Cannot fetch.",
+                missing
+            );
+            return Ok(());
+        }
 
-                    // Process each SHA
-                    let (mr_url, mr_title, mr_number) = self
-                        .mr_metadata
-                        .get(range)
-                        .cloned()
-                        .unwrap_or((None, None, None));
+        let remote_name = self.get_remote_name(url);
+        // Redacted: a forge token can ride in the URL, and both the activity
+        // and a failed request's reason are served to anyone who can read
+        // the patchset.
+        let remote = redact_secret(url);
+        marks.mark(Phase::GitOp {
+            op: format!("git remote setup for {}", remote),
+        });
+        if let Err(e) = self.ensure_remote(&remote_name, url).await {
+            return Err(anyhow!("Failed to set up remote {}: {}", remote, e));
+        }
 
-                    let article_id = if let Some(number) = mr_number {
-                        format!("mr-{}-{}", number, range)
-                    } else {
-                        range.to_string()
-                    };
+        // 1. Try optimistic fetch (fetch specific commits)
+        marks.mark(Phase::Fetching {
+            remote: remote.clone(),
+            commits: missing.len(),
+        });
+        let Err(e) = self.fetch_commits(&remote_name, missing).await else {
+            return Ok(());
+        };
+        warn!(
+            "Optimistic fetch failed for {}: {}. Falling back to full fetch.",
+            remote, e
+        );
 
-                    for (i, sha) in shas.iter().enumerate() {
-                        match self
-                            .extract_patch(
-                                sha,
-                                &article_id,
-                                (i + 1) as u32,
-                                count,
-                                mr_url.as_ref(),
-                                mr_title.as_ref(),
-                                mr_number,
-                            )
-                            .await
-                        {
-                            Ok(mut event) => {
-                                if let Event::PatchSubmitted {
-                                    ref mut message_id, ..
-                                } = event
-                                {
-                                    *message_id = sha.clone();
-                                }
-                                if let Err(e) = self.main_tx.send(event).await {
-                                    error!("Failed to send PatchSubmitted event: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to extract patch {} from range {}: {}",
-                                    sha, range, e
-                                );
-                            }
-                        }
-                    }
-                    info!("Successfully submitted remote range {}", range);
-                } else {
-                    // Single commit
-                    let full_sha = match self.resolve_sha(&commit_or_range).await {
-                        Ok(sha) => sha,
-                        Err(e) => {
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit_or_range.clone(),
-                                    error: format!("Failed to resolve SHA: {}", e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                            continue;
-                        }
-                    };
+        // 2. Fallback: Fetch everything (heads)
+        marks.mark(Phase::Fetching {
+            remote: format!("{} (all heads)", remote),
+            commits: missing.len(),
+        });
+        self.fetch_all(&remote_name)
+            .await
+            .map_err(|e| anyhow!("Failed to fetch from {}: {}", remote, e))
+    }
 
-                    let (mr_url, mr_title, mr_number) = self
-                        .mr_metadata
-                        .get(&commit_or_range)
-                        .cloned()
-                        .unwrap_or((None, None, None));
+    /// Whether `url` names the fetcher's own repository, which has nothing
+    /// to fetch from.
+    fn is_own_repo(&self, url: &str) -> bool {
+        match (
+            std::fs::canonicalize(url),
+            std::fs::canonicalize(&self.repo_path),
+        ) {
+            (Ok(canon_url), Ok(canon_repo)) => canon_url == canon_repo,
+            _ => false,
+        }
+    }
 
-                    let article_id = if let Some(number) = mr_number {
-                        format!("mr-{}-{}", number, commit_or_range)
-                    } else {
-                        commit_or_range.clone()
-                    };
+    /// Fails every request that needed a commit the failed fetch was to
+    /// bring, and returns the rest, whose commits were all present already
+    /// and can still be submitted.
+    async fn fail_unfetched(
+        &self,
+        requests: Vec<BatchRequest>,
+        missing: &[String],
+        error: &str,
+    ) -> Vec<BatchRequest> {
+        let (unfetched, ready): (Vec<_>, Vec<_>) =
+            requests.into_iter().partition(|r| r.needs_any(missing));
+        for request in unfetched {
+            self.fail_request(&request.commit_or_range, error.to_string())
+                .await;
+        }
+        ready
+    }
 
-                    match self
-                        .extract_patch(
-                            &full_sha,
-                            &article_id,
-                            1,
-                            1,
-                            mr_url.as_ref(),
-                            mr_title.as_ref(),
-                            mr_number,
-                        )
-                        .await
-                    {
-                        Ok(mut event) => {
-                            if let Event::PatchSubmitted {
-                                ref mut message_id, ..
-                            } = event
-                            {
-                                *message_id = full_sha.clone();
-                            }
-                            if let Err(e) = self.main_tx.send(event).await {
-                                error!("Failed to send PatchSubmitted event: {}", e);
-                            } else {
-                                info!("Successfully submitted remote patch {}", commit_or_range);
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to extract patch {}: {}", commit_or_range, e);
-                            let _ = self
-                                .main_tx
-                                .send(Event::IngestionFailed {
-                                    article_id: commit_or_range,
-                                    error: format!("Failed to extract patch: {}", e),
-                                    source: MessageSource::GitFetch,
-                                })
-                                .await;
-                        }
+    /// The article id every event about a request carries:
+    /// `mr-{n}-{commit_or_range}` for a forge request, the request itself
+    /// otherwise.
+    ///
+    /// The API's placeholder patchset is this id with `@sashiko.local`
+    /// appended. An event named after anything else, such as one endpoint
+    /// of a range, misses the placeholder and can match an unrelated
+    /// patchset submitted for that commit alone.
+    fn request_article_id(&self, commit_or_range: &str) -> String {
+        match self.mr_fields(commit_or_range).2 {
+            Some(number) => format!("mr-{}-{}", number, commit_or_range),
+            None => commit_or_range.to_string(),
+        }
+    }
+
+    /// The forge URL, title and number recorded for a request, if any.
+    fn mr_fields(&self, commit_or_range: &str) -> (Option<String>, Option<String>, Option<i64>) {
+        self.mr_metadata
+            .get(commit_or_range)
+            .cloned()
+            .unwrap_or((None, None, None))
+    }
+
+    /// Ends a request with `IngestionFailed`, so that its placeholder
+    /// patchset leaves Fetching with `error` as its reason.
+    async fn fail_request(&self, commit_or_range: &str, error: String) {
+        let event = Event::IngestionFailed {
+            article_id: self.request_article_id(commit_or_range),
+            error,
+            source: MessageSource::GitFetch,
+        };
+        if let Err(e) = self.main_tx.send(event).await {
+            error!("Failed to send IngestionFailed event: {}", e);
+        }
+    }
+
+    /// Submits every commit of a `base..head` range as one series.
+    async fn submit_range(&self, range: &str) {
+        let shas = match crate::git_ops::resolve_git_range(&self.repo_path, range).await {
+            Ok(shas) => shas,
+            Err(e) => {
+                self.fail_request(range, format!("Failed to resolve git range: {}", e))
+                    .await;
+                return;
+            }
+        };
+        let count = shas.len() as u32;
+        let (mr_url, mr_title, mr_number) = self.mr_fields(range);
+        let article_id = self.request_article_id(range);
+
+        for (i, sha) in shas.iter().enumerate() {
+            match self
+                .extract_patch(
+                    sha,
+                    &article_id,
+                    (i + 1) as u32,
+                    count,
+                    mr_url.as_ref(),
+                    mr_title.as_ref(),
+                    mr_number,
+                )
+                .await
+            {
+                Ok(event) => {
+                    if let Err(e) = self.main_tx.send(event).await {
+                        error!("Failed to send PatchSubmitted event: {}", e);
                     }
                 }
+                Err(e) => {
+                    error!(
+                        "Failed to extract patch {} from range {}: {}",
+                        sha, range, e
+                    );
+                }
+            }
+        }
+        info!("Successfully submitted remote range {}", range);
+    }
+
+    /// Submits a single commit as a one-patch series.
+    async fn submit_commit(&self, commit: &str) {
+        let full_sha = match self.resolve_sha(commit).await {
+            Ok(sha) => sha,
+            Err(e) => {
+                self.fail_request(commit, format!("Failed to resolve SHA: {}", e))
+                    .await;
+                return;
+            }
+        };
+        let (mr_url, mr_title, mr_number) = self.mr_fields(commit);
+        let article_id = self.request_article_id(commit);
+
+        match self
+            .extract_patch(
+                &full_sha,
+                &article_id,
+                1,
+                1,
+                mr_url.as_ref(),
+                mr_title.as_ref(),
+                mr_number,
+            )
+            .await
+        {
+            Ok(event) => {
+                if let Err(e) = self.main_tx.send(event).await {
+                    error!("Failed to send PatchSubmitted event: {}", e);
+                } else {
+                    info!("Successfully submitted remote patch {}", commit);
+                }
+            }
+            Err(e) => {
+                error!("Failed to extract patch {}: {}", commit, e);
+                self.fail_request(commit, format!("Failed to extract patch: {}", e))
+                    .await;
             }
         }
     }
@@ -638,7 +674,7 @@ impl FetchAgent {
         Ok(Event::PatchSubmitted {
             group: "git-fetch".to_string(),
             article_id: article_id.to_string(),
-            message_id: String::new(), // Set by caller
+            message_id: commit.to_string(),
             subject: meta.subject,
             author: meta.author,
             message: meta.message,
@@ -660,6 +696,87 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
+    /// A remote that refuses every connection at once, so a fetch from it
+    /// fails without waiting on the network.
+    const REFUSING_REMOTE: &str = "http://127.0.0.1:1/nonexistent.git";
+    const MISSING_BASE: &str = "1111111111111111111111111111111111111111";
+    const MISSING_HEAD: &str = "2222222222222222222222222222222222222222";
+
+    /// Creates a repository with one commit and returns that commit's SHA.
+    async fn init_repo_with_commit(repo_path: &std::path::Path) -> Result<String> {
+        for args in [
+            &["init"][..],
+            &["config", "user.name", "Test User"],
+            &["config", "user.email", "test@example.com"],
+        ] {
+            crate::git_cmd::in_dir_async(repo_path)
+                .args(args)
+                .output()
+                .await?;
+        }
+
+        let mut file = File::create(repo_path.join("file.txt"))?;
+        writeln!(file, "content")?;
+
+        crate::git_cmd::in_dir_async(repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        crate::git_cmd::in_dir_async(repo_path)
+            .args(["commit", "-m", "Subject Line\n\nBody Line"])
+            .output()
+            .await?;
+
+        let output = crate::git_cmd::in_dir_async(repo_path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .await?;
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    }
+
+    /// Runs one batch of `requests` against the refusing remote and returns
+    /// every event the agent sent for it.
+    async fn run_refused_batch(
+        agent: &FetchAgent,
+        rx: &mut mpsc::Receiver<Event>,
+        requests: &[&str],
+    ) -> Vec<Event> {
+        let mut queue = HashMap::new();
+        queue.insert(
+            Some(REFUSING_REMOTE.to_string()),
+            requests.iter().map(|r| r.to_string()).collect(),
+        );
+        agent.process_queue(&mut queue).await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// The article ids of the `IngestionFailed` events among `events`.
+    fn failed_ids(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::IngestionFailed { article_id, .. } => Some(article_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The article ids of the `PatchSubmitted` events among `events`.
+    fn submitted_ids(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::PatchSubmitted { article_id, .. } => Some(article_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn test_fetch_agent_lifecycle() {
         let (tx, _rx) = mpsc::channel(1);
@@ -671,42 +788,10 @@ mod tests {
     async fn test_extract_patch_parsing() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let repo_path = temp_dir.path().to_path_buf();
-
-        // Setup dummy repo
-        crate::git_cmd::in_dir_async(&repo_path)
-            .arg("init")
-            .output()
-            .await?;
-        crate::git_cmd::in_dir_async(&repo_path)
-            .args(["config", "user.name", "Test User"])
-            .output()
-            .await?;
-        crate::git_cmd::in_dir_async(&repo_path)
-            .args(["config", "user.email", "test@example.com"])
-            .output()
-            .await?;
-
-        let file_path = repo_path.join("file.txt");
-        let mut file = File::create(&file_path)?;
-        writeln!(file, "content")?;
-
-        crate::git_cmd::in_dir_async(&repo_path)
-            .args(["add", "."])
-            .output()
-            .await?;
-        crate::git_cmd::in_dir_async(&repo_path)
-            .args(["commit", "-m", "Subject Line\n\nBody Line"])
-            .output()
-            .await?;
+        let head = init_repo_with_commit(&repo_path).await?;
 
         let (tx, _rx) = mpsc::channel(1);
         let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None, ActivityRegistry::new());
-
-        let output = crate::git_cmd::in_dir_async(&repo_path)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .await?;
-        let head = String::from_utf8(output.stdout)?.trim().to_string();
 
         let event = agent
             .extract_patch(&head, &head, 1, 1, None, None, None)
@@ -719,6 +804,7 @@ mod tests {
                 message,
                 diff,
                 article_id,
+                message_id,
                 ..
             } => {
                 assert_eq!(subject, "Subject Line");
@@ -726,6 +812,7 @@ mod tests {
                 assert!(message.contains("Body Line"));
                 assert!(diff.contains("diff --git"));
                 assert_eq!(article_id, head);
+                assert_eq!(message_id, head);
             }
             _ => panic!("Wrong event type"),
         }
@@ -737,33 +824,7 @@ mod tests {
     async fn test_is_present_with_tree_sha() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let repo_path = temp_dir.path().to_path_buf();
-
-        // Setup dummy repo
-        crate::git_cmd::in_dir_async(&repo_path)
-            .arg("init")
-            .output()
-            .await?;
-        crate::git_cmd::in_dir_async(&repo_path)
-            .args(["config", "user.name", "Test User"])
-            .output()
-            .await?;
-        crate::git_cmd::in_dir_async(&repo_path)
-            .args(["config", "user.email", "test@example.com"])
-            .output()
-            .await?;
-
-        let file_path = repo_path.join("file.txt");
-        let mut file = File::create(&file_path)?;
-        writeln!(file, "content")?;
-
-        crate::git_cmd::in_dir_async(&repo_path)
-            .args(["add", "."])
-            .output()
-            .await?;
-        crate::git_cmd::in_dir_async(&repo_path)
-            .args(["commit", "-m", "Subject Line"])
-            .output()
-            .await?;
+        let commit_sha = init_repo_with_commit(&repo_path).await?;
 
         let (tx, _rx) = mpsc::channel(1);
         let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None, ActivityRegistry::new());
@@ -778,18 +839,105 @@ mod tests {
             !agent.is_present(&tree_sha).await,
             "Tree SHA should not be considered a present commit"
         );
-
-        let output = crate::git_cmd::in_dir_async(&repo_path)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .await?;
-        let commit_sha = String::from_utf8(output.stdout)?.trim().to_string();
-
         assert!(
             agent.is_present(&commit_sha).await,
             "Commit SHA should be considered present"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn batch_request_splits_a_range_into_its_endpoints() {
+        let range = BatchRequest::new("a..b".to_string());
+        assert_eq!(range.endpoints, ["a", "b"]);
+        let symmetric = BatchRequest::new("a...b".to_string());
+        assert_eq!(symmetric.endpoints, ["a", "b"]);
+        let commit = BatchRequest::new("a".to_string());
+        assert_eq!(commit.endpoints, ["a"]);
+        assert!(range.needs_any(&["b".to_string()]));
+        assert!(!range.needs_any(&["c".to_string()]));
+    }
+
+    /// A failed range fetch fails the range, whose placeholder the API
+    /// created, and not the endpoint SHAs, which name no placeholder.
+    #[tokio::test]
+    async fn failed_range_fetch_names_the_range() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        init_repo_with_commit(temp_dir.path()).await?;
+        let (tx, mut rx) = mpsc::channel(16);
+        let (agent, _) = FetchAgent::new(
+            temp_dir.path().to_path_buf(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+        );
+
+        let range = format!("{}..{}", MISSING_BASE, MISSING_HEAD);
+        let events = run_refused_batch(&agent, &mut rx, &[&range]).await;
+
+        assert_eq!(failed_ids(&events), [range.as_str()]);
+        assert!(submitted_ids(&events).is_empty());
+        let Some(Event::IngestionFailed { error, .. }) = events.first() else {
+            panic!("expected IngestionFailed, got {:?}", events.first());
+        };
+        assert!(
+            error.starts_with(&format!("Failed to fetch from {}: ", REFUSING_REMOTE)),
+            "the reason should be the fetch error, got: {}",
+            error
+        );
+        Ok(())
+    }
+
+    /// A forge request's failure carries the `mr-{n}-` prefix its placeholder
+    /// was created with, for a range and for a single commit alike.
+    #[tokio::test]
+    async fn failed_forge_fetch_names_the_placeholder() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        init_repo_with_commit(temp_dir.path()).await?;
+        let (tx, mut rx) = mpsc::channel(16);
+        let (mut agent, _) = FetchAgent::new(
+            temp_dir.path().to_path_buf(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+        );
+
+        let range = format!("{}..{}", MISSING_BASE, MISSING_HEAD);
+        let commit = "3333333333333333333333333333333333333333";
+        for request in [range.as_str(), commit] {
+            agent
+                .mr_metadata
+                .insert(request.to_string(), (None, None, Some(7)));
+        }
+
+        let events = run_refused_batch(&agent, &mut rx, &[&range]).await;
+        assert_eq!(failed_ids(&events), [format!("mr-7-{}", range)]);
+
+        let events = run_refused_batch(&agent, &mut rx, &[commit]).await;
+        assert_eq!(failed_ids(&events), [format!("mr-7-{}", commit)]);
+        Ok(())
+    }
+
+    /// A request whose commits were all present is still submitted when the
+    /// fetch for another request in its batch fails.
+    #[tokio::test]
+    async fn present_request_survives_a_failed_fetch() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let head = init_repo_with_commit(temp_dir.path()).await?;
+        let (tx, mut rx) = mpsc::channel(16);
+        let (agent, _) = FetchAgent::new(
+            temp_dir.path().to_path_buf(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+        );
+
+        let range = format!("{}..{}", MISSING_BASE, MISSING_HEAD);
+        let events = run_refused_batch(&agent, &mut rx, &[&range, &head]).await;
+
+        assert_eq!(failed_ids(&events), [range.as_str()]);
+        assert_eq!(submitted_ids(&events), [head.as_str()]);
         Ok(())
     }
 }

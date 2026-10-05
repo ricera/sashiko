@@ -111,6 +111,12 @@ const HELD_OUTCOMES: [PatchOutcome; 3] = [
 #[cfg(feature = "server")]
 const LEGACY_FAILED_TO_APPLY: &str = "FailedToApply";
 
+/// The status of a placeholder patchset whose commits or thread are still
+/// being fetched. It is not a [`ReviewStatus`] variant, because adding one
+/// would touch every exhaustive match on the review statuses.
+#[cfg(feature = "server")]
+const FETCHING: &str = "Fetching";
+
 /// The status a list or detail view shows for a patchset or a patch.
 ///
 /// While an embargo holds, a finished review is shown as Embargoed, so the
@@ -9509,20 +9515,57 @@ impl Database {
         }
     }
     pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
-        let candidates = Self::get_msgid_candidates(root_msg_id);
-        for clid in candidates {
-            let res = self
-                .conn
-                .execute(
-                    "UPDATE patchsets SET status = 'Failed', failed_reason = ? WHERE cover_letter_message_id = ?",
-                    libsql::params![error, clid],
-                )
-                .await?;
+        self.fail_patchset_by_msgid(root_msg_id, error, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Fails the placeholder patchset `root_msg_id` names, but only while it
+    /// is still Fetching, and returns whether one was failed.
+    ///
+    /// A failed git fetch is about the request that created or reset the
+    /// placeholder. A forge webhook queues a range again even when its
+    /// placeholder has finished, because `create_fetching_patchset` leaves
+    /// a finished row as it is, and that second fetch can fail where the
+    /// first succeeded. Its failure must not overwrite the finished review.
+    pub async fn fail_fetching_patchset(&self, root_msg_id: &str, error: &str) -> Result<bool> {
+        self.fail_patchset_by_msgid(root_msg_id, error, Some(FETCHING))
+            .await
+    }
+
+    /// Fails the first patchset whose cover letter matches a candidate form
+    /// of `root_msg_id`, limited to one in `only_status` when that is given.
+    async fn fail_patchset_by_msgid(
+        &self,
+        root_msg_id: &str,
+        error: &str,
+        only_status: Option<&str>,
+    ) -> Result<bool> {
+        let failed = ReviewStatus::Failed.as_str();
+        for clid in Self::get_msgid_candidates(root_msg_id) {
+            let res = match only_status {
+                None => {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET status = ?, failed_reason = ? WHERE cover_letter_message_id = ?",
+                            libsql::params![failed, error, clid],
+                        )
+                        .await?
+                }
+                Some(status) => {
+                    self.conn
+                        .execute(
+                            "UPDATE patchsets SET status = ?, failed_reason = ? WHERE cover_letter_message_id = ? AND status = ?",
+                            libsql::params![failed, error, clid, status],
+                        )
+                        .await?
+                }
+            };
             if res > 0 {
-                return Ok(());
+                return Ok(true);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     pub async fn update_patchset_baseline_info(
@@ -17104,6 +17147,80 @@ mod tests {
             db.has_patchset_by_msgid(sha_patch).await.unwrap(),
             "has_patchset_by_msgid should return true for SHA existing in patches table"
         );
+    }
+
+    /// A placeholder like the API creates for a git fetch of `id`.
+    async fn fetching_placeholder(db: &Database, id: &str) -> i64 {
+        db.create_fetching_patchset(
+            &format!("{}@sashiko.local", id),
+            "Fetching placeholder",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The status and failure reason of the patchset `id` names.
+    async fn status_and_reason(db: &Database, id: &str) -> (serde_json::Value, serde_json::Value) {
+        let details = db
+            .get_patchset_details_by_msgid(id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        (details["status"].clone(), details["failed_reason"].clone())
+    }
+
+    /// The fetcher fails a range or forge request under the request's own
+    /// article id, and that id must reach the API's placeholder.
+    #[tokio::test]
+    async fn test_fetch_failure_reaches_range_and_forge_placeholders() {
+        let db = setup_db().await;
+        let range =
+            "aaaa000000000000000000000000000000000000..bbbb000000000000000000000000000000000000";
+        let forge = format!("mr-7-{}", range);
+
+        for id in [range, forge.as_str()] {
+            fetching_placeholder(&db, id).await;
+            let failed = db
+                .fail_fetching_patchset(&format!("{}@sashiko.local", id), "Fetch failed")
+                .await
+                .unwrap();
+            assert!(failed, "{}", id);
+            let (status, reason) = status_and_reason(&db, id).await;
+            assert_eq!(status, ReviewStatus::Failed.as_str(), "{}", id);
+            assert_eq!(reason, "Fetch failed", "{}", id);
+        }
+    }
+
+    /// A fetch failure must not overwrite a patchset that already finished:
+    /// neither one submitted for a range endpoint on its own, which the
+    /// fetcher used to fail by mistake, nor a forge placeholder whose review
+    /// finished before a webhook queued its range again.
+    #[tokio::test]
+    async fn test_fetch_failure_leaves_a_finished_patchset_alone() {
+        let db = setup_db().await;
+        let base = "aaaa000000000000000000000000000000000000";
+        let forge = format!("mr-7-{}..bbbb000000000000000000000000000000000000", base);
+
+        for id in [base, forge.as_str()] {
+            let ps = fetching_placeholder(&db, id).await;
+            db.update_patchset_status(ps, ReviewStatus::Reviewed.as_str())
+                .await
+                .unwrap();
+            let failed = db
+                .fail_fetching_patchset(&format!("{}@sashiko.local", id), "Fetch failed")
+                .await
+                .unwrap();
+            assert!(!failed, "{}", id);
+            let (status, reason) = status_and_reason(&db, id).await;
+            assert_eq!(status, ReviewStatus::Reviewed.as_str(), "{}", id);
+            assert!(reason.is_null(), "{}", id);
+        }
     }
 
     /// Verify that has_patchset_by_msgid returns false for Failed and Cancelled
