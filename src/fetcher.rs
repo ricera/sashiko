@@ -18,11 +18,125 @@ use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::{Output, Stdio};
+use std::process::Output;
 use std::sync::Arc;
+use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, interval};
 use tracing::{error, info, warn};
+
+/// How long a fetcher git command may run before it is killed.
+///
+/// `FetchAgent::run` awaits each batch inline, so one git command that never
+/// returns, such as a fetch from a remote that stopped answering, would stop
+/// every later fetch and leave its patchsets in Fetching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GitOp {
+    /// rev-parse, rev-list, remote get-url/set-url/add/remove.
+    Local,
+    /// One `git fetch` attempt against a remote that existed before this
+    /// batch.
+    Fetch,
+    /// One `git fetch` attempt against a remote `ensure_remote` just added.
+    /// It may have to transfer much more, as `refresh_remote` allows for.
+    FirstFetch,
+}
+
+impl GitOp {
+    fn limit(self) -> Duration {
+        match self {
+            // Local commands never touch the network, so anything this slow
+            // is pathological.
+            Self::Local => Duration::from_secs(30),
+            Self::Fetch => Duration::from_secs(300),
+            // The budget `git_ops::refresh_remote` gives the same kind of
+            // fetch: a remote it just added.
+            Self::FirstFetch => Duration::from_secs(1800),
+        }
+    }
+}
+
+/// What `ensure_remote` found, which sets the budget of the first fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteSetup {
+    /// The remote did not exist and was added for this batch.
+    Added,
+    /// The remote was already configured; its URL now matches the request.
+    Existing,
+}
+
+impl RemoteSetup {
+    /// The budget each fetch attempt from this remote runs under.
+    fn fetch_op(self) -> GitOp {
+        match self {
+            Self::Added => GitOp::FirstFetch,
+            Self::Existing => GitOp::Fetch,
+        }
+    }
+}
+
+/// A fetcher git command that ran past its limit and was killed.
+///
+/// The limit prints as `Duration`'s `Debug`, "300s" for the real limits and
+/// "300ms" for a test's, so a sub-second limit does not read as "0s".
+#[derive(Debug, thiserror::Error)]
+#[error("{what} timed out after {limit:?}")]
+struct GitTimedOut {
+    what: String,
+    limit: Duration,
+}
+
+/// Options that make curl end an https transfer moving under 1000 bytes a
+/// second for 60 seconds. A stalled transfer then ends in about a minute,
+/// in `git` and in its `git-remote-https` child alike, instead of at the
+/// wall-clock limit; killing `git` at that limit does not kill the child.
+const LOW_SPEED_LIMIT: &[&str] = &[
+    "-c",
+    "http.lowSpeedLimit=1000",
+    "-c",
+    "http.lowSpeedTime=60",
+];
+
+/// Runs `cmd` and kills it when it runs past `limit`.
+///
+/// `kill_on_drop` matters as much as the limit: the timeout drops the
+/// future, and without it the abandoned `git` would keep running, and keep
+/// its repository locks, until it ended on its own. `GIT_TERMINAL_PROMPT=0`
+/// makes an https remote that wants credentials fail at once instead of
+/// waiting on git's terminal prompt for the whole limit; credential helpers
+/// still run. ssh prompts on `/dev/tty` itself and ignores the variable, so
+/// an ssh remote that needs a prompt still waits out the limit. stdin needs
+/// no setting because `output()` already closes it.
+async fn run_git_within(mut cmd: Command, limit: Duration, what: &str) -> Result<Output> {
+    cmd.kill_on_drop(true).env("GIT_TERMINAL_PROMPT", "0");
+    match tokio::time::timeout(limit, cmd.output()).await {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(e)) => Err(anyhow!("Failed to execute {}: {}", what, e)),
+        Err(_) => Err(GitTimedOut {
+            what: what.to_string(),
+            limit,
+        }
+        .into()),
+    }
+}
+
+/// The arguments of one `git fetch` with `args`, global options first.
+fn fetch_args<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    crate::git_ops::GIT_PROTOCOL_RESTRICTIONS
+        .iter()
+        .chain(LOW_SPEED_LIMIT)
+        .copied()
+        .chain(std::iter::once("fetch"))
+        .chain(args.iter().copied())
+        .collect()
+}
+
+/// Whether `error` is a git command killed at its limit, as opposed to one
+/// that ended on its own. A remote that stopped answering is handled
+/// differently from one that answered with a failure.
+fn timed_out(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<GitTimedOut>().is_some()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FetchRequest {
@@ -44,6 +158,9 @@ pub struct FetchAgent {
     /// flight. A fetch against a slow or unreachable remote otherwise leaves
     /// its patchset sitting in Fetching with nothing to say why.
     activity: Arc<ActivityRegistry>,
+    /// The limit each `GitOp` runs under: `GitOp::limit`, except in tests
+    /// that need a hung fetch to time out in milliseconds.
+    git_limit: fn(GitOp) -> Duration,
 }
 
 /// The fetch activity of one repository's batch, cleared when the batch is
@@ -124,6 +241,7 @@ impl FetchAgent {
                 mr_metadata: HashMap::new(),
                 gitlab_token,
                 activity,
+                git_limit: GitOp::limit,
             },
             tx,
         )
@@ -268,22 +386,64 @@ impl FetchAgent {
         marks.mark(Phase::GitOp {
             op: format!("git remote setup for {}", remote),
         });
-        if let Err(e) = self.ensure_remote(&remote_name, url).await {
-            return Err(anyhow!(
+        let setup = self.ensure_remote(&remote_name, url).await.map_err(|e| {
+            anyhow!(
                 "Failed to set up remote {}: {}",
                 remote,
                 redact_secret(&e.to_string())
-            ));
-        }
+            )
+        })?;
 
+        let fetched = self
+            .fetch_from(&remote_name, &remote, setup.fetch_op(), missing, marks)
+            .await;
+        if let Err(e) = &fetched
+            && setup == RemoteSetup::Added
+            && !timed_out(e)
+        {
+            // The next request for this URL then adds the remote again and
+            // gets the first-fetch budget, instead of retrying a transfer
+            // that needed more under the shorter one. A remote whose first
+            // fetch timed out is kept: it had the whole first-fetch budget,
+            // a fetch does not resume, and removing it would hold the queue
+            // for that budget again on every later request.
+            self.remove_remote(&remote_name).await;
+        }
+        fetched.map_err(|e| {
+            anyhow!(
+                "Failed to fetch from {}: {}",
+                remote,
+                redact_secret(&e.to_string())
+            )
+        })
+    }
+
+    /// Fetches the missing commits from an already configured remote, each
+    /// attempt under `op`'s limit, falling back to every head when fetching
+    /// the commits by SHA fails for any reason other than a timeout. The
+    /// error is the last attempt's own, so the caller can tell a timeout.
+    async fn fetch_from(
+        &self,
+        remote_name: &str,
+        remote: &str,
+        op: GitOp,
+        missing: &[String],
+        marks: &BatchMarks<'_>,
+    ) -> Result<()> {
         // 1. Try optimistic fetch (fetch specific commits)
         marks.mark(Phase::Fetching {
-            remote: remote.clone(),
+            remote: remote.to_string(),
             commits: missing.len(),
         });
-        let Err(e) = self.fetch_commits(&remote_name, missing).await else {
+        let Err(e) = self.fetch_commits(remote_name, missing, op).await else {
             return Ok(());
         };
+        // A remote that did not answer a fetch of a few commits will not
+        // answer a fetch of every head, and the fallback would hold the
+        // queue for a second full limit.
+        if timed_out(&e) {
+            return Err(e);
+        }
         warn!(
             "Optimistic fetch failed for {}: {}. Falling back to full fetch.",
             remote, e
@@ -294,13 +454,7 @@ impl FetchAgent {
             remote: format!("{} (all heads)", remote),
             commits: missing.len(),
         });
-        self.fetch_all(&remote_name).await.map_err(|e| {
-            anyhow!(
-                "Failed to fetch from {}: {}",
-                remote,
-                redact_secret(&e.to_string())
-            )
-        })
+        self.fetch_all(remote_name, op).await
     }
 
     /// Whether `url` names the fetcher's own repository, which has nothing
@@ -474,9 +628,24 @@ impl FetchAgent {
         format!("fetcher-{:x}", hasher.finish())
     }
 
-    async fn ensure_remote(&self, name: &str, url: &str) -> Result<()> {
+    /// Runs a fetcher git command under `op`'s limit.
+    async fn run_git(&self, cmd: Command, op: GitOp, what: &str) -> Result<Output> {
+        run_git_within(cmd, (self.git_limit)(op), what).await
+    }
+
+    /// A git command in the fetcher's repository with `args`, which may be
+    /// a bare repository.
+    fn local_git(&self, args: &[&str]) -> Command {
+        let mut cmd = crate::git_cmd::in_dir_async(&self.repo_path);
+        cmd.args(["-c", "safe.bareRepository=all"]).args(args);
+        cmd
+    }
+
+    /// The URL to configure for `url`, with the GitLab token in it when the
+    /// remote is on gitlab.com.
+    fn authenticated_url(&self, url: &str) -> String {
         // Inject GitLab token via parsed url::Url to prevent parser differentials.
-        let authenticated_url = if let Some(token) = &self.gitlab_token {
+        if let Some(token) = &self.gitlab_token {
             if let Ok(mut parsed) = url::Url::parse(url)
                 && parsed.scheme() == "https"
                 && parsed
@@ -491,65 +660,95 @@ impl FetchAgent {
             }
         } else {
             url.to_string()
-        };
+        }
+    }
 
-        // Check if remote exists
-        let status = crate::git_cmd::in_dir_async(&self.repo_path)
-            .args(["-c", "safe.bareRepository=all"])
-            .args(["remote", "get-url", name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+    /// Points remote `name` at `url`, adding it when it does not exist, and
+    /// says which of the two it did.
+    async fn ensure_remote(&self, name: &str, url: &str) -> Result<RemoteSetup> {
+        let authenticated_url = self.authenticated_url(url);
+
+        // One get-url says both whether the remote exists, by its exit
+        // status, and where it points, by its output.
+        let existing = self
+            .run_git(
+                self.local_git(&["remote", "get-url", name]),
+                GitOp::Local,
+                "git remote get-url",
+            )
             .await?;
 
-        if status.success() {
-            let output = crate::git_cmd::in_dir_async(&self.repo_path)
-                .args(["-c", "safe.bareRepository=all"])
-                .args(["remote", "get-url", name])
-                .output()
-                .await?;
-            let current_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-            if current_url != authenticated_url {
-                info!(
-                    "Updating remote {} from {} to {}",
-                    name,
-                    redact_secret(&current_url),
-                    redact_secret(&authenticated_url)
-                );
-                let output = crate::git_cmd::in_dir_async(&self.repo_path)
-                    .args(["-c", "safe.bareRepository=all"])
-                    .args(["remote", "set-url", name, &authenticated_url])
-                    .output()
-                    .await?;
-
-                if !output.status.success() {
-                    return Err(anyhow!(
-                        "Failed to update remote: {}",
-                        redact_secret(String::from_utf8_lossy(&output.stderr).trim())
-                    ));
-                }
-            }
-        } else {
+        if !existing.status.success() {
             info!(
                 "Adding remote {} -> {}",
                 name,
                 redact_secret(&authenticated_url)
             );
-            let output = crate::git_cmd::in_dir_async(&self.repo_path)
-                .args(["-c", "safe.bareRepository=all"])
-                .args(["remote", "add", name, &authenticated_url])
-                .output()
+            let output = self
+                .run_git(
+                    self.local_git(&["remote", "add", name, &authenticated_url]),
+                    GitOp::Local,
+                    "git remote add",
+                )
                 .await?;
-
             if !output.status.success() {
                 return Err(anyhow!(
                     "Failed to add remote: {}",
                     redact_secret(String::from_utf8_lossy(&output.stderr).trim())
                 ));
             }
+            return Ok(RemoteSetup::Added);
         }
-        Ok(())
+
+        let current_url = String::from_utf8_lossy(&existing.stdout).trim().to_string();
+        if current_url != authenticated_url {
+            info!(
+                "Updating remote {} from {} to {}",
+                name,
+                redact_secret(&current_url),
+                redact_secret(&authenticated_url)
+            );
+            let output = self
+                .run_git(
+                    self.local_git(&["remote", "set-url", name, &authenticated_url]),
+                    GitOp::Local,
+                    "git remote set-url",
+                )
+                .await?;
+            // Checked because a remote left at its old URL would fetch the
+            // wrong repository and report the requested commits missing.
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "Failed to update remote URL: {}",
+                    redact_secret(String::from_utf8_lossy(&output.stderr).trim())
+                ));
+            }
+        }
+        Ok(RemoteSetup::Existing)
+    }
+
+    /// Removes remote `name`. A failure is only logged: the remote then
+    /// stays, and the next request for its URL fetches from it as an
+    /// existing remote.
+    async fn remove_remote(&self, name: &str) {
+        let removed = self
+            .run_git(
+                self.local_git(&["remote", "remove", name]),
+                GitOp::Local,
+                "git remote remove",
+            )
+            .await;
+        match removed {
+            Ok(output) if output.status.success() => {
+                info!("Removed remote {} after its first fetch failed", name);
+            }
+            Ok(output) => warn!(
+                "Failed to remove remote {}: {}",
+                name,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+            Err(e) => warn!("Failed to remove remote {}: {}", name, e),
+        }
     }
 
     /// Runs one `git fetch`, dropping a stale commit-graph and trying
@@ -558,16 +757,16 @@ impl FetchAgent {
     /// repeats no transfer; the wording the commit parse emits can
     /// come after one, and then the retry pays for it again.  Returns
     /// git's own output either way; the caller words the failure.
-    async fn fetch_with_graph_retry(&self, args: &[&str]) -> Result<Output> {
+    ///
+    /// Each attempt runs under `op`'s limit. A timeout returns `Err`, and
+    /// so never reaches the commit-graph retry.
+    async fn fetch_with_graph_retry(&self, args: &[&str], op: GitOp) -> Result<Output> {
         let mut dropped_graph = false;
 
         loop {
-            let output = crate::git_cmd::in_dir_async(&self.repo_path)
-                .args(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS)
-                .arg("fetch")
-                .args(args)
-                .output()
-                .await?;
+            let mut cmd = crate::git_cmd::in_dir_async(&self.repo_path);
+            cmd.args(fetch_args(args));
+            let output = self.run_git(cmd, op, "git fetch").await?;
 
             if output.status.success() || dropped_graph {
                 if dropped_graph {
@@ -590,7 +789,7 @@ impl FetchAgent {
         }
     }
 
-    async fn fetch_commits(&self, remote: &str, commits: &[String]) -> Result<()> {
+    async fn fetch_commits(&self, remote: &str, commits: &[String], op: GitOp) -> Result<()> {
         let mut args = vec![remote];
         for commit in commits {
             if commit.is_empty()
@@ -608,7 +807,7 @@ impl FetchAgent {
             return Err(anyhow!("No valid commit refs to fetch"));
         }
 
-        let output = self.fetch_with_graph_retry(&args).await?;
+        let output = self.fetch_with_graph_retry(&args, op).await?;
         if !output.status.success() {
             return Err(anyhow!(
                 "Fetch failed: {}",
@@ -618,8 +817,8 @@ impl FetchAgent {
         Ok(())
     }
 
-    async fn fetch_all(&self, remote: &str) -> Result<()> {
-        let output = self.fetch_with_graph_retry(&[remote]).await?;
+    async fn fetch_all(&self, remote: &str, op: GitOp) -> Result<()> {
+        let output = self.fetch_with_graph_retry(&[remote], op).await?;
 
         if !output.status.success() {
             return Err(anyhow!(
@@ -631,20 +830,20 @@ impl FetchAgent {
     }
 
     async fn is_present(&self, commit_or_range: &str) -> bool {
-        let mut args = vec!["-c", "safe.bareRepository=all"];
         let arg_str: String;
-
-        if let Some((start, end)) = commit_or_range.split_once("..") {
+        let (args, what) = if let Some((start, end)) = commit_or_range.split_once("..") {
             arg_str = format!("{}^{{commit}}..{}^{{commit}}", start, end);
-            args.extend(["rev-list", "-n", "1", &arg_str]);
+            (["rev-list", "-n", "1", &arg_str].to_vec(), "git rev-list")
         } else {
             arg_str = format!("{}^{{commit}}", commit_or_range);
-            args.extend(["rev-parse", "--verify", &arg_str]);
+            (
+                ["rev-parse", "--verify", &arg_str].to_vec(),
+                "git rev-parse",
+            )
         };
 
-        let output = crate::git_cmd::in_dir_async(&self.repo_path)
-            .args(&args)
-            .output()
+        let output = self
+            .run_git(self.local_git(&args), GitOp::Local, what)
             .await;
 
         match output {
@@ -669,10 +868,12 @@ impl FetchAgent {
     }
 
     async fn resolve_sha(&self, commit: &str) -> Result<String> {
-        let output = crate::git_cmd::in_dir_async(&self.repo_path)
-            .args(["-c", "safe.bareRepository=all"])
-            .args(["rev-parse", "--verify", commit])
-            .output()
+        let output = self
+            .run_git(
+                self.local_git(&["rev-parse", "--verify", commit]),
+                GitOp::Local,
+                "git rev-parse",
+            )
             .await?;
 
         if !output.status.success() {
@@ -768,9 +969,20 @@ mod tests {
         rx: &mut mpsc::Receiver<Event>,
         requests: &[&str],
     ) -> Vec<Event> {
+        run_batch(agent, rx, REFUSING_REMOTE, requests).await
+    }
+
+    /// Runs one batch of `requests` against `url` and returns every event
+    /// the agent sent for it.
+    async fn run_batch(
+        agent: &FetchAgent,
+        rx: &mut mpsc::Receiver<Event>,
+        url: &str,
+        requests: &[&str],
+    ) -> Vec<Event> {
         let mut queue = HashMap::new();
         queue.insert(
-            Some(REFUSING_REMOTE.to_string()),
+            Some(url.to_string()),
             requests.iter().map(|r| r.to_string()).collect(),
         );
         agent.process_queue(&mut queue).await;
@@ -788,6 +1000,17 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 Event::IngestionFailed { article_id, .. } => Some(article_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The reasons of the `IngestionFailed` events among `events`.
+    fn failure_reasons(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::IngestionFailed { error, .. } => Some(error.as_str()),
                 _ => None,
             })
             .collect()
@@ -966,5 +1189,357 @@ mod tests {
         assert_eq!(failed_ids(&events), [range.as_str()]);
         assert_eq!(submitted_ids(&events), [head.as_str()]);
         Ok(())
+    }
+
+    /// A fetcher agent over a fresh repository with one commit.
+    async fn agent_with_repo(dir: &std::path::Path) -> Result<FetchAgent> {
+        init_repo_with_commit(dir).await?;
+        let (tx, _rx) = mpsc::channel(16);
+        let (agent, _) = FetchAgent::new(dir.to_path_buf(), tx, None, ActivityRegistry::new());
+        Ok(agent)
+    }
+
+    /// The URL remote `name` points at, or `None` when it does not exist.
+    async fn remote_url(repo: &std::path::Path, name: &str) -> Result<Option<String>> {
+        let output = crate::git_cmd::in_dir_async(repo)
+            .args(["remote", "get-url", name])
+            .output()
+            .await?;
+        Ok(output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string()))
+    }
+
+    /// Whether process `pid` is still running. A zombie has ended and only
+    /// waits to be reaped, so it does not count.
+    fn is_running(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{}/stat", pid))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .map(|(_, rest)| !rest.starts_with('Z'))
+            })
+            .unwrap_or(false)
+    }
+
+    /// `sleep` stands in for a `git fetch` against a remote that stopped
+    /// answering: it never returns on its own, so only the limit can end
+    /// it. Before the limit, such a command wedged the whole agent. The
+    /// command must also be killed, not merely abandoned, or it would keep
+    /// running and keep its repository locks.
+    #[tokio::test]
+    async fn run_git_gives_up_on_a_hung_command() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("pid");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo $$ > \"$1\"; exec sleep 60", "sh"])
+            .arg(&pid_file);
+
+        let started = std::time::Instant::now();
+        let result = run_git_within(cmd, Duration::from_millis(500), "sleep").await;
+        let elapsed = started.elapsed();
+
+        let Err(err) = result else {
+            panic!("a hung command must return an error");
+        };
+        assert!(
+            err.downcast_ref::<GitTimedOut>().is_some(),
+            "expected a GitTimedOut, got: {}",
+            err
+        );
+        assert!(err.to_string().contains("timed out"), "got: {}", err);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "run_git waited {:?}; it should have given up at the limit",
+            elapsed
+        );
+
+        // SIGKILL is delivered asynchronously, so allow it a moment.
+        let pid = std::fs::read_to_string(&pid_file)?.trim().to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while is_running(&pid) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !is_running(&pid),
+            "the timed-out command {} still runs",
+            pid
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_git_returns_output_on_success() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let (tx, _rx) = mpsc::channel(16);
+        let (agent, _) = FetchAgent::new(
+            temp_dir.path().to_path_buf(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+        );
+        let mut cmd = crate::git_cmd::detached_async();
+        cmd.arg("--version");
+
+        let output = agent.run_git(cmd, GitOp::Local, "git --version").await?;
+
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).contains("git version"));
+        Ok(())
+    }
+
+    /// A refused fetch is an ordinary failure, not a timeout, so the
+    /// fallback rule would still allow `fetch_all` after it.
+    #[tokio::test]
+    async fn fetch_all_reports_unreachable_remote_as_error() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let agent = agent_with_repo(temp_dir.path()).await?;
+        agent.ensure_remote("broken", REFUSING_REMOTE).await?;
+
+        let Err(err) = agent.fetch_all("broken", GitOp::Fetch).await else {
+            panic!("a fetch from an unreachable remote must fail");
+        };
+        assert!(!timed_out(&err), "got: {}", err);
+        Ok(())
+    }
+
+    /// The first call adds the remote; a later call with another URL finds
+    /// it and points it there, through the single get-url and the checked
+    /// set-url.
+    #[tokio::test]
+    async fn ensure_remote_adds_then_updates_url() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let agent = agent_with_repo(temp_dir.path()).await?;
+        let first = "https://example.com/first.git";
+        let second = "https://example.com/second.git";
+
+        assert_eq!(
+            agent.ensure_remote("origin", first).await?,
+            RemoteSetup::Added
+        );
+        assert_eq!(
+            remote_url(temp_dir.path(), "origin").await?.as_deref(),
+            Some(first)
+        );
+
+        assert_eq!(
+            agent.ensure_remote("origin", second).await?,
+            RemoteSetup::Existing
+        );
+        assert_eq!(
+            remote_url(temp_dir.path(), "origin").await?.as_deref(),
+            Some(second)
+        );
+
+        assert_eq!(
+            agent.ensure_remote("origin", second).await?,
+            RemoteSetup::Existing
+        );
+        Ok(())
+    }
+
+    /// A remote added for a batch whose fetch failed is removed again, so
+    /// the next request for its URL is a first fetch with the longer limit.
+    #[tokio::test]
+    async fn failed_first_fetch_removes_the_remote() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        init_repo_with_commit(temp_dir.path()).await?;
+        let (tx, mut rx) = mpsc::channel(16);
+        let (agent, _) = FetchAgent::new(
+            temp_dir.path().to_path_buf(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+        );
+        let name = agent.get_remote_name(REFUSING_REMOTE);
+
+        let events = run_refused_batch(&agent, &mut rx, &[MISSING_HEAD]).await;
+
+        assert_eq!(failed_ids(&events), [MISSING_HEAD]);
+        assert_eq!(remote_url(temp_dir.path(), &name).await?, None);
+        Ok(())
+    }
+
+    /// A remote that existed before the batch is kept when its fetch fails;
+    /// only one the batch added is taken back.
+    #[tokio::test]
+    async fn failed_fetch_keeps_an_existing_remote() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        init_repo_with_commit(temp_dir.path()).await?;
+        let (tx, mut rx) = mpsc::channel(16);
+        let (agent, _) = FetchAgent::new(
+            temp_dir.path().to_path_buf(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+        );
+        let name = agent.get_remote_name(REFUSING_REMOTE);
+        agent.ensure_remote(&name, REFUSING_REMOTE).await?;
+
+        let events = run_refused_batch(&agent, &mut rx, &[MISSING_HEAD]).await;
+
+        assert_eq!(failed_ids(&events), [MISSING_HEAD]);
+        assert_eq!(
+            remote_url(temp_dir.path(), &name).await?.as_deref(),
+            Some(REFUSING_REMOTE)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn timed_out_tells_a_timeout_from_a_failure() {
+        let timeout = anyhow::Error::from(GitTimedOut {
+            what: "git fetch".to_string(),
+            limit: GitOp::Fetch.limit(),
+        });
+        assert!(timed_out(&timeout));
+        assert_eq!(timeout.to_string(), "git fetch timed out after 300s");
+        assert!(!timed_out(&anyhow!("Fetch failed: refused")));
+    }
+
+    /// An http remote that accepts connections and never answers, as a
+    /// server that stopped responding does, counting the connections.
+    struct HungRemote {
+        url: String,
+        connections: Arc<std::sync::atomic::AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl HungRemote {
+        async fn start() -> Result<Self> {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let url = format!("http://{}/hung.git", listener.local_addr()?);
+            let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = Arc::clone(&connections);
+            let server = tokio::spawn(async move {
+                // Held and never read, so each client waits for a response
+                // that never comes.
+                let mut held = Vec::new();
+                while let Ok((stream, _)) = listener.accept().await {
+                    held.push(stream);
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+            Ok(Self {
+                url,
+                connections,
+                server,
+            })
+        }
+
+        /// The connections taken so far, once any still queued are taken.
+        async fn connections(&self) -> usize {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            self.connections.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for HungRemote {
+        /// Closes the held connections, so the transport children that
+        /// outlived their killed `git` exit too.
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// Limits short enough for a hung fetch to time out within a test, and
+    /// distinct, so a timeout's message names the budget it ran under.
+    fn short_limits(op: GitOp) -> Duration {
+        match op {
+            GitOp::Local => GitOp::Local.limit(),
+            GitOp::Fetch => Duration::from_millis(700),
+            GitOp::FirstFetch => Duration::from_millis(400),
+        }
+    }
+
+    /// An agent over a fresh repository whose fetches time out quickly.
+    async fn agent_with_short_limits(
+        dir: &std::path::Path,
+    ) -> Result<(FetchAgent, mpsc::Receiver<Event>)> {
+        init_repo_with_commit(dir).await?;
+        let (tx, rx) = mpsc::channel(16);
+        let (mut agent, _) = FetchAgent::new(dir.to_path_buf(), tx, None, ActivityRegistry::new());
+        agent.git_limit = short_limits;
+        Ok((agent, rx))
+    }
+
+    /// A fetch of the commits that timed out is not followed by a fetch of
+    /// every head: each fetch attempt opens one connection, and the remote
+    /// sees only the first.
+    #[tokio::test]
+    async fn timeout_skips_the_full_fetch() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let (agent, mut rx) = agent_with_short_limits(temp_dir.path()).await?;
+        let remote = HungRemote::start().await?;
+
+        let events = run_batch(&agent, &mut rx, &remote.url, &[MISSING_HEAD]).await;
+
+        assert_eq!(failed_ids(&events), [MISSING_HEAD]);
+        let reasons = failure_reasons(&events);
+        assert!(reasons[0].contains("timed out"), "got: {:?}", reasons);
+        assert_eq!(remote.connections().await, 1);
+        Ok(())
+    }
+
+    /// A new remote whose first fetch timed out is kept, so the next request
+    /// for it runs under the routine budget instead of the first-fetch one
+    /// again; otherwise a remote that never answers would hold the queue for
+    /// the longest budget on every request.
+    #[tokio::test]
+    async fn timed_out_first_fetch_keeps_the_remote() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let (agent, mut rx) = agent_with_short_limits(temp_dir.path()).await?;
+        let remote = HungRemote::start().await?;
+        let name = agent.get_remote_name(&remote.url);
+        let after = |op| format!("timed out after {:?}", short_limits(op));
+
+        let first = run_batch(&agent, &mut rx, &remote.url, &[MISSING_HEAD]).await;
+        let reasons = failure_reasons(&first);
+        assert_eq!(reasons.len(), 1, "got: {:?}", reasons);
+        assert!(
+            reasons[0].ends_with(&after(GitOp::FirstFetch)),
+            "{:?}",
+            reasons
+        );
+        assert_eq!(
+            remote_url(temp_dir.path(), &name).await?.as_deref(),
+            Some(remote.url.as_str())
+        );
+
+        let second = run_batch(&agent, &mut rx, &remote.url, &[MISSING_HEAD]).await;
+        let reasons = failure_reasons(&second);
+        assert_eq!(reasons.len(), 1, "got: {:?}", reasons);
+        assert!(reasons[0].ends_with(&after(GitOp::Fetch)), "{:?}", reasons);
+        Ok(())
+    }
+
+    /// The low-speed options are global options, so they must come before
+    /// the `fetch` subcommand, and the requested arguments after it.
+    #[test]
+    fn fetch_carries_the_low_speed_limit() {
+        let args = fetch_args(&["origin", "abc"]);
+        let fetch = args.iter().position(|a| *a == "fetch");
+        let Some(fetch) = fetch else {
+            panic!("no fetch subcommand in {:?}", args);
+        };
+        for option in ["http.lowSpeedLimit=1000", "http.lowSpeedTime=60"] {
+            let Some(at) = args.iter().position(|a| *a == option) else {
+                panic!("{} missing from {:?}", option, args);
+            };
+            assert!(at > 0 && args[at - 1] == "-c", "{:?}", args);
+            assert!(at < fetch, "{:?}", args);
+        }
+        assert!(args.starts_with(crate::git_ops::GIT_PROTOCOL_RESTRICTIONS));
+        assert_eq!(args[fetch + 1..], ["origin", "abc"]);
+    }
+
+    #[test]
+    fn git_op_limits_are_the_documented_values() {
+        assert_eq!(GitOp::Local.limit(), Duration::from_secs(30));
+        assert_eq!(GitOp::Fetch.limit(), Duration::from_secs(300));
+        assert_eq!(GitOp::FirstFetch.limit(), Duration::from_secs(1800));
+        assert_eq!(RemoteSetup::Added.fetch_op(), GitOp::FirstFetch);
+        assert_eq!(RemoteSetup::Existing.fetch_op(), GitOp::Fetch);
     }
 }
