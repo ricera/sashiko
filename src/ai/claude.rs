@@ -223,7 +223,62 @@ pub struct ClaudeClient {
     extra_headers: std::collections::HashMap<String, String>,
 }
 
+/// A floor on sustained output rate, used only to size the request timeout.
+///
+/// Roughly an order of magnitude below what a healthy connection sustains. The
+/// estimate is deliberately pessimistic: guessing too high only delays recovery
+/// from a dead connection, while guessing too low kills requests that would have
+/// succeeded and burns the session's transient-retry budget on nothing.
+const SLOWEST_PLAUSIBLE_OUTPUT_TOKENS_PER_SEC: u64 = 10;
+
+/// Headroom for time to first token, which on a large uncached prompt is not
+/// instant and is not covered by the generation estimate.
+const FIRST_TOKEN_ALLOWANCE_SECS: u64 = 120;
+
+/// How long one request may take before it is abandoned.
+///
+/// Thinking tokens are output tokens, so `max_tokens`, not the difficulty of
+/// the question, bounds how long a legitimate response can take. A timeout
+/// below that bound would turn every full-length response into a retry, so the
+/// configured value can raise the ceiling but not lower it past what the model
+/// has been given permission to emit.
+fn request_timeout(api_timeout_secs: u64, max_tokens: u32) -> Duration {
+    let generation = u64::from(max_tokens) / SLOWEST_PLAUSIBLE_OUTPUT_TOKENS_PER_SEC;
+    Duration::from_secs(api_timeout_secs.max(generation + FIRST_TOKEN_ALLOWANCE_SECS))
+}
+
+/// Builds the HTTP client every request of one `ClaudeClient` goes through.
+///
+/// Without a timeout a request has no deadline at all, and a stalled
+/// connection parks the session inside `generate_content` forever. Nothing
+/// above it can rescue that: the turn cap is checked between round trips, so
+/// it cannot fire while one never returns. A failed build is returned rather
+/// than replaced by `Client::new()`, because that fallback would quietly hand
+/// back a client with no deadline, which is the defect this exists to fix.
+fn build_http_client(api_timeout_secs: u64, max_tokens: u32) -> Result<Client> {
+    let timeout = request_timeout(api_timeout_secs, max_tokens);
+    if timeout.as_secs() > api_timeout_secs {
+        info!(
+            "Claude request timeout raised to {}s: {} max_tokens cannot be emitted within the \
+             configured {}s",
+            timeout.as_secs(),
+            max_tokens,
+            api_timeout_secs
+        );
+    }
+    Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("Failed to build the Claude HTTP client")
+}
+
 impl ClaudeClient {
+    /// Creates a client for the Messages API at `base_url`.
+    ///
+    /// Each request is abandoned after `api_timeout_secs`, or after the time
+    /// `max_tokens` needs at a pessimistic output rate when that is longer
+    /// (see `request_timeout`). The deadline is a transport failure, which is
+    /// retried.
     pub fn new(
         model: String,
         enable_caching: bool,
@@ -231,7 +286,8 @@ impl ClaudeClient {
         base_url: String,
         thinking: Option<String>,
         effort: Option<String>,
-    ) -> Self {
+        api_timeout_secs: u64,
+    ) -> Result<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
             .or_else(|_| std::env::var("LLM_API_KEY"))
@@ -239,17 +295,17 @@ impl ClaudeClient {
 
         let extra_headers = Self::parse_env_headers();
 
-        Self {
+        Ok(Self {
             api_key,
             model,
-            client: Client::new(),
+            client: build_http_client(api_timeout_secs, max_tokens)?,
             enable_caching,
             max_tokens,
             base_url,
             thinking,
             effort,
             extra_headers,
-        }
+        })
     }
 
     pub fn default_base_url() -> String {
@@ -794,7 +850,9 @@ mod tests {
                 base_url.to_string(),
                 None,
                 None,
+                300,
             )
+            .unwrap()
         };
         let base = client(4096, "https://example.invalid/v1/messages");
         assert_ne!(
@@ -875,6 +933,53 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// The `max_tokens` every `client_for` client is built with.
+    const CLIENT_FOR_MAX_TOKENS: u32 = 1024;
+
+    /// The `api_timeout_secs` every `client_for` client is built with.
+    const CLIENT_FOR_API_TIMEOUT_SECS: u64 = 300;
+
+    /// A client from the real constructor, so it carries the request
+    /// deadline, with a key and headers that do not come from the
+    /// environment, so a stray ANTHROPIC_API_KEY or ANTHROPIC_CUSTOM_HEADERS
+    /// that is not a valid header value cannot fail the request first.
+    fn client_for(base_url: &str) -> ClaudeClient {
+        ClaudeClient {
+            api_key: "test-key".to_string(),
+            extra_headers: std::collections::HashMap::new(),
+            ..ClaudeClient::new(
+                "claude-opus-4-7".to_string(),
+                false,
+                CLIENT_FOR_MAX_TOKENS,
+                base_url.to_string(),
+                None,
+                None,
+                CLIENT_FOR_API_TIMEOUT_SECS,
+            )
+            .expect("build the Claude test client")
+        }
+    }
+
+    /// Sends a minimal request through a `client_for` client.
+    async fn send_hello(base_url: &str) -> Result<ClaudeResponse> {
+        client_for(base_url).post_request(&hello_request()).await
+    }
+
+    /// Whether `request` holds a whole HTTP request: its headers and as many
+    /// body bytes as its Content-Length names.
+    fn request_is_complete(request: &[u8]) -> bool {
+        let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+        let length = headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+        request.len() >= end + 4 + length
     }
 
     fn local_client(base_url: &str) -> ClaudeClient {
@@ -1067,6 +1172,102 @@ mod tests {
                 "{status} {header}: {err:#}"
             );
         }
+    }
+
+    // --- Request deadline tests ---
+
+    #[test]
+    fn test_request_timeout_is_never_shorter_than_the_output_allowance() {
+        // 4096 tokens at the pessimistic floor rate needs about 410s, so the
+        // 300s default must not be taken literally. Doing so would abandon a
+        // full-length response that was still arriving.
+        let effective = request_timeout(300, 4096);
+        assert!(
+            effective.as_secs() > 300,
+            "a full-length response must not be cut off by the default timeout, got {}s",
+            effective.as_secs()
+        );
+        assert_eq!(effective, Duration::from_secs(4096 / 10 + 120));
+
+        // Thinking tokens are output tokens, so the bound scales with the
+        // permission given rather than with how hard the question is.
+        assert!(request_timeout(300, 32_000) > request_timeout(300, 4096));
+    }
+
+    #[test]
+    fn test_request_timeout_honours_a_longer_configured_value() {
+        // The floor only raises. An operator who wants more patience than the
+        // estimate implies keeps it.
+        assert_eq!(request_timeout(7200, 4096), Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn test_request_timeout_never_falls_below_the_first_token_allowance() {
+        // A zero setting and a zero max_tokens still leave time for the first
+        // token, so even the degenerate configurations get a usable deadline.
+        let allowance = Duration::from_secs(FIRST_TOKEN_ALLOWANCE_SECS);
+        assert_eq!(request_timeout(0, 0), allowance);
+        assert_eq!(request_timeout(0, 9), allowance);
+        assert_eq!(
+            request_timeout(0, 10),
+            allowance + Duration::from_secs(1),
+            "each 10 tokens of max_tokens adds a second"
+        );
+        assert_eq!(
+            request_timeout(u64::MAX / 2, 0),
+            Duration::from_secs(u64::MAX / 2)
+        );
+    }
+
+    /// Accepts one connection, reads the whole request and then never
+    /// answers, as a server whose connection stalls mid-request does.
+    async fn spawn_silent_server() -> std::io::Result<String> {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            while !request_is_complete(&request) {
+                let read = socket.read(&mut buffer).await?;
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            // Park while the socket is still in scope, so the client sees
+            // neither a response nor a closed connection.
+            std::future::pending::<()>().await;
+            std::io::Result::Ok(())
+        });
+        Ok(format!("http://{address}/v1/messages"))
+    }
+
+    /// A server that never answers is abandoned at the client's deadline,
+    /// and the abandoned request is a retryable transport failure.
+    ///
+    /// Time is paused, so tokio jumps the clock to the next timer whenever
+    /// the runtime is idle and the test runs instantly. The outer timeout
+    /// ends the test with a clear failure if the client has no deadline,
+    /// which would otherwise wait forever.
+    #[tokio::test(start_paused = true)]
+    async fn test_silent_server_is_abandoned_at_the_request_deadline() {
+        let base_url = spawn_silent_server()
+            .await
+            .expect("bind a local test server");
+        let deadline = request_timeout(CLIENT_FOR_API_TIMEOUT_SECS, CLIENT_FOR_MAX_TOKENS);
+        let started = tokio::time::Instant::now();
+
+        let err = tokio::time::timeout(deadline * 10, send_hello(&base_url))
+            .await
+            .expect("the client must abandon the request at its own deadline");
+
+        assert_eq!(started.elapsed(), deadline);
+        let err = err.expect_err("a server that never answers fails the request");
+        let message = transient_message(&err);
+        assert!(message.contains("operation timed out"), "{message}");
     }
 
     // --- ThinkingConfig tests (Bug 1 regression) ---
