@@ -1,7 +1,11 @@
 # Design: Port Step 4 -- Fixes Bundled into the Fork's Activity Commit
 
 Status: approved 2026-10-05. Every recommended option in section 8 is
-accepted (D1-D15).
+accepted (D1-D15). Implemented by commits 2-9 of section 7. This document
+describes what they built, including where it differs from the first plan:
+the guarded `fail_fetching_patchset` (§3.3 part 1), keeping a remote whose
+first fetch timed out (§3.3 part 2, D7), and running the stranded-fetch
+sweep inside the activity writer (§3.2). Q1 is answered.
 Branch: `port/upstream` (upstream `origin/main` 2a7e748b1680 plus the ported
 fork features). The fork source is `feat/prior-revision-findings`.
 
@@ -23,6 +27,10 @@ The five items, each tied to an incident the fork saw:
 | Claude request deadline | The direct Claude client had no timeout, so a stalled connection parked a stage indefinitely. Transport errors were Fatal. | Port |
 | Unknown-tool suggestions | The model called `git_gray` for `git_grep` and was told only "Tool not found". | Port |
 
+The incidents are the fork's. On `port/upstream` the empty commit's review
+did not fail: it got one full AI review of nothing, which ended `Reviewed`
+(Q1).
+
 No item is dropped. Every item fixes a defect that still exists on
 `port/upstream`. Upstream did not fix any of them another way.
 
@@ -34,7 +42,9 @@ No item is dropped. Every item fixes a defect that still exists on
    Its reason says it was interrupted and, for a git fetch, what the fetch
    was doing.
 3. A fetch that fails, including one that times out, ends the request it was
-   for: its placeholder patchset ends `Failed` with the error as its reason.
+   for: its placeholder patchset ends `Failed` with the error as its reason,
+   if it is still `Fetching`. A placeholder that has already finished is
+   left as it is.
 4. Every git command that `src/fetcher.rs` spawns itself (`ensure_remote`,
    the fetch attempts, `is_present`, `resolve_sha`) has a time limit, and the
    `git` process is killed when that limit passes. The `git_ops` helpers the
@@ -131,17 +141,19 @@ daemon against a stub model on a personal kernel branch.
   empty for an empty commit.
 - **Baseline.** Resolution takes the SHA fast path, which only checks that the
   commit exists, so the empty commit passes.
-- **Pre-filter.** The pre-filter loop in `review_patchset`
+- **Pre-filter.** The pre-filter loop in `review_patchset_task`
   (`src/reviewer.rs:973-1034`) has no empty check.
 - **Review.** In `process_patch_review`, the ignored-files rule at line 1802
   starts with `!files.is_empty() &&`, so an empty diff falls through. A worker
-  is spawned with `--review-commit <sha>`, and every failed attempt is
-  retried up to `review.max_retries`.
+  is spawned with `--review-commit <sha>` and the model reviews a diff with
+  nothing in it. That review does not fail and is not retried: the patch
+  ends `Reviewed` with one `Reviewed` reviews row, paid for like any other
+  (Q1, measured by `scripts/verify_empty_commit.sh`).
 - **Dead helper.** `GitWorktree::is_empty_commit` (`src/git_ops.rs:274`) is
   called only by tests.
 
 **Verdict: adapt.** Range-submitting a `b4 prep` branch is a normal workflow.
-Today its tracker commit costs at least one full AI review of nothing. The
+Before this port its tracker commit cost one full AI review of nothing. The
 fork's version cannot be copied as is, for three reasons:
 
 1. **Its predicate is wrong.** `extract_files_from_diff` matches only lines
@@ -292,22 +304,31 @@ pub const FETCH_INTERRUPTED_REASON: &str = "Fetch interrupted by daemon restart"
 /// fetch or the API's spawned task for a thread fetch, so it cannot
 /// survive a restart, and no time-based transition ever moves a
 /// `Fetching` patchset on. Assumes one daemon per database, as
-/// `reset_reviewing_status` already does. Must run before
-/// `ActivityRegistry::with_persistence`, whose writer deletes the fetch
-/// rows this reads.
+/// `reset_reviewing_status` already does. Must run before the fetch
+/// activity rows it reads are deleted, so the activity writer calls it at
+/// startup, just ahead of `delete_fetch_activity`, from
+/// `ActivityRegistry::with_persistence`.
 pub async fn fail_stranded_fetching_patchsets(&self) -> Result<u64>
 ```
 
 Steps:
-1. `SELECT id FROM patchsets WHERE status = 'Fetching'`.
-2. For each id, `stranded_fetch_reason(id)`, a private helper:
+1. `SELECT id FROM patchsets WHERE status = 'Fetching'`
+   (`fetching_patchset_ids`).
+2. For each id, `stranded_fetch_reason(id)`, a private helper. When it
+   returns an error, the sweep logs a `warn!` and uses
+   `FETCH_INTERRUPTED_REASON` alone. Where the fetch stopped is context,
+   not the fix: a failed lookup must not leave this or any later patchset in
+   `Fetching` until the next restart, which propagating the error with `?`
+   would do. The helper:
    - `get_patchset_fetch_commit(id)` builds the
      `ActivityKey::Commit(sha).to_string()` key. This strips the forge
      `mr-{n}-` prefix as it already does.
    - Read the `description` of that key from `patchset_activity`.
    - Return `FETCH_INTERRUPTED_REASON`, plus ` while {description}` when a
-     row exists, for example "Fetch interrupted by daemon restart while
-     fetching 3 commit(s) from https://example.com/linux.git".
+     row exists and its description is not blank
+     (`interrupted_fetch_reason`), for example "Fetch interrupted by
+     daemon restart while fetching 3 commit(s) from
+     https://example.com/linux.git".
    - A thread-fetch placeholder (`src/server.rs:603-623`) is keyed by the
      bare message id, with no `@sashiko.local` suffix, so
      `get_patchset_fetch_commit` returns `None` and the reason is
@@ -322,26 +343,48 @@ as a literal (`src/db.rs:6312-9496`). The new query uses one private
 `const FETCHING: &str = "Fetching"`. Adding a `Fetching` variant would touch
 every exhaustive match and is out of scope.
 
-*Startup* (`src/main.rs`, between `db.ensure_project_stamp(project)` and
-`ActivityRegistry::with_persistence`):
+*Startup* (`src/activity.rs`). The sweep runs inside the activity writer, not
+as a separate call in `main.rs`. A private `recover_stranded_fetches(db)` does
+both startup steps in order: the sweep, then `delete_fetch_activity`.
 
 ```rust
-// Before the activity writer starts: it deletes the fetch rows the sweep
-// reads. Also before the API and fetcher exist, so no fetch of this run
-// can be mistaken for a stranded one.
-match db.fail_stranded_fetching_patchsets().await {
-    Ok(0) => {}
-    Ok(n) => warn!("Failed {} patchset(s) stranded mid-fetch by a restart", n),
-    Err(e) => error!("Failed to sweep stranded fetches: {}", e),
+async fn recover_stranded_fetches(db: &crate::db::Database) {
+    match db.fail_stranded_fetching_patchsets().await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!("Failed {} patchset(s) stranded mid-fetch by a restart", n),
+        Err(e) => tracing::error!("Failed to sweep stranded fetches: {}", e),
+    }
+    if let Err(e) = db.delete_fetch_activity().await {
+        tracing::debug!("Failed to clear stale fetch activity: {}", e);
+    }
 }
 ```
+
+- The writer task spawned by `ActivityRegistry::with_persistence` calls it
+  before it takes its first op. The delete therefore cannot race a fetch
+  row this run has already queued, and the sweep always reads the rows
+  before the delete removes them.
+- `with_persistence` is now `async`. It waits on a oneshot the writer
+  signals once recovery is done, so it returns only after the sweep. If the
+  writer died first, it returns anyway and startup goes on.
+- `main.rs` awaits it right after `db.ensure_project_stamp(project)`, before
+  the API and the fetcher start, so no fetch of this run can be mistaken for
+  a stranded one.
+- A failed sweep or delete is only logged. Startup must not stop because
+  recovering a previous run's state did not work.
+
+A separate call in `main.rs` ahead of `with_persistence`, as first planned,
+would also have read the rows before the delete. It was not used because the
+order would then rest on two call sites in two files staying in sequence,
+where one function keeps the two steps together.
 
 Running the sweep in `Reviewer::run`, next to `reset_reviewing_status`, would
 be too late. It would race the writer's delete and new submissions.
 
 *Comment updates.*
-- `src/activity.rs:597-605` and the doc comment on `delete_fetch_activity`:
-  the startup sweep has already copied a stranded fetch's description into
+- The doc comments on `with_persistence` and `recover_stranded_fetches` in
+  `src/activity.rs`, and on `delete_fetch_activity`: the startup sweep has
+  already copied a stranded fetch's description into
   `failed_reason`, which is why deleting the row is safe.
 - `src/server.rs:971-983`: a patchset the sweep failed is finished and has no
   persisted row. Its `failed_reason` says where the fetch stopped, so status
@@ -358,7 +401,8 @@ be too late. It would race the writer's delete and new submissions.
   (`src/db.rs:9182`), which is the intended effect (D5).
 - **Fetcher timeouts.** §3.3 makes a restart a much rarer way out of a hung
   fetch. After §3.3, a failed or timed-out fetch ends its request's
-  placeholder `Failed` through `IngestionFailed` and `update_patchset_error`.
+  placeholder `Failed` through `IngestionFailed` and
+  `fail_fetching_patchset` (§3.3 part 1).
   The sweep handles a restart (a crash, a deploy, or an operator restart)
   while the placeholder is still `Fetching`. A restart during patch
   extraction leaves the patchset `Incomplete`, which the sweep does not
@@ -433,19 +477,44 @@ the failure path above, so a timed-out range or forge fetch would still stay
   `mr-{n}-{commit_or_range}` when `mr_metadata` has a number for the
   request, and the request itself otherwise. The success paths
   (`:301-305`, `:363-367`) already build exactly this, and now call it.
-- `process_queue` keeps, for each requested `commit_or_range`, the endpoints
-  it split out. `missing_commits` is still the union that is fetched.
-- When `ensure_remote` or the fetch fails, the batch sends one
+- `process_queue` hands each repository's batch to `process_batch`, which
+  is split into small steps (`missing_endpoints`, `fetch_missing`,
+  `fail_unfetched`, `submit_range`, `submit_commit`). Each `BatchRequest`
+  keeps, for its `commit_or_range`, the endpoints it split out.
+  `missing_endpoints` is still the union that is fetched, each endpoint
+  checked once.
+- When `ensure_remote` or the fetch fails, `fail_unfetched` sends one
   `IngestionFailed` per request that has a missing endpoint, with
   `article_id: self.request_article_id(request)` and the existing error
-  wording. Requests whose endpoints were all present go on to step 3 with
-  the rest removed, instead of being dropped by the `continue`.
+  wording. Requests whose endpoints were all present go on to extraction,
+  instead of being dropped by the `continue`.
 - The `resolve_git_range`, `resolve_sha` and extraction failures also use
   `request_article_id`.
-- `update_patchset_error` and `resolve_root_msg_id` are unchanged. Every
-  `IngestionFailed` from the fetcher now names a placeholder the API
-  created, so the SHA-level match against an unrelated patchset can no
-  longer happen from this path.
+- The URL in the failure reason is the redacted one (`redact_secret`). The
+  reason lands in the placeholder's `failed_reason`, which the API serves,
+  and a forge token can ride in the URL.
+- `resolve_root_msg_id` is unchanged. Every `IngestionFailed` from the
+  fetcher now names a placeholder the API created, so the SHA-level match
+  against an unrelated patchset can no longer happen from this path.
+- Naming the request exposes a new case. A forge webhook queues a range
+  again even after its review has finished, because
+  `create_fetching_patchset` leaves a finished row as it is. If that second
+  fetch fails, its `IngestionFailed` now names the finished placeholder, and
+  `update_patchset_error`, which has no status guard, would overwrite the
+  finished review as `Failed`. So a new
+  `Database::fail_fetching_patchset(root_msg_id, error) -> Result<bool>`
+  fails a patchset only while it is still `Fetching`, and returns whether it
+  failed one.
+  - `record_ingestion_failure` in `src/main.rs` routes a
+    `MessageSource::GitFetch` failure to `fail_fetching_patchset` and logs
+    at info when nothing was still fetching. Every other source still uses
+    `update_patchset_error`, which behaves as before.
+  - Both share one private helper, `fail_patchset_by_msgid`, which takes an
+    optional status guard and walks the same `get_msgid_candidates`.
+  - The guard does not drop a failure a request should have. The fetcher
+    sends a request's `IngestionFailed` before any `PatchSubmitted` for it,
+    so a placeholder the request created or reset is still `Fetching` when
+    its failure arrives.
 
 **Design, part 2: bounded commands** (`src/fetcher.rs`).
 
@@ -538,16 +607,18 @@ environment scrubbing and `GIT_PROTOCOL_RESTRICTIONS` stay.
   (D14).
   - A timeout returns `Err` through `?`, so it never reaches the graph
     retry.
-- In `process_queue`:
-  - When `fetch_commits` fails with a `GitTimedOut`
-    (`e.downcast_ref::<GitTimedOut>()`), the batch does not fall back to
+- In `fetch_from` and `fetch_missing`, the steps of a batch's fetch phase:
+  - When `fetch_commits` fails with a `GitTimedOut` (`timed_out(&e)`, a
+    `e.downcast_ref::<GitTimedOut>()`), the batch does not fall back to
     `fetch_all`. A remote that did not answer a small fetch will not answer
-    a larger one. Any other failure keeps the fallback.
+    a larger one. Any other failure keeps the fallback. `fetch_from`
+    returns the last attempt's own error, so a timed-out fallback is seen
+    as a timeout too.
   - When the fetch of an `Added` remote fails other than by a timeout, the
-    remote is removed again (`remote remove`, `Local`; a failure is logged
-    and ignored). The next request for that URL is then a first fetch
-    again, with the first-fetch budget, instead of a 300 s retry of a
-    transfer that needed more.
+    remote is removed again (`remove_remote`: `remote remove`, `Local`; a
+    failure is logged and ignored). The next request for that URL is then
+    a first fetch again, with the first-fetch budget, instead of a 300 s
+    retry of a transfer that needed more.
   - When it timed out, the remote is kept. It had the whole first-fetch
     budget and a fetch does not resume, so a second 1800 s attempt would
     end the same way. Removing it would give a remote that never answers
@@ -835,14 +906,30 @@ All tests are unit tests in the module they cover, plus one script. Run
   - It builds a throwaway repo under its `mktemp` dir: a base commit,
     `git commit --allow-empty -m tracker`, and one real commit. It checks
     with `git diff-tree --name-only -r` that the tracker changes nothing.
-  - It submits the range and asserts four things:
-    - there are 2 patch rows;
-    - patch 1 is `Skipped`;
-    - patch 1 has 0 `reviews` rows;
+  - It submits the range and checks:
+    - there are 2 patch rows, the tracker as part 1;
+    - the tracker is `Skipped` and has 0 `reviews` rows;
+    - the real commit is part 2, `Reviewed`, with a `Reviewed` reviews row;
     - the patchset is `Reviewed`.
-  - Before the review commit lands, the script shows what happens today
-    (open question Q1). It is run once on each side of the change and both
-    results are recorded in the commit message.
+  - The checks on the real commit are what catch a skip that is too broad.
+    A skipped patch is neutral in the tally, so a patchset whose every patch
+    was skipped still ends `Reviewed`. With the predicate widened to skip
+    every patch, the tracker checks passed and only the real-commit check
+    failed.
+  - The stub model returns one object that carries every JSON stage's
+    required field, each empty, because this branch's pre-screen stage
+    rejects an answer without `selected_prompts`.
+  - `--self-test` checks the query helper and that the tracker changes no
+    files, without a daemon.
+  - It was run once on each side of the skip commit, answering Q1:
+
+    | | Before the skip | After the skip |
+    | --- | --- | --- |
+    | Exit code | 1 | 0 |
+    | Tracker | `Reviewed`, 1 `Reviewed` reviews row | `Skipped`, 0 reviews rows |
+    | Real commit | not reached | part 2, `Reviewed`, 1 `Reviewed` reviews row |
+    | Patchset | `Reviewed` | `Reviewed` |
+
   - No `--b4-cover-letter` case and no personal paths.
 
 ### 6.2 Stranded-fetch sweep (`src/db.rs` tests)
@@ -866,9 +953,20 @@ All tests are unit tests in the module they cover, plus one script. Run
 - A thread-fetch placeholder, a bare message id with no `@sashiko.local`
   suffix: it is swept, and its reason equals `FETCH_INTERRUPTED_REASON`
   exactly.
+- `test_interrupted_fetch_reason_ignores_a_blank_description`: `""` and
+  `"  "` give `FETCH_INTERRUPTED_REASON` exactly, and `"queued"` gives
+  "Fetch interrupted by daemon restart while queued".
+- `test_sweep_survives_a_failed_context_lookup`: with `patchset_activity`
+  dropped, so every context lookup fails, both stranded patchsets are still
+  swept, each with `FETCH_INTERRUPTED_REASON` exactly.
 - Resubmission: after the sweep, `create_fetching_patchset` on the same msgid
   gives `Fetching` with a NULL `failed_reason`.
 - Running the sweep twice: the second run returns 0.
+- `test_startup_keeps_fetch_context_while_clearing_fetch_rows`: with a
+  stranded placeholder and its fetch row on record, awaiting
+  `ActivityRegistry::with_persistence` leaves the patchset `Failed` with the
+  reason naming where the fetch stopped, and the fetch row deleted. No wait
+  is needed, because the constructor returns only after recovery.
 
 ### 6.3 Fetcher (`src/fetcher.rs` tests unless noted)
 
@@ -885,10 +983,18 @@ events from the agent's channel.
   holds a commit that is present and a range that is missing. The range
   gets `IngestionFailed`, and the present commit still gets
   `PatchSubmitted`.
-- `src/db.rs`: `update_patchset_error` on `<base>..<head>@sashiko.local`
-  and on `mr-7-<base>..<head>@sashiko.local` fails the matching
-  placeholder, and leaves a `Reviewed` patchset `<base>@sashiko.local`
-  untouched.
+- `src/db.rs`:
+  - `test_fetch_failure_reaches_range_and_forge_placeholders`:
+    `fail_fetching_patchset` on `<base>..<head>@sashiko.local` and on
+    `mr-7-<base>..<head>@sashiko.local` fails the matching `Fetching`
+    placeholder and returns true.
+  - `test_fetch_failure_leaves_a_finished_patchset_alone`: it returns false
+    and leaves a `Reviewed` patchset untouched, both one at
+    `<base>@sashiko.local`, which the fetcher used to fail by mistake, and a
+    finished forge placeholder `mr-7-<base>..<head>@sashiko.local`.
+- `src/main.rs`: `test_a_failed_git_fetch_fails_only_a_fetching_placeholder`
+  runs a `GitFetch` `IngestionFailed` through `process_parsed_article`. It
+  fails a `Fetching` forge placeholder and leaves a `Reviewed` one alone.
 
 Bounds (commit 6).
 - `run_git_gives_up_on_a_hung_command`: `tokio::process::Command::new("sleep")`
@@ -910,20 +1016,47 @@ Bounds (commit 6).
 - `failed_first_fetch_removes_the_remote`: after a batch against the
   refusing remote, `git remote get-url <name>` fails, so the next request
   is a first fetch again.
-- `timeout_skips_the_full_fetch`: the fallback predicate is false for a
-  `GitTimedOut` error and true for any other error.
+- `failed_fetch_keeps_an_existing_remote`: a remote that existed before the
+  batch is kept when its fetch fails.
+- `timed_out_tells_a_timeout_from_a_failure`: the fallback predicate,
+  `timed_out`, is true for a `GitTimedOut` error and false for any other
+  error.
+- Against `HungRemote`, an http server that accepts connections and never
+  answers, with the limits shortened through the agent's `git_limit`:
+  - `timeout_skips_the_full_fetch`: the request fails with "timed out" and
+    the server sees one connection, so `fetch_all` did not run.
+  - `timed_out_first_fetch_keeps_the_remote`: the first batch times out
+    under `FirstFetch` and the remote is still configured; a second batch
+    times out under `Fetch`.
 - The fetch command carries `http.lowSpeedLimit` and `http.lowSpeedTime`.
   The fetch arguments come from one helper, and the test checks its output.
 - `GitOp::limit` returns the three documented values.
 
 ### 6.4 Claude deadline and transport retries
-- `src/ai/claude.rs` tests, verbatim from the fork:
+- `src/ai/claude.rs` tests from the fork:
   - `test_transport_error_classifies_as_transient`;
   - `test_request_timeout_is_never_shorter_than_the_output_allowance`, where
     `(300, 4096)` gives 529 s;
   - `test_request_timeout_honours_a_longer_configured_value`, where
     `(7200, 4096)` gives 7200 s;
-  - `test_request_timeout_is_always_finite`.
+  - `test_request_timeout_never_falls_below_the_first_token_allowance`,
+    the fork's `test_request_timeout_is_always_finite` renamed and
+    tightened. The fork's version asserted only that the deadline is above
+    zero, and every `Duration` is finite, so its name promised nothing the
+    test checked. The port asserts exact values: `(0, 0)` and `(0, 9)` give
+    the 120 s allowance, `(0, 10)` gives 121 s, and a huge configured value
+    is kept.
+- Tests that send real requests through the Claude client, added by the
+  port:
+  - `test_refused_connection_is_a_transport_error` and
+    `test_truncated_body_is_a_transport_error`: a refused send and a 200
+    whose body stops short are `ClaudeError::Transport` whose message names
+    the cause;
+  - `test_unbuildable_request_is_fatal`: an `ftp://` URL gives an untyped
+    error that classifies as Fatal;
+  - `test_silent_server_is_abandoned_at_the_request_deadline`: with tokio's
+    clock paused, a server that never answers is abandoned exactly at the
+    deadline, with a transient transport error.
 - In the same file, the `client(..)` helper in
   `cache_identity_tracks_the_knobs_outside_the_request` passes `300` and
   unwraps the `Result`.
@@ -967,15 +1100,17 @@ commit.
 
    It follows commit 3, so a deadline is never Fatal.
 5. **fetcher: fail the request a failed fetch was for.** §3.3 part 1:
-   `request_article_id`, per-request `IngestionFailed`, and the present
-   requests that survive a failed fetch. Its tests.
+   `request_article_id`, per-request `IngestionFailed`, the present
+   requests that survive a failed fetch, and `fail_fetching_patchset` for
+   `GitFetch` failures. Its tests.
 6. **fetcher: bound every git command and kill it when abandoned.** §3.3
    part 2: `GitOp`, `RemoteSetup`, `GitTimedOut`, `run_git`, the low-speed
    limit, no fallback after a timeout, and removing a remote whose first
    fetch failed other than by a timeout. Its tests.
 7. **db: fail fetches a daemon restart stranded.**
-   - The sweep, its startup call and the comment updates in `activity.rs`,
-     `server.rs` and `db.rs`.
+   - The sweep, its startup call from the activity writer through
+     `recover_stranded_fetches` with `with_persistence` made `async`, and
+     the comment updates in `activity.rs`, `server.rs` and `db.rs`.
    - Its tests.
 8. **review: skip a patch whose diff is empty.**
    - `diff_is_empty`, the `process_patch_review` change, the comment on the
@@ -1000,10 +1135,19 @@ Each decision has a recommended option.
 - (b) Also write a `reviews` row with status `Skipped` and a reason ("changes
   no files"), as the ignored-files rule does.
 
-*Recommend (a).* Any skip that happens before a review starts writes no row
-today. (b) would be the only such skip with a row, and the patch's subject
+*Recommend (a).* The skips that happen before any worker is spawned do not
+agree today. The subject and size pre-filters in `review_patchset_task`
+write no row. The ignored-files rule in `process_patch_review` does write
+one, with status `Skipped` and "Skipped: touches only ignored files". Where
+the empty-diff skip falls between them is decided by what the patch holds,
+not by where the check sits. An ignored-files patch did change files, so
+its row records that there was a change and which rule hid it from review.
+An empty patch changes nothing, so there is nothing a reviewer could report
+on and nothing for a row to record; the code comment on the skip in
+`process_patch_review` gives the same reason. The patch's subject
 ("tracker" or a b4 cover subject) already shows why it was skipped. If skip
-reasons are wanted, they should come for every pre-review skip in one change.
+reasons are wanted, they should come for every pre-review skip in one
+change, which would also settle the disagreement.
 
 **D2. The empty-commit predicate.**
 - (a) The stored diff is empty after `trim()`.
@@ -1073,11 +1217,15 @@ routine one, and the `fetch_all` fallback, which fetches every head with
 tags, more still. Under (a) such a fetch is killed at 300 s, then the
 fallback is killed at 300 s too, and every later request fails the same
 way. (b) gives the first fetch the budget upstream already chose for the
-same kind of fetch, keeps a hung known remote at 300 s, and the remote
-removal stops a large first fetch from being retried under the short limit.
-(c) lets a hung ssh or git:// remote, which D14 does not cover, hold the
-queue for 30 minutes on every request. The cost of (b) is that a hung new
-remote holds the queue for up to 1800 s once, unless it is https.
+same kind of fetch, keeps a hung known remote at 300 s, and removing a
+remote whose first fetch failed other than by a timeout stops a large first
+fetch from being retried under the short limit. A remote whose first fetch
+timed out is kept rather than removed: it already had the whole first-fetch
+budget, a fetch does not resume, and removing it would let a remote that
+never answers hold the queue for 1800 s on every request. (c) lets a hung
+ssh or git:// remote, which D14 does not cover, hold the queue for 30
+minutes on every request. The cost of (b) is that a hung new remote holds
+the queue for up to 1800 s once, unless it is https.
 
 **D8. Bounding `resolve_git_range` and `extract_patch_metadata`.**
 - (a) Leave them unbounded, as the fork and upstream do.
@@ -1172,6 +1320,14 @@ connection is Transient encodes this choice.
   reviews git-fetched patches with `--review-commit` after the SHA fast path,
   with no `git am`. The script in commit 9, run before commit 8, settles it.
   The skip is worth having either way.
+
+  *Answer:* it does not fail. Run before the skip, the script found the
+  tracker `Reviewed` with one `Reviewed` reviews row: one full AI review of
+  a diff with nothing in it, not failed and not retried. The patchset ended
+  `Reviewed`. After the skip, the tracker is `Skipped` with no reviews row
+  and the real commit after it is still reviewed (§6.1). The fork counted
+  its failures as "Failed To Apply", a step this branch does not run for a
+  git-fetched patch.
 - **Q2.** Could an mbox patch with an empty body reach the `git am` path?
   `parse_email` (`src/patch.rs:273`) declines to make a patch without a
   diff, and stores the whole body as the diff when it makes one. A stored
