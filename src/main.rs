@@ -622,18 +622,14 @@ async fn run_daemon(
     let db = Arc::new(Database::new(&settings.database).await?);
     db.migrate().await?;
     db.ensure_project_stamp(project).await?;
-    match db.fail_interrupted_fetching_patchsets().await {
-        Ok(count) if count > 0 => {
-            info!("Marked {} interrupted Fetching patchsets as Failed", count);
-        }
-        Ok(_) => {}
-        Err(e) => error!("Failed to clean up interrupted Fetching patchsets: {}", e),
-    }
 
     // What running fetches and reviews are doing. One registry, written by the
     // fetcher and the reviewer and read by the API, with its last-known state
     // persisted so a restart can still say where interrupted work stopped.
-    let activity = sashiko::activity::ActivityRegistry::with_persistence(db.clone());
+    // Creating it fails the patchsets a restart left mid-fetch, so it must
+    // come before the API and the fetcher: no fetch of this run can then be
+    // mistaken for a stranded one.
+    let activity = sashiko::activity::ActivityRegistry::with_persistence(db.clone()).await;
 
     // Load and initialize authoritative immutable MAINTAINERS index when the
     // reviewed project uses kernel MAINTAINERS.
