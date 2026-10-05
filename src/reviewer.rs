@@ -160,6 +160,16 @@ fn git_am_message(author: &str, date: i64, subject: &str, diff: &str) -> Result<
     ))
 }
 
+/// Whether a stored diff is empty, so the patch changes nothing.
+///
+/// A `b4 prep` tracker, or any `git commit --allow-empty`, is stored with
+/// an empty diff, and a clean merge with a lone newline. Every other
+/// source stores a non-empty one, so this never skips a patch that has a
+/// header `extract_files_from_diff` cannot read.
+fn diff_is_empty(diff: &str) -> bool {
+    diff.trim().is_empty()
+}
+
 /// The `Reviewer` service orchestrates the review process for patchsets.
 ///
 /// It manages:
@@ -1861,7 +1871,29 @@ impl Reviewer {
             });
         }
 
+        // No review row is written, as for the pre-filter skips: a patch
+        // that changes nothing has nothing a reviewer could report on.
+        if diff_is_empty(diff) {
+            info!(
+                "Skipping review for patch {}/{} (ID: {}) as it changes no files.",
+                patchset_id, index, patch_id
+            );
+            if let Err(e) = ctx
+                .db
+                .update_patch_status(patch_id, PatchOutcome::Skipped)
+                .await
+            {
+                warn!("Failed to mark patch {} skipped: {}", patch_id, e);
+            }
+            return Ok(PatchResult::Success);
+        }
+
         let files = extract_files_from_diff(diff);
+        // The emptiness guard stays even though an empty diff has already
+        // returned above. A diff whose only headers are C-quoted paths,
+        // combined (`diff --cc`) or plain unified ones is non-empty, yet
+        // yields no extracted files, and it must still be reviewed rather
+        // than vacuously matching "every file is ignored".
         if !files.is_empty()
             && files.iter().all(|f| {
                 ctx.settings
@@ -6624,104 +6656,105 @@ fi
         assert_baseline_failure_log(&ctx, tip_diff, "Unrecognized patch application failure.").await
     }
 
+    /// A patchset reviewed with a mock provider and the default worker
+    /// binary, for tests whose patches `process_patch_review` must settle
+    /// before it would spawn a worker.
+    struct SkipHarness {
+        ctx: ReviewContext,
+        thread_id: i64,
+        patchset_id: i64,
+    }
+
+    impl SkipHarness {
+        async fn new(mut settings: Settings) -> Result<Self> {
+            settings.database.url = ":memory:".to_string();
+            let db = Arc::new(Database::new(&settings.database).await?);
+            db.migrate().await?;
+            let ctx = ReviewContext {
+                semaphore: Arc::new(Semaphore::new(1)),
+                llm_semaphore: Arc::new(Semaphore::new(56)),
+                db: db.clone(),
+                settings,
+                baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None)?),
+                quota_manager: Arc::new(QuotaManager::new()),
+                target_review_count: 1,
+                provider: Arc::new(MockProvider),
+                activity: crate::activity::ActivityRegistry::new(),
+                worker_program: None,
+            };
+            let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+            let patchset_id = db
+                .create_patchset(
+                    thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                    None, false, None, None,
+                )
+                .await?
+                .ok_or_else(|| anyhow!("patchset was not created"))?;
+            Ok(Self {
+                ctx,
+                thread_id,
+                patchset_id,
+            })
+        }
+
+        /// Stores part `index` with `diff`, and its message, and returns
+        /// the new patch's id.
+        async fn add_patch(&self, index: u32, diff: &str) -> Result<i64> {
+            let message_id = format!("msg_id_p{index}");
+            self.ctx
+                .db
+                .create_message(
+                    &message_id,
+                    self.thread_id,
+                    None,
+                    "Author",
+                    "Subject",
+                    1000,
+                    "Body",
+                    "",
+                    "",
+                    None,
+                    None,
+                )
+                .await?;
+            self.ctx
+                .db
+                .create_patch(self.patchset_id, &message_id, index, diff)
+                .await
+        }
+
+        /// Reviews part `index`, stored as `patch_id`, once.
+        async fn review(&self, patch_id: i64, index: u32, diff: &str) -> Result<PatchResult> {
+            Reviewer::process_patch_review(
+                &self.ctx,
+                self.patchset_id,
+                patch_id,
+                i64::from(index),
+                "HEAD",
+                None,
+                &json!({}),
+                None,
+                None,
+                None,
+                diff,
+                None,
+            )
+            .await
+        }
+    }
+
     #[tokio::test]
     async fn test_skip_ignored_files() -> Result<()> {
         let mut settings = Settings::new()?;
-        settings.database.url = ":memory:".to_string();
         settings.review.ignore_files = vec!["ignored.txt".to_string(), "ignore_dir/".to_string()];
-
-        let db = Arc::new(Database::new(&settings.database).await?);
-        db.migrate().await?;
-        let quota_manager = Arc::new(QuotaManager::new());
-        let provider = Arc::new(MockProvider);
-
-        let ctx = ReviewContext {
-            semaphore: Arc::new(Semaphore::new(1)),
-            llm_semaphore: Arc::new(Semaphore::new(56)),
-            db: db.clone(),
-            settings: settings.clone(),
-            baseline_registry: Arc::new(BaselineRegistry::new(Path::new("."), None).unwrap()),
-            quota_manager,
-            target_review_count: 1,
-            provider,
-            activity: crate::activity::ActivityRegistry::new(),
-            worker_program: None,
-        };
-
-        // Create dummy patchset and patch in DB
-        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
-
-        // Create messages for patches
-        db.create_message(
-            "msg_id_p1",
-            thread_id,
-            None,
-            "Author",
-            "Subject",
-            1000,
-            "Body",
-            "",
-            "",
-            None,
-            None,
-        )
-        .await?;
-        db.create_message(
-            "msg_id_p2",
-            thread_id,
-            None,
-            "Author",
-            "Subject",
-            1000,
-            "Body",
-            "",
-            "",
-            None,
-            None,
-        )
-        .await?;
-        db.create_message(
-            "msg_id_p3",
-            thread_id,
-            None,
-            "Author",
-            "Subject",
-            1000,
-            "Body",
-            "",
-            "",
-            None,
-            None,
-        )
-        .await?;
-
-        let ps_id = db
-            .create_patchset(
-                thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
-                None, false, None, None,
-            )
-            .await?
-            .expect("Failed to create patchset");
+        let harness = SkipHarness::new(settings).await?;
+        let db = harness.ctx.db.clone();
 
         // Case 1: Ignored file
         let diff_ignored = "diff --git a/ignored.txt b/ignored.txt\nindex ...";
-        let p_id = db.create_patch(ps_id, "msg_id_p1", 1, diff_ignored).await?;
+        let p_id = harness.add_patch(1, diff_ignored).await?;
 
-        let result = Reviewer::process_patch_review(
-            &ctx,
-            ps_id,
-            p_id,
-            1,
-            "HEAD",
-            None,
-            &json!({}),
-            None,
-            None,
-            None,
-            diff_ignored,
-            None,
-        )
-        .await?;
+        let result = harness.review(p_id, 1, diff_ignored).await?;
 
         // Should return Success (because it's skipped gracefully)
         match result {
@@ -6746,23 +6779,9 @@ fi
 
         // Case 2: Ignored directory prefix
         let diff_dir = "diff --git a/ignore_dir/subfile.c b/ignore_dir/subfile.c\n...";
-        let p_id_2 = db.create_patch(ps_id, "msg_id_p2", 2, diff_dir).await?;
+        let p_id_2 = harness.add_patch(2, diff_dir).await?;
 
-        let result = Reviewer::process_patch_review(
-            &ctx,
-            ps_id,
-            p_id_2,
-            2,
-            "HEAD",
-            None,
-            &json!({}),
-            None,
-            None,
-            None,
-            diff_dir,
-            None,
-        )
-        .await?;
+        let result = harness.review(p_id_2, 2, diff_dir).await?;
 
         match result {
             PatchResult::Success => {}
@@ -6782,23 +6801,9 @@ fi
 
         // Case 3: Mixed (Ignored + Not Ignored) -> Should NOT skip
         let diff_mixed = "diff --git a/ignored.txt b/ignored.txt\n...\ndiff --git a/src/main.rs b/src/main.rs\n...";
-        let p_id_3 = db.create_patch(ps_id, "msg_id_p3", 3, diff_mixed).await?;
+        let p_id_3 = harness.add_patch(3, diff_mixed).await?;
 
-        let _result = Reviewer::process_patch_review(
-            &ctx,
-            ps_id,
-            p_id_3,
-            3,
-            "HEAD",
-            None,
-            &json!({}),
-            None,
-            None,
-            None,
-            diff_mixed,
-            None,
-        )
-        .await;
+        let _result = harness.review(p_id_3, 3, diff_mixed).await;
 
         // Even if it fails to run tool, it shouldn't be "Skipped".
         let mut rows = db
@@ -6825,6 +6830,85 @@ fi
             // So we should find at least one review.
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn diff_is_empty_holds_only_for_a_diff_that_changes_nothing() {
+        for empty in ["", "\n", "\n\n"] {
+            assert!(diff_is_empty(empty), "{empty:?} changes nothing");
+        }
+        let changes = [
+            "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+            // A C-quoted non-ASCII path, which extract_files_from_diff
+            // cannot read.
+            "diff --git \"a/\\303\\251.c\" \"b/\\303\\251.c\"\nindex 1..2 100644\n@@ -1 +1 @@\n-a\n+b\n",
+            // A merge that resolved a conflict.
+            "diff --cc file\nindex 1,2..3\n@@@ -1,1 -1,1 +1,1 @@@\n- a\n -b\n++c\n",
+            // A plain unified diff with no git header.
+            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+        ];
+        for diff in changes {
+            assert!(!diff_is_empty(diff), "{diff:?} changes a file");
+        }
+    }
+
+    /// The premise of the empty-diff skip for git-sourced patches: the
+    /// diff the fetcher stores is empty for a commit that changes nothing,
+    /// and only for one.
+    #[tokio::test]
+    async fn git_stores_an_empty_diff_only_for_a_commit_that_changes_nothing() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let repo = temp_dir.path();
+        run_git(repo, &["init", "-q", "--initial-branch=master"])?;
+        run_git(repo, &["config", "user.name", "Test Author"])?;
+        run_git(repo, &["config", "user.email", "author@example.com"])?;
+        std::fs::write(repo.join("a.txt"), "a\n")?;
+        run_git(repo, &["add", "a.txt"])?;
+        run_git(repo, &["commit", "-q", "-m", "base"])?;
+
+        run_git(repo, &["commit", "-q", "--allow-empty", "-m", "tracker"])?;
+        let tracker = run_git(repo, &["rev-parse", "HEAD"])?;
+
+        run_git(repo, &["checkout", "-q", "-b", "side"])?;
+        std::fs::write(repo.join("b.txt"), "b\n")?;
+        run_git(repo, &["add", "b.txt"])?;
+        run_git(repo, &["commit", "-q", "-m", "side"])?;
+        run_git(repo, &["checkout", "-q", "master"])?;
+        std::fs::write(repo.join("a.txt"), "a\nmore\n")?;
+        run_git(repo, &["commit", "-q", "-am", "change"])?;
+        let change = run_git(repo, &["rev-parse", "HEAD"])?;
+        run_git(repo, &["merge", "-q", "--no-ff", "--no-edit", "side"])?;
+        let merge = run_git(repo, &["rev-parse", "HEAD"])?;
+
+        let stored = |sha: String| async move {
+            crate::git_ops::extract_patch_metadata(repo, &sha)
+                .await
+                .map(|metadata| metadata.diff)
+        };
+        let tracker_diff = stored(tracker).await?;
+        assert!(diff_is_empty(&tracker_diff), "{tracker_diff:?}");
+        let merge_diff = stored(merge).await?;
+        assert!(diff_is_empty(&merge_diff), "{merge_diff:?}");
+        let change_diff = stored(change).await?;
+        assert!(!diff_is_empty(&change_diff), "{change_diff:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_skip_patch_with_empty_diff() -> Result<()> {
+        let harness = SkipHarness::new(Settings::new()?).await?;
+        let patch_id = harness.add_patch(1, "").await?;
+
+        let result = harness.review(patch_id, 1, "").await?;
+
+        assert!(matches!(result, PatchResult::Success));
+        assert_eq!(
+            patch_status(&harness.ctx.db, patch_id).await?.as_deref(),
+            Some(PatchOutcome::Skipped.as_str())
+        );
+        // A worker would have opened a review row before it ran.
+        assert!(review_rows(&harness.ctx.db, patch_id).await?.is_empty());
         Ok(())
     }
 
