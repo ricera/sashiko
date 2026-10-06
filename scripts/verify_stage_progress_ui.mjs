@@ -1334,13 +1334,68 @@ function findingCalibrationRenderChecks(fns, expect) {
             && card.includes('<span class="finding-label">Reachability:</span> always.'));
 }
 
+// The speculative tag and the note for findings that do not say either way.
+function findingSpeculativeChecks(fns, expect) {
+    const tagText = f => fns.findingTags(f).join('');
+    expect('speculative: true tags the finding',
+        tagText({ speculative: true }).includes('(speculative)'));
+    expect('speculative: false, absent and "true" do not',
+        [{ speculative: false }, {}, { speculative: 'true' }, { speculative: 1 }, null].every(f =>
+            !tagText(f).includes('(speculative)')));
+    expect('speculative: the tooltip says the severity is capped',
+        tagText({ speculative: true }).includes(
+            'title="The reviewer could not establish how this bug is triggered, so its severity is capped"'));
+    expect('speculative: it is read from the key, not from the reasoning',
+        !tagText({ speculative: false,
+                   severity_explanation: 'Triggering path (verified, not speculative): boot' })
+            .includes('(speculative)'));
+    expect('speculative: the tag comes before the preexisting tag',
+        (() => {
+            const text = tagText({ speculative: true, preexisting: true });
+            return text.includes('(speculative)') && text.indexOf('(speculative)') < text.indexOf('(preexisting)');
+        })());
+
+    const high = findingsBlock(findingsCard(fns,
+        [{ severity: 'High', problem: 'h-one', speculative: true }]));
+    expect('speculative: a High finding shows the tag too',
+        high.includes('>High<') && high.includes('(speculative)'));
+    const mixed = findingsBlock(findingsCard(fns, [
+        { severity: 'High', problem: 'h-one', speculative: true },
+        { severity: 'Low', problem: 'l-one', speculative: false }]));
+    expect('speculative: only the marked row carries the tag',
+        mixed.split('(speculative)').length === 2
+            && mixed.indexOf('(speculative)') < mixed.indexOf('>l-one<'));
+
+    const NOTE = 'These findings do not say whether they are speculative.';
+    const countNotes = findings => findingsBlock(findingsCard(fns, findings)).split(NOTE).length - 1;
+    const unmarked = [{ severity: 'High', problem: 'a' }, { severity: 'Low', problem: 'b' },
+                      { severity: 'Low', problem: 'c' }];
+    expect('note: shown once when no finding says whether it is speculative', countNotes(unmarked) === 1);
+    const unmarkedBlock = findingsBlock(findingsCard(fns, unmarked));
+    expect('note: it opens the list, before the first row',
+        unmarkedBlock.indexOf(NOTE) >= 0 && unmarkedBlock.indexOf(NOTE) < unmarkedBlock.indexOf('>a<'));
+    expect('note: not shown when one finding says false',
+        countNotes([...unmarked, { severity: 'Low', problem: 'd', speculative: false }]) === 0);
+    expect('note: not shown when one finding says true',
+        countNotes([...unmarked, { severity: 'Low', problem: 'd', speculative: true }]) === 0);
+    expect('note: a value that is not a boolean does not count as marked',
+        countNotes([{ severity: 'High', problem: 'a', speculative: 'true' },
+                    { severity: 'Low', problem: 'b', speculative: null }]) === 1);
+    const patchset = findingsCard(fns, [{ severity: 'High', problem: 'new-one' },
+        { severity: 'High', problem: 'old-one', preexisting: true, speculative: false }], { patch_id: null });
+    expect('note: a finding the card does not list cannot mark the others',
+        findingsBlock(patchset).includes(NOTE) && !patchset.includes('old-one'));
+    expect('note: absent from a card with no findings block',
+        !findingsCard(fns, []).includes(NOTE));
+}
+
 function findingChecks(fns) {
     const failed = [];
     const expect = (name, cond) => { if (!cond) failed.push(name); };
     const groups = [findingTitleChecks, findingOrderChecks, findingCardChecks, findingMalformedChecks,
                     findingEscapingChecks, findingLocationChecks, findingCalibrationLabelChecks,
                     findingCalibrationShapeChecks, findingCalibrationProseChecks,
-                    findingCalibrationRenderChecks];
+                    findingCalibrationRenderChecks, findingSpeculativeChecks];
     for (const group of groups) {
         try { group(fns, expect); } catch (e) { failed.push(`${group.name}: threw ${e}`); }
     }
@@ -1893,6 +1948,21 @@ const mutate = (name, from, to) => {
             mutate('parseSeverityCalibration', 'whole.slice(0, marks[0].start).trim() : whole', "'' : whole")],
         ['a label match that keeps the bold in the label is caught',
             mutate('parseSeverityCalibration', 'label: m[2] ?? m[4]', 'label: m[0]')],
+        ['a speculative tag read from the severity reasoning is caught',
+            mutate('findingTags', 'f.speculative === true', '/speculative/.test(f.severity_explanation)')],
+        ['a speculative tag on any truthy value is caught',
+            mutate('findingTags', 'f.speculative === true', 'f.speculative')],
+        ['a not-marked note shown on every row is caught',
+            mutate('renderFindingsList', '${notMarked}${listed.map(({ f }) => renderFindingRow(f)).join(\'\')}',
+                '${listed.map(({ f }) => notMarked + renderFindingRow(f)).join(\'\')}')],
+        ['a not-marked note that never shows is caught',
+            mutate('renderFindingsList', "typeof f.speculative !== 'boolean'", 'false')],
+        ['a not-marked note that shows beside marked findings is caught',
+            mutate('renderFindingsList', "listed.every(({ f }) => typeof f.speculative !== 'boolean')", 'true')],
+        ['a not-marked note that counts any value as marked is caught',
+            mutate('renderFindingsList', "typeof f.speculative !== 'boolean'", 'f.speculative === undefined')],
+        ['a not-marked note that looks at unlisted findings is caught',
+            mutate('renderFindingsList', 'listed.every(({ f }) =>', 'findings.every(f =>')],
         ['a title clipped at exactly the limit is caught',
             mutate('findingTitle', 'chars.length > FINDING_TITLE_MAX_CHARS',
                 'chars.length >= FINDING_TITLE_MAX_CHARS')],
