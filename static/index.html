@@ -1031,6 +1031,71 @@
             line-height: 1.4;
         }
 
+        /* One finding on a review card. A finding with a body is a <details>
+           whose marker is drawn as the page's other toggles draw theirs; one
+           with nothing to open is a plain <div> that keeps the marker's space,
+           so every severity starts in the same column. */
+        .finding {
+            margin: 2px 0;
+            font-size: 0.9em;
+        }
+
+        details.finding > summary {
+            cursor: pointer;
+            list-style: none;
+        }
+
+        details.finding > summary::-webkit-details-marker {
+            display: none;
+        }
+
+        details.finding > summary::before,
+        div.finding::before {
+            display: inline-block;
+            width: 1.2em;
+            color: var(--text-muted);
+            content: '▶';
+        }
+
+        details.finding[open] > summary::before {
+            content: '▼';
+        }
+
+        div.finding::before {
+            content: '';
+        }
+
+        /* The right margin keeps a severity wider than the column, such as
+           an unknown label the model made up, from running into the text
+           after it. */
+        .finding-severity {
+            display: inline-block;
+            min-width: 5em;
+            margin-right: 0.5em;
+            font-weight: bold;
+        }
+
+        .finding-tag {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
+        .finding-body {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin: 4px 0 10px 1.2em;
+        }
+
+        .finding-text {
+            white-space: pre-wrap;
+        }
+
+        .finding-muted {
+            color: var(--text-muted);
+            white-space: pre-wrap;
+        }
+
         /* Diff highlighting */
         .diff-line {
             display: block;
@@ -2810,6 +2875,125 @@
                     <span style="color:${low > 0 ? 'var(--sev-low)' : 'var(--text-dim)'}" title="Low">${low}</span>
                 </div>
             `;
+        }
+
+        // How long a finding title may be before its row clips it. Matches
+        // TITLE_MAX_CHARS in src/finding_view.rs, so the page and the CLIs cut
+        // the same title at the same place.
+        const FINDING_TITLE_MAX_CHARS = 160;
+
+        // The verification stage has no validator, so an entry of a review's
+        // findings array can be any JSON value. Every finding helper reads its
+        // finding through this, so a string or a number in the array reads as
+        // a finding with no fields instead of throwing.
+        function findingObject(finding) {
+            return finding && typeof finding === 'object' ? finding : {};
+        }
+
+        // A finding's one-line title, and whether it had to be clipped to fit.
+        // Reviews are asked for a problem under 80 characters, but nothing
+        // enforces it and older reviews wrote a whole argument there. Code
+        // points are counted, so a surrogate pair is never split. A clipped
+        // title is the caller's cue to show the full text in the body.
+        function findingTitle(finding) {
+            const problem = findingObject(finding).problem;
+            const text = typeof problem === 'string' ? problem.trim() : '';
+            if (!text) return { title: '(no description)', clipped: false };
+            const chars = Array.from(text);
+            if (chars.length > FINDING_TITLE_MAX_CHARS) {
+                const cut = chars.slice(0, FINDING_TITLE_MAX_CHARS).join('').trimEnd();
+                return { title: `${cut}…`, clipped: true };
+            }
+            return { title: text, clipped: false };
+        }
+
+        // A finding's locations, each as file:line (function) with the reason
+        // it matters beneath it. The rule is the CLIs' (format_location in
+        // src/finding_view.rs): missing parts are dropped, and only a
+        // non-negative integer is a line number, so the page never shows a line
+        // the model did not name. The code snippet is left out because the
+        // inline review already quotes the code, and a snippet here would bury
+        // the reasoning beside it.
+        function renderFindingLocations(locations) {
+            if (!Array.isArray(locations)) return '';
+            const textOf = (loc, key) => (typeof loc[key] === 'string' ? loc[key].trim() : '');
+            const items = locations.filter(loc => loc && typeof loc === 'object').map(loc => {
+                const file = textOf(loc, 'file');
+                const fn = textOf(loc, 'function_or_symbol');
+                const line = Number.isInteger(loc.line) && loc.line >= 0 ? `:${loc.line}` : '';
+                const where = file ? `${file}${line}${fn ? ` (${fn})` : ''}` : fn;
+                const why = textOf(loc, 'why_this_location_matters');
+                if (!where && !why) return '';
+                return '<div>'
+                    + (where ? `<code>${escapeHtml(where)}</code>` : '')
+                    + (why ? `<div class="finding-muted">${escapeHtml(why)}</div>` : '')
+                    + '</div>';
+            }).filter(Boolean);
+            return items.length ? `<div>${items.join('')}</div>` : '';
+        }
+
+        // The tags shown after a finding's severity. They live in one list so
+        // that a later tag has one place to go. Only a JSON true counts, as in
+        // the CLIs, so a stray string never tags a finding.
+        function findingTags(finding) {
+            const f = findingObject(finding);
+            const tags = [];
+            if (f.preexisting === true) {
+                tags.push('<span class="finding-tag"'
+                    + ' title="The bug was already in the code before this change">(preexisting)</span>');
+            }
+            return tags;
+        }
+
+        // One finding as a row: severity, tags and title, opening onto the full
+        // problem when the title was clipped, the severity reasoning and the
+        // locations. A finding with none of those is a plain row, because a
+        // control that opens onto nothing is worse than no control.
+        function renderFindingRow(finding) {
+            const f = findingObject(finding);
+            // The severity counts read a missing severity as Low, so the row
+            // says Low too and agrees with the Result line beside it. The colour
+            // comes from a whitelist, never from the model's text, which would
+            // otherwise land unescaped in a style attribute.
+            const severity = typeof f.severity === 'string' && f.severity ? f.severity : 'Low';
+            const { title, clipped } = findingTitle(f);
+            const head = `<span class="finding-severity" style="color:${getSeverityColor(severity)};">`
+                + `${escapeHtml(severity)}</span>`
+                + findingTags(f).map(tag => `${tag} `).join('')
+                + `<span title="${escapeHtml(title)}">${escapeHtml(title)}</span>`;
+            const explanation = typeof f.severity_explanation === 'string' ? f.severity_explanation.trim() : '';
+            const body = (clipped ? `<div class="finding-text">${escapeHtml(f.problem.trim())}</div>` : '')
+                + (explanation ? `<div class="finding-text">${escapeHtml(explanation)}</div>` : '')
+                + renderFindingLocations(f.locations);
+            if (!body) return `<div class="finding">${head}</div>`;
+            return `<details class="finding"><summary>${head}</summary>`
+                + `<div class="finding-body">${body}</div></details>`;
+        }
+
+        // A review's findings, worst first, as a block that starts open. The
+        // entries are the ones the Result line counts, so "Findings (N)" agrees
+        // with the counts beside it: a patchset-level card leaves preexisting
+        // findings out, as its counts do. A severity the counts do not know is
+        // counted as Low, so it is listed with the Lows, and findings of one
+        // level keep the order the model gave them.
+        function renderFindingsList(findings, uniqueId, { includePreexisting }) {
+            if (!Array.isArray(findings)) return '';
+            const rankOf = f => {
+                const rank = ['critical', 'high', 'medium'].indexOf(String(f.severity || '').toLowerCase());
+                return rank < 0 ? 3 : rank;
+            };
+            const listed = findings
+                .map((finding, index) => ({ f: findingObject(finding), index }))
+                .filter(({ f }) => includePreexisting || !f.preexisting)
+                .map(entry => ({ ...entry, rank: rankOf(entry.f) }))
+                .sort((a, b) => a.rank - b.rank || a.index - b.index);
+            if (listed.length === 0) return '';
+            return `
+                    <div style="margin-top:8px;">
+                        <button class="toggle-btn" onclick="toggleCollapsible('findings-${uniqueId}', this)">▼ Findings (${listed.length})</button>
+                        <div id="findings-${uniqueId}" class="collapsible open">${listed.map(({ f }) => renderFindingRow(f)).join('')}</div>
+                    </div>
+                `;
         }
 
         // The status and findings cells of one row of the patchset list.
@@ -4864,6 +5048,7 @@
             // 1. Try to parse output for structured findings
             let parsedFindings = false;
             let outputJson = null;
+            const isPatchset = (r.patch_id === null || r.patch_id === undefined);
             try {
                 if (r.output) {
                     if (typeof r.output === 'string') {
@@ -4874,8 +5059,6 @@
 
                     // Findings
                     if (outputJson && outputJson.findings && Array.isArray(outputJson.findings)) {
-                        const isPatchset = (r.patch_id === null || r.patch_id === undefined);
-                        
                         if (isPatchset) {
                             // For patchsets, only count and display newly introduced bugs.
                             const newFindings = outputJson.findings.filter(f => !f.preexisting);
@@ -4949,6 +5132,14 @@
                 }
             } catch (e) { }
 
+            // Built only from an array the counts above could read, so the list
+            // never disagrees with the Result line. An entry the counts choke
+            // on (a null) leaves parsedFindings false, and the card falls back
+            // to the result text with no list.
+            const findingsHtml = parsedFindings
+                ? renderFindingsList(outputJson.findings, uniqueId, { includePreexisting: !isPatchset })
+                : '';
+
             // 2. If no structured findings, fallback to r.result
             if (!parsedFindings) {
                 const rawResult = r.result || 'Finished';
@@ -4986,10 +5177,13 @@
             let inlineHtml = '';
             const inlineReview = r.inline_review || r.description;
             if (inlineReview) {
-                // Expanded by default when the review found something.
-                const hasIssues = parsedFindings && !foundNothing;
-                const isOpen = hasIssues ? 'open' : '';
-                const icon = hasIssues ? '▼' : '▶';
+                // Expanded by default when the review found something, unless
+                // the findings are already listed above it. A Sashiko inline
+                // review is a bullet list of those same findings, so opening
+                // both would show every finding twice on load.
+                const openInline = parsedFindings && !foundNothing && !findingsHtml;
+                const isOpen = openInline ? 'open' : '';
+                const icon = openInline ? '▼' : '▶';
                 inlineHtml = `
                     <div style="margin-top:8px;">
                         <button class="toggle-btn" onclick="toggleCollapsible('inline-${uniqueId}', this)">${icon} Inline Review</button>
@@ -5035,6 +5229,7 @@
                     </div>${referencesHtml}
                     ${showDetails ? `
                     ${summaryHtml}
+                    ${findingsHtml}
                     ${inlineHtml}
                     <div style="margin-top: 24px; margin-bottom: 0;">
                         ${emailHtml}
