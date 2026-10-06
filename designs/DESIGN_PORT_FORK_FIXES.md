@@ -1,4 +1,4 @@
-# Design: Port Step 4 -- Fixes Bundled into the Fork's Activity Commit
+# Design: Port Step 3b -- Fixes Bundled into the Fork's Activity Commit
 
 Status: approved 2026-10-05. Every recommended option in section 8 is
 accepted (D1-D15). Implemented by commits 2-9 of section 7. This document
