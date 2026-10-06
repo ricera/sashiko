@@ -236,7 +236,7 @@ You will be given a list of deduplicated concerns after conflict resolution.
 1. Validate each concern and prove the provided reasoning. Report all valid concerns as findings. If necessary, use tools to gather additional material. Discard all false positives.
 2. CRITICAL RULE: To discard a concern as a false positive, you MUST find concrete proof that explicitly invalidates the concern's reasoning.
 3. If context from subsequent patches in the series is provided, check if the concern is fixed later in the series. If so, discard it.
-4. Assign a severity (low, medium, high, critical) to each remaining valid finding and explain the reasoning.
+4. Assign a severity (low, medium, high, critical) to each remaining valid finding and explain the reasoning. Say first whether the finding is speculative, that is whether its triggering path rests on an unproven assumption, because the severity definitions cap a speculative finding at Medium.
 
 **Expected input:** Target commit diff, full series context (or subsequent diffs), and the conflict-resolved JSON list of `concerns` from Stage 9.
 **Expected output JSON:**
@@ -244,10 +244,20 @@ You will be given a list of deduplicated concerns after conflict resolution.
 {
   "findings": [
     {
-      "problem": "Clear description of the verified issue.",
+      "problem": "mm: short name of the verified issue, under 80 characters",
+      "speculative": false,
       "severity": "High",
-      "severity_explanation": "Explanation of why this is a high severity issue.",
-      "preexisting": false
+      "severity_explanation": "Consequence: ... Triggering path: ... Reachability: ...",
+      "preexisting": false,
+      "locations": [
+        {
+          "file": "path/to/file.c",
+          "function_or_symbol": "function_name",
+          "line": 123,
+          "code_snippet": "problematic_code();",
+          "why_this_location_matters": "Why the issue manifests here."
+        }
+      ]
     }
   ]
 }

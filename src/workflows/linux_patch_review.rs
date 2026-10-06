@@ -1181,7 +1181,7 @@ CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must fi
 Consolidated Concerns:
 {{{{patch_concerns}}}}
 
-Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "speculative" (a boolean: true if you could not lay out a concrete triggering path because it rests on an unproven assumption, or on an ABI, register, or convention you might be misreading; the severity definitions cap a speculative finding at Medium. If any part of the triggering path rests on such an assumption, answer true. false if the triggering path is established from the code. Uncertainty about reachability or about the consequence alone does not make a finding speculative and never lowers its level), "severity" (a string: Low, Medium, High, or Critical), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: true if the problem already existed in the codebase before these patches were applied, or false if it was newly introduced by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated concern; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
 
 Example Output:
 ```json
@@ -1189,6 +1189,7 @@ Example Output:
   "findings": [
     {{
       "problem": "mm: memory leak in func_x() due to unmet condition Y",
+      "speculative": false,
       "severity": "High",
       "severity_explanation": "Consequence: the buffer allocated in func_x() leaks on every call that meets condition Y. Triggering path: a caller passes Y, func_x() returns early before kfree(). Reachability: reachable from the ioctl handler by an unprivileged user.",
       "preexisting": false,
@@ -2012,6 +2013,7 @@ mod tests {
         let example = verification_example(&prompt);
         for key in [
             "problem",
+            "speculative",
             "severity",
             "severity_explanation",
             "preexisting",
@@ -2026,6 +2028,52 @@ mod tests {
                 "example lacks {key}: {example}"
             );
         }
+    }
+
+    /// The speculative cap is a condition on the level, so the model has to
+    /// commit to it before it picks one.
+    #[test]
+    fn verification_asks_for_speculative_before_severity() {
+        let prompt = verification_prompt();
+        let keys = verification_key_list(&prompt);
+        let example = verification_example(&prompt);
+        for (span, speculative, severity) in [
+            (keys, "\"speculative\" (", "\"severity\" ("),
+            (example, "\"speculative\":", "\"severity\":"),
+        ] {
+            let speculative = span.find(speculative).expect("speculative is asked for");
+            let severity = span.find(severity).expect("severity is asked for");
+            assert!(speculative < severity, "speculative after severity: {span}");
+        }
+    }
+
+    #[test]
+    fn test_verification_stage_keeps_the_speculative_mark() {
+        let stage = verification_stage(20, 0.0);
+        let mut state = LinuxPatchReviewState::default();
+        let output = VerificationOutput {
+            findings: vec![
+                json!({
+                    "problem": "mm: unproven leak",
+                    "speculative": true,
+                    "severity": "Medium",
+                    "preexisting": false,
+                }),
+                json!({
+                    "problem": "mm: old unproven leak",
+                    "speculative": true,
+                    "severity": "Medium",
+                    "preexisting": true,
+                }),
+            ],
+        };
+
+        (stage.reducer)(&mut state, output);
+
+        assert_eq!(state.findings.len(), 1);
+        assert_eq!(state.findings[0]["speculative"], true);
+        assert_eq!(state.concerns.len(), 1);
+        assert_eq!(state.concerns[0]["description"], "mm: old unproven leak");
     }
 
     /// Instruction item 5 and the kernel rubric ask for consequence,

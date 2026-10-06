@@ -985,7 +985,7 @@ CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must fi
 Consolidated Concerns:
 {{{{patch_concerns}}}}
 
-Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, or Critical), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters)."#
+Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "speculative" (boolean: true if the concrete path and preconditions that trigger the bug rest on an unverified assumption; severity.md caps a speculative finding at Medium, or Low if the impact is minor. If any part of that path rests on one, answer true. false if that path and its preconditions are established from the code. A low likelihood that is established from the code is reflected in the level, not in this key), "severity" (Low, Medium, High, or Critical), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters)."#
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
@@ -1410,5 +1410,54 @@ mod tests {
             "db: pre-existing missing index on patches table"
         );
         assert_eq!(state.concerns[0]["preexisting"], true);
+    }
+
+    /// The rubric tells the model to mark a speculative finding; the key list
+    /// gives the mark a place, ahead of the level it caps.
+    #[test]
+    fn verification_asks_whether_a_finding_is_speculative() {
+        let prompt = verification_stage(10, 1.0)
+            .user_prompt
+            .render_for_log(&SashikoPatchReviewState::default());
+        let start = prompt
+            .find("Each object in the 'findings' array MUST use exactly the following keys:")
+            .expect("the verification prompt has a key list");
+        let keys = &prompt[start..];
+        let speculative = keys
+            .find("\"speculative\" (")
+            .expect("the key list asks for speculative");
+        let severity = keys
+            .find("\"severity\" (")
+            .expect("the key list asks for severity");
+        assert!(speculative < severity, "speculative after severity: {keys}");
+    }
+
+    #[test]
+    fn test_sashiko_verification_keeps_the_speculative_mark() {
+        let stage = verification_stage(1, 0.0);
+        let mut state = SashikoPatchReviewState::default();
+        let output = VerificationOutput {
+            findings: vec![
+                json!({
+                    "problem": "db: unproven race",
+                    "speculative": true,
+                    "severity": "Medium",
+                    "preexisting": false,
+                }),
+                json!({
+                    "problem": "db: old unproven race",
+                    "speculative": true,
+                    "severity": "Medium",
+                    "preexisting": true,
+                }),
+            ],
+        };
+
+        (stage.reducer)(&mut state, output);
+
+        assert_eq!(state.findings.len(), 1);
+        assert_eq!(state.findings[0]["speculative"], true);
+        assert_eq!(state.concerns.len(), 1);
+        assert_eq!(state.concerns[0]["description"], "db: old unproven race");
     }
 }
