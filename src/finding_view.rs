@@ -145,11 +145,63 @@ fn severity_color(severity: Severity) -> Color {
     }
 }
 
-/// Trims `problem` and clips it at `TITLE_MAX_CHARS` code points, so a
-/// multibyte character is never split. A clipped title loses its trailing
-/// whitespace and ends in "…".
+/// The largest integer a JSON number can name without rounding (2^53 - 1),
+/// the same bound as `Number.MAX_SAFE_INTEGER` on the web page.
+const MAX_SAFE_LINE_INT: u64 = 9_007_199_254_740_991;
+
+/// Reports whether a character must not reach a terminal as it is: a control
+/// character such as newline, tab or ESC, a line or paragraph separator, a
+/// zero-width or directional mark (U+200B to U+200F), or a bidirectional
+/// embedding, override or isolate (U+202A to U+202E and U+2066 to U+2069). The
+/// last two groups can make a bidi-aware terminal draw text in another order
+/// than it was written, so a file name or a title could read differently from
+/// what it is.
+fn is_unsafe_for_terminal(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{2028}' | '\u{2029}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Replaces every character for which `is_unsafe_for_terminal` holds with a
+/// single space and trims the result. Finding text comes from the model and
+/// is printed to a terminal, so such a character must neither split one
+/// finding over several lines, nor reach the terminal as an escape sequence,
+/// nor reorder the text around it.
+fn sanitize_text(text: &str) -> String {
+    text.chars()
+        .map(|c| if is_unsafe_for_terminal(c) { ' ' } else { c })
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Reads a line number: a JSON non-negative integer, or an integral
+/// non-negative number written as a float such as 12.0. A string, a negative
+/// number, a fraction and anything above 2^53 - 1 give `None`, whether the
+/// number was written as an integer or as a float.
+fn line_number(value: Option<&Value>) -> Option<u64> {
+    let value = value?;
+    if let Some(line) = value.as_u64() {
+        // serde_json keeps an integer literal exact up to u64::MAX, but the web
+        // page rounds anything above 2^53 - 1, so both apply the same bound.
+        return Some(line).filter(|line| *line <= MAX_SAFE_LINE_INT);
+    }
+    value
+        .as_f64()
+        .filter(|line| line.fract() == 0.0 && (0.0..=MAX_SAFE_LINE_INT as f64).contains(line))
+        // The filter proves the value is a non-negative integer below 2^53,
+        // so the conversion is exact.
+        .map(|line| line as u64)
+}
+
+/// Sanitises `problem` (see `sanitize_text`) and clips it at
+/// `TITLE_MAX_CHARS` code points, so a multibyte character is never split.
+/// A clipped title loses its trailing whitespace and ends in "…".
 fn clip_title(problem: &str) -> String {
-    let problem = problem.trim();
+    let problem = sanitize_text(problem);
     if problem.is_empty() {
         return NO_DESCRIPTION.to_string();
     }
@@ -161,26 +213,26 @@ fn clip_title(problem: &str) -> String {
 
 /// Formats one location as `file:line (function)`, dropping absent parts.
 /// Returns `None` for an entry that is not an object or names neither a file
-/// nor a function, so the caller moves on to the next location. Only a JSON
-/// non-negative integer is a line number; a string such as "45", a negative
-/// number or a float such as 12.0 is dropped, because the verification
+/// nor a function, so the caller moves on to the next location. Only a
+/// non-negative integer up to 2^53 - 1 is a line number, and an integral
+/// float such as 12.0 counts as 12; a string such as "45", a negative number,
+/// a fraction and a larger number are dropped, because the verification
 /// schema asks for an integer and a guessed conversion could print a line the
-/// model never named. The web page must apply the same rule when it lists a
-/// finding's locations.
+/// model never named. The web page applies the same rule when it lists a
+/// finding's locations. The file and function are sanitised like a title.
 fn format_location(location: &Value) -> Option<String> {
     let text_of = |key: &str| {
         location
             .get(key)
             .and_then(Value::as_str)
-            .map(str::trim)
+            .map(sanitize_text)
             .filter(|text| !text.is_empty())
     };
     let file = text_of("file");
     let function = text_of("function_or_symbol");
-    let line = location.get("line").and_then(Value::as_u64);
+    let line = line_number(location.get("line"));
     match (file, function) {
-        (Some(file), function) => {
-            let mut text = file.to_string();
+        (Some(mut text), function) => {
             if let Some(line) = line {
                 text.push_str(&format!(":{line}"));
             }
@@ -189,7 +241,7 @@ fn format_location(location: &Value) -> Option<String> {
             }
             Some(text)
         }
-        (None, Some(function)) => Some(function.to_string()),
+        (None, Some(function)) => Some(function),
         (None, None) => None,
     }
 }
@@ -341,7 +393,13 @@ mod tests {
 
     #[test]
     fn a_line_number_must_be_a_non_negative_integer() {
-        for line in [json!("45"), json!(-1), json!(12.0)] {
+        for line in [
+            json!("45"),
+            json!(-1),
+            json!(12.5),
+            json!(1e22),
+            json!(9_007_199_254_740_992.0),
+        ] {
             let locations = json!([{"file": "f.c", "line": line, "function_or_symbol": "fn"}]);
             assert_eq!(
                 location_of(locations).as_deref(),
@@ -349,6 +407,100 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    #[test]
+    fn an_integer_literal_above_the_safe_bound_is_not_a_line_number() {
+        // serde_json keeps these exact as u64, so they reach the integer path
+        // that the float cases above never take.
+        for text in [
+            "9007199254740992",
+            "9007199254740993",
+            "18446744073709551615",
+        ] {
+            let line: Value = serde_json::from_str(text).expect("the text is a JSON number");
+            assert!(line.as_u64().is_some(), "{text}");
+            let locations = json!([{"file": "f.c", "line": line}]);
+            assert_eq!(location_of(locations).as_deref(), Some("f.c"), "{text}");
+        }
+        let largest: Value = serde_json::from_str("9007199254740991").expect("a JSON number");
+        let locations = json!([{"file": "f.c", "line": largest}]);
+        assert_eq!(
+            location_of(locations).as_deref(),
+            Some("f.c:9007199254740991")
+        );
+    }
+
+    #[test]
+    fn bidi_and_format_characters_are_replaced_like_control_characters() {
+        let locations =
+            json!([{"file": "a\u{202E}c.", "function_or_symbol": "f\u{2066}g\u{200B}h"}]);
+        assert_eq!(location_of(locations).as_deref(), Some("a c. (f g h)"));
+        let line = FindingLine::from_json(&json!({"problem": "\u{202E}gnirts\u{2028}two"}));
+        assert_eq!(line.title, "gnirts two");
+    }
+
+    #[test]
+    fn an_integral_float_is_a_line_number() {
+        for (line, expected) in [
+            (json!(12.0), "f.c:12"),
+            (json!(0.0), "f.c:0"),
+            (json!(0), "f.c:0"),
+            (json!(9_007_199_254_740_991.0), "f.c:9007199254740991"),
+        ] {
+            let locations = json!([{"file": "f.c", "line": line}]);
+            assert_eq!(location_of(locations).as_deref(), Some(expected), "{line}");
+        }
+    }
+
+    #[test]
+    fn padded_and_blank_location_parts_are_trimmed_or_dropped() {
+        let padded = json!([{"file": "  a.c  ", "function_or_symbol": "  "}]);
+        assert_eq!(location_of(padded).as_deref(), Some("a.c"));
+        let both = json!([{"file": "  a.c ", "line": 3, "function_or_symbol": " fn "}]);
+        assert_eq!(location_of(both).as_deref(), Some("a.c:3 (fn)"));
+        let blank_file = json!([{"file": " \t ", "function_or_symbol": " fn "}]);
+        assert_eq!(location_of(blank_file).as_deref(), Some("fn"));
+    }
+
+    #[test]
+    fn a_title_with_a_newline_prints_as_one_line() {
+        let line = FindingLine::from_json(&json!({
+            "severity": "High",
+            "problem": "first\nsecond\tthird\r\n",
+            "speculative": true,
+        }));
+        assert_eq!(line.title, "first second third");
+        assert_eq!(
+            written(&line),
+            "  [High] first second third (speculative)\n"
+        );
+    }
+
+    #[test]
+    fn an_escape_sequence_in_a_location_never_reaches_the_terminal() {
+        let locations = json!([{"file": "\u{1b}[2Ja.c", "function_or_symbol": "f\u{1b}[0m"}]);
+        let location = location_of(locations).expect("the location names a file");
+        assert!(!location.contains('\u{1b}'), "{location:?}");
+        assert_eq!(location, "[2Ja.c (f [0m)");
+        let line = FindingLine::from_json(&json!({
+            "problem": "\u{1b}[31mred",
+            "locations": [{"file": "\u{1b}[2Ja.c"}],
+        }));
+        assert!(!written(&line).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn the_clip_counts_code_points_after_sanitising() {
+        // Leading control characters are trimmed before the count, so the
+        // title keeps the full limit of visible characters.
+        let problem = format!("\n\u{1b}{}", "é".repeat(400));
+        let title = FindingLine::from_json(&json!({"problem": problem})).title;
+        assert_eq!(title, format!("{}…", "é".repeat(TITLE_MAX_CHARS)));
+        // An interior control character is one space and counts as one.
+        let problem = format!("{}\n{}", "a".repeat(TITLE_MAX_CHARS - 2), "b".repeat(50));
+        let title = FindingLine::from_json(&json!({"problem": problem})).title;
+        assert_eq!(title, format!("{} b…", "a".repeat(TITLE_MAX_CHARS - 2)));
     }
 
     #[test]
