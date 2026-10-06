@@ -2067,7 +2067,7 @@ mod tests {
                 } else if last_user.contains("# Verification and severity estimation")
                     || last_user.contains("# Consolidate, classify, and verify concerns")
                 {
-                    r#"{"findings": [{"source_ids": ["C1"], "problem": "some issue", "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}], "hard_cases": [], "dismissed_concerns": []}"#
+                    r#"{"findings": [{"source_ids": ["C1"], "problem": "some issue", "speculative": false, "severity": "High", "severity_explanation": "bad", "preexisting": false, "locations": []}], "hard_cases": [], "dismissed_concerns": []}"#
                 } else {
                     r#"{"concerns": [], "dismissed_concerns": []}"#
                 };
@@ -2156,7 +2156,7 @@ mod tests {
                 } else if last_user.contains("# Verification and severity estimation")
                     || last_user.contains("# Consolidate, classify, and verify concerns")
                 {
-                    r#"{"findings": [{"source_ids": ["C1"], "problem": "mm: memory leak in foo()", "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}], "hard_cases": [], "dismissed_concerns": []}"#
+                    r#"{"findings": [{"source_ids": ["C1"], "problem": "mm: memory leak in foo()", "speculative": false, "severity": "High", "severity_explanation": "foo() returns -ENOMEM without freeing buf", "preexisting": true, "locations": [{"file": "foo.c", "function_or_symbol": "foo", "line": 10, "code_snippet": "return -ENOMEM;", "why_this_location_matters": "leaks buf"}]}], "hard_cases": [], "dismissed_concerns": []}"#
                 } else if last_user.contains("# LKML-friendly report generation") {
                     "commit sha1\nAuthor: Test <test@example.com>\n\nSubject\n\nSummary.\n\n> +int x;\n\n[Severity: High]\nThis problem wasn't introduced by this patch, but foo() leaks buf on error.\n"
                 } else {

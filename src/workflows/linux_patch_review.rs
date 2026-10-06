@@ -558,11 +558,18 @@ fn validate_finding_object(finding: &Value, idx: usize) -> Result<(), String> {
         .get("severity_explanation")
         .and_then(Value::as_str)
         .is_some_and(|s| !s.trim().is_empty());
+    let has_speculative = finding.get("speculative").is_some_and(Value::is_boolean);
     let has_preexisting = finding.get("preexisting").is_some_and(Value::is_boolean);
     let has_locations = finding.get("locations").is_some_and(Value::is_array);
-    if !has_problem || !has_severity || !has_explanation || !has_preexisting || !has_locations {
+    if !has_problem
+        || !has_speculative
+        || !has_severity
+        || !has_explanation
+        || !has_preexisting
+        || !has_locations
+    {
         return Err(format!(
-            "findings[{idx}] must have non-empty 'problem', valid 'severity' (Low, Medium, High, Critical, or Unknown), non-empty 'severity_explanation', boolean 'preexisting', and a 'locations' array."
+            "findings[{idx}] must have non-empty 'problem', boolean 'speculative', valid 'severity' (Low, Medium, High, Critical, or Unknown), non-empty 'severity_explanation', boolean 'preexisting', and a 'locations' array."
         ));
     }
     Ok(())
@@ -2361,7 +2368,7 @@ Aggregated Dismissed Concerns:
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
 - LINEAGE REQUIREMENT ('source_ids'): Every input item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every input item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every output object across 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the exact input "id" string(s) merged into that item (e.g. ["C1", "D2"]). Every input "id" (all C* and D* IDs) MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference C* IDs (any contested C* + D* or promoted D* must go to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference D* IDs (never C* IDs).
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "speculative" (a boolean: true if you could not lay out a concrete triggering path because it rests on an unproven assumption, or on an ABI, register, or convention you might be misreading; the severity definitions cap a speculative finding at Medium. If any part of the triggering path rests on such an assumption, answer true. false if the triggering path is established from the code. Uncertainty about reachability or about the consequence alone does not make a finding speculative and never lowers its level. A Category 1a finding rests on concrete code proof, so a concern you would mark true belongs in 'hard_cases' with "signal_reason": "speculative_concern" instead), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
 - Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
 - Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of D* input IDs), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts".
 
@@ -2372,6 +2379,7 @@ Example Output:
     {{
       "source_ids": ["C1"],
       "problem": "mm: memory leak in func_x() due to unmet condition Y",
+      "speculative": false,
       "severity": "High",
       "severity_explanation": "Consequence: the buffer allocated in func_x() leaks on every call that meets condition Y. Triggering path: a caller passes Y, func_x() returns early before kfree(). Reachability: reachable from the ioctl handler by an unprivileged user.",
       "preexisting": false,
@@ -2490,7 +2498,7 @@ Candidate Hard Case(s) to Verify:
 
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (ONLY if concrete code disproves the candidate; never return both empty arrays).
 - LINEAGE REQUIREMENT ('source_ids'): Each candidate hard case in this batch has an "id" (e.g. "H1"). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the candidate "id"(s) from this batch that it resolves (e.g. ["H1"]), and every candidate "id" in this batch must be accounted for.
-- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces, modifies, triggers, exposes, or relies on the buggy code path, caller/callee interaction, or error cleanup path, even if the underlying helper, check, or cleanup label already existed; true ONLY if the bug is in untouched code whose reachability, inputs, and behavior are completely unaffected by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "speculative" (a boolean: true if you could not lay out a concrete triggering path because it rests on an unproven assumption, or on an ABI, register, or convention you might be misreading; the severity definitions cap a speculative finding at Medium. If any part of the triggering path rests on such an assumption, answer true. false if the triggering path is established from the code. Uncertainty about reachability or about the consequence alone does not make a finding speculative and never lowers its level. A candidate you report only because no code disproves it, without having established its triggering path, is speculative; one whose triggering path your tool inspection established is not, whatever its "signal_reason"), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces, modifies, triggers, exposes, or relies on the buggy code path, caller/callee interaction, or error cleanup path, even if the underlying helper, check, or cleanup label already existed; true ONLY if the bug is in untouched code whose reachability, inputs, and behavior are completely unaffected by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
 - Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving guard, lock, cleanup path, or caller/callee implementation).
 
 Example Output:
@@ -2500,6 +2508,7 @@ Example Output:
     {{
       "source_ids": ["H1"],
       "problem": "mm: memory leak in func_x() due to unmet condition Y",
+      "speculative": false,
       "severity": "High",
       "severity_explanation": "Consequence: the buffer allocated in func_x() leaks on every call that meets condition Y. Triggering path: a caller passes Y, func_x() returns early before kfree(). Reachability: reachable from the ioctl handler by an unprivileged user.",
       "preexisting": false,
@@ -3265,6 +3274,7 @@ mod tests {
         let raised_in_dismissed = VerificationOutput {
             findings: vec![json!({
                 "problem": "mm: memory leak in foo()",
+                "speculative": false,
                 "severity": "High",
                 "severity_explanation": "Leaks buf on error path",
                 "preexisting": false,
@@ -3311,6 +3321,7 @@ mod tests {
         let both_empty_dismissed = VerificationOutput {
             findings: vec![json!({
                 "problem": "mm: memory leak in foo()",
+                "speculative": false,
                 "severity": "High",
                 "severity_explanation": "Leaks buf on error path",
                 "preexisting": false,
@@ -3335,6 +3346,7 @@ mod tests {
         let valid_output = VerificationOutput {
             findings: vec![json!({
                 "problem": "mm: memory leak in foo()",
+                "speculative": false,
                 "severity": "High",
                 "severity_explanation": "Leaks buf on error path",
                 "preexisting": false,
@@ -3430,6 +3442,7 @@ mod tests {
         let valid = PostVerificationOutput {
             findings: vec![json!({
                 "problem": "mm: memory leak in foo()",
+                "speculative": false,
                 "severity": "High",
                 "severity_explanation": "Buffer allocated in foo() is not freed on error return.",
                 "preexisting": false,
@@ -3443,6 +3456,7 @@ mod tests {
         let empty_problem = PostVerificationOutput {
             findings: vec![json!({
                 "problem": "   ",
+                "speculative": false,
                 "severity": "High",
                 "severity_explanation": "Explanation",
                 "preexisting": false,
@@ -4321,6 +4335,7 @@ mod tests {
             findings: vec![json!({
                 "source_ids": ["C1"],
                 "problem": "net: bug one",
+                "speculative": false,
                 "severity": "High",
                 "severity_explanation": "explain",
                 "preexisting": false,
@@ -4343,6 +4358,7 @@ mod tests {
             findings: vec![json!({
                 "source_ids": ["C1"],
                 "problem": "net: bug one",
+                "speculative": false,
                 "severity": "High",
                 "severity_explanation": "explain",
                 "preexisting": false,
@@ -4365,6 +4381,7 @@ mod tests {
             findings: vec![json!({
                 "source_ids": ["C1", "D1"],
                 "problem": "net: bug one",
+                "speculative": false,
                 "severity": "High",
                 "severity_explanation": "explain",
                 "preexisting": false,
@@ -4392,6 +4409,7 @@ mod tests {
             findings: vec![json!({
                 "source_ids": ["C1"],
                 "problem": "net: bug one",
+                "speculative": false,
                 "severity": "High",
                 "severity_explanation": "explain",
                 "preexisting": false,
@@ -4437,6 +4455,7 @@ mod tests {
             findings: vec![json!({
                 "source_ids": ["H99"],
                 "problem": "net: bug two",
+                "speculative": false,
                 "severity": "Medium",
                 "severity_explanation": "explain",
                 "preexisting": false,
@@ -4455,6 +4474,7 @@ mod tests {
             findings: vec![json!({
                 "source_ids": ["H1", "H2"],
                 "problem": "net: merged bug",
+                "speculative": false,
                 "severity": "Medium",
                 "severity_explanation": "explain",
                 "preexisting": false,
@@ -4468,6 +4488,7 @@ mod tests {
             findings: vec![json!({
                 "source_ids": ["H1"],
                 "problem": "net: bug two",
+                "speculative": false,
                 "severity": "Medium",
                 "severity_explanation": "explain",
                 "preexisting": false,
@@ -4551,6 +4572,7 @@ mod tests {
             let example = worked_example(&prompt);
             for key in [
                 "problem",
+                "speculative",
                 "severity",
                 "severity_explanation",
                 "preexisting",
@@ -4588,5 +4610,131 @@ mod tests {
                 "{stage}: labels out of rubric order: {example}"
             );
         }
+    }
+
+    /// Speculative caps the level, so both stages ask for it before severity,
+    /// in the key list and in the worked example.
+    #[test]
+    fn findings_ask_for_speculative_before_severity() {
+        for (stage, prompt) in finding_prompts() {
+            let keys = findings_key_list(&prompt);
+            let example = worked_example(&prompt);
+            let at = |text: &str, needle: &str| {
+                text.find(needle)
+                    .unwrap_or_else(|| panic!("{stage}: no {needle} in {text}"))
+            };
+            assert!(
+                at(keys, "\"speculative\" (") < at(keys, "\"severity\" ("),
+                "{stage}"
+            );
+            assert!(
+                at(example, "\"speculative\":") < at(example, "\"severity\":"),
+                "{stage}"
+            );
+        }
+    }
+
+    /// Two findings, one new and one preexisting, both marked speculative.
+    fn speculative_findings() -> Vec<Value> {
+        vec![
+            json!({
+                "problem": "mm: unproven race",
+                "speculative": true,
+                "severity": "Medium",
+                "preexisting": false,
+            }),
+            json!({
+                "problem": "mm: old unproven race",
+                "speculative": true,
+                "severity": "Medium",
+                "preexisting": true,
+            }),
+        ]
+    }
+
+    /// The reduce keeps the mark on a finding and drops it from the concern
+    /// a preexisting finding becomes, whichever stage wrote the finding.
+    #[test]
+    fn test_finding_stages_keep_the_speculative_mark() {
+        let outcome = crate::workflow::stage::StageOutcome::default();
+        let mut verified = LinuxPatchReviewState::default();
+        apply_verification_stage_output(
+            &mut verified,
+            VerificationOutput {
+                findings: speculative_findings(),
+                hard_cases: vec![],
+                dismissed_concerns: vec![],
+            },
+            &outcome,
+            analysis_stage_by_name,
+        );
+        let mut post_verified = LinuxPatchReviewState::default();
+        apply_post_verification_stage_output(
+            &mut post_verified,
+            POST_VERIFICATION_STAGE_NAMES[0],
+            &[],
+            PostVerificationOutput {
+                findings: speculative_findings(),
+                dismissed_concerns: vec![],
+            },
+            &outcome,
+            analysis_stage_by_name,
+        );
+        for (stage, state) in [
+            ("verification", verified),
+            ("post-verification", post_verified),
+        ] {
+            assert_eq!(state.findings.len(), 1, "{stage}");
+            assert_eq!(state.findings[0]["speculative"], true, "{stage}");
+            assert_eq!(state.concerns.len(), 1, "{stage}");
+            assert!(state.concerns[0].get("speculative").is_none(), "{stage}");
+        }
+    }
+
+    /// With report_preexisting the preexisting finding stays a finding, and
+    /// keeps its mark there too.
+    #[test]
+    fn test_report_preexisting_keeps_the_speculative_mark() {
+        let mut state = LinuxPatchReviewState {
+            report_preexisting: true,
+            ..Default::default()
+        };
+        apply_verification_stage_output(
+            &mut state,
+            VerificationOutput {
+                findings: vec![speculative_findings().remove(1)],
+                hard_cases: vec![],
+                dismissed_concerns: vec![],
+            },
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        assert_eq!(state.findings[0]["speculative"], true);
+        assert!(state.concerns[0].get("speculative").is_none());
+    }
+
+    /// The shared validator requires the mark as a boolean, so a prompt that
+    /// loses the key is answered with feedback, not silently.
+    #[test]
+    fn finding_validator_requires_a_boolean_speculative() {
+        let finding = |speculative: Option<Value>| {
+            let mut f = json!({
+                "problem": "mm: leak",
+                "severity": "High",
+                "severity_explanation": "Consequence: x. Triggering path: y. Reachability: z.",
+                "preexisting": false,
+                "locations": [],
+            });
+            if let Some(v) = speculative {
+                f["speculative"] = v;
+            }
+            f
+        };
+        for bad in [None, Some(json!("true"))] {
+            let err = validate_finding_object(&finding(bad.clone()), 0)
+                .expect_err("a finding without a boolean speculative is rejected");
+            assert!(err.contains("boolean 'speculative'"), "{bad:?}: {err}");
+        }
+        assert!(validate_finding_object(&finding(Some(json!(false))), 0).is_ok());
     }
 }

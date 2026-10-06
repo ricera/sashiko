@@ -1038,7 +1038,7 @@ Aggregated Dismissed Concerns:
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
 - LINEAGE REQUIREMENT ('source_ids'): Every item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every object in 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array of strings listing the exact input "C*" and/or "D*" IDs consolidated into that output item. Every input "C*" and "D*" ID MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference "C*" IDs (any contested "C*" + "D*" or promoted "D*" must be routed to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference "D*" IDs in "source_ids" (never "C*" IDs).
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of "C*" IDs only), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and may include "stages" (array of stage names) and "prompts" (array of prompt files).
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of "C*" IDs only), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "speculative" (boolean: true if the concrete path and preconditions that trigger the bug rest on an unverified assumption; severity.md caps a speculative finding at Medium, or Low if the impact is minor. If any part of that path rests on one, answer true. false if that path and its preconditions are established from the code. A low likelihood that is established from the code is reflected in the level, not in this key. A Category 1a finding rests on concrete code proof, so a concern you would mark true belongs in 'hard_cases' with "signal_reason": "speculative_concern" instead), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and may include "stages" (array of stage names) and "prompts" (array of prompt files).
 - Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
 - Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of "D*" IDs only), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts"."#
         ))
@@ -1121,7 +1121,7 @@ Candidate Hard Case(s) to Verify:
 
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (if disproved by concrete code or excluded by rules 1-2; never return both empty arrays).
 - LINEAGE REQUIREMENT ('source_ids'): Every candidate hard case in this batch has an "id" ("H1", "H2", ...). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array of strings listing the exact candidate "H*" ID(s) from this batch that it resolves, and every candidate "H*" ID in this batch MUST be accounted for in at least one output item's "source_ids".
-- Each object in 'findings' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "severity" (Low, Medium, High, Critical, or Unknown), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters).
+- Each object in 'findings' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "speculative" (boolean: true if the concrete path and preconditions that trigger the bug rest on an unverified assumption; severity.md caps a speculative finding at Medium, or Low if the impact is minor. If any part of that path rests on one, answer true. false if that path and its preconditions are established from the code. A low likelihood that is established from the code is reflected in the level, not in this key. A candidate you report only because no code disproves it, without having established that path, is speculative; one whose path your tool inspection established is not, whatever its "signal_reason"), "severity" (Low, Medium, High, Critical, or Unknown), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters).
 - Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code or policy rule disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving code or target snippet)."#
         ))
         .include_file("false-positive-guide.md")
@@ -1665,6 +1665,7 @@ mod tests {
                             "findings": [
                                 {
                                     "problem": "db: pre-existing missing index on patches table",
+                                    "speculative": false,
                                     "severity": "Medium",
                                     "severity_explanation": "Existed before this commit.",
                                     "preexisting": true,
@@ -1672,6 +1673,7 @@ mod tests {
                                 },
                                 {
                                     "problem": "api: newly introduced panic on empty header",
+                                    "speculative": false,
                                     "severity": "High",
                                     "severity_explanation": "Introduced by this patch.",
                                     "preexisting": false,
@@ -1810,7 +1812,7 @@ mod tests {
         let err = ver_stage
             .output_format
             .validate(
-                r#"{"findings": [{"problem": "workflow: bug", "severity": "High", "severity_explanation": "explain", "preexisting": false}], "hard_cases": [], "dismissed_concerns": []}"#,
+                r#"{"findings": [{"problem": "workflow: bug", "speculative": false, "severity": "High", "severity_explanation": "explain", "preexisting": false}], "hard_cases": [], "dismissed_concerns": []}"#,
                 &state,
             )
             .expect_err("finding missing locations must fail");
@@ -1821,7 +1823,7 @@ mod tests {
             ver_stage
                 .output_format
                 .validate(
-                    r#"{"findings": [{"problem": "workflow: missing check", "severity": "High", "severity_explanation": "Unchecked return value", "preexisting": false, "locations": []}], "hard_cases": [], "dismissed_concerns": []}"#,
+                    r#"{"findings": [{"problem": "workflow: missing check", "speculative": false, "severity": "High", "severity_explanation": "Unchecked return value", "preexisting": false, "locations": []}], "hard_cases": [], "dismissed_concerns": []}"#,
                     &state
                 )
                 .is_ok()
@@ -1830,6 +1832,7 @@ mod tests {
         let pv_ok = PostVerificationOutput {
             findings: vec![json!({
                 "problem": "workflow: missing check",
+                "speculative": false,
                 "severity": "High",
                 "severity_explanation": "Unchecked return value",
                 "preexisting": false,
@@ -1956,5 +1959,80 @@ mod tests {
                 && STAGE_POST_VERIFICATION_INSTRUCTION.contains("ALL-CALLERS VERIFICATION"),
             "Sashiko post-verification stage must enforce symmetrical proof bar and all-callers verification"
         );
+    }
+
+    /// The rubric tells the model to mark a speculative finding; each findings
+    /// key list gives the mark a place, ahead of the level it caps.
+    #[test]
+    fn findings_ask_whether_a_finding_is_speculative() {
+        let state = SashikoPatchReviewState::default();
+        for (stage, prompt, opening) in [
+            (
+                "verification",
+                verification_stage(10, 1.0)
+                    .user_prompt
+                    .render_for_log(&state),
+                "- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys:",
+            ),
+            (
+                "post-verification",
+                post_verification_stage(POST_VERIFICATION_STAGE_NAMES[0], Vec::new(), 10, 1.0)
+                    .user_prompt
+                    .render_for_log(&state),
+                "- Each object in 'findings' MUST use:",
+            ),
+        ] {
+            let start = prompt
+                .find(opening)
+                .unwrap_or_else(|| panic!("{stage}: the prompt has a findings key list"));
+            let keys = &prompt[start..];
+            let keys = &keys[..keys.find('\n').unwrap_or(keys.len())];
+            let speculative = keys
+                .find("\"speculative\" (")
+                .unwrap_or_else(|| panic!("{stage}: the key list asks for speculative"));
+            let severity = keys
+                .find("\"severity\" (")
+                .unwrap_or_else(|| panic!("{stage}: the key list asks for severity"));
+            assert!(
+                speculative < severity,
+                "{stage}: speculative after severity: {keys}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sashiko_verification_keeps_the_speculative_mark() {
+        let mut state = SashikoPatchReviewState::default();
+        let output = VerificationOutput {
+            findings: vec![
+                json!({
+                    "problem": "db: unproven race",
+                    "speculative": true,
+                    "severity": "Medium",
+                    "preexisting": false,
+                }),
+                json!({
+                    "problem": "db: old unproven race",
+                    "speculative": true,
+                    "severity": "Medium",
+                    "preexisting": true,
+                }),
+            ],
+            hard_cases: vec![],
+            dismissed_concerns: vec![],
+        };
+
+        crate::workflows::linux_patch_review::apply_verification_stage_output(
+            &mut state,
+            output,
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+
+        assert_eq!(state.findings.len(), 1);
+        assert_eq!(state.findings[0]["speculative"], true);
+        assert_eq!(state.concerns.len(), 1);
+        assert_eq!(state.concerns[0]["description"], "db: old unproven race");
+        assert!(state.concerns[0].get("speculative").is_none());
     }
 }
