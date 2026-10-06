@@ -2373,7 +2373,7 @@ Example Output:
       "source_ids": ["C1"],
       "problem": "mm: memory leak in func_x() due to unmet condition Y",
       "severity": "High",
-      "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
+      "severity_explanation": "Consequence: the buffer allocated in func_x() leaks on every call that meets condition Y. Triggering path: a caller passes Y, func_x() returns early before kfree(). Reachability: reachable from the ioctl handler by an unprivileged user.",
       "preexisting": false,
       "locations": [
         {{
@@ -2501,7 +2501,7 @@ Example Output:
       "source_ids": ["H1"],
       "problem": "mm: memory leak in func_x() due to unmet condition Y",
       "severity": "High",
-      "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
+      "severity_explanation": "Consequence: the buffer allocated in func_x() leaks on every call that meets condition Y. Triggering path: a caller passes Y, func_x() returns early before kfree(). Reachability: reachable from the ioctl handler by an unprivileged user.",
       "preexisting": false,
       "locations": [
         {{
@@ -4494,5 +4494,99 @@ mod tests {
         assert_eq!(state.findings[1]["id"], "PVF1");
         assert_eq!(state.findings[0]["stage_item_id"], "VF1");
         assert_eq!(state.findings[1]["stage_item_id"], "PVF1");
+    }
+
+    fn verification_prompt() -> String {
+        verification_stage(10, 1.0)
+            .user_prompt
+            .render_for_log(&LinuxPatchReviewState::default())
+    }
+
+    fn post_verification_prompt() -> String {
+        post_verification_stage(POST_VERIFICATION_STAGE_NAMES[0], Vec::new(), 10, 1.0)
+            .user_prompt
+            .render_for_log(&LinuxPatchReviewState::default())
+    }
+
+    /// Both stages that write findings, with their names for messages.
+    fn finding_prompts() -> [(&'static str, String); 2] {
+        [
+            ("verification", verification_prompt()),
+            ("post-verification", post_verification_prompt()),
+        ]
+    }
+
+    /// The findings key list, cut at its own opening sentence. The
+    /// instructions before it are left out because they already name
+    /// "preexisting", which would satisfy a check on the whole prompt
+    /// whatever the key list says.
+    fn findings_key_list(prompt: &str) -> &str {
+        let start = prompt
+            .find("Each object in 'findings'")
+            .expect("the prompt has a findings key list");
+        let end = prompt[start..]
+            .find("Example Output:")
+            .expect("the key list is followed by the example");
+        &prompt[start..start + end]
+    }
+
+    /// The fenced example only, so neither the rubric nor the instructions
+    /// can satisfy a check meant for the example.
+    fn worked_example(prompt: &str) -> &str {
+        let start = prompt
+            .find("Example Output:\n```json")
+            .expect("the prompt has a worked example");
+        let body = &prompt[start + "Example Output:\n```json".len()..];
+        let end = body.find("```").expect("the example is fenced");
+        &body[..end]
+    }
+
+    /// The validators check lineage and accounting, not that the key list and
+    /// the example agree, so a key that drifts out of either half is silently
+    /// no longer emitted, or emitted without a definition.
+    #[test]
+    fn findings_key_list_and_example_name_the_same_keys() {
+        for (stage, prompt) in finding_prompts() {
+            let keys = findings_key_list(&prompt);
+            let example = worked_example(&prompt);
+            for key in [
+                "problem",
+                "severity",
+                "severity_explanation",
+                "preexisting",
+                "locations",
+            ] {
+                assert!(
+                    keys.contains(&format!("\"{key}\" (")),
+                    "{stage}: key list lacks {key}: {keys}"
+                );
+                assert!(
+                    example.contains(&format!("\"{key}\":")),
+                    "{stage}: example lacks {key}: {example}"
+                );
+            }
+        }
+    }
+
+    /// The kernel rubric asks for consequence, triggering path and
+    /// reachability at the start of the explanation; each example that
+    /// shows a finding has to show the same shape it asks for.
+    #[test]
+    fn finding_examples_label_their_severity_reasoning() {
+        for (stage, prompt) in finding_prompts() {
+            let example = worked_example(&prompt);
+            let positions: Vec<usize> = ["Consequence:", "Triggering path:", "Reachability:"]
+                .iter()
+                .map(|label| {
+                    example
+                        .find(label)
+                        .unwrap_or_else(|| panic!("{stage}: example lacks {label}: {example}"))
+                })
+                .collect();
+            assert!(
+                positions.windows(2).all(|w| w[0] < w[1]),
+                "{stage}: labels out of rubric order: {example}"
+            );
+        }
     }
 }
