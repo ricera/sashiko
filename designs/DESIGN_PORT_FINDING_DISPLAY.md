@@ -1,8 +1,10 @@
 # Design: Port Step 4 -- What Each Finding Is and Why It Got Its Severity
 
 Status: approved, 2026-10-05, after two review rounds and a check of every
-data claim against the three deployment databases (§1.3). Nothing in this
-document is built yet.
+data claim against the three deployment databases (§1.3). Built on
+`port/upstream` as commits 2 to 7 of §7 (plus two follow-ups from the
+independent review: a safer CLI finding line, and a web row that agrees
+with the counters). The §6.5 measurement of commits 2 and 3 is under way.
 Branch: `port/upstream` (upstream `origin/main` 2a7e748b1680 plus the ported
 fork features). The fork source is `feat/prior-revision-findings`, commit
 46d809932fa9 ("web, review: say what each finding is and why it got its
@@ -492,7 +494,10 @@ counts, so "Findings (N)" never disagrees with the counts beside it:
     median of 113 and went over in 24% of cases, with a maximum of 161
     (§1.3). So expect a minority of new titles between 80 and 120, which
     are shown whole, and the clip to fire mostly on the 207 old findings
-    that never had a title.
+    that never had a title. That holds once a fork database has been
+    adopted (D14). Before that, the page reads only `problem`, which in
+    every stored fork finding is the long argument: run over the deployment
+    copies, 810 of 811 titles clip, including rows that have a headline.
   - One function decides both the row text and whether the full text goes
     into the expansion.
 - `parseSeverityCalibration(text)`, adapted from the fork (D4):
@@ -540,7 +545,13 @@ counts, so "Findings (N)" never disagrees with the counts beside it:
     - On the 747 deployment explanations this finds all three kernel
       sections in 636 (85%), against 584 for the same rule without list
       numbers and qualifiers, and leaves no stray list number at the end
-      of a body (§1.3).
+      of a body (§1.3). The shipped page code reproduces this exactly
+      (636 of 747; 685 of 811 on a later copy of the databases), parses
+      every named case, and throws on none. About nine explanations use a
+      qualifier the rule does not accept, such as "Triggering path for the
+      underlying bug:"; they render as prose, so no text is lost. The shipped page code reproduces this exactly
+      (636 of 747; 685 of 811 on a later copy of the databases), parses
+      every named case, and throws on none.
   - The regex is built per call, so `lastIndex` never carries over between
     findings.
   - Only the first occurrence of each label counts.
@@ -559,7 +570,12 @@ counts, so "Findings (N)" never disagrees with the counts beside it:
   the escaped body.
 - `renderFindingLocations(locations)`:
   - Each location is shown as `file:line (function_or_symbol)`, with absent
-    parts dropped: `file (fn)`, `file:12`, or just `fn`.
+    parts dropped: `file (fn)`, `file:12`, or just `fn`. Text parts are
+    trimmed and blank ones dropped. A line is shown only when it is a
+    non-negative integral number up to 2^53 - 1 (`Number.isSafeInteger`),
+    so a float such as 12.5, a negative, a string and a number the page
+    would round are all dropped, and 12.0, which JSON parsing turns into
+    12, is shown.
   - Under it, `why_this_location_matters` in muted text, escaped.
   - `code_snippet` is left out. The inline review quotes code, and a
     snippet here would bury the reasoning next to it.
@@ -613,6 +629,22 @@ counts, so "Findings (N)" never disagrees with the counts beside it:
   that finished." sits above the details block. It now covers the Findings
   block as well, and its wording stays true.
 
+**What the code does that the list above left open.**
+- Two small helpers hold the guard and the row: `findingObject(finding)`
+  (the guard `f && typeof f === 'object' ? f : {}`) and
+  `renderFindingRow(finding)` (one `<details>` or plain `<div>`).
+- A missing, non-string or blank severity shows as Low, so the row agrees
+  with the Result line, which counts it as Low. A padded severity such as
+  " High " is shown as written, in the unknown colour, because the counts,
+  the ordering and the CLIs all compare the text exactly; trimming it in
+  the row alone made the row say High while the Result line counted Low.
+- A finding is listed by the counters' own truthiness test for
+  `preexisting`, while the "(preexisting)" tag needs a JSON `true`. A
+  string such as "yes" is therefore counted and listed on a patch card,
+  and carries no tag.
+- The closing-parenthesis rule of the label parser (§4.4, above) was added
+  with the parser: a `)` boundary closes the previous text and stays in it.
+
 **CSS.** One rule in the existing style block for `details.finding > summary`:
 pointer cursor and no list marker, with the disclosure triangle drawn as
 `▶`/`▼` to match the page's other toggles. Plus spacing for the body.
@@ -634,18 +666,52 @@ pub struct FindingLine {
     pub title: String,            // problem, clipped at TITLE_MAX_CHARS
     pub speculative: Option<bool>, // None: absent or not a JSON boolean
     pub preexisting: bool,        // only a JSON true counts, as in the counts
-    pub location: Option<String>, // first location, file:line (function)
+    pub location: Option<String>, // first location naming a file or function
 }
 
 impl FindingLine {
     /// A non-object finding reads as an empty one: Unknown, "(no
-    /// description)", nothing else.
+    /// description)", nothing else. Title and location text are made safe
+    /// for one terminal line (see below).
     pub fn from_json(finding: &serde_json::Value) -> Self;
 }
 
 /// True when no finding carries a boolean speculative key (§4.1, D13).
 pub fn none_marked_speculative(findings: &[serde_json::Value]) -> bool;
+
+/// The D13 note both CLIs print, and the function that prints it as one dim
+/// line when the list is non-empty and none of its findings is marked.
+pub const NOT_MARKED_NOTE: &str = "These findings do not say whether they are speculative.";
+pub fn write_not_marked_note(out: &mut impl WriteColor, findings: &[serde_json::Value]) -> io::Result<()>;
 ```
+
+What the code does that this sketch left open:
+
+- **Severity** is read by the rule the CLIs' counts and exit code already
+  use: one of the four names, compared without ASCII case and without
+  trimming; anything else is `Unknown`. `db::Severity::from_str` is not
+  used because it also accepts prefixes such as "High (capped)", which the
+  counts skip, so a label read that way could print a red `[High]` for a
+  finding no count includes and that does not fail the exit code.
+- **Safe for one line.** Model text goes to a terminal, so the title and the
+  file and function of a location have every control character (newline,
+  tab, ESC), line or paragraph separator, zero-width or directional mark
+  (U+200B to U+200F) and bidirectional embedding, override or isolate
+  (U+202A to U+202E, U+2066 to U+2069) replaced by a space, and are
+  trimmed, before the title is clipped. One finding is always one printed
+  line, no escape sequence reaches the terminal, and a path cannot be made
+  to read differently from what it is.
+- **Line number.** The same rule as the page (§4.4): a non-negative
+  integral number up to 2^53 - 1, whether written as an integer or as a
+  float such as 12.0. A string, a negative, a fraction and anything larger
+  are dropped.
+- **Location.** The first entry that names a file or a function, not
+  literally the first entry.
+- **Order.** Findings print in stored order, not worst first; the page
+  does the ordering.
+- **Dropped output.** The old `sashiko-cli` loop also printed
+  "Fix: <recommended_fix>". No workflow writes that key, so nothing a
+  reader could see is lost.
 
 `speculative` keeps "not marked" (`None`) apart from `Some(false)`, so a
 later step that reuses `FindingLine` to store or summarise findings cannot
@@ -749,7 +815,7 @@ this step:
 | --- | --- | --- |
 | Speculative finding | `speculative: bool` in the verification output, written by the model; `Option<bool>` wherever it is read back, `None` meaning not marked | regex over `severity_explanation` |
 | Finding title | `problem` (upstream's short title) | fork `headline` column and field |
-| Severity in a CLI line | `db::Severity` via `Severity::from_str` | raw string match per binary |
+| Severity in a CLI line | `db::Severity`, read by the counts' own rule (one of four names, ASCII case ignored, no trimming) | raw string match per binary |
 | One finding's CLI line | `finding_view::FindingLine` | two hand-rolled readers, one reading keys nobody emits |
 
 The page is JavaScript and reads JSON, so the type there is the shape
