@@ -1,8 +1,8 @@
-// Checks the web UI's review card, the per-patch stage table (live and
-// recorded), how live activity is routed and polled, the live conversation log,
-// the line naming the reference repositories each review had, and how partial
-// and timed-out reviews read in the list, the summary table, the card and the
-// statistics.
+// Checks the web UI's review card and the findings it lists, the per-patch
+// stage table (live and recorded), how live activity is routed and polled, the
+// live conversation log, the line naming the reference repositories each review
+// had, and how partial and timed-out reviews read in the list, the summary
+// table, the card and the statistics.
 //
 // static/index.html has no build step and no other test coverage, so this is the
 // only thing standing between a bad edit and a page that silently renders
@@ -48,8 +48,20 @@ function grabLet(name) {
     return m[1];
 }
 
+// Extracts one module-level `const` declaration written on a single line. Read
+// from the page so a limit such as the finding title length is checked as
+// shipped rather than as a copy here remembers it.
+function grabConst(name) {
+    const m = new RegExp(`\\n\\s*(const ${name} = [^\\n]*;)`).exec(script);
+    if (!m) throw new Error(`no single-line const ${name}`);
+    return m[1];
+}
+
 const LETS = ['activityPoll', 'viewGeneration', 'logView', 'logTimer'];
-const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'renderReviewCard',
+const CONSTS = ['FINDING_TITLE_MAX_CHARS'];
+const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'renderReviewCard', 'getSeverityColor',
+               'findingObject', 'findingTitle', 'renderFindingLocations', 'findingTags',
+               'renderFindingRow', 'renderFindingsList',
                'formatDuration', 'describeStageWait', 'summarizeReason', 'compareStageRows',
                'stageTableLabel', 'stageRowsFromRecord', 'stageStopCause', 'stageStopLabel',
                'stoppedStageStatus', 'stageRowsFromActivity',
@@ -62,14 +74,15 @@ const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'rend
                'getToolPreview', 'formatSize', 'formatJsonPretty', 'sortToolArgs',
                'renderLogView', 'appendNewLogEntries', 'lastSeqOf', 'liveLogRunOf', 'stopLogPolling'];
 
-// Defines the named functions and lets in a scope of their own and returns
-// them, so a test can build a variant with one function's source replaced and
-// check that the suite notices. The lets are reached through `state()`, since
-// the functions reassign them.
+// Defines the named functions, consts and lets in a scope of their own and
+// returns them, so a test can build a variant with one function's source
+// replaced and check that the suite notices. The lets are reached through
+// `state()`, since the functions reassign them.
 function load(sources) {
     const ctx = {};
     new Function('ctx',
-        LETS.map(grabLet).join('\n') + '\n\n'
+        CONSTS.map(grabConst).join('\n') + '\n'
+        + LETS.map(grabLet).join('\n') + '\n\n'
         + NAMES.map(n => sources[n]).join('\n\n')
         + `\n;` + NAMES.map(n => `ctx.${n} = ${n};`).join('')
         + `\nctx.state = () => ({ ${LETS.join(', ')} });`
@@ -977,7 +990,8 @@ function partialChecks(fns) {
             && nothingFound.includes('No findings from the stages that finished'));
     expect('card: and does not open its inline review as if it found something',
         nothingFound.includes('▶ Inline Review') && !nothingFound.includes('▼ Inline Review'));
-    expect('card: a Partial review that found something opens it', card.includes('▼ Inline Review'));
+    expect('card: a Partial review that found something opens its findings',
+        card.includes('▼ Findings (1)') && card.includes('▶ Inline Review'));
     const reviewed = guard(() => fns.renderReviewCard({
         id: 52, status: 'Reviewed', patch_id: 62, output: output([]) }));
     expect('card: a Reviewed review with no findings still reads no regressions',
@@ -1021,6 +1035,191 @@ console.log('partial and timed-out reviews');
                        '.status-dot.status-Partial {', '.status-dot.status-TimedOut {']) {
         check(`the page styles ${cls.slice(0, -2)}`, src.includes(cls));
     }
+}
+
+// ---- the findings on a review card -----------------------------------------
+// A finished card lists the findings its Result line counts, worst first, each
+// with its title and tags and opening onto why it got its level and where it
+// is. The list starts open and the inline review then starts collapsed, so a
+// card never opens on the same findings twice. Model text is escaped
+// everywhere, and an entry the counts cannot read gives no list at all.
+const findingsCard = (fns, findings, extra = {}) => {
+    try {
+        return String(fns.renderReviewCard({ id: 70, status: 'Reviewed', patch_id: 80,
+            output: JSON.stringify({ findings }), inline_review: 'the inline review', ...extra }));
+    } catch (e) { return `THREW ${e}`; }
+};
+// The Findings block of a card: from its button to the inline review's.
+const findingsBlock = card => {
+    const start = card.indexOf('Findings (');
+    if (start < 0) return '';
+    const end = card.indexOf('Inline Review', start);
+    return card.slice(start, end < 0 ? card.length : end);
+};
+
+function findingTitleChecks(fns, expect) {
+    const guard = f => { try { return f(); } catch (e) { return { title: `THREW ${e}`, clipped: null }; } };
+    const short = 'net: ionic: leak of the rx ring in ionic_lif_open() when the queue fails';
+    const shortTitle = guard(() => fns.findingTitle({ problem: `  ${short}  ` }));
+    expect('title: a short problem is the title, trimmed',
+        shortTitle.title === short && shortTitle.clipped === false);
+    expect('title: an empty or missing problem reads "(no description)"',
+        ['   ', undefined, 7].every(problem =>
+            guard(() => fns.findingTitle({ problem })).title === '(no description)'));
+    const shortCard = findingsCard(fns, [{ severity: 'High', problem: short, severity_explanation: 'why' }]);
+    expect('title: a short title is not repeated in the body',
+        visibleText(shortCard).split(short).length === 2);
+
+    // A multibyte character at the cut: the clip keeps it whole.
+    const long = 'a'.repeat(159) + '😀' + ' b'.repeat(120);
+    const clipped = guard(() => fns.findingTitle({ problem: long }));
+    expect('title: a long problem is clipped at the limit and ends in "…"',
+        clipped.clipped === true && Array.from(clipped.title).length === 161
+            && clipped.title.endsWith('😀…'));
+    const exact = guard(() => fns.findingTitle({ problem: 'y'.repeat(160) }));
+    expect('title: a problem exactly at the limit is not clipped',
+        exact.title === 'y'.repeat(160) && exact.clipped === false);
+    expect('title: trailing space at the cut is trimmed',
+        guard(() => fns.findingTitle({ problem: 'a'.repeat(159) + ' ' + 'b'.repeat(50) })).title
+            === 'a'.repeat(159) + '…');
+    const longCard = findingsCard(fns, [{ severity: 'Low', problem: long }]);
+    expect('title: a clipped title puts the full problem in the body',
+        longCard.includes(long) && longCard.includes('<details class="finding">'));
+}
+
+function findingOrderChecks(fns, expect) {
+    const ordered = findingsCard(fns, [
+        { severity: 'Medium', problem: 'm-one' },
+        { severity: 'High', problem: 'h-one' },
+        { severity: 'high', problem: 'h-two' },
+    ]);
+    const at = name => ordered.indexOf(`>${name}<`);
+    expect('order: "Findings (3)"', ordered.includes('▼ Findings (3)'));
+    expect('order: severest first, equal severities in the model\'s order',
+        at('h-one') > 0 && at('h-one') < at('h-two') && at('h-two') < at('m-one'));
+    const unknown = findingsCard(fns, [
+        { severity: 'bogus', problem: 'u-one' }, { severity: 'Low', problem: 'l-one' },
+        { severity: 'Medium', problem: 'm-two' },
+    ]);
+    expect('order: an unknown severity is listed with the Lows',
+        unknown.indexOf('>m-two<') < unknown.indexOf('>u-one<')
+            && unknown.indexOf('>u-one<') < unknown.indexOf('>l-one<'));
+    expect('order: a severity is coloured by its level',
+        ordered.includes('color:var(--sev-high);">High<')
+            && ordered.includes('color:var(--sev-medium);">Medium<'));
+}
+
+function findingCardChecks(fns, expect) {
+    const card = findingsCard(fns, [{ severity: 'High', problem: 'h', severity_explanation: 'why' }],
+        { summary: 'the summary' });
+    expect('card: the findings block starts open',
+        card.includes('▼ Findings (1)') && /id="findings-[^"]+" class="collapsible open"/.test(card));
+    expect('card: the inline review starts collapsed beside it',
+        card.includes('▶ Inline Review') && !card.includes('▼ Inline Review'));
+    expect('card: summary, then findings, then inline review',
+        card.indexOf('the summary') < card.indexOf('Findings (')
+            && card.indexOf('Findings (') < card.indexOf('Inline Review'));
+
+    const both = [{ severity: 'High', problem: 'new-one' },
+                  { severity: 'High', problem: 'old-one', preexisting: true }];
+    const patchset = findingsCard(fns, both, { patch_id: null });
+    expect('card: a patchset-level card leaves preexisting findings out, as its counts do',
+        patchset.includes('Findings (1)') && !patchset.includes('old-one')
+            && /High: <span[^>]*>1</.test(patchset));
+    const patch = findingsCard(fns, both);
+    expect('card: a patch card lists them, tagged',
+        patch.includes('Findings (2)') && findingsBlock(patch).includes('(preexisting)')
+            && findingsBlock(patch).split('(preexisting)').length === 2);
+    expect('tags: only a JSON true is preexisting',
+        fns.findingTags({ preexisting: 'yes' }).length === 0
+            && fns.findingTags({ preexisting: true }).join('').includes('(preexisting)'));
+
+    const reasoned = findingsBlock(findingsCard(fns, [{ severity: 'High', problem: 'h',
+        severity_explanation: 'it crashes on every boot' }]));
+    const reasonedBody = reasoned.slice(reasoned.indexOf('<div class="finding-body">'));
+    expect('card: a finding opens onto its severity reasoning',
+        reasoned.includes('<details class="finding">') && reasonedBody.includes('it crashes on every boot'));
+
+    const bare = findingsCard(fns, [{ severity: 'Low', problem: 'bare' }]);
+    expect('card: a finding with no body is a plain row',
+        bare.includes('<div class="finding">') && !bare.includes('<details class="finding"'));
+
+    expect('card: no findings, no block', !findingsCard(fns, []).includes('Findings ('));
+    for (const [what, output] of [['unparseable output', '{ not json'],
+                                  ['output with no findings array', JSON.stringify({ summary: 's' })]]) {
+        const c = findingsCard(fns, [], { output });
+        expect(`card: ${what} gives no block and keeps the inline review collapsed`,
+            !c.includes('Findings (') && c.includes('▶ Inline Review') && !c.includes('THREW'));
+    }
+}
+
+function findingMalformedChecks(fns, expect) {
+    const withNull = findingsCard(fns, [null, { severity: 'High', problem: 'x' }]);
+    expect('malformed: a null entry renders the card without a list',
+        !withNull.includes('THREW') && !withNull.includes('Findings (')
+            && withNull.includes('font-weight:bold;">Finished<'));
+    const withString = findingsCard(fns, ['junk', { severity: 'High', problem: 'x' }]);
+    const block = findingsBlock(withString);
+    expect('malformed: a string entry is listed as a Low "(no description)"',
+        withString.includes('Findings (2)')
+            && /color:var\(--sev-low\);">Low<\/span><span[^>]*>\(no description\)</.test(block));
+    expect('malformed: and the Result line counts the same two',
+        /High: <span[^>]*>1</.test(withString) && /Low: <span[^>]*>1</.test(withString));
+}
+
+function findingEscapingChecks(fns, expect) {
+    const evil = '<script>x</script>"onerror=alert(1)\'';
+    const card = findingsCard(fns, [{ severity: 'High', problem: evil, severity_explanation: evil,
+        locations: [{ file: evil, line: 3, function_or_symbol: evil, why_this_location_matters: evil }] }]);
+    const block = findingsBlock(card);
+    expect('escaping: no raw markup or attribute break-out in a finding',
+        block.length > 0 && !block.includes('<script>') && !block.includes('"onerror'));
+    // Six places show the text: the title and its tooltip, the severity
+    // reasoning, the file and function in the location, and why it matters.
+    // An exact count catches any one of them going missing.
+    expect('escaping: problem, reasoning and location shown escaped',
+        block.split('&lt;script&gt;').length === 7);
+    const injected = findingsBlock(findingsCard(fns, [{ severity: 'low;" onmouseover="x', problem: 'p' }]));
+    expect('escaping: a severity is neither injected nor coloured',
+        !injected.includes('" onmouseover="x')
+            && injected.includes('color:var(--sev-unknown);">low;&quot; onmouseover=&quot;x<'));
+}
+
+function findingLocationChecks(fns, expect) {
+    const where = locations => visibleText(String(fns.renderFindingLocations(locations))).trim();
+    expect('location: file:line (function)',
+        where([{ file: 'f.c', line: 12, function_or_symbol: 'fn' }]) === 'f.c:12 (fn)');
+    expect('location: absent parts are dropped',
+        where([{ file: 'f.c', function_or_symbol: 'fn' }]) === 'f.c (fn)'
+            && where([{ file: 'f.c', line: 12 }]) === 'f.c:12'
+            && where([{ function_or_symbol: 'fn' }]) === 'fn');
+    expect('location: only a non-negative integer is a line',
+        where([{ file: 'f.c', line: '12' }]) === 'f.c' && where([{ file: 'f.c', line: -1 }]) === 'f.c'
+            && where([{ file: 'f.c', line: 12.5 }]) === 'f.c');
+    expect('location: non-objects and non-arrays render nothing',
+        fns.renderFindingLocations(['f.c', null, 4]) === '' && fns.renderFindingLocations('f.c') === '');
+    const card = findingsCard(fns, [{ severity: 'Medium', problem: 'p', locations: [
+        { file: 'f.c', line: 12, function_or_symbol: 'fn', why_this_location_matters: 'the ring leaks here',
+          code_snippet: 'SNIPPET' }] }]);
+    expect('location: the card shows it with why it matters, without the snippet',
+        card.includes('<code>f.c:12 (fn)</code>') && card.includes('the ring leaks here')
+            && !card.includes('SNIPPET'));
+}
+
+function findingChecks(fns) {
+    const failed = [];
+    const expect = (name, cond) => { if (!cond) failed.push(name); };
+    const groups = [findingTitleChecks, findingOrderChecks, findingCardChecks, findingMalformedChecks,
+                    findingEscapingChecks, findingLocationChecks];
+    for (const group of groups) {
+        try { group(fns, expect); } catch (e) { failed.push(`${group.name}: threw ${e}`); }
+    }
+    return failed;
+}
+console.log('findings on a review card');
+{
+    const findingFailures = findingChecks(ctx);
+    check('every finding check passes', findingFailures.length === 0, findingFailures.join(', '));
 }
 
 // ---- polling hygiene -------------------------------------------------------
@@ -1508,9 +1707,48 @@ const mutate = (name, from, to) => {
     check('a card that hides the findings of a Partial review is caught', partialChecks(partialHidden).length > 0);
     const partialSucceeded = mutate('renderReviewCard', 'failed || partial ?', 'failed ?');
     check('a Partial card that says it succeeded is caught', partialChecks(partialSucceeded).length > 0);
-    const openOnNothing = mutate('renderReviewCard', 'parsedFindings && !foundNothing', 'parsedFindings');
+    const OPEN_RULE = 'parsedFindings && !foundNothing && !findingsHtml';
+    const openOnNothing = mutate('renderReviewCard', OPEN_RULE, 'parsedFindings && !findingsHtml');
     check('a Partial card that opens an empty inline review is caught',
         partialChecks(openOnNothing).length > 0);
+
+    const findingMutations = [
+        ['a list ranked by index only is caught',
+            mutate('renderFindingsList', 'a.rank - b.rank || a.index - b.index', 'a.index - b.index')],
+        ['a title that is never clipped is caught',
+            mutate('findingTitle', 'chars.length > FINDING_TITLE_MAX_CHARS', 'false')],
+        ['a finding row that does not escape is caught',
+            load({ ...sources, renderFindingRow: sources.renderFindingRow.replaceAll('escapeHtml(', 'String(') })],
+        ['a location list that does not escape is caught',
+            load({ ...sources,
+                renderFindingLocations: sources.renderFindingLocations.replaceAll('escapeHtml(', 'String(') })],
+        ['a severity colour built from the model\'s text is caught',
+            mutate('renderFindingRow', '${getSeverityColor(severity)}',
+                'var(--sev-${String(severity).toLowerCase()})')],
+        ['an inline review opened beside the findings is caught',
+            mutate('renderReviewCard', OPEN_RULE, 'parsedFindings && !foundNothing')],
+        ['a list that ignores includePreexisting is caught',
+            mutate('renderFindingsList', 'includePreexisting || !f.preexisting', 'true')],
+        ['a list built outside the parsedFindings guard is caught',
+            mutate('renderReviewCard', 'const findingsHtml = parsedFindings',
+                'const findingsHtml = outputJson && Array.isArray(outputJson.findings)')],
+        ['a finding with no body that still opens is caught',
+            mutate('renderFindingRow', 'if (!body) return', 'if (false) return')],
+        ['a preexisting tag on any truthy value is caught',
+            mutate('findingTags', 'f.preexisting === true', 'f.preexisting')],
+        ['a card without the findings list is caught',
+            mutate('renderReviewCard', '${findingsHtml}', '')],
+        ['a finding body without the severity reasoning is caught',
+            mutate('renderFindingRow', '+ (explanation ?', '+ (false ?')],
+        ['a title clipped at exactly the limit is caught',
+            mutate('findingTitle', 'chars.length > FINDING_TITLE_MAX_CHARS',
+                'chars.length >= FINDING_TITLE_MAX_CHARS')],
+        ['a fractional line number shown as a line is caught',
+            mutate('renderFindingLocations', 'Number.isInteger(loc.line)', "typeof loc.line === 'number'")],
+    ];
+    for (const [name, broken] of findingMutations) {
+        check(name, findingChecks(broken).length > 0);
+    }
     const noPartialCard = mutate('renderReviewStatCards',
         "+ renderStatCard('Total Partial', reviewsData.total_partial ?? 0)", '');
     check('a stats page without the Partial card is caught', partialChecks(noPartialCard).length > 0);
