@@ -104,6 +104,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `fetcher.rs`: Fetches emails/threads (e.g., from lore.kernel.org).
 - `reviewer.rs`: Logic for reviewing patches.
 - `local_review.rs`: Logic for `sashiko-cli local` executing reviews locally.
+- `finding_view.rs`: Typed one-line view of a review finding (severity, title, tags, location), shared by both CLIs.
 - `git_ops.rs`: Git operations wrapper.
 - `nntp.rs`: NNTP protocol handling.
 - `patch.rs`: Patch parsing and manipulation.

@@ -19,6 +19,7 @@ use sashiko::baseline::CommitId;
 use sashiko::db::Database;
 #[cfg(feature = "server")]
 use sashiko::events::{Event, MessageSource, ParsedArticle};
+use sashiko::finding_view::{self, FindingLine};
 #[cfg(feature = "server")]
 use sashiko::ingestor::Ingestor;
 use sashiko::local_review::{
@@ -2449,41 +2450,7 @@ fn print_review_result(
         print_colored(color_choice, Color::Cyan, &counts.low.to_string())?;
         println!("\n");
 
-        let mut grouped_findings: std::collections::BTreeMap<i64, Vec<&Value>> =
-            std::collections::BTreeMap::new();
-        let mut ungrouped_findings = Vec::new();
-
-        for finding in findings {
-            if let Some(p_idx) = finding.get("patch_index").and_then(|v| v.as_i64()) {
-                grouped_findings.entry(p_idx).or_default().push(finding);
-            } else {
-                ungrouped_findings.push(finding);
-            }
-        }
-
-        for (p_idx, patch_findings) in grouped_findings {
-            let subject = patch_findings
-                .first()
-                .and_then(|f| f.get("patch_subject"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            print!("  --- Patch [{}] ", p_idx);
-            if !subject.is_empty() {
-                print_colored(color_choice, Color::Cyan, subject)?;
-            }
-            println!(" ---");
-            for finding in patch_findings {
-                print_finding(finding, color_choice)?;
-            }
-            println!();
-        }
-
-        if !ungrouped_findings.is_empty() {
-            println!("  --- General Findings ---");
-            for finding in ungrouped_findings {
-                print_finding(finding, color_choice)?;
-            }
-        }
+        print_finding_list(findings, color_choice)?;
     }
 
     if let Some(inline) = result.get("inline_review").and_then(|v| v.as_str())
@@ -2531,26 +2498,54 @@ fn print_review_result(
     Ok(())
 }
 
-fn print_finding(finding: &Value, color_choice: ColorChoice) -> std::io::Result<()> {
-    let severity = finding
-        .get("severity")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let color = match severity.to_ascii_lowercase().as_str() {
-        "critical" | "high" => Color::Red,
-        "medium" => Color::Yellow,
-        "low" => Color::Cyan,
-        _ => Color::White,
-    };
-    let problem = finding
-        .get("problem")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+/// Prints every finding, grouped by the patch it names. When no finding
+/// says whether it is speculative, a note after the list says so once.
+fn print_finding_list(findings: &[Value], color_choice: ColorChoice) -> std::io::Result<()> {
+    let mut grouped_findings: std::collections::BTreeMap<i64, Vec<&Value>> =
+        std::collections::BTreeMap::new();
+    let mut ungrouped_findings = Vec::new();
 
-    print!("  ");
-    print_colored(color_choice, color, &format!("[{}] ", severity))?;
-    println!("{}", problem);
-    Ok(())
+    for finding in findings {
+        if let Some(p_idx) = finding.get("patch_index").and_then(|v| v.as_i64()) {
+            grouped_findings.entry(p_idx).or_default().push(finding);
+        } else {
+            ungrouped_findings.push(finding);
+        }
+    }
+
+    for (p_idx, patch_findings) in grouped_findings {
+        let subject = patch_findings
+            .first()
+            .and_then(|f| f.get("patch_subject"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        print!("  --- Patch [{}] ", p_idx);
+        if !subject.is_empty() {
+            print_colored(color_choice, Color::Cyan, subject)?;
+        }
+        println!(" ---");
+        for finding in patch_findings {
+            print_finding(finding, color_choice)?;
+        }
+        println!();
+    }
+
+    if !ungrouped_findings.is_empty() {
+        println!("  --- General Findings ---");
+        for finding in ungrouped_findings {
+            print_finding(finding, color_choice)?;
+        }
+    }
+
+    let mut stdout = StandardStream::stdout(color_choice);
+    finding_view::write_not_marked_note(&mut stdout, findings)?;
+    stdout.flush()
+}
+
+fn print_finding(finding: &Value, color_choice: ColorChoice) -> std::io::Result<()> {
+    let mut stdout = StandardStream::stdout(color_choice);
+    finding_view::write_finding_line(&mut stdout, &FindingLine::from_json(finding))?;
+    stdout.flush()
 }
 
 #[derive(Default)]
@@ -3434,6 +3429,16 @@ fn should_start_nntp_ingestor(settings: &Settings) -> bool {
 mod tests {
     use super::*;
     use termcolor::Buffer;
+
+    #[test]
+    fn a_finding_label_agrees_with_the_severity_counts() {
+        for spelling in ["high", "HIGH", "High (capped)", "high ", "highest"] {
+            let finding = serde_json::json!({"severity": spelling, "problem": "p"});
+            let counted = count_findings(std::slice::from_ref(&finding)).high == 1;
+            let labelled = FindingLine::from_json(&finding).severity == sashiko::db::Severity::High;
+            assert_eq!(labelled, counted, "{spelling:?}");
+        }
+    }
 
     /// The terminfo entry for `term`, where this machine has one.
     ///

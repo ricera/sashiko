@@ -22,6 +22,7 @@ use sashiko::api::{
     SubmitResponse,
 };
 use sashiko::auth::LocalToken;
+use sashiko::finding_view::{self, FindingLine};
 use sashiko::project::ProjectId;
 use sashiko::settings::Settings;
 use sashiko::utils::utf8_prefix;
@@ -2982,41 +2983,7 @@ fn print_findings_summary(
     print_severity_count("Low", counts.low, Color::Cyan, mode);
     println!("\n");
 
-    for f in &findings_to_process {
-        let sev = f
-            .get("severity")
-            .and_then(|s| s.as_str())
-            .unwrap_or("Unknown");
-        let file = f.get("file").and_then(|s| s.as_str()).unwrap_or("");
-        let line = f.get("line").and_then(|l| l.as_i64()).unwrap_or(0);
-        let desc = f
-            .get("problem_description")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-        let fix = f
-            .get("recommended_fix")
-            .and_then(|s| s.as_str())
-            .unwrap_or("");
-
-        let color = match sev.to_lowercase().as_str() {
-            "critical" | "high" => Color::Red,
-            "medium" => Color::Yellow,
-            "low" => Color::Cyan,
-            _ => Color::White,
-        };
-
-        let location = if !file.is_empty() {
-            format!("{}:{}: ", file, line)
-        } else {
-            "".to_string()
-        };
-
-        print_colored(color, &format!("  {}[{}] ", location, sev));
-        println!("{}", desc);
-        if !fix.is_empty() {
-            println!("    Fix: {}", fix);
-        }
-    }
+    print_finding_lines(&findings_to_process);
     println!();
 
     if let Some(inline) = inline_review
@@ -3029,9 +2996,25 @@ fn print_findings_summary(
     true
 }
 
+/// Prints one line per finding. When no finding says whether it is
+/// speculative, a note after the list says so once. Write errors are ignored,
+/// as in `print_colored`, because a closed stdout leaves nothing to report to.
+fn print_finding_lines(findings: &[Value]) {
+    let mut stdout = colored_stdout();
+    for finding in findings {
+        let _ = finding_view::write_finding_line(&mut stdout, &FindingLine::from_json(finding));
+    }
+    let _ = finding_view::write_not_marked_note(&mut stdout, findings);
+    let _ = stdout.flush();
+}
+
+/// Stdout with the colour choice the command line selected.
+fn colored_stdout() -> StandardStream {
+    StandardStream::stdout(COLOR_CHOICE.get().copied().unwrap_or(ColorChoice::Auto))
+}
+
 fn print_colored(color: Color, text: &str) {
-    let choice = COLOR_CHOICE.get().copied().unwrap_or(ColorChoice::Auto);
-    let mut stdout = StandardStream::stdout(choice);
+    let mut stdout = colored_stdout();
     let _ = stdout.set_color(ColorSpec::new().set_fg(Some(color)));
     let _ = write!(&mut stdout, "{}", text);
     let _ = stdout.reset();
