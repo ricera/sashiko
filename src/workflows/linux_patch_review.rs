@@ -1190,7 +1190,7 @@ Example Output:
     {{
       "problem": "mm: memory leak in func_x() due to unmet condition Y",
       "severity": "High",
-      "severity_explanation": "1. Condition Y is met.\n2. The buffer is allocated but not freed before return.",
+      "severity_explanation": "Consequence: the buffer allocated in func_x() leaks on every call that meets condition Y. Triggering path: a caller passes Y, func_x() returns early before kfree(). Reachability: reachable from the ioctl handler by an unprivileged user.",
       "preexisting": false,
       "locations": [
         {{
@@ -1970,5 +1970,82 @@ mod tests {
         assert_eq!(state.concerns[1]["reasoning"], "Old leak");
         assert_eq!(state.findings.len(), 1);
         assert_eq!(state.findings[0]["problem"], "new regression");
+    }
+
+    fn verification_prompt() -> String {
+        verification_stage(10, 1.0)
+            .user_prompt
+            .render_for_log(&LinuxPatchReviewState::default())
+    }
+
+    /// The key list, cut at its own opening sentence. The instructions
+    /// before it are left out because item 6 already says
+    /// "preexisting": true, which would satisfy a check on the whole prompt
+    /// whatever the key list says.
+    fn verification_key_list(prompt: &str) -> &str {
+        let start = prompt
+            .find("Each object in the 'findings' array MUST use exactly the following keys:")
+            .expect("the verification prompt has a key list");
+        let end = prompt[start..]
+            .find("Example Output:")
+            .expect("the key list is followed by the example");
+        &prompt[start..start + end]
+    }
+
+    /// The fenced example only, so neither the rubric nor the instructions
+    /// can satisfy a check meant for the example.
+    fn verification_example(prompt: &str) -> &str {
+        let start = prompt
+            .find("Example Output:\n```json")
+            .expect("the verification prompt has a worked example");
+        let body = &prompt[start + "Example Output:\n```json".len()..];
+        let end = body.find("```").expect("the example is fenced");
+        &body[..end]
+    }
+
+    /// The stage has no validator, so a key that drifts out of either half
+    /// is silently no longer emitted, or emitted without a definition.
+    #[test]
+    fn verification_key_list_and_example_name_the_same_keys() {
+        let prompt = verification_prompt();
+        let keys = verification_key_list(&prompt);
+        let example = verification_example(&prompt);
+        for key in [
+            "problem",
+            "severity",
+            "severity_explanation",
+            "preexisting",
+            "locations",
+        ] {
+            assert!(
+                keys.contains(&format!("\"{key}\" (")),
+                "key list lacks {key}: {keys}"
+            );
+            assert!(
+                example.contains(&format!("\"{key}\":")),
+                "example lacks {key}: {example}"
+            );
+        }
+    }
+
+    /// Instruction item 5 and the kernel rubric ask for consequence,
+    /// triggering path and reachability at the start of the explanation;
+    /// the example has to show the same shape it asks for.
+    #[test]
+    fn verification_example_labels_its_severity_reasoning() {
+        let prompt = verification_prompt();
+        let example = verification_example(&prompt);
+        let positions: Vec<usize> = ["Consequence:", "Triggering path:", "Reachability:"]
+            .iter()
+            .map(|label| {
+                example
+                    .find(label)
+                    .unwrap_or_else(|| panic!("example lacks {label}: {example}"))
+            })
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "labels out of rubric order: {example}"
+        );
     }
 }
