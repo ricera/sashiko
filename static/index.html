@@ -3375,17 +3375,18 @@
         // A finding's locations, each as file:line (function) with the reason
         // it matters beneath it. The rule is the CLIs' (format_location in
         // src/finding_view.rs): missing parts are dropped, and only a
-        // non-negative integer is a line number, so the page never shows a line
-        // the model did not name. The code snippet is left out because the
-        // inline review already quotes the code, and a snippet here would bury
-        // the reasoning beside it.
+        // non-negative integer up to 2^53 - 1 is a line number, so the page
+        // never shows a line the model did not name, nor a rounded huge one.
+        // The code snippet is left out because the inline review already
+        // quotes the code, and a snippet here would bury the reasoning beside
+        // it.
         function renderFindingLocations(locations) {
             if (!Array.isArray(locations)) return '';
             const textOf = (loc, key) => (typeof loc[key] === 'string' ? loc[key].trim() : '');
             const items = locations.filter(loc => loc && typeof loc === 'object').map(loc => {
                 const file = textOf(loc, 'file');
                 const fn = textOf(loc, 'function_or_symbol');
-                const line = Number.isInteger(loc.line) && loc.line >= 0 ? `:${loc.line}` : '';
+                const line = Number.isSafeInteger(loc.line) && loc.line >= 0 ? `:${loc.line}` : '';
                 const where = file ? `${file}${line}${fn ? ` (${fn})` : ''}` : fn;
                 const why = textOf(loc, 'why_this_location_matters');
                 if (!where && !why) return '';
@@ -3423,11 +3424,15 @@
         // control that opens onto nothing is worse than no control.
         function renderFindingRow(finding) {
             const f = findingObject(finding);
-            // The severity counts read a missing severity as Low, so the row
-            // says Low too and agrees with the Result line beside it. The colour
-            // comes from a whitelist, never from the model's text, which would
-            // otherwise land unescaped in a style attribute.
-            const severity = typeof f.severity === 'string' && f.severity ? f.severity : 'Low';
+            // The severity counts, the ordering and the CLIs compare the text
+            // exactly, without trimming, and read a missing or blank severity as
+            // Low. The row follows the same rule, so it is never coloured as a
+            // level that the Result line counts elsewhere: a padded " High " is
+            // shown as it is, in the unknown colour. The colour comes from a
+            // whitelist, never from the model's text, which would otherwise land
+            // unescaped in a style attribute.
+            const severity = typeof f.severity === 'string' && f.severity.trim() !== ''
+                ? f.severity : 'Low';
             const { title, clipped } = findingTitle(f);
             const head = `<span class="finding-severity" style="color:${getSeverityColor(severity)};">`
                 + `${escapeHtml(severity)}</span>`
