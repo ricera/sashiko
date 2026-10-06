@@ -33,6 +33,7 @@ pub mod email_router;
 pub mod events;
 #[cfg(feature = "server")]
 pub mod fetcher;
+pub mod finding_view;
 #[cfg(feature = "server")]
 pub mod forge;
 pub mod git_cmd;

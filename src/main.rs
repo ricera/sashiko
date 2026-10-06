@@ -19,6 +19,7 @@ use sashiko::baseline::CommitId;
 use sashiko::db::Database;
 #[cfg(feature = "server")]
 use sashiko::events::{Event, MessageSource, ParsedArticle};
+use sashiko::finding_view::{self, FindingLine};
 #[cfg(feature = "server")]
 use sashiko::ingestor::Ingestor;
 use sashiko::local_review::{
@@ -2731,6 +2732,9 @@ fn write_review_result(
         write_grouped_findings(out, &preexisting_findings, true)?;
     }
 
+    // Once, after every list: older reviews mark no finding either way.
+    finding_view::write_not_marked_note(out, findings)?;
+
     if let Some(inline) = result.get("inline_review").and_then(|v| v.as_str())
         && !inline.trim().is_empty()
         && inline.trim() != "No issues found."
@@ -2833,33 +2837,18 @@ fn write_grouped_findings(
     Ok(())
 }
 
-fn severity_color(severity: &str) -> Color {
-    match severity.to_ascii_lowercase().as_str() {
-        "critical" | "high" => Color::Red,
-        "medium" => Color::Yellow,
-        "low" => Color::Cyan,
-        _ => Color::White,
-    }
-}
-
 fn write_finding(
     out: &mut impl WriteColor,
     finding: &Value,
     include_details: bool,
 ) -> std::io::Result<()> {
-    let severity = finding
-        .get("severity")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let color = severity_color(severity);
-    let problem = finding
-        .get("problem")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    write!(out, "  ")?;
-    write_colored(out, color, &format!("[{}] ", severity))?;
-    writeln!(out, "{}", problem)?;
+    let mut line = FindingLine::from_json(finding);
+    // The detailed view lists every location, labelled, below the line, so
+    // the line's own first location would only repeat one of them.
+    if include_details {
+        line.location = None;
+    }
+    finding_view::write_finding_line(out, &line)?;
 
     if include_details {
         write_locations(out, finding)?;
@@ -3947,6 +3936,16 @@ mod tests {
     }
 
     use termcolor::Buffer;
+
+    #[test]
+    fn a_finding_label_agrees_with_the_severity_counts() {
+        for spelling in ["high", "HIGH", "High (capped)", "high ", "highest"] {
+            let finding = serde_json::json!({"severity": spelling, "problem": "p"});
+            let counted = count_findings_slice(&[&finding]).high == 1;
+            let labelled = FindingLine::from_json(&finding).severity == sashiko::db::Severity::High;
+            assert_eq!(labelled, counted, "{spelling:?}");
+        }
+    }
 
     /// The terminfo entry for `term`, where this machine has one.
     ///

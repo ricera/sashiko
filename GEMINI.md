@@ -64,6 +64,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `ingestor.rs`, `fetcher.rs`, `mbox.rs`, `nntp.rs`, `patchwork.rs`, `backfill.rs`: Mailing list, Lore mbox, NNTP, and Patchwork ingestion pipelines.
 - `reviewer.rs`: Patchset review worker orchestration.
 - `local_review.rs`: Local review execution (`sashiko review`).
+- `finding_view.rs`: Typed one-line view of a review finding (severity, title, tags, location), shared by both CLIs.
 - `git_cmd.rs` & `git_ops.rs`: Safe git process spawning and repository operations.
 - `patch.rs`, `baseline.rs`, `prerequisites.rs`: Patch parsing, baseline detection, and prerequisite series resolution.
 - `forge.rs`: Webhook integration and review posting for external forges (GitHub, GitLab).
