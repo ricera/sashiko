@@ -60,8 +60,8 @@ function grabConst(name) {
 const LETS = ['activityPoll', 'viewGeneration', 'logView', 'logTimer'];
 const CONSTS = ['FINDING_TITLE_MAX_CHARS'];
 const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'renderReviewCard', 'getSeverityColor',
-               'findingObject', 'findingTitle', 'renderFindingLocations', 'findingTags',
-               'renderFindingRow', 'renderFindingsList',
+               'findingObject', 'findingTitle', 'parseSeverityCalibration', 'renderSeverityCalibration',
+               'renderFindingLocations', 'findingTags', 'renderFindingRow', 'renderFindingsList',
                'formatDuration', 'describeStageWait', 'summarizeReason', 'compareStageRows',
                'stageTableLabel', 'stageRowsFromRecord', 'stageStopCause', 'stageStopLabel',
                'stoppedStageStatus', 'stageRowsFromActivity',
@@ -1206,11 +1206,141 @@ function findingLocationChecks(fns, expect) {
             && !card.includes('SNIPPET'));
 }
 
+// What `parseSeverityCalibration` makes of an explanation, as [label, body]
+// pairs, so a check can state the whole split at once.
+const calibration = (fns, text) => {
+    const r = fns.parseSeverityCalibration(text);
+    return r && { preamble: r.preamble, sections: r.sections.map(x => [x.label, x.body]) };
+};
+const sameSplit = (got, preamble, sections) => !!got && got.preamble === preamble
+    && JSON.stringify(got.sections) === JSON.stringify(sections);
+
+function findingCalibrationLabelChecks(fns, expect) {
+    const split = text => calibration(fns, text);
+    expect('calibration: all three kernel labels, in order, each body stopping at the next',
+        sameSplit(split('Consequence: a leak. Triggering path: a caller passes Y. Reachability: ioctl.'), '',
+            [['Consequence', 'a leak'], ['Triggering path', 'a caller passes Y'], ['Reachability', 'ioctl.']]));
+    expect('calibration: the Sashiko headings, in the plain form',
+        sameSplit(split('Blast radius and irreversibility: one queue. Likelihood and preconditions: rare.'), '',
+            [['Blast radius and irreversibility', 'one queue'], ['Likelihood and preconditions', 'rare.']]));
+    expect('calibration: the short Sashiko headings',
+        sameSplit(split('Blast radius: one queue.\nLikelihood: rare.'), '',
+            [['Blast radius', 'one queue.'], ['Likelihood', 'rare.']]));
+    const bullets = split('- **Blast radius and irreversibility**: data loss.\n- **Likelihood and preconditions**: needs root.');
+    expect('calibration: the bold bullet form, with no markup left in a body',
+        sameSplit(bullets, '', [['Blast radius and irreversibility', 'data loss.'],
+                                ['Likelihood and preconditions', 'needs root.']]));
+    expect('calibration: the colon may sit inside the bold',
+        sameSplit(split('**Consequence:** a. **Triggering path:** b'), '',
+            [['Consequence', 'a'], ['Triggering path', 'b']])
+            && sameSplit(split('**Consequence:** a.\n**Triggering path:** b'), '',
+                [['Consequence', 'a.'], ['Triggering path', 'b']]));
+    expect('calibration: labels on their own lines give two sections',
+        sameSplit(split('Consequence: a.\nTriggering path: b.'), '',
+            [['Consequence', 'a.'], ['Triggering path', 'b.']]));
+    expect('calibration: a label after a blank line, and after two spaces',
+        sameSplit(split('Consequence: a.\n\nReachability: c'), '',
+            [['Consequence', 'a.'], ['Reachability', 'c']])
+            && sameSplit(split('Consequence: a.  Triggering path: b'), '',
+                [['Consequence', 'a'], ['Triggering path', 'b']]));
+    expect('calibration: text before the first label is the preamble',
+        sameSplit(split('It breaks. Consequence: a leak.'), 'It breaks',
+            [['Consequence', 'a leak.']]));
+    expect('calibration: only the first occurrence of a label opens a section',
+        sameSplit(split('Consequence: a.\nConsequence: b.'), '', [['Consequence', 'a.\nConsequence: b.']]));
+    expect('calibration: a section with an empty body is dropped',
+        sameSplit(split('Consequence:\nTriggering path: b'), '', [['Triggering path', 'b']]));
+}
+
+function findingCalibrationShapeChecks(fns, expect) {
+    const split = text => calibration(fns, text);
+    // Shapes the deployments' explanations take (kernel-fork #35,
+    // driver-a #59, #42, #153).
+    const list = split('1. Consequence: a.\n2. Triggering path: b.\n3. Reachability: c.');
+    expect('calibration: a numbered list gives three sections and no stray list number',
+        sameSplit(list, '', [['Consequence', 'a.'], ['Triggering path', 'b.'], ['Reachability', 'c.']]));
+    expect('calibration: the same list on one line gives two sections',
+        sameSplit(split('x. 1. Consequence: a. 2. Triggering path: b.'), 'x',
+            [['Consequence', 'a'], ['Triggering path', 'b.']]));
+    expect('calibration: a parenthesised qualifier stays in the label',
+        sameSplit(split('Consequence: a.\nTriggering path (verified, not speculative): b'), '',
+            [['Consequence', 'a.'], ['Triggering path (verified, not speculative)', 'b']]));
+    expect('calibration: a plain qualifier stays in the label',
+        sameSplit(split('Consequence: a.\nTriggering path verified in code: b'), '',
+            [['Consequence', 'a.'], ['Triggering path verified in code', 'b']]));
+    expect('calibration: "Consequence first:" opens a section',
+        sameSplit(split('Consequence first: a'), '', [['Consequence first', 'a']]));
+    expect('calibration: a number that ends a sentence stays in the previous body',
+        sameSplit(split('Consequence: it leaves it at 1. Triggering path: b'), '',
+            [['Consequence', 'it leaves it at 1'], ['Triggering path', 'b']]));
+    expect('calibration: a closing parenthesis stays in the body before a label on the same line',
+        sameSplit(split('Consequence: crash (null deref) Triggering path: x'), '',
+            [['Consequence', 'crash (null deref)'], ['Triggering path', 'x']])
+            && sameSplit(split('It breaks (badly) Consequence: a'), 'It breaks (badly)', [['Consequence', 'a']]));
+    expect('calibration: a bullet marker before a label is not carried into either body',
+        sameSplit(split('* Consequence: a.\n* Reachability: c.'), '',
+            [['Consequence', 'a.'], ['Reachability', 'c.']]));
+}
+
+function findingCalibrationProseChecks(fns, expect) {
+    const split = text => calibration(fns, text);
+    expect('calibration: prose that names a label is not a section',
+        sameSplit(split('Consequence: nothing, because reachability is speculative here.'), '',
+            [['Consequence', 'nothing, because reachability is speculative here.']]));
+    expect('calibration: "Not lowered for reachability:" is prose',
+        sameSplit(split('Not lowered for reachability: x'), 'Not lowered for reachability: x', []));
+    expect('calibration: a lowercase label after a sentence end is prose',
+        sameSplit(split('Consequence: a. consequence: x'), '', [['Consequence', 'a. consequence: x']]));
+    expect('calibration: a label after unpunctuated text on the line is prose',
+        sameSplit(split('Consequence: a, the Reachability: x'), '',
+            [['Consequence', 'a, the Reachability: x']]));
+    expect('calibration: a half-bold label is prose',
+        sameSplit(split('**Consequence: x'), '**Consequence: x', [])
+            && sameSplit(split('Consequence**: x'), 'Consequence**: x', []));
+    expect('calibration: a label with no colon is prose',
+        sameSplit(split('Consequence is bad. Reachability is fine.'), 'Consequence is bad. Reachability is fine.', []));
+    expect('calibration: an unlabelled numbered list is all preamble',
+        sameSplit(split('1. Condition Y is met.\n2. The buffer leaks.'), '1. Condition Y is met.\n2. The buffer leaks.', []));
+    expect('calibration: empty and whitespace text give null',
+        ['', '   \n\t', undefined, null, 7].every(text => fns.parseSeverityCalibration(text) === null));
+    const text = 'Consequence: a. Triggering path: b. Reachability: c.';
+    const first = JSON.stringify(fns.parseSeverityCalibration(text));
+    expect('calibration: repeated calls agree, so no regex state carries over',
+        [1, 2, 3].every(() => JSON.stringify(fns.parseSeverityCalibration(text)) === first)
+            && JSON.parse(first).sections.length === 3);
+}
+
+function findingCalibrationRenderChecks(fns, expect) {
+    const rendered = text => String(fns.renderSeverityCalibration(text));
+    expect('calibration: nothing to render for empty text',
+        rendered('') === '' && rendered('  ') === '' && rendered(undefined) === '');
+    const html = rendered('It breaks. Consequence: a leak. Reachability: ioctl.');
+    expect('calibration: the preamble, then one line per step with its label in muted bold',
+        html.indexOf('It breaks') >= 0 && html.indexOf('It breaks') < html.indexOf('Consequence:')
+            && html.indexOf('Consequence:') < html.indexOf('Reachability:')
+            && (html.match(/<span class="finding-label">/g) || []).length === 2
+            && visibleText(html).replace(/\s+/g, ' ').includes('Consequence: a leak'));
+    const unlabelled = rendered('just prose, no labels');
+    expect('calibration: an unlabelled explanation is shown whole',
+        unlabelled.includes('just prose, no labels') && !unlabelled.includes('finding-label'));
+    const evil = '<img src=x onerror=alert(1)>';
+    const escaped = rendered(`${evil}. Consequence (${evil.slice(1, 4)}): ${evil}`);
+    expect('calibration: model text is escaped in the preamble, the label and the body',
+        !escaped.includes('<img') && escaped.split('&lt;img').length === 3);
+    const card = findingsCard(fns, [{ severity: 'High', problem: 'h',
+        severity_explanation: 'Consequence: it crashes. Triggering path: boot. Reachability: always.' }]);
+    expect('calibration: a card opens onto the split reasoning',
+        card.includes('<span class="finding-label">Triggering path:</span> boot')
+            && card.includes('<span class="finding-label">Reachability:</span> always.'));
+}
+
 function findingChecks(fns) {
     const failed = [];
     const expect = (name, cond) => { if (!cond) failed.push(name); };
     const groups = [findingTitleChecks, findingOrderChecks, findingCardChecks, findingMalformedChecks,
-                    findingEscapingChecks, findingLocationChecks];
+                    findingEscapingChecks, findingLocationChecks, findingCalibrationLabelChecks,
+                    findingCalibrationShapeChecks, findingCalibrationProseChecks,
+                    findingCalibrationRenderChecks];
     for (const group of groups) {
         try { group(fns, expect); } catch (e) { failed.push(`${group.name}: threw ${e}`); }
     }
@@ -1739,7 +1869,30 @@ const mutate = (name, from, to) => {
         ['a card without the findings list is caught',
             mutate('renderReviewCard', '${findingsHtml}', '')],
         ['a finding body without the severity reasoning is caught',
-            mutate('renderFindingRow', '+ (explanation ?', '+ (false ?')],
+            mutate('renderFindingRow', '+ renderSeverityCalibration(f.severity_explanation)', "+ ''")],
+        ['a severity reasoning that is not split into its steps is caught',
+            mutate('renderSeverityCalibration', 'parseSeverityCalibration(text)', "{ preamble: String(text), sections: [] }")],
+        ['a label match without the list-number boundary is caught',
+            mutate('parseSeverityCalibration', "const listNumber = '\\\\d+[.)][ \\\\t]+';",
+                "const listNumber = '(?!)';")],
+        ['a label match that drops the list number after a sentence end is caught',
+            mutate('parseSeverityCalibration', '[.;)][ \\\\t]+(?:${listNumber})?)', '[.;)][ \\\\t]+)')],
+        ['a label match without the qualifier is caught',
+            mutate('parseSeverityCalibration', 'const full = `((${labels})${qualifier})`', 'const full = `((${labels}))`')],
+        ['a body that loses its closing parenthesis is caught',
+            mutate('parseSeverityCalibration', "m[1].startsWith(')') ? 1 : 0", '0')],
+        ['a label match that ignores case is caught',
+            mutate('parseSeverityCalibration', "new RegExp(pattern, 'g')", "new RegExp(pattern, 'gi')")],
+        ['a label match without the boundary is caught',
+            mutate('parseSeverityCalibration', '|[.;)][ \\\\t]+(?:${listNumber})?)', '|)')],
+        ['a label match that accepts the half-bold form is caught',
+            mutate('parseSeverityCalibration', '(?::\\\\*\\\\*|\\\\*\\\\*:)|${full}:)', '(?::\\\\*\\\\*|\\\\*\\\\*:)?|${full}:)')],
+        ['a label match that lets every occurrence open a section is caught',
+            mutate('parseSeverityCalibration', 'if (seen.has(base)) continue;', '')],
+        ['a label match that keeps the preamble out is caught',
+            mutate('parseSeverityCalibration', 'whole.slice(0, marks[0].start).trim() : whole', "'' : whole")],
+        ['a label match that keeps the bold in the label is caught',
+            mutate('parseSeverityCalibration', 'label: m[2] ?? m[4]', 'label: m[0]')],
         ['a title clipped at exactly the limit is caught',
             mutate('findingTitle', 'chars.length > FINDING_TITLE_MAX_CHARS',
                 'chars.length >= FINDING_TITLE_MAX_CHARS')],

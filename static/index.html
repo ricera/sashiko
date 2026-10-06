@@ -1167,6 +1167,11 @@
             white-space: pre-wrap;
         }
 
+        .finding-label {
+            color: var(--text-muted);
+            font-weight: bold;
+        }
+
         .finding-muted {
             color: var(--text-muted);
             white-space: pre-wrap;
@@ -3296,6 +3301,77 @@
             return { title: text, clipped: false };
         }
 
+        // Splits a finding's severity explanation at the rubric's step labels
+        // (Consequence, Triggering path and Reachability from the kernel rubric,
+        // Blast radius and Likelihood from the Sashiko one), so the page can show
+        // each step on its own line. Returns null for an empty text, and
+        // otherwise { preamble, sections: [{ label, body }] }, where the preamble
+        // is whatever precedes the first label and a text with no label is all
+        // preamble.
+        //
+        // The model writes the labels in several shapes, so a label counts only
+        // in the forms below, and anything else is prose that stays in the
+        // section it appears in. The spelling is case-sensitive and ends in a
+        // colon, with an optional qualifier before it ("Triggering path
+        // (verified, not speculative):", "Consequence first:") or in the bold
+        // form ("**Label**:" or "**Label:**"). The label must also stand at a
+        // boundary: the start of the text, the start of a line, or after a
+        // sentence end ('.', ';' or ')' and spaces). A bullet marker or a list
+        // number may sit between the boundary and the label, so "1. Consequence:"
+        // and ". 2. Triggering path:" open sections. The boundary is matched
+        // rather than looked behind, and a section's body stops where the next
+        // boundary starts, so a list number never ends up on the end of the
+        // previous body, while a number that closes a sentence ("at 1.") stays
+        // in it. Only the first occurrence of each label opens a section.
+        //
+        // The pattern is built on every call so that no lastIndex carries over
+        // from one finding to the next.
+        function parseSeverityCalibration(text) {
+            const whole = typeof text === 'string' ? text.trim() : '';
+            if (!whole) return null;
+            const labels = '(?:Consequence|Triggering path|Reachability'
+                + '|Blast radius(?: and irreversibility)?|Likelihood(?: and preconditions)?)';
+            const qualifier = '(?:[ \\t]*\\([^()\\n]{1,80}\\)|,?[ \\t]+[a-z][^:;.\\n()]{0,47})?';
+            const full = `((${labels})${qualifier})`;
+            const listNumber = '\\d+[.)][ \\t]+';
+            const marker = `(?:[-*][ \\t]+|${listNumber})`;
+            const boundary = `(^${marker}?|\\n[ \\t]*${marker}?|[.;)][ \\t]+(?:${listNumber})?)`;
+            const pattern = `${boundary}(?:\\*\\*${full}(?::\\*\\*|\\*\\*:)|${full}:)`;
+            const re = new RegExp(pattern, 'g');
+            const seen = new Set();
+            const marks = [];
+            for (let m = re.exec(whole); m; m = re.exec(whole)) {
+                const base = m[3] ?? m[5];
+                if (seen.has(base)) continue;
+                seen.add(base);
+                // A closing parenthesis ends the previous text, so it stays there;
+                // the other boundary characters are only separators.
+                const keep = m[1].startsWith(')') ? 1 : 0;
+                marks.push({ label: m[2] ?? m[4], start: m.index + keep, bodyStart: m.index + m[0].length });
+            }
+            const sections = marks.map((mark, i) => ({
+                label: mark.label,
+                body: whole.slice(mark.bodyStart, i + 1 < marks.length ? marks[i + 1].start : whole.length).trim(),
+            })).filter(section => section.body);
+            const preamble = marks.length ? whole.slice(0, marks[0].start).trim() : whole;
+            return { preamble, sections };
+        }
+
+        // A finding's severity explanation as its preamble followed by one line
+        // per rubric step, each led by its label in muted bold as the model
+        // wrote it. An explanation with no labels is shown whole as the
+        // preamble, so nothing the model said is lost.
+        function renderSeverityCalibration(text) {
+            const parsed = parseSeverityCalibration(text);
+            if (!parsed) return '';
+            const preamble = parsed.preamble
+                ? `<div class="finding-text">${escapeHtml(parsed.preamble)}</div>` : '';
+            return preamble + parsed.sections.map(section =>
+                '<div class="finding-text">'
+                + `<span class="finding-label">${escapeHtml(section.label)}:</span> `
+                + `${escapeHtml(section.body)}</div>`).join('');
+        }
+
         // A finding's locations, each as file:line (function) with the reason
         // it matters beneath it. The rule is the CLIs' (format_location in
         // src/finding_view.rs): missing parts are dropped, and only a
@@ -3350,9 +3426,8 @@
                 + `${escapeHtml(severity)}</span>`
                 + findingTags(f).map(tag => `${tag} `).join('')
                 + `<span title="${escapeHtml(title)}">${escapeHtml(title)}</span>`;
-            const explanation = typeof f.severity_explanation === 'string' ? f.severity_explanation.trim() : '';
             const body = (clipped ? `<div class="finding-text">${escapeHtml(f.problem.trim())}</div>` : '')
-                + (explanation ? `<div class="finding-text">${escapeHtml(explanation)}</div>` : '')
+                + renderSeverityCalibration(f.severity_explanation)
                 + renderFindingLocations(f.locations);
             if (!body) return `<div class="finding">${head}</div>`;
             return `<details class="finding"><summary>${head}</summary>`

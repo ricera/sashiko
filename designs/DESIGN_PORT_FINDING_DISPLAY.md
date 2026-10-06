@@ -526,6 +526,9 @@ counts, so "Findings (N)" never disagrees with the counts beside it:
       and "Not lowered for reachability:" are prose. A sentence ending in
       a number keeps it: in "leaves it at 1. Triggering path:" the
       boundary is the ". " after the 1, so the previous body ends "at 1".
+      A `)` boundary is the exception: it closes the previous text and
+      stays in it, so "crash (null deref) Triggering path:" gives the
+      body "crash (null deref)".
     - As a regex, built per call, with the boundary matched and not looked
       behind:
       `(^(?:[-*][ \t]+|\d+[.)][ \t]+)?|\n[ \t]*(?:[-*][ \t]+|\d+[.)][ \t]+)?|[.;)][ \t]+(?:\d+[.)][ \t]+)?)(?:\*\*(LABELS)QUAL(?::\*\*|\*\*:)|(LABELS)QUAL:)`
@@ -917,8 +920,11 @@ Mutations, each of which must fail `findingChecks`:
 - the list-number boundary removed (caught by the numbered list);
 - the qualifier removed from the label pattern (caught by "Triggering path
   (verified, not speculative):");
-- the label match made case-insensitive (caught by "Not lowered for
-  reachability:").
+- the label match made case-insensitive (caught by the lowercase
+  "consequence:" after ". "; "Not lowered for reachability:" has no
+  boundary before its label, so it is prose with or without the flag);
+- the closing parenthesis dropped from a body before a same-line label
+  (caught by "crash (null deref) Triggering path:").
 
 ### 6.4 By hand
 
