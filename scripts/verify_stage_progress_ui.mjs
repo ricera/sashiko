@@ -1389,13 +1389,94 @@ function findingSpeculativeChecks(fns, expect) {
         !findingsCard(fns, []).includes(NOTE));
 }
 
+// The Findings button must open the block it sits beside. The id is built in
+// two places of one template, so a typo in either leaves a button that does
+// nothing and no error anywhere.
+function findingToggleChecks(fns, expect) {
+    const card = findingsCard(fns, [{ severity: 'High', problem: 'h' }]);
+    const toggled = /toggleCollapsible\('([^']*)'/.exec(card);
+    const opened = /id="(findings-[^"]*)" class="collapsible open"/.exec(card);
+    expect('toggle: the Findings button opens exactly the block it sits beside',
+        !!toggled && !!opened && toggled[1] === opened[1]);
+    expect('toggle: the id is built from the review, never "undefined"',
+        !!toggled && toggled[1].startsWith('findings-') && !card.includes('undefined')
+            && toggled[1] !== 'findings-');
+}
+
+// Padded and blank location parts are trimmed or dropped, as the CLIs do, so a
+// location never prints as "a.c  (   )".
+function findingLocationTrimChecks(fns, expect) {
+    const where = locations => visibleText(String(fns.renderFindingLocations(locations))).trim();
+    expect('location trim: padded parts are trimmed and a blank function is dropped',
+        where([{ file: '  a.c  ', function_or_symbol: '  ' }]) === 'a.c');
+    expect('location trim: a padded line and function keep one space between them',
+        where([{ file: '  a.c ', line: 3, function_or_symbol: ' fn ' }]) === 'a.c:3 (fn)');
+    expect('location trim: a blank file leaves the function alone',
+        where([{ file: ' \t ', function_or_symbol: ' fn ' }]) === 'fn');
+    expect('location trim: a location with only blank parts is dropped',
+        fns.renderFindingLocations([{ file: ' ', function_or_symbol: ' ',
+            why_this_location_matters: ' ' }]) === '');
+}
+
+// A line number is a non-negative integer a JSON reader can hold exactly, the
+// CLIs' rule: 1e22 is an integer to JavaScript but prints as "1e+22".
+function findingLineNumberChecks(fns, expect) {
+    const shown = line => visibleText(String(fns.renderFindingLocations([{ file: 'f.c', line }]))).trim();
+    for (const line of [12, 0, 9007199254740991]) {
+        expect(`line number: ${line} is shown`, shown(line) === `f.c:${line}`);
+    }
+    for (const line of [1e22, 9007199254740992, 12.5, -1, '12', null]) {
+        expect(`line number: ${String(line)} is not shown`, shown(line) === 'f.c');
+    }
+}
+
+// A whitespace-only severity is Low on the page, as in the severity counts. A
+// padded severity is not trimmed, because the counts and the ordering do not
+// trim it either: the row must not colour it as a level they do not count.
+function findingBlankSeverityChecks(fns, expect) {
+    const block = findingsBlock(findingsCard(fns, [{ severity: '  ', problem: 'p' }]));
+    expect('severity: a whitespace-only severity reads Low',
+        block.includes('color:var(--sev-low);">Low<'));
+    const padded = findingsBlock(findingsCard(fns, [{ severity: ' High ', problem: 'p' }]));
+    expect('severity: a padded severity is not coloured as the level it pads',
+        !padded.includes('--sev-high'));
+    const counts = fns.countNewFindings({ output: { findings: [{ severity: ' High ', problem: 'p' }] } });
+    expect('severity: the row and the Result line agree on a padded severity',
+        counts.high === 0 && counts.low === 1);
+}
+
+// The order of a row inside its <details>: the summary reads severity, tags,
+// title; the body reads the full problem (when the title was clipped), the
+// severity reasoning, then the locations. Every block is checked against the
+// next, so swapping any two is caught.
+function findingRowLayoutChecks(fns, expect) {
+    const problem = 'FULLPROBLEM ' + 'x'.repeat(200);
+    const block = findingsBlock(findingsCard(fns, [{
+        severity: 'High', problem, speculative: true, preexisting: true,
+        severity_explanation: 'Triggering path: REASONMARK', locations: [{ file: 'loc.c', line: 4 }],
+    }]));
+    const details = /<details class="finding"><summary>([\s\S]*?)<\/summary><div class="finding-body">([\s\S]*)<\/div><\/details>/
+        .exec(block);
+    expect('layout: a finding with a body is one details with a summary and a body', !!details);
+    if (!details) return;
+    const [, summary, body] = details;
+    const inOrder = (text, marks) => marks.every(mark => text.indexOf(mark) >= 0)
+        && marks.every((mark, i) => i === 0 || text.indexOf(marks[i - 1]) < text.indexOf(mark));
+    expect('layout: summary reads severity, then tags, then title',
+        inOrder(summary, ['finding-severity', '(speculative)', '(preexisting)', 'FULLPROBLEM']));
+    expect('layout: body reads full problem, then severity reasoning, then locations',
+        inOrder(body, ['FULLPROBLEM', 'REASONMARK', '<code>loc.c:4</code>']));
+}
+
 function findingChecks(fns) {
     const failed = [];
     const expect = (name, cond) => { if (!cond) failed.push(name); };
     const groups = [findingTitleChecks, findingOrderChecks, findingCardChecks, findingMalformedChecks,
                     findingEscapingChecks, findingLocationChecks, findingCalibrationLabelChecks,
                     findingCalibrationShapeChecks, findingCalibrationProseChecks,
-                    findingCalibrationRenderChecks, findingSpeculativeChecks];
+                    findingCalibrationRenderChecks, findingSpeculativeChecks,
+                    findingToggleChecks, findingLocationTrimChecks, findingLineNumberChecks,
+                    findingBlankSeverityChecks, findingRowLayoutChecks];
     for (const group of groups) {
         try { group(fns, expect); } catch (e) { failed.push(`${group.name}: threw ${e}`); }
     }
@@ -1967,7 +2048,37 @@ const mutate = (name, from, to) => {
             mutate('findingTitle', 'chars.length > FINDING_TITLE_MAX_CHARS',
                 'chars.length >= FINDING_TITLE_MAX_CHARS')],
         ['a fractional line number shown as a line is caught',
-            mutate('renderFindingLocations', 'Number.isInteger(loc.line)', "typeof loc.line === 'number'")],
+            mutate('renderFindingLocations', 'Number.isSafeInteger(loc.line)', "typeof loc.line === 'number'")],
+        ['a line number that is only an integer, not a safe one, is caught',
+            mutate('renderFindingLocations', 'Number.isSafeInteger(loc.line)', 'Number.isInteger(loc.line)')],
+        ['a Findings button that toggles another id is caught',
+            mutate('renderFindingsList', "toggleCollapsible('findings-${uniqueId}'",
+                "toggleCollapsible('findings-${uniqueId}-x'")],
+        ['a Findings button that toggles no id is caught',
+            mutate('renderFindingsList', "toggleCollapsible('findings-${uniqueId}'", "toggleCollapsible('findings-'")],
+        ['a location that does not trim its parts is caught',
+            mutate('renderFindingLocations', "loc[key].trim() : ''", "loc[key] : ''")],
+        ['a severity that is trimmed for the row but not for the counts is caught',
+            mutate('renderFindingRow', "f.severity.trim() !== ''\n                ? f.severity : 'Low'",
+                "f.severity.trim() !== ''\n                ? f.severity.trim() : 'Low'")],
+        ['a blank severity that is not read as Low is caught',
+            mutate('renderFindingRow', "f.severity.trim() !== ''", "f.severity !== ''")],
+        ['a row with the reasoning after the locations is caught',
+            mutate('renderFindingRow',
+                '+ renderSeverityCalibration(f.severity_explanation)\n                + renderFindingLocations(f.locations)',
+                '+ renderFindingLocations(f.locations)\n                + renderSeverityCalibration(f.severity_explanation)')],
+        ['a row with the full problem after the reasoning is caught',
+            mutate('renderFindingRow',
+                "const body = (clipped ? `<div class=\"finding-text\">${escapeHtml(f.problem.trim())}</div>` : '')\n                + renderSeverityCalibration(f.severity_explanation)",
+                "const body = renderSeverityCalibration(f.severity_explanation)\n                + (clipped ? `<div class=\"finding-text\">${escapeHtml(f.problem.trim())}</div>` : '')")],
+        ['a row with the title before the tags is caught',
+            mutate('renderFindingRow',
+                "+ findingTags(f).map(tag => `${tag} `).join('')\n                + `<span title=\"${escapeHtml(title)}\">${escapeHtml(title)}</span>`;",
+                "+ `<span title=\"${escapeHtml(title)}\">${escapeHtml(title)}</span>`\n                + findingTags(f).map(tag => ` ${tag}`).join('');")],
+        ['a row with the severity after the title is caught',
+            mutate('renderFindingRow',
+                "const head = `<span class=\"finding-severity\" style=\"color:${getSeverityColor(severity)};\">`\n                + `${escapeHtml(severity)}</span>`\n                + findingTags(f).map(tag => `${tag} `).join('')\n                + `<span title=\"${escapeHtml(title)}\">${escapeHtml(title)}</span>`;",
+                "const head = findingTags(f).map(tag => `${tag} `).join('')\n                + `<span title=\"${escapeHtml(title)}\">${escapeHtml(title)}</span>`\n                + `<span class=\"finding-severity\" style=\"color:${getSeverityColor(severity)};\">`\n                + `${escapeHtml(severity)}</span>`;")],
     ];
     for (const [name, broken] of findingMutations) {
         check(name, findingChecks(broken).length > 0);
