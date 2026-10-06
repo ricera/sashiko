@@ -4,7 +4,8 @@ Status: approved, 2026-10-05, after two review rounds and a check of every
 data claim against the three deployment databases (§1.3). Built on
 `port/upstream` as commits 2 to 7 of §7 (plus two follow-ups from the
 independent review: a safer CLI finding line, and a web row that agrees
-with the counters). The §6.5 measurement of commits 2 and 3 is under way.
+with the counters). The §6.5 measurement of commits 2 and 3 is done and its
+results are recorded there.
 Branch: `port/upstream` (upstream `origin/main` 2a7e748b1680 plus the ported
 fork features). The fork source is `feat/prior-revision-findings`, commit
 46d809932fa9 ("web, review: say what each finding is and why it got its
@@ -1077,6 +1078,83 @@ The user approved a targeted re-review and its model spend on 2026-10-05
   wording nobody wants, commit 3 also adds one line to each report
   instruction, and the comparison is repeated for that line.
 
+### 6.5.1 Results (2026-10-06)
+
+Run as planned, on the five of the six patches that reach verification
+(the sixth, a driver-a XSK pool patch, had no findings in the base run, so
+verification never ran on it). Every run replayed all turns before
+verification from the cache, 18 of 18 first runs and 75 of 75 repeats, so
+each difference below comes from the verification and report stages alone.
+The old prompt has 7 samples (the base build once, the A/A control once, and
+five A/A repeats), commit 2 has 6 and commit 3 has 6; one sample is the five
+patches reviewed once, and a repeat starts from a fresh copy of the cache
+without its verification and report rows. Cost: about $246 at Opus 5 list
+price, of which the single full base arm was $150.
+
+| Per sample (5 patches) | old prompt | commit 2 | commit 3 |
+| --- | --- | --- | --- |
+| findings | 15.4 +- 1.6 | 16.0 +- 1.5 | 15.3 +- 1.4 |
+| High | 1.4 +- 0.5 | 1.2 +- 0.4 | 1.3 +- 0.7 |
+| Medium | 4.7 +- 0.9 | 4.5 +- 1.0 | 5.0 +- 1.2 |
+| Low | 9.3 +- 1.2 | 10.3 +- 2.3 | 9.0 +- 1.0 |
+| explanations fully split (§4.4) | 54% | 85% | 73% |
+| numbered "1. Consequence:" hybrids | 12% to 29% of findings | none | none |
+| speculative true / false / absent | 0 / 0 / all | 0 / 0 / all | 25 / 67 / 0 |
+| speculative true above Medium | 0 | 0 | 0 |
+| median length of problem | 88.5 | 91.5 | 96.5 |
+| problem 80 characters or less | 20% | 15% | 15% |
+
+What this shows, and how sure it is:
+
+- **Commit 2 does what it was for.** The share of explanations that split
+  into all three rubric sections rose from 54% to 85% (permutation test
+  p = 0.005), and the numbered hybrids that every old sample contained
+  (2 to 4 of 13 to 18 findings) did not occur in any of the 12 new ones.
+  Commit 3 sits between (73%, p = 0.058 against the old prompt, and
+  p = 0.086 against commit 2), so its gain is smaller but is not shown to
+  differ from commit 2's.
+- **Severity did not move.** Finding counts and the High, Medium and Low
+  counts differ by less than the spread between identical builds, and
+  High plus Medium per sample is 6.1 old and 6.3 commit 3 (p = 0.84). The
+  one High that looked suppressed in a first single comparison (a NULL
+  dereference reached from ethtool on a driver-a patch, reported by both
+  of the first two old runs and by neither new run) turned out to be
+  noise: it appears in 3 of 7 old samples and in 2 of 12 new ones. The
+  other High, on a driver-b patch, appears in every sample of every arm.
+  The sample is small, so a shift smaller than about one finding per
+  sample cannot be excluded.
+- **`speculative` is emitted reliably and calibrated.** It is present on all
+  92 findings in the commit 3 samples (25 true), and no finding marked
+  speculative is above Medium. The consequence-only and partly speculative
+  cases of §4.1 are too rare to measure separately here; the High plus
+  Medium counts show no sign that the definition lifts them.
+- **The reports did not change.** The word speculative appeared in 0.3
+  old reports per sample and 0.2 commit 3 reports, and no finding left the
+  email, so Q3 needs no report instruction line. Reports carry more
+  [Severity] tags than the finding count in every arm, including the old
+  one, because a finding anchored at two code sites gets a comment at
+  each.
+- **A small cost in problem length.** The median problem is 8 characters
+  longer under commit 3 (p = 0.004), while the share at 80 characters or
+  less (the rule's limit) is 20% before and 15% after. The model does not
+  keep to the 80-character rule in any arm: only 15% to 20% of titles
+  do, and 93% to 98% are under 120. Only a validator, which D6 leaves to its
+  own item, would enforce it.
+- **Limits.** Five patches and about 95 findings per arm, one model, and
+  no kernel reference tree (the same in every arm). The replay design
+  measures the two changed stages and not a full re-review, which is the
+  point, and a full-review effect from a different analysis sample is not
+  in these numbers.
+
+**Setup lesson.** A first attempt replayed nothing: the toolbox emitted its
+tool declarations in hash order, so two runs of one request differed and
+the response cache never hit. The measurement builds sort them
+(a one-line change in `ToolRegistry`, with a test); it is not part of this
+step. Two separate processes differed on the same request, so on this
+evidence a response cache cannot replay across process runs, which a
+deployment's cache would also need to; whether a retry inside one process
+differs too was not measured.
+
 ## 7. Commit Breakdown
 
 Each commit is one consistent change. Each has `Signed-off-by`, body lines of
@@ -1333,11 +1411,9 @@ is what makes it necessary.
 - **Q2. Sashiko label shape.** Once self-reviews have run under this step,
   check how many Sashiko `severity_explanation` values open with "Blast
   radius:" or "Likelihood:". If few do, revisit D4 (c).
-- **Q3. Does `speculative` change the reports?** The report stages now see
-  the key. This is not a follow-up: it is the gate on commit 3 (§6.5). The
-  LKML emails and Sashiko bullet lists from the §6.5 runs are compared
-  before and after commit 3. If the wording changes in a way nobody wants,
-  commit 3 adds one line to each report instruction before it lands.
+- **Q3. Does `speculative` change the reports?** Resolved by §6.5.1: no.
+  No new wording and no finding dropped from the email, so commit 3 adds
+  no report instruction line.
 - **Q4. Which §6.5 run.** Resolved on 2026-10-05: the targeted
   re-review on deployment patches, with its model spend approved.
 
