@@ -15,7 +15,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// A trait representing a single tool that can be exposed to an LLM.
@@ -44,15 +44,20 @@ pub trait LlmTool<C>: Send + Sync {
 }
 
 /// A registry that manages a set of LLM tools and handles dynamic dispatching.
+///
+/// Tools are kept in name order so every process declares them in the same
+/// order. A request lists the declarations, so a per-process hash order made
+/// otherwise identical requests differ between runs, and the response cache
+/// could never replay one.
 pub struct ToolRegistry<C> {
-    tools: HashMap<&'static str, Arc<dyn LlmTool<C>>>,
+    tools: BTreeMap<&'static str, Arc<dyn LlmTool<C>>>,
 }
 
 impl<C> ToolRegistry<C> {
     /// Creates a new empty `ToolRegistry`.
     pub fn new() -> Self {
         Self {
-            tools: HashMap::new(),
+            tools: BTreeMap::new(),
         }
     }
 
@@ -214,21 +219,42 @@ mod tests {
         }
     }
 
+    /// The response cache keys on the whole request, declarations included,
+    /// so their order has to be the same in every process. All nine real
+    /// names, registered in reverse, so a hash order would pass this only by
+    /// a one-in-362880 chance.
+    #[test]
+    fn declarations_come_in_name_order_whatever_the_registration_order() {
+        let mut reg = ToolRegistry::new();
+        for name in REAL_TOOL_NAMES.iter().rev() {
+            reg.register(Stub(name));
+        }
+        let names: Vec<String> = reg
+            .declarations()
+            .iter()
+            .filter_map(|d| d["name"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(names, REAL_TOOL_NAMES);
+    }
+
+    /// The registry's real tool names, in name order.
+    const REAL_TOOL_NAMES: [&str; 9] = [
+        "git_blame",
+        "git_diff",
+        "git_find_files",
+        "git_grep",
+        "git_log",
+        "git_ls",
+        "git_read_files",
+        "git_show",
+        "read_prompt",
+    ];
+
     /// The real set, because the near misses this exists to catch come from the
     /// names sharing a `git_` prefix.
     fn registry() -> ToolRegistry<()> {
         let mut reg = ToolRegistry::new();
-        for name in [
-            "git_blame",
-            "git_diff",
-            "git_find_files",
-            "git_grep",
-            "git_log",
-            "git_ls",
-            "git_read_files",
-            "git_show",
-            "read_prompt",
-        ] {
+        for name in REAL_TOOL_NAMES {
             reg.register(Stub(name));
         }
         reg

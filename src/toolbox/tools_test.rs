@@ -27,6 +27,23 @@ mod tests {
         (linux_path, prompts_path)
     }
 
+    /// Every review builds its own ToolBox, often in a fresh process, and the
+    /// response cache only replays a request that is byte-for-byte the same.
+    /// Two toolboxes must therefore declare their tools identically.
+    #[test]
+    fn two_toolboxes_declare_their_tools_identically() {
+        let (repo, prompts) = get_test_paths();
+        let declare = || {
+            let tools = ToolBox::new(repo.clone(), Some(prompts.clone()));
+            serde_json::to_string(&tools.get_declarations_generic())
+                .expect("tool declarations serialize")
+        };
+        let first = declare();
+        for _ in 0..8 {
+            assert_eq!(declare(), first);
+        }
+    }
+
     #[test]
     fn test_virtualize_ref() {
         let mut toolbox = ToolBox::new(PathBuf::from("."), None);
