@@ -7905,8 +7905,8 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         Ok(row.get(0)?)
     }
 
-    #[tokio::test]
-    async fn tool_calls_in_a_truncated_response_are_not_recorded() -> Result<()> {
+    /// An in-memory database holding one review to record tool calls for.
+    async fn database_with_a_review() -> Result<(Database, i64)> {
         let mut settings = Settings::new()?;
         settings.database.url = ":memory:".to_string();
         let db = Database::new(&settings.database).await?;
@@ -7926,21 +7926,32 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         let review_id = db
             .create_review(patchset_id, None, "prov", "model", None, None, None)
             .await?;
+        Ok((db, review_id))
+    }
 
-        let mut resp = AiResponse {
+    /// A model response that asks for one git_grep call with these arguments.
+    fn grep_response(arguments: Value) -> AiResponse {
+        AiResponse {
             content: None,
             thought: None,
             thought_signature: None,
             tool_calls: Some(vec![crate::ai::ToolCall {
                 id: "call_1".to_string(),
                 function_name: "git_grep".to_string(),
-                arguments: json!({"pattern": "foo"}),
+                arguments,
                 thought_signature: None,
                 unparsed_arguments: None,
             }]),
             usage: None,
-            truncated: true,
-        };
+            truncated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_calls_in_a_truncated_response_are_not_recorded() -> Result<()> {
+        let (db, review_id) = database_with_a_review().await?;
+        let mut resp = grep_response(json!({"pattern": "foo"}));
+        resp.truncated = true;
         record_tool_calls(&db, review_id, "prov", "model", &resp).await;
         assert_eq!(
             tool_usage_rows(&db, review_id).await?,
@@ -7951,6 +7962,31 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         resp.truncated = false;
         record_tool_calls(&db, review_id, "prov", "model", &resp).await;
         assert_eq!(tool_usage_rows(&db, review_id).await?, 1);
+        Ok(())
+    }
+
+    /// The per-review tool call counts read a call's repository back from
+    /// its stored arguments, so the arguments must keep the top-level repo
+    /// argument as the model sent it. A change that truncated, compressed or
+    /// reshaped them would fail here before it silently zeroed the counts.
+    #[tokio::test]
+    async fn recorded_arguments_keep_the_repo_argument() -> Result<()> {
+        let (db, review_id) = database_with_a_review().await?;
+        let resp = grep_response(json!({"pattern": "x", "repo": "rdma-core"}));
+        record_tool_calls(&db, review_id, "prov", "model", &resp).await;
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT json_extract(arguments, '$.repo') FROM tool_usages WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await?;
+        let row = rows
+            .next()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("the call was not recorded"))?;
+        assert_eq!(row.get::<Option<String>>(0)?.as_deref(), Some("rdma-core"));
         Ok(())
     }
 

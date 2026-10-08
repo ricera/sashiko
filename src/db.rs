@@ -1232,6 +1232,66 @@ fn stored_json(raw: Option<String>) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// The counts of a review that has made no tool call yet, from its stored
+/// `reference_repos` text: a zero for each attached reference, in configured
+/// order, or no split when the record is missing or unreadable.
+///
+/// An unreadable record gives no split rather than an empty one, because an
+/// empty split would count every call naming a reference as a call to an
+/// unattached repository, which is a guess about what the review had.
+#[cfg(feature = "server")]
+fn no_tool_calls(reference_repos: Option<&str>) -> crate::api::ToolCallCounts {
+    let record = reference_repos
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|value| crate::references::parse_record(&value));
+    crate::api::ToolCallCounts {
+        total: 0,
+        by_reference: record.map(|rec| crate::api::ReferenceSplit {
+            references: rec
+                .attached
+                .into_iter()
+                .map(|a| crate::api::ReferenceCalls {
+                    name: a.name,
+                    calls: 0,
+                })
+                .collect(),
+            unattached: 0,
+        }),
+    }
+}
+
+/// Adds one group of a review's recorded tool calls, all with the same tool
+/// name and `repo` argument, to its counts.
+///
+/// Every call counts in the total. With a known split, a call is credited to
+/// the reference or to the unattached repositories exactly when the toolbox
+/// would have resolved it there; calls to the code under review and to tools
+/// that read no repository need no count of their own.
+#[cfg(feature = "server")]
+fn add_tool_calls(
+    counts: &mut crate::api::ToolCallCounts,
+    tool_name: &str,
+    repo: Option<&str>,
+    calls: u64,
+) {
+    use crate::toolbox::CallTarget;
+
+    counts.total = counts.total.saturating_add(calls);
+    let Some(split) = counts.by_reference.as_mut() else {
+        return;
+    };
+    let attached: Vec<&str> = split.references.iter().map(|r| r.name.as_str()).collect();
+    match crate::toolbox::call_target(tool_name, repo, &attached) {
+        CallTarget::Reference(index) => {
+            if let Some(reference) = split.references.get_mut(index) {
+                reference.calls = reference.calls.saturating_add(calls);
+            }
+        }
+        CallTarget::Unattached => split.unattached = split.unattached.saturating_add(calls),
+        CallTarget::Review | CallTarget::NoRepository => {}
+    }
+}
+
 /// Renders the summary of a bug as it appears embedded in a patchset or review
 /// payload.
 ///
@@ -2420,12 +2480,21 @@ impl Database {
     /// both runs, and they would be judged against the new run's reference
     /// record, which the restart may have changed.
     ///
-    /// The two statements need no transaction: only the worker reviewing
-    /// this patch takes its row, and nothing records a tool call against a
-    /// row until that worker has taken it and started an attempt on it.
+    /// The earlier run's reference record is cleared as well. The new run
+    /// replaces it only when it sends a hand-off, and it sends none when no
+    /// references are configured any more or when storing the hand-off
+    /// fails. A kept record would then split the new run's calls against
+    /// references the new run never had, where no record correctly reports
+    /// the split as unknown.
     ///
-    /// A failed delete is only logged, because tool calls are statistics
-    /// and must not stop the patch's review; the row is still returned.
+    /// The statements need no transaction: only the worker reviewing this
+    /// patch takes its row, and nothing records a tool call or a reference
+    /// record against a row until that worker has taken it and started an
+    /// attempt on it.
+    ///
+    /// A failed statement is only logged, because tool calls and reference
+    /// records are statistics and must not stop the patch's review; the row
+    /// is still returned.
     pub async fn take_pending_review_id(
         &self,
         patchset_id: i64,
@@ -2443,17 +2512,20 @@ impl Database {
             Ok(Some(row)) => row.get(0)?,
             _ => return Ok(None),
         };
-        if let Err(e) = self
-            .execute(
-                "DELETE FROM tool_usages WHERE review_id = ?",
-                libsql::params![review_id],
-            )
-            .await
-        {
-            warn!(
-                "Failed to clear the tool calls of reused review {}: {}",
-                review_id, e
-            );
+        let resets = [
+            ("tool calls", "DELETE FROM tool_usages WHERE review_id = ?"),
+            (
+                "reference record",
+                "UPDATE reviews SET reference_repos = NULL WHERE id = ?",
+            ),
+        ];
+        for (what, sql) in resets {
+            if let Err(e) = self.execute(sql, libsql::params![review_id]).await {
+                warn!(
+                    "Failed to clear the {} of reused review {}: {}",
+                    what, review_id, e
+                );
+            }
         }
         Ok(Some(review_id))
     }
@@ -2826,6 +2898,107 @@ impl Database {
         )
         .await?;
         Ok(())
+    }
+
+    /// Tool calls recorded for each of these reviews, by repository.
+    ///
+    /// Every review in `review_ids` that exists gets an entry, a review with
+    /// no calls included, so a reader can tell "no calls" from "not asked".
+    /// Each call is classified by [`crate::toolbox::call_target`], the rule
+    /// the toolbox applied when it served the call, against the attached
+    /// references in the review's own `reference_repos` record. A review
+    /// with no readable record gets no split; see
+    /// [`crate::api::ToolCallCounts`].
+    ///
+    /// The repository is read back from the stored arguments, which hold the
+    /// model's JSON verbatim. Arguments that are NULL, not JSON, not an
+    /// object, or carry a `repo` that is not a string read as no `repo`, so
+    /// one odd row cannot fail the query.
+    pub async fn tool_call_counts(
+        &self,
+        review_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, crate::api::ToolCallCounts>> {
+        if review_ids.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let ids = serde_json::to_string(review_ids)?;
+        let mut counts = self.tool_call_count_bases(&ids).await?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT tu.review_id,
+                        tu.tool_name,
+                        CASE WHEN json_valid(tu.arguments) THEN
+                            CASE WHEN json_type(tu.arguments, '$.repo') = 'text'
+                                 THEN json_extract(tu.arguments, '$.repo') END
+                        END AS repo,
+                        COUNT(*)
+                 FROM tool_usages tu
+                 WHERE tu.review_id IN (SELECT value FROM json_each(?))
+                 GROUP BY 1, 2, 3",
+                libsql::params![ids.as_str()],
+            )
+            .await?;
+        while let Some(row) = rows.next().await? {
+            let review_id: i64 = row.get(0)?;
+            let tool_name: String = row.get(1)?;
+            let repo: Option<String> = row.get(2)?;
+            // COUNT(*) is never negative, so the conversion cannot fail.
+            let calls = u64::try_from(row.get::<i64>(3)?).unwrap_or(0);
+            add_tool_calls(
+                counts.entry(review_id).or_default(),
+                &tool_name,
+                repo.as_deref(),
+                calls,
+            );
+        }
+        Ok(counts)
+    }
+
+    /// The counts each review starts from before its calls are added, from
+    /// its reference record, for the reviews in `ids`, a JSON array of ids.
+    async fn tool_call_count_bases(
+        &self,
+        ids: &str,
+    ) -> Result<std::collections::HashMap<i64, crate::api::ToolCallCounts>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, reference_repos FROM reviews
+                 WHERE id IN (SELECT value FROM json_each(?))",
+                libsql::params![ids],
+            )
+            .await?;
+        let mut counts = std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let record = row.get::<Option<String>>(1)?;
+            counts.insert(row.get::<i64>(0)?, no_tool_calls(record.as_deref()));
+        }
+        Ok(counts)
+    }
+
+    /// Sets `tool_calls` on each review object of a payload, from
+    /// [`Self::tool_call_counts`].
+    ///
+    /// The counts are advisory: a database error is logged, and every review
+    /// is served with `tool_calls` null rather than failing the whole
+    /// payload, the same as a review from a daemon that counts no calls.
+    async fn attach_tool_call_counts(&self, reviews: &mut [serde_json::Value]) {
+        let ids: Vec<i64> = reviews.iter().filter_map(|r| r["id"].as_i64()).collect();
+        let counts = self.tool_call_counts(&ids).await.unwrap_or_else(|e| {
+            warn!("Failed to count the tool calls of reviews {:?}: {}", ids, e);
+            std::collections::HashMap::new()
+        });
+        for review in reviews.iter_mut() {
+            let value = review["id"]
+                .as_i64()
+                .and_then(|id| counts.get(&id))
+                .and_then(|c| serde_json::to_value(c).ok())
+                .unwrap_or(serde_json::Value::Null);
+            if let Some(fields) = review.as_object_mut() {
+                fields.insert("tool_calls".to_string(), value);
+            }
+        }
     }
 
     pub async fn create_finding(&self, finding: Finding) -> Result<()> {
@@ -8377,16 +8550,20 @@ impl Database {
             patch_ids.push(p.get::<i64>(0)?);
         }
 
-        self.get_patchset_reviews_for_patches(
-            patchset_id,
-            &patch_ids,
-            model_name.as_deref(),
-            provider.as_deref(),
-            prompts_git_hash.as_deref(),
-            baseline.as_ref(),
-            include_logs,
-        )
-        .await
+        let mut reviews = self
+            .get_patchset_reviews_for_patches(
+                patchset_id,
+                &patch_ids,
+                model_name.as_deref(),
+                provider.as_deref(),
+                prompts_git_hash.as_deref(),
+                baseline.as_ref(),
+                include_logs,
+            )
+            .await?;
+        // A maintainer the embargo admits sees the counts everyone will.
+        self.attach_tool_call_counts(&mut reviews).await;
+        Ok(reviews)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8590,7 +8767,7 @@ impl Database {
 
             let final_status = shown_under_embargo(status, is_embargoed);
 
-            let reviews = if is_embargoed {
+            let mut reviews = if is_embargoed {
                 Vec::new()
             } else {
                 self.get_patchset_reviews_for_patches(
@@ -8604,6 +8781,9 @@ impl Database {
                 )
                 .await?
             };
+            // Counted only for the reviews served, so the counts cover this
+            // page's patches and nothing under embargo.
+            self.attach_tool_call_counts(&mut reviews).await;
 
             // Fetch thread messages
             let mut messages = Vec::new();
@@ -8792,7 +8972,7 @@ impl Database {
 
             let final_status = shown_under_embargo(status, is_embargoed);
 
-            let reviews = if is_embargoed {
+            let mut reviews = if is_embargoed {
                 Vec::new()
             } else {
                 self.get_patchset_reviews_for_patches(
@@ -8806,6 +8986,9 @@ impl Database {
                 )
                 .await?
             };
+            // Counted only for the reviews served, so the counts cover this
+            // page's patches and nothing under embargo.
+            self.attach_tool_call_counts(&mut reviews).await;
 
             let mut messages = Vec::new();
             if let Some(tid) = thread_id {
@@ -8947,7 +9130,7 @@ impl Database {
                 .map(|(bug, is_new)| bug_reference_json(&bug, is_new))
                 .collect::<Vec<_>>();
 
-            Ok(Some(serde_json::json!({
+            let mut review = serde_json::json!({
                 "id": r.get::<i64>(0)?,
                 "model": r.get::<Option<String>>(1).ok(),
                 "summary": r.get::<Option<String>>(2).ok(),
@@ -8981,7 +9164,10 @@ impl Database {
                 "duration_seconds": r.get::<Option<i64>>(25).ok().flatten(),
                 "stage_durations": stored_json(r.get::<Option<String>>(26).ok().flatten()),
                 "bugs": bugs_json,
-            })))
+            });
+            self.attach_tool_call_counts(std::slice::from_mut(&mut review))
+                .await;
+            Ok(Some(review))
         } else {
             Ok(None)
         }
@@ -24837,6 +25023,19 @@ mod tests {
             .await
             .unwrap();
         record_greps(&db, interrupted, &["a", "b", "c"]).await;
+        // It ran with kernel attached and read it, so its calls, if they
+        // survived, would show against the record of the run that takes the
+        // row over.
+        db.set_review_reference_repos(interrupted, &reference_record(&["kernel"], &[]))
+            .await
+            .unwrap();
+        record_call(
+            &db,
+            interrupted,
+            "git_grep",
+            Some(r#"{"pattern":"k","repo":"kernel"}"#),
+        )
+        .await;
         db.reset_reviewing_status().await.unwrap();
 
         let taken = db.take_pending_review_id(ps_id, Some(p_id)).await.unwrap();
@@ -24857,6 +25056,38 @@ mod tests {
             vec![r#"{"pattern":"new"}"#.to_string()]
         );
 
+        // Until the new run sends a hand-off, which it never does with no
+        // references configured, the row has no record: its calls are
+        // totalled and the split is unknown, not judged against kernel.
+        let counts = review_tool_calls(&db, interrupted).await;
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.by_reference, None);
+
+        // The new run's hand-off attaches rdma-core and leaves kernel
+        // dormant, as a restart that applied a configuration change would.
+        // Only the new run's calls are judged, and against the new record:
+        // its kernel call reads nothing, and no earlier kernel read appears.
+        db.set_review_reference_repos(interrupted, &reference_record(&["rdma-core"], &["kernel"]))
+            .await
+            .unwrap();
+        record_call(
+            &db,
+            interrupted,
+            "git_grep",
+            Some(r#"{"pattern":"k","repo":"kernel"}"#),
+        )
+        .await;
+        record_call(
+            &db,
+            interrupted,
+            "git_grep",
+            Some(r#"{"pattern":"r","repo":"rdma-core"}"#),
+        )
+        .await;
+        let counts = review_tool_calls(&db, interrupted).await;
+        assert_eq!(counts.total, 3);
+        assert_eq!(reference_split(&counts), Some((vec![("rdma-core", 1)], 1)));
+
         // A patch with no Pending row has nothing to take.
         db.complete_review(interrupted, "Reviewed", "ok", None, None, None, None)
             .await
@@ -24865,7 +25096,7 @@ mod tests {
             db.take_pending_review_id(ps_id, Some(p_id)).await.unwrap(),
             None
         );
-        assert_eq!(recorded_arguments(&db, interrupted).await.len(), 1);
+        assert_eq!(recorded_arguments(&db, interrupted).await.len(), 3);
     }
 
     #[tokio::test]
@@ -24873,12 +25104,287 @@ mod tests {
         let db = setup_db().await;
         let (ps_id, p_id, pending) = reviewed_patchset(&db, "take_pending_cleanup").await;
 
-        // Without the table the delete fails, which must not stop the take.
+        db.set_review_reference_repos(pending, &reference_record(&["kernel"], &[]))
+            .await
+            .unwrap();
+
+        // Without the table the delete fails, which must not stop the take
+        // nor the clearing of the reference record.
         db.conn.execute("DROP TABLE tool_usages", ()).await.unwrap();
         assert_eq!(
             db.take_pending_review_id(ps_id, Some(p_id)).await.unwrap(),
             Some(pending)
         );
+        let review = db.get_review_details(pending).await.unwrap().unwrap();
+        assert!(review["reference_repos"].is_null(), "{review}");
+    }
+
+    /// A reviews.reference_repos record with these references attached, in
+    /// this order, and these dormant.
+    fn reference_record(attached: &[&str], dormant: &[&str]) -> String {
+        let attached: Vec<_> = attached
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "kind": "source",
+                    "revision": "main",
+                    "commit": "0".repeat(40),
+                    "why": "always",
+                })
+            })
+            .collect();
+        let dormant: Vec<_> = dormant
+            .iter()
+            .map(|name| serde_json::json!({"name": name, "applies_to": ["x/**"]}))
+            .collect();
+        serde_json::json!({"attached": attached, "dormant": dormant}).to_string()
+    }
+
+    /// Records one tool call with its arguments stored exactly as given.
+    async fn record_call(db: &Database, review_id: i64, tool_name: &str, arguments: Option<&str>) {
+        db.create_tool_usage(ToolUsage {
+            review_id,
+            provider: "mock".to_string(),
+            model: "mock".to_string(),
+            tool_name: tool_name.to_string(),
+            arguments: arguments.map(str::to_string),
+            output_length: 0,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// One review's counts, which must be present because the review exists.
+    async fn review_tool_calls(db: &Database, review_id: i64) -> crate::api::ToolCallCounts {
+        db.tool_call_counts(&[review_id])
+            .await
+            .unwrap()
+            .remove(&review_id)
+            .expect("an entry for every existing review")
+    }
+
+    /// The split as (name, calls) pairs and the unattached count.
+    fn reference_split(counts: &crate::api::ToolCallCounts) -> Option<(Vec<(&str, u64)>, u64)> {
+        counts.by_reference.as_ref().map(|split| {
+            let references = split
+                .references
+                .iter()
+                .map(|r| (r.name.as_str(), r.calls))
+                .collect();
+            (references, split.unattached)
+        })
+    }
+
+    #[tokio::test]
+    async fn tool_calls_are_counted_per_review_by_repository() {
+        let db = setup_db().await;
+        let (_, _, review_id) = reviewed_patchset(&db, "tool_calls_split").await;
+        db.set_review_reference_repos(
+            review_id,
+            &reference_record(&["kernel", "rdma-core"], &["iproute2"]),
+        )
+        .await
+        .unwrap();
+
+        // Before any call every attached reference is there, at zero.
+        let counts = review_tool_calls(&db, review_id).await;
+        assert_eq!(counts.total, 0);
+        assert_eq!(
+            reference_split(&counts),
+            Some((vec![("kernel", 0), ("rdma-core", 0)], 0))
+        );
+
+        for (tool, args) in [
+            ("git_grep", r#"{"pattern":"a"}"#),
+            ("git_grep", r#"{"pattern":"b","repo":"review"}"#),
+            ("git_grep", r#"{"pattern":"c","repo":"kernel"}"#),
+            ("GIT_SHOW", r#"{"object":"HEAD","repo":"kernel"}"#),
+            ("git_grep", r#"{"pattern":"d","repo":"iproute2"}"#),
+            // read_prompt reads no repository; the toolbox ignores its repo.
+            ("read_prompt", r#"{"name":"x","repo":"kernel"}"#),
+            // A repo inside files[] is not the call's repo argument.
+            (
+                "git_read_files",
+                r#"{"files":[{"path":"a.c","repo":"kernel"}]}"#,
+            ),
+        ] {
+            record_call(&db, review_id, tool, Some(args)).await;
+        }
+        let counts = review_tool_calls(&db, review_id).await;
+        assert_eq!(counts.total, 7);
+        assert_eq!(
+            reference_split(&counts),
+            Some((vec![("kernel", 2), ("rdma-core", 0)], 1))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_calls_without_a_reference_record_are_totalled_only() {
+        let db = setup_db().await;
+        let (_, _, review_id) = reviewed_patchset(&db, "tool_calls_no_record").await;
+        record_call(
+            &db,
+            review_id,
+            "git_grep",
+            Some(r#"{"pattern":"a","repo":"kernel"}"#),
+        )
+        .await;
+
+        // Without a record nothing says what the review had, so the call is
+        // neither a kernel read nor a call to an unattached repository.
+        let counts = review_tool_calls(&db, review_id).await;
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.by_reference, None);
+
+        // A record that does not parse is no record either.
+        db.set_review_reference_repos(review_id, "{not json")
+            .await
+            .unwrap();
+        assert_eq!(review_tool_calls(&db, review_id).await, counts);
+    }
+
+    #[tokio::test]
+    async fn tool_calls_of_a_review_with_every_reference_dormant_are_unattached() {
+        let db = setup_db().await;
+        let (_, _, review_id) = reviewed_patchset(&db, "tool_calls_all_dormant").await;
+        db.set_review_reference_repos(review_id, &reference_record(&[], &["kernel"]))
+            .await
+            .unwrap();
+        record_call(
+            &db,
+            review_id,
+            "git_grep",
+            Some(r#"{"pattern":"a","repo":"kernel"}"#),
+        )
+        .await;
+        record_greps(&db, review_id, &["b"]).await;
+
+        // The record says the review had no reference, so the split is known
+        // and empty: the call naming dormant kernel went to an unattached
+        // repository, and the call to the tree under review is only totalled.
+        let counts = review_tool_calls(&db, review_id).await;
+        assert_eq!(counts.total, 2);
+        assert_eq!(reference_split(&counts), Some((vec![], 1)));
+    }
+
+    #[tokio::test]
+    async fn tool_call_counts_survive_unreadable_arguments() {
+        let db = setup_db().await;
+        let (_, _, review_id) = reviewed_patchset(&db, "tool_calls_odd").await;
+        db.set_review_reference_repos(review_id, &reference_record(&["kernel"], &[]))
+            .await
+            .unwrap();
+        for args in [
+            None,
+            Some("null"),
+            Some("not json"),
+            Some("[1,2]"),
+            Some(r#"{"repo":5}"#),
+        ] {
+            record_call(&db, review_id, "git_grep", args).await;
+        }
+
+        // Each odd row is a call to the code under review, as the toolbox
+        // would have read it, and none of them fails the query.
+        let counts = review_tool_calls(&db, review_id).await;
+        assert_eq!(counts.total, 5);
+        assert_eq!(reference_split(&counts), Some((vec![("kernel", 0)], 0)));
+    }
+
+    #[tokio::test]
+    async fn review_payloads_carry_tool_calls() {
+        let db = setup_db().await;
+        let thread_id = db.create_thread("tc_pages", "Subject", 1000).await.unwrap();
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "tc_pages", "Subject", "Author", 1000, 2, 2, "", "", None, 1,
+                None, false, None, None,
+            )
+            .await
+            .unwrap()
+            .expect("patchset");
+        let mut review_ids = Vec::new();
+        for part in 1..=2 {
+            let msg = format!("tc_pages_p{part}");
+            db.create_message(
+                &msg, thread_id, None, "Author", "Subject", 1000, "Body", "", "", None, None,
+            )
+            .await
+            .unwrap();
+            let p_id = db.create_patch(ps_id, &msg, part, "diff").await.unwrap();
+            let review_id = db
+                .create_review(ps_id, Some(p_id), "mock", "mock", None, None, Some(1))
+                .await
+                .unwrap();
+            review_ids.push(review_id);
+        }
+        let (first, second) = (review_ids[0], review_ids[1]);
+        db.set_review_reference_repos(first, &reference_record(&["kernel"], &[]))
+            .await
+            .unwrap();
+        record_call(
+            &db,
+            first,
+            "git_grep",
+            Some(r#"{"pattern":"a","repo":"kernel"}"#),
+        )
+        .await;
+        record_call(&db, first, "git_grep", Some(r#"{"pattern":"b"}"#)).await;
+        record_greps(&db, second, &["c", "d", "e"]).await;
+
+        let expected = serde_json::json!({
+            "total": 2,
+            "by_reference": {"references": [{"name": "kernel", "calls": 1}], "unattached": 0},
+        });
+        let page_one = db
+            .get_patchset_summary(ps_id, Some(1), Some(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(review_in(&page_one, first)["tool_calls"], expected);
+        assert!(
+            page_one["reviews"]
+                .as_array()
+                .is_some_and(|reviews| reviews.iter().all(|r| r["id"] != second)),
+            "a review of a patch on another page is not served: {page_one}"
+        );
+        let page_two = db
+            .get_patchset_summary(ps_id, Some(2), Some(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            review_in(&page_two, second)["tool_calls"],
+            serde_json::json!({"total": 3, "by_reference": null})
+        );
+
+        let details = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(review_in(&details, first)["tool_calls"], expected);
+        let review = db.get_review_details(first).await.unwrap().unwrap();
+        assert_eq!(review["tool_calls"], expected);
+    }
+
+    #[tokio::test]
+    async fn review_payloads_survive_a_failed_tool_call_count() {
+        let db = setup_db().await;
+        let (ps_id, _, review_id) = reviewed_patchset(&db, "tool_calls_fail").await;
+
+        // Without the table the count fails; the counts are advisory, so
+        // the review is still served, with no counts.
+        db.conn.execute("DROP TABLE tool_usages", ()).await.unwrap();
+        let summary = db
+            .get_patchset_summary(ps_id, None, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(review_in(&summary, review_id)["tool_calls"].is_null());
+        let review = db.get_review_details(review_id).await.unwrap().unwrap();
+        assert!(review["tool_calls"].is_null(), "{review}");
     }
 
     #[tokio::test]
