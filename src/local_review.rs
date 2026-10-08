@@ -1083,10 +1083,12 @@ async fn review_single_patch(
     // in the final output: the deployment's logs last about an hour, and a
     // review that times out or is cancelled is killed before it writes a final
     // output, as is a worker that crashes, yet each still has to record which
-    // trees it was given. Only
-    // the daemon reads these lines -- `sashiko-cli local` parses the worker's
-    // whole stdout as one JSON document -- and they go through the shared IPC
-    // writer so they cannot interleave with a concurrent model request.
+    // trees it was given. This is the only reference record the daemon
+    // stores, because it counts each reference's reads from its own tool call
+    // rows rather than from the worker's final output. Only the daemon reads
+    // these lines -- `sashiko-cli local` parses the worker's whole stdout as
+    // one JSON document -- and they go through the shared IPC writer so they
+    // cannot interleave with a concurrent model request.
     if let Some(line) = early_reference_handoff(ai, p.index, &attach) {
         let sent = match line {
             Ok(line) => crate::ai::ipc_writer().write_line(&line).await,
@@ -1464,7 +1466,8 @@ fn patch_stage_failures(review: &Value, patch_index: i64) -> Vec<StageFailureRec
 }
 
 /// Records which references a patch's review had, with their read counts, on
-/// the patch's entry, where the daemon picks it up for the review row.
+/// the patch's entry. A local review reports it there; the daemon stores the
+/// early hand-off instead and counts reads from its own tool call rows.
 fn record_patch_references(patches: &mut [Value], patch_index: i64, refs: &ReviewReferences) {
     if let Some(patch) = patches
         .iter_mut()
@@ -3145,7 +3148,7 @@ mod tests {
         assert_eq!(
             crate::references::parse_record(&patches[1]["reference_repos"]),
             Some(refs),
-            "what the worker writes is what the daemon reads back"
+            "what the worker writes parses back as the same record"
         );
     }
 

@@ -606,9 +606,10 @@ impl PatchReferences {
     /// What the review row records about this patch's references, or `None`
     /// with none configured, so an unconfigured deployment stores NULL.
     ///
-    /// `reads[i]` is the number of tool calls that named `attached[i]`. It is
-    /// `None` for the record sent before the review runs, and stays missing if
-    /// the review never finishes, which a reader must not mistake for zero.
+    /// `reads[i]` is the number of tool calls resolved to `attached[i]`. It is
+    /// `None` for the early hand-off, which is the record the daemon stores,
+    /// and filled in only for the worker's final output, which a local review
+    /// reports and the daemon does not store.
     pub fn record(&self, reads: Option<&[u64]>) -> Option<ReviewReferences> {
         if self.attached.is_empty() && self.dormant.is_empty() {
             return None;
@@ -701,8 +702,13 @@ pub struct AttachedReference {
     /// For [`AttachWhy::Match`], the pattern `file` matched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glob: Option<String>,
-    /// Tool calls that named this reference, cache hits and refused calls
-    /// included. Missing until the worker finishes.
+    /// Tool calls the toolbox resolved to this reference, cache hits and calls
+    /// git rejected included, summed over the worker's attempts. Only the
+    /// local worker's final output fills it in (`sashiko review`,
+    /// `sashiko-cli local`). The daemon stores the early hand-off, which has
+    /// none, and counts a review's calls per reference from its tool_usages
+    /// rows instead; daemon rows written before that change may still carry
+    /// it, and nothing renders it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reads: Option<u64>,
 }
@@ -1323,7 +1329,7 @@ mod tests {
         let json = serde_json::to_string(&rec).unwrap();
         assert!(
             !json.contains("reads"),
-            "an unfinished review has no count: {json}"
+            "the early hand-off has no count: {json}"
         );
         assert!(
             attach_for_patch(&[], &touched(&["a.c"]))
