@@ -407,23 +407,46 @@ is invited to wander into it, while an `rdma/drv/` patch gets both.
   `reviews.reference_repos` (API field `reference_repos` on reviews from
   `/api/patch`, `/api/patchset` and `/api/review`), each attached reference's
   name, kind, configured revision, resolved commit, why it was attached
-  (`always`, or the first matching file and glob), and its read count, plus
-  the dormant references with their `applies_to`. The worker sends the record
-  as soon as the patch's references are decided and again, with read counts,
-  in its final output, which it writes for a failed review as well as a
-  successful one. Only a review whose worker is killed (a timeout or a
-  cancellation) or exits without a final output keeps the record without read
-  counts. A read is any tool call that named the reference, cache hits and
-  calls git refused included. The review card shows it on one
-  line, e.g. `References: kernel @ v6.18 (1a2b3c4d5e6f), 34 reads; rdma-core @
-  origin/ionic-rdma (9f8e7d6c5b4a), 12 reads`, with the reason each was
-  attached on hover. Dormant references are kept in the record and the API but
-  not shown on the card, where they would be named on every patch outside their
-  area. Reviews from before this was added, deployments with no references, and
-  patches whose references were all dormant show no line. `sashiko review`
-  and `sashiko-cli local` have no review row; their worker JSON carries the
-  same object under `patches[].reference_repos`, with reads summed over the
-  worker's in-process attempts.
+  (`always`, or the first matching file and glob), plus the dormant references
+  with their `applies_to`. The worker sends the record as soon as the patch's
+  references are decided, before the review runs, so a review whose worker is
+  later killed (a timeout or a cancellation) keeps it too. The record carries
+  no read counts; reviews stored by an older daemon may still carry a `reads`
+  field, which nothing shows. The review card shows the record on one line,
+  e.g. `References: kernel @ v6.18 (1a2b3c4d5e6f); rdma-core @
+  origin/ionic-rdma (9f8e7d6c5b4a)`, with the reason each was attached on
+  hover. Dormant references are kept in the record and the API but not shown
+  on the card, where they would be named on every patch outside their area.
+  Reviews from before this was added, deployments with no references, and
+  patches whose references were all dormant show no line.
+
+  How much each reference was used is on the card's `Tool calls:` line, under
+  `Tokens used:`, e.g. `Tool calls: 350 (72 to kernel, 0 to rdma-core)`, and
+  in the API field `tool_calls` on the same reviews. It is counted from the
+  tool calls the daemon recorded for that review row, so it is there for a
+  failed, timed-out or partial review as well:
+  - the total is every call the model made, of every tool, including the few
+    the session declined to run (a repeat of the call just before it, or a
+    call on the final turn);
+  - `N to <name>` counts the calls aimed at that attached reference, cache
+    hits and calls git rejected included. Every attached reference is named,
+    `0` included, once the review has made any call, so a reference that was
+    available and never read shows as `0`; a review with no calls shows no
+    per-reference counts;
+  - `N to unattached repositories` counts calls naming a repository the
+    review did not have, dormant or unknown; they read nothing, and the
+    clause is shown only when there are any;
+  - the rest went to the code under review or to tools that read no
+    repository;
+  - a retried review's later attempts each have their own card, marked `on
+    this attempt`;
+  - a review with no reference record shows the total only.
+
+  `sashiko review` and `sashiko-cli local` have no review row; their worker
+  JSON carries the record under `patches[].reference_repos`, with each
+  attached reference's `reads` summed over the worker's in-process attempts.
+  There a read is any tool call the toolbox resolved to the reference, cache
+  hits and calls git rejected included.
 
 - **The kernel rule.** The out-of-tree caveats appear only when a
   `kind = "kernel"` reference is attached to that patch. A kernel entry may be

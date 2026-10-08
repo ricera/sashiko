@@ -3912,13 +3912,19 @@ async fn run_review_tool_with_cmd(
                                         });
                                         spawned_tasks.push(handle);
                                     }
-                                    // Stored as soon as it arrives, not with the
-                                    // final result: a review that times out, fails
-                                    // or is cancelled is killed before it writes
-                                    // one, and its row must still say which
-                                    // reference trees it had. Awaited inline so the
-                                    // write lands before the final line is handled.
-                                    // A bad hand-off never stops the review.
+                                    // Stored as soon as it arrives, and the only
+                                    // reference record the daemon stores: a review
+                                    // that times out, fails or is cancelled is
+                                    // killed before it writes a final result, and
+                                    // its row must still say which reference trees
+                                    // it had. The copy in the final result, which
+                                    // adds read counts, is not stored, because the
+                                    // per-reference count of a daemon review comes
+                                    // from its tool_usages rows and a second count
+                                    // from another source could disagree with it.
+                                    // Awaited inline so the write lands before the
+                                    // final line is handled. A bad hand-off never
+                                    // stops the review.
                                     crate::references::REFERENCE_REPOS_MESSAGE => {
                                         match crate::references::parse_handoff(&json_msg) {
                                             Some((idx, rec)) if Some(idx) == review_index => {
@@ -4147,7 +4153,6 @@ async fn run_review_tool_with_cmd(
                     }
                 }
             }
-            store_final_reference_repos(&db, review_id, review_index, &json).await;
             ReviewToolOutcome {
                 result: Ok(json),
                 wound_down,
@@ -4563,44 +4568,6 @@ async fn write_ipc_line(
     let mut writer = stdin.lock().await;
     writer.write_all(line.as_bytes()).await?;
     writer.flush().await
-}
-
-/// Replaces the review's early reference record with the worker's final one,
-/// which adds how many reads each reference served.
-///
-/// Without a final record the early one is kept, read counts and all missing,
-/// which the UI shows as not reported rather than as zero.
-async fn store_final_reference_repos(
-    db: &Database,
-    review_id: i64,
-    review_index: Option<i64>,
-    json: &Value,
-) {
-    let Some(raw) = json["patches"].as_array().and_then(|patches| {
-        patches
-            .iter()
-            .find(|p| review_index.is_some() && p["index"].as_i64() == review_index)
-            .and_then(|p| p.get("reference_repos"))
-    }) else {
-        return;
-    };
-    let Some(rec) = crate::references::parse_record(raw) else {
-        warn!(
-            "Ignoring malformed reference repositories in the result of review {}",
-            review_id
-        );
-        return;
-    };
-    let stored = match serde_json::to_string(&rec) {
-        Ok(text) => db.set_review_reference_repos(review_id, &text).await,
-        Err(e) => Err(e.into()),
-    };
-    if let Err(e) = stored {
-        warn!(
-            "Failed to store reference repositories for review {}: {}",
-            review_id, e
-        );
-    }
 }
 
 impl Reviewer {
@@ -5898,7 +5865,7 @@ mod tests {
     }
 
     /// The early reference hand-off as a worker would print it for patch
-    /// `index`, with no read counts yet.
+    /// `index`, which carries no read counts.
     fn kernel_handoff(index: i64) -> String {
         crate::references::handoff_line(
             index,
@@ -5935,32 +5902,61 @@ mod tests {
         assert_eq!(refs["attached"][0]["name"], "kernel");
         assert!(
             refs["attached"][0].get("reads").is_none(),
-            "an unfinished review has no read count: {refs}"
+            "the early hand-off has no read count: {refs}"
         );
         assert_eq!(refs["dormant"][0]["name"], "rdma-core");
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_final_output_fills_in_reference_reads() -> Result<()> {
+    /// The final output of patch 1 as a worker writes it, its reference record
+    /// carrying a read count of 5 for the kernel.
+    fn final_line_with_reads() -> Result<Value> {
         let mut final_refs: Value =
             serde_json::from_str::<Value>(&kernel_handoff(1))?["payload"].clone();
         final_refs["attached"][0]["reads"] = json!(5);
-        let final_line = json!({
+        Ok(json!({
             "patchset_id": 1,
             "patches": [{"index": 1, "status": "applied", "reference_repos": final_refs}],
-        });
+        }))
+    }
+
+    /// A daemon review's per-reference count comes from its tool_usages rows,
+    /// so the read counts a worker's final output carries are not stored: the
+    /// row keeps the early hand-off as it was sent.
+    #[tokio::test]
+    async fn test_final_output_leaves_reference_reads_unstored() -> Result<()> {
         let mock_script = format!(
             "#!/bin/bash\nread -r input\necho '{}'\necho '{}'\n",
             kernel_handoff(1),
-            final_line
+            final_line_with_reads()?
         );
         let (result, db, review_id) =
             run_review_tool_mock(&mock_script, Arc::new(MockProvider), 5).await?;
         result?;
         let review = db.get_review_details(review_id).await?.unwrap();
-        assert_eq!(review["reference_repos"]["attached"][0]["reads"], 5);
-        assert_eq!(review["reference_repos"]["dormant"][0]["name"], "rdma-core");
+        let refs = &review["reference_repos"];
+        assert_eq!(refs["attached"][0]["name"], "kernel");
+        assert!(
+            refs["attached"][0].get("reads").is_none(),
+            "the final read count must not be stored: {refs}"
+        );
+        assert_eq!(refs["dormant"][0]["name"], "rdma-core");
+        Ok(())
+    }
+
+    /// Only the early hand-off is stored, so a review that never sent one
+    /// keeps no record even when its final output carries one.
+    #[tokio::test]
+    async fn test_final_output_alone_stores_no_reference_record() -> Result<()> {
+        let mock_script = format!(
+            "#!/bin/bash\nread -r input\necho '{}'\n",
+            final_line_with_reads()?
+        );
+        let (result, db, review_id) =
+            run_review_tool_mock(&mock_script, Arc::new(MockProvider), 5).await?;
+        result?;
+        let review = db.get_review_details(review_id).await?.unwrap();
+        assert!(review["reference_repos"].is_null(), "{review}");
         Ok(())
     }
 

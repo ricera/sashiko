@@ -8514,9 +8514,10 @@ impl Database {
     }
 
     /// Stores which reference repositories a review had, as the JSON of a
-    /// [`crate::references::ReviewReferences`]. Called once early, when the
-    /// worker reports the patch's references, and again with read counts when
-    /// it finishes.
+    /// [`crate::references::ReviewReferences`]. Called when the worker's early
+    /// hand-off reports the patch's references; the record carries no read
+    /// counts, because a review's calls per reference are counted from its
+    /// tool_usages rows.
     pub async fn set_review_reference_repos(&self, review_id: i64, json: &str) -> Result<()> {
         self.conn
             .execute(
