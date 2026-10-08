@@ -2092,7 +2092,61 @@ async fn forge_webhook(
         })));
     }
 
-    let default_subject = format!("{} #{}", forge.name(), metadata.pr_number);
+    enqueue_pull_request(&state, forge.name(), &metadata, ExistingRevision::Refetch).await?;
+
+    Ok(Json(serde_json::json!({
+        "status": "accepted",
+        "message": format!("{} {} queued for review", forge.name(), action)
+    })))
+}
+
+/// What to do about a pull request revision whose placeholder already
+/// existed and was not reset to Fetching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingRevision {
+    /// Send the fetch request whatever the row was. A webhook delivery
+    /// queues a fetch every time, and sharing the enqueue path does not
+    /// change that.
+    Refetch,
+    /// Send it only for a row that was created, reset, or is still
+    /// Fetching. A row that is pending, in review or finished already has
+    /// its patches, so fetching them again would do nothing for an operator
+    /// who asked for the revision by number.
+    Leave,
+}
+
+impl ExistingRevision {
+    /// Whether a fetch request is sent for a placeholder that queuing
+    /// found in `found`. A row that was already Fetching is fetched again
+    /// in both modes, because a fetch request lost to a daemon restart is
+    /// recovered only by a new one.
+    fn sends_fetch(self, found: &crate::db::PlaceholderState) -> bool {
+        use crate::db::PlaceholderState;
+        match self {
+            Self::Refetch => true,
+            Self::Leave => matches!(
+                found,
+                PlaceholderState::Created
+                    | PlaceholderState::Reset { .. }
+                    | PlaceholderState::AlreadyFetching
+            ),
+        }
+    }
+}
+
+/// Creates or finds the Fetching placeholder of one pull request revision
+/// and queues its fetch when `existing` says so.
+///
+/// The webhook and the manual review route both come through here, so a
+/// revision reaches one placeholder id, subject and slug whichever way it
+/// arrived. The placeholder id is built only here.
+async fn enqueue_pull_request(
+    state: &AppState,
+    forge_name: &str,
+    metadata: &crate::forge::ForgeMetadata,
+    existing: ExistingRevision,
+) -> Result<crate::db::FetchingPlaceholder, StatusCode> {
+    let default_subject = format!("{} #{}", forge_name, metadata.pr_number);
     let subject = metadata.pr_title.as_deref().unwrap_or(&default_subject);
 
     let commit_range = format!("{}..{}", metadata.base_sha, metadata.head_sha);
@@ -2103,11 +2157,11 @@ async fn forge_webhook(
         format!("{}-{}", repo, metadata.pr_number)
     });
 
-    state
+    let placeholder = state
         .db
-        .create_fetching_patchset(
+        .queue_fetching_patchset(
             &placeholder_id,
-            &format!("Fetching {} PR/MR: {}", forge.name(), subject),
+            &format!("Fetching {} PR/MR: {}", forge_name, subject),
             None,
             None,
             metadata.pr_url.as_deref(),
@@ -2121,11 +2175,15 @@ async fn forge_webhook(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
+    if !existing.sends_fetch(&placeholder.state) {
+        return Ok(placeholder);
+    }
+
     let req = FetchRequest {
-        repo_url: metadata.repo_url,
+        repo_url: metadata.repo_url.clone(),
         commit_hash: commit_range,
-        mr_url: metadata.pr_url,
-        mr_title: metadata.pr_title,
+        mr_url: metadata.pr_url.clone(),
+        mr_title: metadata.pr_title.clone(),
         mr_number: Some(metadata.pr_number),
     };
 
@@ -2134,10 +2192,7 @@ async fn forge_webhook(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    Ok(Json(serde_json::json!({
-        "status": "accepted",
-        "message": format!("{} {} queued for review", forge.name(), action)
-    })))
+    Ok(placeholder)
 }
 
 async fn list_bugs(
@@ -2539,6 +2594,260 @@ mod tests {
         let id = generate_synthetic_id("test");
         assert!(id.starts_with("sashiko-test-"));
         assert!(id.ends_with("@sashiko.local"));
+    }
+
+    const PR_BASE: &str = "1111111111111111111111111111111111111111";
+
+    /// A state over an in-memory database whose fetch requests the test
+    /// reads from the returned receiver.
+    async fn pull_request_state() -> (AppState, mpsc::Receiver<FetchRequest>) {
+        let db_settings = crate::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Arc::new(Database::new(&db_settings).await.unwrap());
+        db.migrate().await.unwrap();
+        let (sender, _) = mpsc::channel(1);
+        let (fetch_sender, fetch_rx) = mpsc::channel(16);
+        let mut settings = crate::settings::Settings::new().unwrap();
+        settings.forge.webhook_secret = None;
+        let state = AppState {
+            settings: Arc::new(settings),
+            db,
+            sender,
+            fetch_sender,
+            read_only: false,
+            allow_all_submit: false,
+            smtp_enabled: false,
+            dry_run: true,
+            forge_registry: Arc::new(crate::forge::ForgeRegistry::new()),
+            sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
+            stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
+            stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
+            stats_tools_cache: AsyncCache::new(Duration::from_secs(60)),
+            messages_count_cache: AsyncCache::new(Duration::from_secs(30)),
+            patchsets_count_cache: AsyncCache::new(Duration::from_secs(30)),
+            patchsets_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+            messages_homepage_cache: AsyncCache::new(Duration::from_secs(10)),
+            bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
+            local_token: None,
+            activity: Default::default(),
+        };
+        (state, fetch_rx)
+    }
+
+    /// Pull request `number` of acme/widget, at a head named after it.
+    fn widget_pull_request(number: i64) -> crate::forge::ForgeMetadata {
+        crate::forge::ForgeMetadata {
+            repo_url: Some("https://github.com/acme/widget.git".to_string()),
+            base_sha: PR_BASE.to_string(),
+            head_sha: format!("{number:040x}"),
+            pr_number: number,
+            pr_title: Some("Fix the widget".to_string()),
+            pr_url: Some(format!("https://github.com/acme/widget/pull/{number}")),
+            author: None,
+        }
+    }
+
+    /// How many fetch requests are waiting on the channel, taking them off.
+    fn fetches_sent(fetch_rx: &mut mpsc::Receiver<FetchRequest>) -> usize {
+        std::iter::from_fn(|| fetch_rx.try_recv().ok()).count()
+    }
+
+    /// Whether an operator asking for a revision by number fetches it
+    /// again once its row is in `status`. Only a resubmittable row is reset
+    /// and fetched; the others already have their patches. The match is
+    /// exhaustive so that a new status must be placed here.
+    fn manual_path_fetches_again(status: crate::ReviewStatus) -> bool {
+        use crate::ReviewStatus::*;
+        match status {
+            Incomplete | Pending | InReview | Skipped | Reviewed => false,
+            Cancelled | Partial | Failed | FailedToApply => true,
+        }
+    }
+
+    /// Queues a fresh revision with `existing`, stores `status` on its row
+    /// when one is given (otherwise it stays Fetching), queues it again,
+    /// and returns what the second call found and how many fetches it sent.
+    /// The first call always creates the row and sends one fetch.
+    async fn requeue_revision(
+        state: &AppState,
+        fetch_rx: &mut mpsc::Receiver<FetchRequest>,
+        number: i64,
+        status: Option<&str>,
+        existing: ExistingRevision,
+    ) -> (crate::db::PlaceholderState, usize) {
+        let metadata = widget_pull_request(number);
+        let first = enqueue_pull_request(state, "GitHub", &metadata, existing)
+            .await
+            .unwrap();
+        assert_eq!(first.state, crate::db::PlaceholderState::Created);
+        assert_eq!(fetches_sent(fetch_rx), 1, "a new revision is fetched");
+        if let Some(status) = status {
+            state
+                .db
+                .conn
+                .execute(
+                    "UPDATE patchsets SET status = ? WHERE id = ?",
+                    libsql::params![status, first.id],
+                )
+                .await
+                .unwrap();
+        }
+        let again = enqueue_pull_request(state, "GitHub", &metadata, existing)
+            .await
+            .unwrap();
+        assert_eq!(again.id, first.id, "one revision has one row");
+        (again.state, fetches_sent(fetch_rx))
+    }
+
+    /// The stored statuses a revision is queued again from, with whether
+    /// the manual path fetches it again from each. Fetching is the row a
+    /// lost request left behind; "Embargoed" is a status no writer stores.
+    fn requeued_statuses() -> Vec<(Option<&'static str>, bool)> {
+        crate::ReviewStatus::ALL
+            .iter()
+            .map(|status| (Some(status.as_str()), manual_path_fetches_again(*status)))
+            .chain([(None, true), (Some("Embargoed"), false)])
+            .collect()
+    }
+
+    /// A webhook delivery queues a fetch whatever the revision's row was,
+    /// as it did before the enqueue path was shared.
+    #[tokio::test]
+    async fn the_webhook_still_refetches_every_revision() {
+        let (state, mut fetch_rx) = pull_request_state().await;
+        for (number, (status, _)) in (1..).zip(requeued_statuses()) {
+            let (found, sent) = requeue_revision(
+                &state,
+                &mut fetch_rx,
+                number,
+                status,
+                ExistingRevision::Refetch,
+            )
+            .await;
+            assert_eq!(sent, 1, "{status:?} was found as {found:?}");
+        }
+    }
+
+    /// The manual path fetches a revision again only when its row was
+    /// reset or is still Fetching, and leaves a pending, running or
+    /// finished one alone.
+    #[tokio::test]
+    async fn the_manual_path_does_not_refetch_a_kept_revision() {
+        let (state, mut fetch_rx) = pull_request_state().await;
+        for (number, (status, fetches_again)) in (1..).zip(requeued_statuses()) {
+            let (found, sent) = requeue_revision(
+                &state,
+                &mut fetch_rx,
+                number,
+                status,
+                ExistingRevision::Leave,
+            )
+            .await;
+            assert_eq!(
+                sent,
+                usize::from(fetches_again),
+                "{status:?} was found as {found:?}"
+            );
+        }
+    }
+
+    /// A GitHub delivery still produces the placeholder id, subject, slug
+    /// and fetch request it did before the enqueue path was shared, and a
+    /// second delivery for a finished revision still queues a fetch while
+    /// leaving the row as it was.
+    #[tokio::test]
+    async fn the_webhook_queues_the_same_placeholder_subject_and_slug() {
+        let (mut state, mut fetch_rx) = pull_request_state().await;
+        // Without a webhook secret the gate admits only the local token or
+        // the unsafe flag; the flag is the simpler of the two to set here.
+        state.allow_all_submit = true;
+        let state = Arc::new(state);
+        let head = format!("{:040x}", 7);
+        let payload = serde_json::json!({
+            "action": "opened",
+            "pull_request": {
+                "number": 7,
+                "title": "Fix the widget",
+                "html_url": "https://github.com/acme/widget/pull/7",
+                "head": { "sha": head },
+                "base": { "sha": PR_BASE },
+                "user": { "login": "alice" },
+            },
+            "repository": { "clone_url": "https://github.com/acme/widget.git" },
+        });
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-github-event", "pull_request".parse().unwrap());
+        let deliver = || {
+            forge_webhook(
+                ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))),
+                State(state.clone()),
+                Path("github".to_string()),
+                headers.clone(),
+                axum::body::Bytes::from(payload.to_string()),
+            )
+        };
+
+        let Json(reply) = deliver().await.unwrap_or_else(|status| {
+            panic!("webhook refused with {status}");
+        });
+        assert_eq!(reply["status"], "accepted");
+        let placeholder_id = format!("mr-7-{PR_BASE}..{head}@sashiko.local");
+        let expected_fetch = FetchRequest {
+            repo_url: Some("https://github.com/acme/widget.git".to_string()),
+            commit_hash: format!("{PR_BASE}..{head}"),
+            mr_url: Some("https://github.com/acme/widget/pull/7".to_string()),
+            mr_title: Some("Fix the widget".to_string()),
+            mr_number: Some(7),
+        };
+        assert_eq!(fetch_rx.try_recv().ok(), Some(expected_fetch.clone()));
+
+        let mut rows = state
+            .db
+            .conn
+            .query(
+                "SELECT id, subject, slug, mr_number, status FROM patchsets \
+                 WHERE cover_letter_message_id = ?",
+                libsql::params![placeholder_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("the placeholder row");
+        let id: i64 = row.get(0).unwrap();
+        assert_eq!(row.get::<String>(1).unwrap(), "#7: Fix the widget");
+        assert_eq!(row.get::<String>(2).unwrap(), "widget-7");
+        assert_eq!(row.get::<i64>(3).unwrap(), 7);
+        assert_eq!(row.get::<String>(4).unwrap(), "Fetching");
+
+        state
+            .db
+            .conn
+            .execute(
+                "UPDATE patchsets SET status = 'Reviewed' WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let Json(again) = deliver().await.unwrap();
+        assert_eq!(again["status"], "accepted");
+        assert_eq!(fetch_rx.try_recv().ok(), Some(expected_fetch));
+        let status: String = state
+            .db
+            .conn
+            .query(
+                "SELECT status FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .expect("the row")
+            .get(0)
+            .unwrap();
+        assert_eq!(status, "Reviewed");
     }
 
     /// Serves a router with `activity` behind it, read-only so that nothing
