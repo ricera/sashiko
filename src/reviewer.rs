@@ -1847,7 +1847,7 @@ impl Reviewer {
 
             let review_id = if let Some(id) = ctx
                 .db
-                .get_pending_review_id(patchset_id, Some(patch_id))
+                .take_pending_review_id(patchset_id, Some(patch_id))
                 .await?
             {
                 id
@@ -1901,7 +1901,7 @@ impl Reviewer {
 
         let mut existing_pending_review_id = ctx
             .db
-            .get_pending_review_id(patchset_id, Some(patch_id))
+            .take_pending_review_id(patchset_id, Some(patch_id))
             .await?;
 
         loop {
