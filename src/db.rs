@@ -123,6 +123,62 @@ const FETCHING: &str = "Fetching";
 #[cfg(feature = "server")]
 pub const FETCH_INTERRUPTED_REASON: &str = "Fetch interrupted by daemon restart";
 
+/// What [`Database::queue_fetching_patchset`] found under the placeholder
+/// id, before it changed anything.
+///
+/// A new row and one that was already Fetching both end up Fetching, so the
+/// row's status after the call cannot tell a caller which of them it got;
+/// this records the status before it.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaceholderState {
+    /// No row had the id; a Fetching row was created.
+    Created,
+    /// The row was resubmittable (Partial, Failed, Cancelled,
+    /// FailedToApply) and is Fetching again.
+    Reset { was: ReviewStatus },
+    /// The row was already Fetching and stays so.
+    AlreadyFetching,
+    /// The row was left as it was: Incomplete, Pending, In Review, Skipped
+    /// or Reviewed.
+    Kept(ReviewStatus),
+    /// The row was left as it was, because its status is neither Fetching
+    /// nor any status [`ReviewStatus`] names. No writer stores such a
+    /// status today; a NULL status reads as the empty string.
+    KeptUnknown { status: String },
+}
+
+#[cfg(feature = "server")]
+impl PlaceholderState {
+    /// Whether the existing row this state describes is rewritten with the
+    /// request's columns and set to Fetching. A Created row is inserted
+    /// with them instead, so it is not reset.
+    fn resets_row(&self) -> bool {
+        matches!(self, Self::Reset { .. } | Self::AlreadyFetching)
+    }
+}
+
+/// The patchset a fetch request belongs to, and what queuing it found.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchingPlaceholder {
+    pub id: i64,
+    pub state: PlaceholderState,
+}
+
+/// The columns a Fetching placeholder row is written with, whether it is
+/// created or reset.
+#[cfg(feature = "server")]
+struct PlaceholderColumns<'a> {
+    subject: String,
+    skip_filters: Option<String>,
+    only_filters: Option<String>,
+    mr_url: Option<&'a str>,
+    mr_title: Option<&'a str>,
+    mr_number: Option<i64>,
+    slug: Option<&'a str>,
+}
+
 /// [`FETCH_INTERRUPTED_REASON`], followed by the last recorded description
 /// of what the fetch was doing, when there is one.
 #[cfg(feature = "server")]
@@ -9853,6 +9909,10 @@ impl Database {
         Ok(false)
     }
 
+    /// Creates the Fetching placeholder patchset `root_msg_id` names, or
+    /// finds it, and returns its id. [`Self::queue_fetching_patchset`] does
+    /// the work and also says what it found; the callers that need only the
+    /// id call this.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_fetching_patchset(
         &self,
@@ -9865,97 +9925,190 @@ impl Database {
         mr_number: Option<i64>,
         slug: Option<&str>,
     ) -> Result<i64> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs() as i64;
+        self.queue_fetching_patchset(
+            root_msg_id,
+            subject,
+            skip_filters,
+            only_filters,
+            mr_url,
+            mr_title,
+            mr_number,
+            slug,
+        )
+        .await
+        .map(|placeholder| placeholder.id)
+    }
 
-        let clid_candidates = Self::get_msgid_candidates(root_msg_id);
-
-        let skip_filters_json = skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
-        let only_filters_json = only_filters.map(|f| serde_json::to_string(f).unwrap_or_default());
-
-        let mr_ver = if let Some(num) = mr_number {
-            Some(
-                self.get_mr_version_for_commit_range(num, root_msg_id)
-                    .await
-                    .unwrap_or(1),
-            )
-        } else {
-            None
+    /// Creates the Fetching placeholder patchset `root_msg_id` names, or
+    /// finds it, and reports what it found before it changed anything.
+    ///
+    /// An existing row is set to Fetching again only when it may be
+    /// resubmitted or is already Fetching. A row that is Incomplete,
+    /// Pending, In Review, Skipped or Reviewed is left as it was, because
+    /// its patches are already ingested or reviewed. Either way the pull
+    /// request's superseded revisions are reconciled again.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn queue_fetching_patchset(
+        &self,
+        root_msg_id: &str,
+        subject: &str,
+        skip_filters: Option<&Vec<String>>,
+        only_filters: Option<&Vec<String>>,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+        slug: Option<&str>,
+    ) -> Result<FetchingPlaceholder> {
+        let columns = PlaceholderColumns {
+            subject: self
+                .fetching_placeholder_subject(root_msg_id, subject, mr_url, mr_title, mr_number)
+                .await,
+            skip_filters: skip_filters.map(|f| serde_json::to_string(f).unwrap_or_default()),
+            only_filters: only_filters.map(|f| serde_json::to_string(f).unwrap_or_default()),
+            mr_url,
+            mr_title,
+            mr_number,
+            slug,
         };
 
-        let effective_subject =
-            if let (Some(num), Some(title), Some(ver)) = (mr_number, mr_title, mr_ver) {
-                crate::forge::format_mr_subject(mr_url, num, ver, title)
-            } else {
-                subject.to_string()
-            };
+        let placeholder = match self.find_placeholder_status(root_msg_id).await? {
+            Some((id, status)) => {
+                let state = Self::placeholder_state_of(&status);
+                if state.resets_row() {
+                    self.reset_fetching_placeholder(id, &columns).await?;
+                }
+                FetchingPlaceholder { id, state }
+            }
+            None => FetchingPlaceholder {
+                id: self
+                    .insert_fetching_placeholder(root_msg_id, &columns)
+                    .await?,
+                state: PlaceholderState::Created,
+            },
+        };
+        self.reconcile_superseded_pr_patchsets(placeholder.id, mr_url, mr_number)
+            .await?;
+        Ok(placeholder)
+    }
 
-        // 1. Check if it already exists
-        for clid in clid_candidates {
+    /// The subject a Fetching placeholder is written with: the pull
+    /// request's `#N [vK]: title` form when the request names a pull
+    /// request and its title, else `subject` as given.
+    async fn fetching_placeholder_subject(
+        &self,
+        root_msg_id: &str,
+        subject: &str,
+        mr_url: Option<&str>,
+        mr_title: Option<&str>,
+        mr_number: Option<i64>,
+    ) -> String {
+        let (Some(number), Some(title)) = (mr_number, mr_title) else {
+            return subject.to_string();
+        };
+        // A failed count names the revision v1 rather than refusing the
+        // fetch, because the subject is only a label.
+        let version = self
+            .get_mr_version_for_commit_range(number, root_msg_id)
+            .await
+            .unwrap_or(1);
+        crate::forge::format_mr_subject(mr_url, number, version, title)
+    }
+
+    /// The id and stored status of the patchset whose cover letter id is
+    /// one of `root_msg_id`'s candidate forms, if any. A NULL status reads
+    /// as the empty string.
+    async fn find_placeholder_status(&self, root_msg_id: &str) -> Result<Option<(i64, String)>> {
+        for clid in Self::get_msgid_candidates(root_msg_id) {
             let mut rows = self
                 .conn
                 .query(
                     "SELECT id, status FROM patchsets WHERE cover_letter_message_id = ?",
-                    libsql::params![clid.clone()],
+                    libsql::params![clid],
                 )
                 .await?;
-
             if let Ok(Some(row)) = rows.next().await {
                 let id: i64 = row.get(0)?;
                 let status: String = row.get(1).unwrap_or_default();
-                drop(rows);
-
-                // Only reset to Fetching if it may be resubmitted or is currently fetching.
-                // We don't want to reset if it is already Incomplete, Pending, or Reviewed.
-                // Fetching is not one of the resubmittable statuses because
-                // has_patchset_by_msgid counts a fetching series as already
-                // ingested, so it is accepted here by a term of its own.
-                if Self::is_resubmittable(&status) || status == "Fetching" {
-                    if let Some(s) = slug {
-                        self.rotate_mr_slug(s, Some(id)).await?;
-                    }
-                    self.conn.execute(
-                        "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
-                        libsql::params![effective_subject, skip_filters_json.clone(), only_filters_json.clone(), mr_url, mr_title, mr_number, slug, id]
-                    ).await?;
-                    // A resubmission asks for a new review, so a patch that
-                    // ran out of time or failed must not be skipped as
-                    // already final.
-                    self.clear_held_outcomes(id).await?;
-                }
-                self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
-                    .await?;
-                return Ok(id);
+                return Ok(Some((id, status)));
             }
         }
+        Ok(None)
+    }
 
-        // 2. Ensure a placeholder thread and message exist to satisfy Foreign Key constraints
+    /// What an existing placeholder row's stored status means for a new
+    /// fetch of it.
+    ///
+    /// The reset decision is [`Self::is_resubmittable`]'s, the same test
+    /// ingestion uses, so the two cannot drift apart. Fetching is accepted
+    /// by a term of its own, because `has_patchset_by_msgid` counts a
+    /// fetching series as already ingested and so it is not resubmittable.
+    fn placeholder_state_of(status: &str) -> PlaceholderState {
+        if status == FETCHING {
+            return PlaceholderState::AlreadyFetching;
+        }
+        let parsed = if status == LEGACY_FAILED_TO_APPLY {
+            Ok(ReviewStatus::FailedToApply)
+        } else {
+            ReviewStatus::from_str(status)
+        };
+        match parsed {
+            Ok(was) if Self::is_resubmittable(status) => PlaceholderState::Reset { was },
+            Ok(kept) => PlaceholderState::Kept(kept),
+            Err(()) => PlaceholderState::KeptUnknown {
+                status: status.to_string(),
+            },
+        }
+    }
+
+    /// Sets an existing placeholder row to Fetching with the request's
+    /// columns, after moving the pull request's bare slug to it.
+    async fn reset_fetching_placeholder(
+        &self,
+        id: i64,
+        columns: &PlaceholderColumns<'_>,
+    ) -> Result<()> {
+        if let Some(s) = columns.slug {
+            self.rotate_mr_slug(s, Some(id)).await?;
+        }
+        self.conn.execute(
+            "UPDATE patchsets SET status = 'Fetching', failed_reason = NULL, subject = ?, skip_filters = ?, only_filters = ?, mr_url = ?, mr_title = ?, mr_number = ?, slug = ? WHERE id = ?",
+            libsql::params![columns.subject.as_str(), columns.skip_filters.clone(), columns.only_filters.clone(), columns.mr_url, columns.mr_title, columns.mr_number, columns.slug, id]
+        ).await?;
+        // A resubmission asks for a new review, so a patch that ran out of
+        // time or failed must not be skipped as already final.
+        self.clear_held_outcomes(id).await
+    }
+
+    /// Creates a Fetching placeholder row for `root_msg_id`, with the
+    /// placeholder thread and message its foreign keys need, after moving
+    /// the pull request's bare slug out of the way.
+    async fn insert_fetching_placeholder(
+        &self,
+        root_msg_id: &str,
+        columns: &PlaceholderColumns<'_>,
+    ) -> Result<i64> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
         let thread_id = self.ensure_thread_for_message(root_msg_id, now).await?;
 
-        if let Some(s) = slug {
+        if let Some(s) = columns.slug {
             self.rotate_mr_slug(s, None).await?;
         }
 
-        // 3. Create the fetching patchset
         let mut rows = self.conn
             .query(
                 "INSERT INTO patchsets (thread_id, cover_letter_message_id, subject, status, date, skip_filters, only_filters, mr_url, mr_title, mr_number, slug)
                      VALUES (?, ?, ?, 'Fetching', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
-                libsql::params![thread_id, root_msg_id, effective_subject, now, skip_filters_json, only_filters_json, mr_url, mr_title, mr_number, slug],
+                libsql::params![thread_id, root_msg_id, columns.subject.as_str(), now, columns.skip_filters.clone(), columns.only_filters.clone(), columns.mr_url, columns.mr_title, columns.mr_number, columns.slug],
             )
             .await?;
-
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            drop(rows);
-            self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
-                .await?;
-            Ok(id)
-        } else {
-            Err(anyhow::anyhow!("Failed to get patchset ID"))
+        match rows.next().await {
+            Ok(Some(row)) => Ok(row.get(0)?),
+            _ => Err(anyhow::anyhow!("Failed to get patchset ID")),
         }
     }
+
     pub async fn update_patchset_error(&self, root_msg_id: &str, error: &str) -> Result<()> {
         self.fail_patchset_by_msgid(root_msg_id, error, None)
             .await
@@ -18276,6 +18429,200 @@ mod tests {
             db.has_patchset_by_msgid(sha_partial_patch).await.unwrap(),
             "the same series counts as ingested once it is Reviewed"
         );
+    }
+
+    /// Each stored status reads as the placeholder state the design names
+    /// for it: the resubmittable statuses as a reset, Fetching as already
+    /// fetching, the other review statuses as kept, and a status no code
+    /// writes as kept and unknown. A reset is reported exactly when
+    /// is_resubmittable allows one, so the report and the decision agree.
+    #[test]
+    fn placeholder_state_reads_every_stored_status() {
+        let expected = |status: ReviewStatus| match status {
+            ReviewStatus::Partial
+            | ReviewStatus::Failed
+            | ReviewStatus::Cancelled
+            | ReviewStatus::FailedToApply => PlaceholderState::Reset { was: status },
+            ReviewStatus::Incomplete
+            | ReviewStatus::Pending
+            | ReviewStatus::InReview
+            | ReviewStatus::Skipped
+            | ReviewStatus::Reviewed => PlaceholderState::Kept(status),
+        };
+        for status in ReviewStatus::ALL {
+            let state = Database::placeholder_state_of(status.as_str());
+            assert_eq!(state, expected(status), "{status}");
+            assert_eq!(
+                state.resets_row(),
+                Database::is_resubmittable(status.as_str()),
+                "{status} is reset exactly when it may be resubmitted"
+            );
+        }
+        assert_eq!(
+            Database::placeholder_state_of(FETCHING),
+            PlaceholderState::AlreadyFetching
+        );
+        assert_eq!(
+            Database::placeholder_state_of(LEGACY_FAILED_TO_APPLY),
+            PlaceholderState::Reset {
+                was: ReviewStatus::FailedToApply
+            }
+        );
+        assert!(Database::placeholder_state_of(LEGACY_FAILED_TO_APPLY).resets_row());
+        for unknown in ["", "fetching", "Embargoed"] {
+            let state = Database::placeholder_state_of(unknown);
+            assert_eq!(
+                state,
+                PlaceholderState::KeptUnknown {
+                    status: unknown.to_string()
+                }
+            );
+            assert!(!state.resets_row(), "{unknown:?} is left as it was");
+        }
+        // A row that is already Fetching is rewritten with the newest
+        // request's columns, as it always was; a created row is inserted
+        // with them and has nothing to reset.
+        assert!(PlaceholderState::AlreadyFetching.resets_row());
+        assert!(!PlaceholderState::Created.resets_row());
+    }
+
+    /// Queues the placeholder `cover` names with no pull request facts.
+    async fn queue_placeholder(db: &Database, cover: &str) -> FetchingPlaceholder {
+        db.queue_fetching_patchset(cover, "Fetching", None, None, None, None, None, None)
+            .await
+            .unwrap()
+    }
+
+    /// The subject a re-queue writes, different from queue_placeholder's.
+    const REQUEUED_SUBJECT: &str = "Requeued";
+
+    /// Queues the placeholder `cover` names again, with a subject and skip
+    /// filters that differ from queue_placeholder's, so that a test can
+    /// tell from the row whether the call rewrote it.
+    async fn requeue_placeholder(db: &Database, cover: &str) -> FetchingPlaceholder {
+        let skip = vec!["requeued".to_string()];
+        db.queue_fetching_patchset(
+            cover,
+            REQUEUED_SUBJECT,
+            Some(&skip),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The status, subject and skip filters of patchset `id`, NULL as None.
+    async fn stored_placeholder_columns(
+        db: &Database,
+        id: i64,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, subject, skip_filters FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+        )
+    }
+
+    /// Asserts that patchset `id` was rewritten by requeue_placeholder when
+    /// `state` is a reset or already fetching, and otherwise still holds
+    /// `status` and queue_placeholder's columns. The rule is spelled out
+    /// here rather than taken from resets_row, so that a change to that
+    /// gate shows up in the row.
+    async fn assert_requeue_effect(
+        db: &Database,
+        id: i64,
+        state: &PlaceholderState,
+        status: Option<&str>,
+    ) {
+        let (after, subject, skip_filters) = stored_placeholder_columns(db, id).await;
+        let rewritten = matches!(
+            state,
+            PlaceholderState::Reset { .. } | PlaceholderState::AlreadyFetching
+        );
+        if rewritten {
+            assert_eq!(after.as_deref(), Some(FETCHING), "{status:?}");
+            assert_eq!(subject.as_deref(), Some(REQUEUED_SUBJECT), "{status:?}");
+            assert_eq!(
+                skip_filters.as_deref(),
+                Some(r#"["requeued"]"#),
+                "{status:?}"
+            );
+        } else {
+            assert_eq!(after.as_deref(), status, "{status:?} is left as it was");
+            assert_eq!(subject.as_deref(), Some("Fetching"), "{status:?}");
+            assert_eq!(skip_filters, None, "{status:?}");
+        }
+    }
+
+    /// queue_fetching_patchset says what it found under the placeholder id
+    /// before it changed anything: Created for a new row, AlreadyFetching
+    /// on a second call, a reset from each resubmittable status and a kept
+    /// row for every other one. A reset or fetching row is rewritten with
+    /// the newest request's columns and is Fetching afterwards; a kept row
+    /// keeps its status and columns. The wrapper returns the same id.
+    #[tokio::test]
+    async fn queue_fetching_patchset_reports_what_it_found() {
+        let db = setup_db().await;
+
+        let first = queue_placeholder(&db, "queue-new@sashiko.local").await;
+        assert_eq!(first.state, PlaceholderState::Created);
+        let second = requeue_placeholder(&db, "queue-new@sashiko.local").await;
+        assert_eq!(
+            second,
+            FetchingPlaceholder {
+                id: first.id,
+                state: PlaceholderState::AlreadyFetching
+            }
+        );
+        assert_requeue_effect(&db, first.id, &second.state, Some(FETCHING)).await;
+
+        let stored: Vec<Option<&str>> = ReviewStatus::ALL
+            .iter()
+            .map(|status| Some(status.as_str()))
+            .chain([Some(LEGACY_FAILED_TO_APPLY), Some("Embargoed"), None])
+            .collect();
+        for (index, status) in stored.into_iter().enumerate() {
+            let cover = format!("queue-{index}@sashiko.local");
+            let id = queue_placeholder(&db, &cover).await.id;
+            db.conn
+                .execute(
+                    "UPDATE patchsets SET status = ? WHERE id = ?",
+                    libsql::params![status, id],
+                )
+                .await
+                .unwrap();
+
+            let found = requeue_placeholder(&db, &cover).await;
+            let expected = Database::placeholder_state_of(status.unwrap_or_default());
+            assert_eq!(
+                found,
+                FetchingPlaceholder {
+                    id,
+                    state: expected
+                },
+                "{status:?}"
+            );
+            assert_requeue_effect(&db, id, &found.state, status).await;
+            assert_eq!(
+                db.create_fetching_patchset(&cover, "Fetching", None, None, None, None, None, None)
+                    .await
+                    .unwrap(),
+                id
+            );
+        }
     }
 
     /// Verify that create_fetching_patchset resets patchsets in 'Failed To Apply'
