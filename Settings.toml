@@ -9,6 +9,12 @@ enabled = false
 # provider = "github"
 # api_token = "your-api-token"
 
+# The GitHub repository whose pull request numbers the daemon reviews, as
+# "owner/name" on github.com or "host/owner/name" for GitHub Enterprise.
+# It names the base repository the pull requests are opened against, not
+# a fork. Webhooks do not need it.
+# github_repository = "owner/name"
+
 # Webhook authentication (recommended for production).
 # When configured, Sashiko authenticates incoming webhook requests using
 # this token. Non-localhost requests are permitted without

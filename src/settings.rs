@@ -117,6 +117,83 @@ pub struct ForgeSettings {
     pub app_private_key: Option<String>,
     #[serde(default)]
     pub app_private_key_path: Option<String>,
+    /// The GitHub repository that a pull request number given to the daemon
+    /// belongs to. It is named here rather than read from a git remote,
+    /// because the daemon's repository also holds fetcher remotes whose URLs
+    /// come from requests, so a remote cannot be trusted to name it.
+    #[serde(default)]
+    pub github_repository: Option<ForgeRepo>,
+}
+
+/// The host a two-part forge.github_repository value lives on.
+const DEFAULT_GITHUB_HOST: &str = "github.com";
+
+/// A GitHub repository, from the forge.github_repository setting: "owner/name"
+/// on github.com, or "host/owner/name" for GitHub Enterprise, which is the
+/// form gh's -R option takes.
+///
+/// It is the base repository of the pull requests it numbers, because a forge
+/// publishes refs/pull/N/head on the base and not on the fork. A value that
+/// does not parse fails the settings load, so the daemon does not start with
+/// a repository it cannot name. The parse error names the value only: the
+/// config loader appends the key it was read from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ForgeRepo {
+    pub host: String,
+    pub owner: String,
+    pub name: String,
+}
+
+impl std::str::FromStr for ForgeRepo {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let segments: Vec<&str> = value.split('/').collect();
+        let (host, owner, name) = match segments.as_slice() {
+            [owner, name] => (DEFAULT_GITHUB_HOST, *owner, *name),
+            [host, owner, name] => (*host, *owner, *name),
+            _ => {
+                return Err(format!(
+                    "{value:?} is not \"owner/name\" or \"host/owner/name\""
+                ));
+            }
+        };
+        if let Some(bad) = [host, owner, name]
+            .into_iter()
+            .find(|segment| !is_repository_segment(segment))
+        {
+            return Err(format!(
+                "{value:?} has the part {bad:?}, which is not made of letters, digits, '_', \
+                 '.' and '-' alone, or is \".\" or \"..\""
+            ));
+        }
+        Ok(Self {
+            host: host.to_string(),
+            owner: owner.to_string(),
+            name: name.to_string(),
+        })
+    }
+}
+
+impl TryFrom<String> for ForgeRepo {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+/// Whether one part of a repository name is safe to pass to gh and to build
+/// a URL from: a non-empty run of ASCII letters, digits, '_', '.' and '-' that
+/// is not a path component naming the current or the parent directory.
+fn is_repository_segment(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment != "."
+        && segment != ".."
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 fn default_true() -> bool {
@@ -1372,6 +1449,7 @@ fn default_forge() -> ForgeSettings {
         installation_id: None,
         app_private_key: None,
         app_private_key_path: None,
+        github_repository: None,
     }
 }
 
@@ -1641,6 +1719,92 @@ mod tests {
             err.to_string().contains("reference_repository_path"),
             "{err}"
         );
+    }
+
+    /// forge.github_repository takes gh's -R forms and nothing else: a URL,
+    /// a remote spec, a path that climbs, or a stray space is refused rather
+    /// than passed on to gh or into a URL.
+    #[test]
+    fn github_repository_setting_parses() {
+        let repo = |value: &str| value.parse::<ForgeRepo>();
+        assert_eq!(
+            repo("example-org/driver-a"),
+            Ok(ForgeRepo {
+                host: "github.com".to_string(),
+                owner: "example-org".to_string(),
+                name: "driver-a".to_string(),
+            })
+        );
+        assert_eq!(
+            repo("ghe.example.com/Team_1/repo.name"),
+            Ok(ForgeRepo {
+                host: "ghe.example.com".to_string(),
+                owner: "Team_1".to_string(),
+                name: "repo.name".to_string(),
+            })
+        );
+
+        for bad in [
+            "",
+            "driver-a",
+            "github.com/example-org/driver-a/extra",
+            "example-org/..",
+            "./driver-a",
+            "example-org/",
+            "/example-org/driver-a",
+            "https://github.com/example-org/driver-a",
+            "git@github.com:example-org/driver-a.git",
+            "example-org/driver a",
+            " example-org/driver-a",
+            "example-org/driver-a\n",
+        ] {
+            let err = repo(bad).expect_err(bad);
+            assert!(err.starts_with(&format!("{bad:?} ")), "{err}");
+        }
+    }
+
+    /// The setting goes through the loader the daemon starts with: unset is
+    /// None, a valid value arrives parsed, and an invalid one stops the load
+    /// with the setting's name in the error.
+    #[test]
+    fn github_repository_setting_is_read_at_startup() {
+        let shipped =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Settings.toml"))
+                .unwrap();
+        assert!(
+            shipped.contains("[forge]\n"),
+            "the shipped file has a forge table"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let load = |value: Option<&str>| {
+            let path = dir.path().join("Settings.toml");
+            let line = value
+                .map(|v| format!("github_repository = \"{v}\"\n"))
+                .unwrap_or_default();
+            std::fs::write(
+                &path,
+                shipped.replacen("[forge]\n", &format!("[forge]\n{line}"), 1),
+            )
+            .unwrap();
+            Settings::from_file(&path)
+        };
+
+        let settings = load(None).expect("the shipped settings load");
+        assert_eq!(settings.forge.github_repository, None);
+
+        let settings = load(Some("example-org/driver-b")).expect("a valid value loads");
+        assert_eq!(
+            settings.forge.github_repository,
+            Some(ForgeRepo {
+                host: "github.com".to_string(),
+                owner: "example-org".to_string(),
+                name: "driver-b".to_string(),
+            })
+        );
+
+        let err = load(Some("https://github.com/example-org/driver-b"))
+            .expect_err("a URL must stop the load");
+        assert!(err.to_string().contains("forge.github_repository"), "{err}");
     }
 
     /// A key this build does not implement fails the load rather than being
