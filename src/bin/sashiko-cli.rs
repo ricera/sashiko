@@ -18,8 +18,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use reqwest::Client;
 use sashiko::activity::{Phase, StageTiming, format_duration};
 use sashiko::api::{
-    ActivityEntry, ActivityResponse, PatchsetActivityResponse, PatchsetsResponse, SubmitRequest,
-    SubmitResponse,
+    ActivityEntry, ActivityResponse, PatchToolCalls, PatchsetActivityResponse, PatchsetsResponse,
+    ReviewAttempt, SubmitRequest, SubmitResponse, ToolCallCounts, review_runs,
 };
 use sashiko::auth::LocalToken;
 use sashiko::finding_view::{self, FindingLine};
@@ -1465,6 +1465,33 @@ struct PatchActivity {
     /// them. This side does not know the daemon's project, so it does not
     /// re-sort.
     by_patch: std::collections::HashMap<i64, Vec<ActivityEntry>>,
+    /// Tool calls of each patch the entries name, over the patch's current
+    /// run, by patch. Empty from a daemon that does not count them.
+    tool_calls: std::collections::HashMap<i64, PatchToolCalls>,
+}
+
+impl PatchActivity {
+    /// The activity response grouped by patch.
+    fn from_response(data: PatchsetActivityResponse) -> Self {
+        let mut by_patch: std::collections::HashMap<i64, Vec<ActivityEntry>> =
+            std::collections::HashMap::new();
+        for entry in data.entries {
+            // Entries with no patch describe the patchset as a whole and
+            // belong in the activity summary, not under any one patch.
+            if let Some(patch_id) = entry.patch_id {
+                by_patch.entry(patch_id).or_default().push(entry);
+            }
+        }
+        PatchActivity {
+            live: data.live,
+            by_patch,
+            tool_calls: data
+                .tool_calls
+                .into_iter()
+                .map(|calls| (calls.patch_id, calls))
+                .collect(),
+        }
+    }
 }
 
 async fn fetch_patchset_activity(
@@ -1486,19 +1513,7 @@ async fn fetch_patch_activity(
     patchset_id: &str,
 ) -> Option<PatchActivity> {
     let data = fetch_patchset_activity(client, base_url, patchset_id).await?;
-    let mut by_patch: std::collections::HashMap<i64, Vec<ActivityEntry>> =
-        std::collections::HashMap::new();
-    for entry in data.entries {
-        // Entries with no patch describe the patchset as a whole and belong in
-        // the activity summary, not under any one patch.
-        if let Some(patch_id) = entry.patch_id {
-            by_patch.entry(patch_id).or_default().push(entry);
-        }
-    }
-    Some(PatchActivity {
-        live: data.live,
-        by_patch,
-    })
+    Some(PatchActivity::from_response(data))
 }
 
 /// How many turns, for a table column.
@@ -1636,7 +1651,17 @@ fn stage_breakdown_note(stages: &[StageTiming]) -> String {
 /// Printed whatever the patchset's status. The recorded breakdown only exists
 /// once a review has finished, and the most interesting moment to ask what the
 /// stages are doing is while they are still doing it.
-fn print_patch_timings(patches: &[Value], reviews: &[&Value], activity: Option<&PatchActivity>) {
+///
+/// `reviews` are the reviews the command shows, which pick the review whose
+/// recorded table is printed. `all_reviews` are every review of the patchset,
+/// so that the tool calls of that review's run are summed in full even when
+/// `--since` hides the run's first attempts.
+fn print_patch_timings(
+    patches: &[Value],
+    reviews: &[&Value],
+    all_reviews: &[Value],
+    activity: Option<&PatchActivity>,
+) {
     if patches.is_empty() {
         return;
     }
@@ -1649,42 +1674,150 @@ fn print_patch_timings(patches: &[Value], reviews: &[&Value], activity: Option<&
         let p_id = patch["id"].as_i64().unwrap_or(0);
         let subject = patch["subject"].as_str().unwrap_or("");
         println!("  Patch {}: {}", idx, subject);
-
-        let live_entries = activity
-            .and_then(|a| a.by_patch.get(&p_id))
-            .filter(|e| !e.is_empty());
-        // Stored by the daemon in pipeline order, which this side cannot
-        // reconstruct from the names.
-        let recorded: Option<Vec<StageTiming>> = find_best_review_for_patch_refs(p_id, reviews)
-            .and_then(|r| r.get("stage_durations"))
-            .and_then(|d| serde_json::from_value(d.clone()).ok())
-            .filter(|d: &Vec<StageTiming>| !d.is_empty());
-
-        match (live_entries, recorded) {
-            // Live wins: it is the current truth, and the recorded breakdown for
-            // an earlier attempt would contradict it.
-            (Some(entries), _) => {
-                let live = activity.map(|a| a.live).unwrap_or(true);
-                println!(
-                    "    {:<20} {:>10}  {:>12}  STATE",
-                    "STAGE", "ELAPSED", "TURNS"
-                );
-                for entry in entries {
-                    println!("{}", stage_row(entry, live));
-                }
-            }
-            (None, Some(stages)) => {
-                println!("    {:<20} {:>10}  {:>12}", "STAGE", "ELAPSED", "TURNS");
-                for st in &stages {
-                    println!("{}", recorded_stage_row(st));
-                }
-                println!("    ({})", stage_breakdown_note(&stages));
-            }
-            // Said plainly rather than left blank, which is indistinguishable
-            // from the flag not working.
-            (None, None) => println!("    no stage timings recorded"),
+        for line in patch_timing_lines(p_id, reviews, all_reviews, activity) {
+            println!("{}", line);
         }
     }
+}
+
+/// What `print_patch_timings` prints under one patch's heading: its stage
+/// table, then the tool calls of the run that table describes.
+fn patch_timing_lines(
+    p_id: i64,
+    reviews: &[&Value],
+    all_reviews: &[Value],
+    activity: Option<&PatchActivity>,
+) -> Vec<String> {
+    let live_entries = activity
+        .and_then(|a| a.by_patch.get(&p_id))
+        .filter(|e| !e.is_empty());
+    let best = find_best_review_for_patch_refs(p_id, reviews);
+
+    // Live wins: it is the current truth, and the recorded breakdown for an
+    // earlier attempt would contradict it. For the same reason a live table
+    // takes its tool calls only from the activity response, which counts the
+    // current run; an earlier run's figure under it would describe other work.
+    let (mut lines, tool_calls) = match live_entries {
+        Some(entries) => (
+            live_stage_table(entries, activity.is_none_or(|a| a.live)),
+            activity.and_then(|a| a.tool_calls.get(&p_id)).map(|t| {
+                (
+                    t.counts.clone(),
+                    usize::try_from(t.attempts).unwrap_or(usize::MAX),
+                )
+            }),
+        ),
+        None => (
+            recorded_stage_table(best),
+            best.and_then(|r| recorded_run_tool_calls(r, all_reviews)),
+        ),
+    };
+    // Nothing is printed when no counts are known (an older daemon), rather
+    // than a zero that would claim the review made no call.
+    if let Some((counts, attempts)) = tool_calls {
+        lines.push(format!("    {}", tool_calls_line(&counts, attempts)));
+    }
+    lines
+}
+
+/// A patch's stage table from its live (or last persisted) activity entries.
+fn live_stage_table(entries: &[ActivityEntry], live: bool) -> Vec<String> {
+    std::iter::once(format!(
+        "    {:<20} {:>10}  {:>12}  STATE",
+        "STAGE", "ELAPSED", "TURNS"
+    ))
+    .chain(entries.iter().map(|entry| stage_row(entry, live)))
+    .collect()
+}
+
+/// A patch's stage table from the review that stands for it.
+fn recorded_stage_table(review: Option<&Value>) -> Vec<String> {
+    // Stored by the daemon in pipeline order, which this side cannot
+    // reconstruct from the names.
+    let recorded: Option<Vec<StageTiming>> = review
+        .and_then(|r| r.get("stage_durations"))
+        .and_then(|d| serde_json::from_value(d.clone()).ok())
+        .filter(|d: &Vec<StageTiming>| !d.is_empty());
+    let Some(stages) = recorded else {
+        // Said plainly rather than left blank, which is indistinguishable
+        // from the flag not working.
+        return vec!["    no stage timings recorded".to_string()];
+    };
+    std::iter::once(format!(
+        "    {:<20} {:>10}  {:>12}",
+        "STAGE", "ELAPSED", "TURNS"
+    ))
+    .chain(stages.iter().map(recorded_stage_row))
+    .chain(std::iter::once(format!(
+        "    ({})",
+        stage_breakdown_note(&stages)
+    )))
+    .collect()
+}
+
+/// The tool calls of the run a review belongs to, summed over the run's
+/// attempts, and the number of attempts, from the reviews the daemon served.
+///
+/// The run is found and summed by the same `api` functions the daemon uses
+/// for its live figure, so a run reads the same during it and after it: a run
+/// whose first attempt did the work and whose retries made no call prints
+/// that work, not the last attempt's zero.
+///
+/// `None` when any attempt of the run carries no counts, from an older daemon
+/// or a daemon that could not count them, because a sum missing an attempt
+/// would understate the run.
+fn recorded_run_tool_calls(
+    review: &Value,
+    all_reviews: &[Value],
+) -> Option<(ToolCallCounts, usize)> {
+    let review_id = review.get("id")?.as_i64()?;
+    let patch_id = review.get("patch_id")?.as_i64()?;
+    let rows: std::collections::HashMap<i64, &Value> = all_reviews
+        .iter()
+        .filter(|r| r.get("patch_id").and_then(Value::as_i64) == Some(patch_id))
+        .filter_map(|r| Some((r.get("id")?.as_i64()?, r)))
+        .collect();
+    // An attempt that does not fit a u32 cannot have been written by the
+    // retry loop, and reads as no attempt, as the daemon reads it.
+    let attempts: Vec<ReviewAttempt> = rows
+        .iter()
+        .map(|(&review_id, r)| ReviewAttempt {
+            review_id,
+            attempt: r
+                .get("attempt")
+                .and_then(Value::as_u64)
+                .and_then(|a| u32::try_from(a).ok()),
+        })
+        .collect();
+    let run = review_runs(&attempts)
+        .into_iter()
+        .find(|run| run.contains(&review_id))?;
+    let counts: Vec<ToolCallCounts> = run
+        .iter()
+        .map(|id| {
+            let calls = rows.get(id)?.get("tool_calls")?;
+            serde_json::from_value(calls.clone()).ok()
+        })
+        .collect::<Option<_>>()?;
+    Some((ToolCallCounts::sum(&counts), run.len()))
+}
+
+/// The "Tool calls:" line under a patch's stage table, without its indent,
+/// such as "Tool calls: 120 over 2 attempts (30 to kernel, 0 to rdma-core)".
+///
+/// The attempts are named only when there was more than one, so a reader
+/// can tell why the figure can exceed what one attempt's table shows.
+fn tool_calls_line(counts: &ToolCallCounts, attempts: usize) -> String {
+    let mut line = format!("Tool calls: {}", counts.total);
+    if attempts > 1 {
+        line.push_str(&format!(" over {} attempts", attempts));
+    }
+    let breakdown = counts.breakdown();
+    if !breakdown.is_empty() {
+        line.push(' ');
+        line.push_str(&breakdown);
+    }
+    line
 }
 
 /// One-line summary of everything a patchset is currently doing.
@@ -1923,7 +2056,12 @@ async fn handle_show(
                     // running are the ones worth having.
                     if opts.timings {
                         let activity = fetch_patch_activity(client, base_url, &numeric_id).await;
-                        print_patch_timings(&patches, &reviews_filtered, activity.as_ref());
+                        print_patch_timings(
+                            &patches,
+                            &reviews_filtered,
+                            &reviews,
+                            activity.as_ref(),
+                        );
                     }
 
                     if let Some(review) = review_data {
@@ -3342,6 +3480,152 @@ mod tests {
             rows.push(review(99, 8, "Reviewed", false));
             assert_eq!(id_of_best(&rows), expected, "{statuses:?}");
         }
+    }
+
+    /// A review row of patch 7 as the daemon serves it, with the attempt it
+    /// was for, its tool calls (`total` and the kernel reference's share),
+    /// and one recorded stage named `stage`.
+    fn attempt_row(id: i64, attempt: u64, status: &str, calls: (u64, u64), stage: &str) -> Value {
+        let mut row = review(id, 7, status, false);
+        row["attempt"] = json!(attempt);
+        row["tool_calls"] = json!({
+            "total": calls.0,
+            "by_reference": {
+                "references": [{ "name": "kernel", "calls": calls.1 }],
+                "unattached": 0,
+            },
+        });
+        row["stage_durations"] = json!([{ "stage": stage, "seconds": 60, "turns": 4 }]);
+        row
+    }
+
+    /// With no live entries, the tool calls printed under a patch's recorded
+    /// stage table are those of the run of the review that table comes from,
+    /// summed over the run's attempts: a run whose first attempt did the work
+    /// prints that work, not its last attempt's zero, and an earlier run that
+    /// stands for the patch is not mixed with a newer one that failed.
+    #[test]
+    fn test_tool_calls_line_sums_the_chosen_review_run() {
+        let lines = |rows: &[Value], shown: &[&Value]| patch_timing_lines(7, shown, rows, None);
+
+        let failed_run: Vec<Value> = (1..=4)
+            .map(|n| {
+                let calls = if n == 1 { (120, 30) } else { (0, 0) };
+                attempt_row(n as i64, n, "Failed", calls, "only")
+            })
+            .collect();
+        let all: Vec<&Value> = failed_run.iter().collect();
+        assert_eq!(
+            lines(&failed_run, &all).last().map(String::as_str),
+            Some("    Tool calls: 120 over 4 attempts (30 to kernel)")
+        );
+        // Hiding the run's first attempts, as --since does, does not shrink it.
+        let since: Vec<&Value> = failed_run[2..].iter().collect();
+        assert_eq!(
+            lines(&failed_run, &since).last().map(String::as_str),
+            Some("    Tool calls: 120 over 4 attempts (30 to kernel)")
+        );
+
+        let rows = vec![
+            attempt_row(10, 1, "Reviewed", (50, 0), "earlier"),
+            // Another patch's retry, numbered straight after the chosen run,
+            // is still no attempt of it: the run belongs to patch 7 alone.
+            json!({ "id": 11, "patch_id": 8, "attempt": 2, "tool_calls": { "total": 5 } }),
+            attempt_row(12, 1, "Failed", (9, 9), "newer"),
+            attempt_row(13, 2, "Failed", (3, 3), "newer"),
+        ];
+        let shown: Vec<&Value> = rows.iter().collect();
+        let printed = lines(&rows, &shown);
+        assert!(printed.iter().any(|l| l.contains("earlier")), "{printed:?}");
+        assert!(!printed.iter().any(|l| l.contains("newer")), "{printed:?}");
+        assert_eq!(
+            printed.last().map(String::as_str),
+            Some("    Tool calls: 50 (0 to kernel)")
+        );
+    }
+
+    /// A run whose split or counts are not fully known prints what is known,
+    /// and nothing at all when an attempt carries no counts.
+    #[test]
+    fn test_tool_calls_line_needs_every_attempt_counted() {
+        let mut rows = vec![
+            attempt_row(1, 1, "Failed", (0, 0), "only"),
+            attempt_row(2, 2, "Reviewed", (0, 0), "only"),
+        ];
+        let tail = |rows: &[Value]| {
+            let shown: Vec<&Value> = rows.iter().collect();
+            patch_timing_lines(7, &shown, rows, None).pop()
+        };
+        // References attached and no call made: no per-reference zero.
+        assert_eq!(
+            tail(&rows).as_deref(),
+            Some("    Tool calls: 0 over 2 attempts")
+        );
+        rows[0]["tool_calls"] = json!({ "total": 4 });
+        assert_eq!(
+            tail(&rows).as_deref(),
+            Some("    Tool calls: 4 over 2 attempts")
+        );
+        // An attempt served without counts leaves the stage table last.
+        rows[0]["tool_calls"] = Value::Null;
+        let note = format!("    (1 stage, {})", format_duration(60));
+        assert_eq!(tail(&rows), Some(note.clone()));
+        // So does one from a daemon that does not count them at all.
+        if let Some(row) = rows[0].as_object_mut() {
+            row.remove("tool_calls");
+        }
+        assert_eq!(tail(&rows), Some(note));
+    }
+
+    /// A live table takes its tool calls from the activity response, the
+    /// current run, and never from a recorded run, which would describe
+    /// other work.
+    #[test]
+    fn test_live_tool_calls_come_from_the_activity_response() {
+        let rows = vec![attempt_row(1, 1, "Reviewed", (50, 5), "earlier")];
+        let shown: Vec<&Value> = rows.iter().collect();
+        let activity = |tool_calls: Value| {
+            let data: PatchsetActivityResponse = serde_json::from_value(json!({
+                "live": true,
+                "entries": [{
+                    "key": "patchset:1/patch:7", "phase": null,
+                    "description": "reviewing", "patch_id": 7, "stage": null,
+                    "stage_label": null, "order": null, "age_seconds": 3,
+                    "idle_seconds": 1, "updated_at": null,
+                }],
+                "tool_calls": tool_calls,
+            }))
+            .expect("a well-formed activity response");
+            PatchActivity::from_response(data)
+        };
+
+        let counted = activity(json!([{
+            "patch_id": 7, "attempts": 2, "total": 47,
+            "by_reference": {
+                "references": [{ "name": "kernel", "calls": 3 },
+                               { "name": "rdma-core", "calls": 0 }],
+                "unattached": 1,
+            },
+        }]));
+        let printed = patch_timing_lines(7, &shown, &rows, Some(&counted));
+        assert!(
+            !printed.iter().any(|l| l.contains("earlier")),
+            "{printed:?}"
+        );
+        assert_eq!(
+            printed.last().map(String::as_str),
+            Some(
+                "    Tool calls: 47 over 2 attempts \
+                 (3 to kernel, 0 to rdma-core; 1 to an unattached repository)"
+            )
+        );
+
+        let uncounted = activity(json!([]));
+        let printed = patch_timing_lines(7, &shown, &rows, Some(&uncounted));
+        assert!(
+            !printed.iter().any(|l| l.contains("Tool calls")),
+            "{printed:?}"
+        );
     }
 
     /// `show --summary` counts a patch by the same review every other view
