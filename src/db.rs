@@ -1260,6 +1260,22 @@ fn no_tool_calls(reference_repos: Option<&str>) -> crate::api::ToolCallCounts {
     }
 }
 
+/// The text of a column selected as a blob, every byte of it.
+///
+/// A text column is selected as a blob where a NUL inside it matters,
+/// because libsql reads text only up to its first NUL. Bytes that are not
+/// UTF-8 are decoded with replacement characters rather than failing the
+/// query. A tool name is written from a Rust string and is always UTF-8, but
+/// a repository is decoded by SQLite from the model's JSON, where an unpaired
+/// surrogate escape such as `\ud800` yields bytes that are not UTF-8. The
+/// replacement characters then match no reference, so such a call is never
+/// credited to one.
+#[cfg(feature = "server")]
+fn text_from_column_bytes(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned())
+}
+
 /// Adds one group of a review's recorded tool calls, all with the same tool
 /// name and `repo` argument, to its counts.
 ///
@@ -2970,6 +2986,11 @@ impl Database {
     /// model's JSON verbatim. Arguments that are NULL, not JSON, not an
     /// object, or carry a `repo` that is not a string read as no `repo`, so
     /// one odd row cannot fail the query.
+    ///
+    /// The tool name and the repository are selected as blobs and decoded
+    /// by [`text_from_column_bytes`], because libsql reads a text column only
+    /// up to its first NUL. A name the toolbox refused for the bytes after a
+    /// NUL would otherwise be counted as the tool or reference before it.
     pub async fn tool_call_counts(
         &self,
         review_ids: &[i64],
@@ -2983,11 +3004,11 @@ impl Database {
             .conn
             .query(
                 "SELECT tu.review_id,
-                        tu.tool_name,
-                        CASE WHEN json_valid(tu.arguments) THEN
+                        CAST(tu.tool_name AS BLOB),
+                        CAST(CASE WHEN json_valid(tu.arguments) THEN
                             CASE WHEN json_type(tu.arguments, '$.repo') = 'text'
                                  THEN json_extract(tu.arguments, '$.repo') END
-                        END AS repo,
+                        END AS BLOB) AS repo,
                         COUNT(*)
                  FROM tool_usages tu
                  WHERE tu.review_id IN (SELECT value FROM json_each(?))
@@ -2997,8 +3018,8 @@ impl Database {
             .await?;
         while let Some(row) = rows.next().await? {
             let review_id: i64 = row.get(0)?;
-            let tool_name: String = row.get(1)?;
-            let repo: Option<String> = row.get(2)?;
+            let tool_name = text_from_column_bytes(row.get(1)?);
+            let repo = row.get::<Option<Vec<u8>>>(2)?.map(text_from_column_bytes);
             // COUNT(*) is never negative, so the conversion cannot fail.
             let calls = u64::try_from(row.get::<i64>(3)?).unwrap_or(0);
             add_tool_calls(
@@ -25466,6 +25487,77 @@ mod tests {
         let counts = review_tool_calls(&db, review_id).await;
         assert_eq!(counts.total, 5);
         assert_eq!(reference_split(&counts), Some((vec![("kernel", 0)], 0)));
+    }
+
+    #[tokio::test]
+    async fn tool_calls_with_a_nul_are_classified_as_the_toolbox_served_them() {
+        let db = setup_db().await;
+        let (ps_id, p_id, review_id) = reviewed_patchset(&db, "tool_calls_nul").await;
+        db.set_review_reference_repos(review_id, &reference_record(&["kernel"], &[]))
+            .await
+            .unwrap();
+        // The toolbox has no reference named "kernel\0x", so it refused this
+        // call; read up to the NUL, the name would be kernel's.
+        record_call(
+            &db,
+            review_id,
+            "git_grep",
+            Some(r#"{"pattern":"a","repo":"kernel\u0000x"}"#),
+        )
+        .await;
+        // The toolbox has no tool named "git_grep\0x", so this call read no
+        // repository; read up to the NUL, the name would be git_grep's.
+        record_call(
+            &db,
+            review_id,
+            "git_grep\0x",
+            Some(r#"{"pattern":"b","repo":"kernel"}"#),
+        )
+        .await;
+
+        let counts = review_tool_calls(&db, review_id).await;
+        assert_eq!(counts.total, 2);
+        assert_eq!(reference_split(&counts), Some((vec![("kernel", 0)], 1)));
+
+        // A patch's figure is summed from the same counts.
+        let patches = db.patch_tool_calls(ps_id, &[p_id]).await.unwrap();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].counts, counts);
+    }
+
+    #[tokio::test]
+    async fn tool_call_with_an_unpaired_surrogate_repo_counts_as_unattached() {
+        let db = setup_db().await;
+        let (_, _, review_id) = reviewed_patchset(&db, "tool_calls_surrogate").await;
+        db.set_review_reference_repos(review_id, &reference_record(&["kernel"], &[]))
+            .await
+            .unwrap();
+        let arguments = r#"{"pattern":"a","repo":"\ud800"}"#;
+        record_call(&db, review_id, "git_grep", Some(arguments)).await;
+
+        // SQLite decodes the lone surrogate into bytes that are not UTF-8,
+        // so this call exercises the replacement-character decoding.
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT hex(json_extract(?, '$.repo'))",
+                libsql::params![arguments],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("one row");
+        assert_eq!(row.get::<String>(0).unwrap(), "EDA080");
+
+        let counts = review_tool_calls(&db, review_id).await;
+        assert_eq!(counts.total, 1);
+        assert_eq!(reference_split(&counts), Some((vec![("kernel", 0)], 1)));
+    }
+
+    #[test]
+    fn column_bytes_decode_whole_and_never_fail() {
+        assert_eq!(text_from_column_bytes(b"kernel\0x".to_vec()), "kernel\0x");
+        assert_eq!(text_from_column_bytes(Vec::new()), "");
+        assert_eq!(text_from_column_bytes(b"a\xffb".to_vec()), "a\u{fffd}b");
     }
 
     /// A patchset with this many patches and no review yet. Returns the
