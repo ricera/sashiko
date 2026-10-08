@@ -8731,6 +8731,90 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         Ok(())
     }
 
+    /// A retry's row carries its attempt number from the moment it is
+    /// created, not only once the attempt ends, so a reader that finds the
+    /// row while the retry runs already sees which attempt it is. The worker
+    /// fails its first attempt and holds its second until the test has read
+    /// the second row, so that read happens mid-attempt.
+    #[tokio::test]
+    async fn test_a_retry_row_carries_its_attempt_from_creation() -> Result<()> {
+        let signal_dir = tempdir()?;
+        let first_ran = signal_dir.path().join("first_ran");
+        let row_read = signal_dir.path().join("row_read");
+        let script = worker_reporting_then(
+            &[],
+            &format!(
+                "if [ ! -f '{first}' ]; then : > '{first}'; echo '{failed}'; exit 0; fi\n\
+                 while [ ! -f '{read}' ]; do sleep 0.02; done\necho '{reviewed}'\n",
+                first = first_ran.display(),
+                read = row_read.display(),
+                failed = error_output("boom", None),
+                reviewed = reviewed_output(json!([])),
+            ),
+        );
+
+        let seen = std::cell::Cell::new(None);
+        let seen_attempt = &seen;
+        let read_retry_row = |db: Arc<Database>, patchset_id: i64| async move {
+            let retry_attempt = || async {
+                let mut rows = db
+                    .conn
+                    .query(
+                        "SELECT attempt FROM reviews WHERE patchset_id = ? ORDER BY id",
+                        libsql::params![patchset_id],
+                    )
+                    .await?;
+                let mut attempts = Vec::new();
+                while let Some(row) = rows.next().await? {
+                    attempts.push(row.get::<Option<i64>>(0)?);
+                }
+                anyhow::Ok(attempts.get(1).copied())
+            };
+            let wait = async {
+                loop {
+                    if let Some(attempt) = retry_attempt().await? {
+                        return anyhow::Ok(attempt);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let read = tokio::time::timeout(Duration::from_secs(20), wait).await;
+            // The worker is released whatever the read found, so a failed
+            // read fails the test instead of leaving the worker waiting.
+            std::fs::write(&row_read, "")?;
+            seen_attempt.set(Some(read??));
+            Ok(())
+        };
+        let run = review_patch_with_worker_while(
+            &script,
+            Arc::new(MockProvider),
+            |s| s.review.max_retries = 2,
+            read_retry_row,
+        )
+        .await?;
+        assert!(matches!(run.result, PatchResult::Success));
+        assert_eq!(
+            seen.get(),
+            Some(Some(2)),
+            "the retry's row read while it ran carries attempt 2"
+        );
+
+        let reviews = review_rows(&run.db, run.patch_id).await?;
+        let stored: Vec<(&Value, &Value)> = reviews
+            .iter()
+            .map(|review| (&review["status"], &review["attempt"]))
+            .collect();
+        assert_eq!(
+            stored,
+            vec![
+                (&json!("Failed"), &json!(1)),
+                (&json!("Reviewed"), &json!(2))
+            ],
+            "{reviews:?}"
+        );
+        Ok(())
+    }
+
     /// A provider that holds the runtime's only thread for `hold` before
     /// answering, as [`MockProviderWithUsage`] would. A `#[tokio::test]`
     /// runtime has one thread, so while a call is held the I/O loop cannot
