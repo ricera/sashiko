@@ -3001,6 +3001,91 @@ impl Database {
         }
     }
 
+    /// Tool calls of each of these patches of a patchset, over the patch's
+    /// current run: the last run [`crate::api::review_runs`] finds among the
+    /// patch's review rows, summed with [`crate::api::ToolCallCounts::sum`].
+    ///
+    /// The current run, not every review of the patch, because a rerun is a
+    /// new review whose figure must not include a finished review's calls,
+    /// while the retries of one run are one piece of work whose last attempt
+    /// may have made no call at all.
+    ///
+    /// Returned in the order of `patch_ids`, each patch once. A patch with no
+    /// review row has nothing to count and gets no entry. Only reviews of
+    /// these patches in this patchset are read.
+    pub async fn patch_tool_calls(
+        &self,
+        patchset_id: i64,
+        patch_ids: &[i64],
+    ) -> Result<Vec<crate::api::PatchToolCalls>> {
+        if patch_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let current_runs: std::collections::HashMap<i64, Vec<i64>> = self
+            .patch_review_attempts(patchset_id, patch_ids)
+            .await?
+            .into_iter()
+            .filter_map(|(patch_id, rows)| {
+                crate::api::review_runs(&rows)
+                    .pop()
+                    .map(|run| (patch_id, run))
+            })
+            .collect();
+        let review_ids: Vec<i64> = current_runs.values().flatten().copied().collect();
+        let counts = self.tool_call_counts(&review_ids).await?;
+        let mut seen = std::collections::HashSet::new();
+        Ok(patch_ids
+            .iter()
+            .filter(|patch_id| seen.insert(**patch_id))
+            .filter_map(|&patch_id| {
+                let run = current_runs.get(&patch_id)?;
+                Some(crate::api::PatchToolCalls {
+                    patch_id,
+                    attempts: u32::try_from(run.len()).unwrap_or(u32::MAX),
+                    counts: crate::api::ToolCallCounts::sum(
+                        run.iter().filter_map(|id| counts.get(id)),
+                    ),
+                })
+            })
+            .collect())
+    }
+
+    /// The review rows of each of these patches of a patchset, by patch, each
+    /// with the attempt it was for.
+    ///
+    /// An attempt that does not fit a `u32` cannot have been written by the
+    /// retry loop, and reads as no attempt.
+    async fn patch_review_attempts(
+        &self,
+        patchset_id: i64,
+        patch_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Vec<crate::api::ReviewAttempt>>> {
+        let ids = serde_json::to_string(patch_ids)?;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, patch_id, attempt FROM reviews
+                 WHERE patchset_id = ? AND patch_id IN (SELECT value FROM json_each(?))",
+                libsql::params![patchset_id, ids.as_str()],
+            )
+            .await?;
+        let mut by_patch: std::collections::HashMap<i64, Vec<crate::api::ReviewAttempt>> =
+            std::collections::HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let attempt = row
+                .get::<Option<i64>>(2)?
+                .and_then(|a| u32::try_from(a).ok());
+            by_patch
+                .entry(row.get::<i64>(1)?)
+                .or_default()
+                .push(crate::api::ReviewAttempt {
+                    review_id: row.get(0)?,
+                    attempt,
+                });
+        }
+        Ok(by_patch)
+    }
+
     pub async fn create_finding(&self, finding: Finding) -> Result<()> {
         let val = finding.preexisting.map(|b| if b { 1 } else { 0 });
         let locations_val = finding
@@ -9207,15 +9292,19 @@ impl Database {
         Ok(())
     }
 
-    /// Records which retry produced this review row.
+    /// Records which retry produced this review row, or None for a row that
+    /// is not an attempt of the retry loop (a Skipped patch).
     ///
     /// A new row gets its attempt from `create_review`. This restamps a row
     /// that already exists: a Pending row an interrupted run left behind,
-    /// which the next run reuses for its own attempt. It is stamped before
-    /// the attempt runs, so a row that never reaches a terminal state still
-    /// says which attempt it was; the live attempt counter in the activity
-    /// view disappears the moment the review finishes.
-    pub async fn set_review_attempt(&self, review_id: i64, attempt: u32) -> Result<()> {
+    /// which the next run reuses for its own attempt or for its Skipped
+    /// result. It is stamped before the attempt runs, so a row that never
+    /// reaches a terminal state still says which attempt it was; the live
+    /// attempt counter in the activity view disappears the moment the review
+    /// finishes. A reused row must not keep the old run's number, because
+    /// `crate::api::review_runs` reads a number above 1 as continuing the run
+    /// before it.
+    pub async fn set_review_attempt(&self, review_id: i64, attempt: Option<u32>) -> Result<()> {
         self.execute(
             "UPDATE reviews SET attempt = ? WHERE id = ?",
             libsql::params![attempt, review_id],
@@ -24920,7 +25009,7 @@ mod tests {
 
         // Each retry gets its own review row, so the attempt number is what
         // makes "it took three goes" answerable once the live counter is gone.
-        db.set_review_attempt(review_id, 3).await.unwrap();
+        db.set_review_attempt(review_id, Some(3)).await.unwrap();
 
         let summary = db
             .get_patchset_summary(ps_id, None, None)
@@ -25292,32 +25381,135 @@ mod tests {
         assert_eq!(reference_split(&counts), Some((vec![("kernel", 0)], 0)));
     }
 
-    #[tokio::test]
-    async fn review_payloads_carry_tool_calls() {
-        let db = setup_db().await;
-        let thread_id = db.create_thread("tc_pages", "Subject", 1000).await.unwrap();
+    /// A patchset with this many patches and no review yet. Returns the
+    /// patchset and its patches in order.
+    async fn patchset_with_patches(db: &Database, root: &str, patches: u32) -> (i64, Vec<i64>) {
+        let thread_id = db.create_thread(root, "Subject", 1000).await.unwrap();
         let ps_id = db
             .create_patchset(
-                thread_id, None, "tc_pages", "Subject", "Author", 1000, 2, 2, "", "", None, 1,
+                thread_id, None, root, "Subject", "Author", 1000, patches, 2, "", "", None, 1,
                 None, false, None, None,
             )
             .await
             .unwrap()
             .expect("patchset");
-        let mut review_ids = Vec::new();
-        for part in 1..=2 {
-            let msg = format!("tc_pages_p{part}");
+        let mut patch_ids = Vec::new();
+        for part in 1..=patches {
+            let msg = format!("{root}_p{part}");
             db.create_message(
                 &msg, thread_id, None, "Author", "Subject", 1000, "Body", "", "", None, None,
             )
             .await
             .unwrap();
-            let p_id = db.create_patch(ps_id, &msg, part, "diff").await.unwrap();
-            let review_id = db
-                .create_review(ps_id, Some(p_id), "mock", "mock", None, None, Some(1))
+            patch_ids.push(db.create_patch(ps_id, &msg, part, "diff").await.unwrap());
+        }
+        (ps_id, patch_ids)
+    }
+
+    /// A new review row of a patch, for this attempt of the retry loop.
+    async fn review_attempt(db: &Database, ps_id: i64, p_id: i64, attempt: Option<u32>) -> i64 {
+        db.create_review(ps_id, Some(p_id), "mock", "mock", None, None, attempt)
+            .await
+            .unwrap()
+    }
+
+    /// Records this many git_grep calls aimed at `repo`, or at the code under
+    /// review when it is None.
+    async fn record_calls_to(db: &Database, review_id: i64, repo: Option<&str>, calls: usize) {
+        for n in 0..calls {
+            let mut args = serde_json::json!({ "pattern": format!("p{n}") });
+            if let Some(repo) = repo {
+                args["repo"] = repo.into();
+            }
+            record_call(db, review_id, "git_grep", Some(&args.to_string())).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn patch_tool_calls_sum_the_current_run() {
+        let db = setup_db().await;
+        let (ps_id, patches) = patchset_with_patches(&db, "tc_runs", 4).await;
+        let (retried, unknown, kept, unreviewed) = (patches[0], patches[1], patches[2], patches[3]);
+
+        // An earlier run, since rerun, which must not add to the current one.
+        let earlier = review_attempt(&db, ps_id, retried, Some(1)).await;
+        record_calls_to(&db, earlier, None, 9).await;
+        db.complete_review(earlier, "Reviewed", "ok", None, None, None, None)
+            .await
+            .unwrap();
+        // The current run: three attempts with 40, 0 and 7 calls, the first
+        // with kernel attached and the last with rdma-core as well.
+        let calls = [
+            (40, &["kernel"][..]),
+            (0, &[]),
+            (7, &["rdma-core", "kernel"]),
+        ];
+        for (attempt, (count, attached)) in (1..).zip(calls) {
+            let review = review_attempt(&db, ps_id, retried, Some(attempt)).await;
+            db.set_review_reference_repos(review, &reference_record(attached, &[]))
                 .await
                 .unwrap();
-            review_ids.push(review_id);
+            record_calls_to(&db, review, Some("kernel"), count / 2).await;
+            record_calls_to(&db, review, None, count - count / 2).await;
+        }
+
+        // A run in which an attempt that made calls had no record.
+        let first = review_attempt(&db, ps_id, unknown, Some(1)).await;
+        record_calls_to(&db, first, Some("kernel"), 2).await;
+        let second = review_attempt(&db, ps_id, unknown, Some(2)).await;
+        db.set_review_reference_repos(second, &reference_record(&["kernel"], &[]))
+            .await
+            .unwrap();
+        record_calls_to(&db, second, Some("kernel"), 1).await;
+
+        // A run in which only an attempt with no calls had no record.
+        let first = review_attempt(&db, ps_id, kept, Some(1)).await;
+        db.set_review_reference_repos(first, &reference_record(&["kernel"], &[]))
+            .await
+            .unwrap();
+        record_calls_to(&db, first, Some("kernel"), 3).await;
+        review_attempt(&db, ps_id, kept, Some(2)).await;
+
+        let all = db
+            .patch_tool_calls(ps_id, &[retried, unknown, kept, unreviewed, retried])
+            .await
+            .unwrap();
+        let summary: Vec<_> = all
+            .iter()
+            .map(|p| (p.patch_id, p.attempts, p.counts.total))
+            .collect();
+        // Each patch once, in the order asked, and none for a patch with no
+        // review row.
+        assert_eq!(summary, [(retried, 3, 47), (unknown, 2, 3), (kept, 2, 3)]);
+        assert_eq!(
+            reference_split(&all[0].counts),
+            Some((vec![("kernel", 23), ("rdma-core", 0)], 0))
+        );
+        assert_eq!(all[1].counts.by_reference, None);
+        assert_eq!(
+            reference_split(&all[2].counts),
+            Some((vec![("kernel", 3)], 0))
+        );
+
+        // Only the patches asked for are read.
+        let one = db.patch_tool_calls(ps_id, &[unknown]).await.unwrap();
+        assert_eq!(one, all[1..2]);
+        assert!(db.patch_tool_calls(ps_id, &[]).await.unwrap().is_empty());
+        assert!(
+            db.patch_tool_calls(ps_id + 1, &[retried])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn review_payloads_carry_tool_calls() {
+        let db = setup_db().await;
+        let (ps_id, patch_ids) = patchset_with_patches(&db, "tc_pages", 2).await;
+        let mut review_ids = Vec::new();
+        for p_id in patch_ids {
+            review_ids.push(review_attempt(&db, ps_id, p_id, Some(1)).await);
         }
         let (first, second) = (review_ids[0], review_ids[1]);
         db.set_review_reference_repos(first, &reference_record(&["kernel"], &[]))
@@ -25414,7 +25606,7 @@ mod tests {
         let db = setup_db().await;
         let (ps_id, _, review_id) = reviewed_patchset(&db, "fields").await;
 
-        db.set_review_attempt(review_id, 2).await.unwrap();
+        db.set_review_attempt(review_id, Some(2)).await.unwrap();
         db.set_review_duration(review_id, 321).await.unwrap();
         db.set_review_stage_failures(
             review_id,
@@ -25910,7 +26102,7 @@ mod tests {
         assert!(has_activity_table(&db).await);
         let review = db.get_review_details(review_id).await.unwrap().unwrap();
         assert!(review["stage_durations"].is_null(), "{review}");
-        db.set_review_attempt(review_id, 2).await.unwrap();
+        db.set_review_attempt(review_id, Some(2)).await.unwrap();
 
         // A database from the build that introduced these columns has some or
         // all of them already, at an earlier version. The migration adds only

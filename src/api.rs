@@ -479,6 +479,11 @@ pub struct PatchsetActivityResponse {
     /// own. Defaulted so a client can still read an older daemon's answer.
     #[serde(default)]
     pub finished: bool,
+    /// Tool calls of each patch named by `entries`, over its current run (see
+    /// [`review_runs`]). A patch that has no review row yet has no entry.
+    /// Defaulted so a client can still read an older daemon's answer.
+    #[serde(default)]
+    pub tool_calls: Vec<PatchToolCalls>,
 }
 
 /// Query for `/api/patchset/activity`.
@@ -555,6 +560,112 @@ impl ToolCallCounts {
             (false, false) => format!("({references}; {unattached})"),
         }
     }
+
+    /// The counts of several review attempts taken together, such as the
+    /// attempts of one run.
+    ///
+    /// Totals add up. The split is known only when every attempt that made a
+    /// call had a known split, because a call of an attempt whose references
+    /// are unknown may have gone to any of them, and a summed zero would
+    /// claim it did not. References merge by name, in the order each name
+    /// first appears, and calls to unattached repositories add up.
+    ///
+    /// Attempts that made no call add nothing to any count and do not decide
+    /// whether the split is known. Only when no attempt made a call do they
+    /// decide it, by the same rule, so that a run that has not made its first
+    /// call yet still says which references it has, as its single attempt
+    /// would. With nothing to sum the result is zero with an unknown split.
+    pub fn sum<'a>(counts: impl IntoIterator<Item = &'a ToolCallCounts>) -> ToolCallCounts {
+        let counts: Vec<&ToolCallCounts> = counts.into_iter().collect();
+        let total = counts
+            .iter()
+            .fold(0u64, |sum, c| sum.saturating_add(c.total));
+        let calling: Vec<&ToolCallCounts> =
+            counts.iter().copied().filter(|c| c.total > 0).collect();
+        let deciding = if calling.is_empty() {
+            &counts
+        } else {
+            &calling
+        };
+        let by_reference = if deciding.is_empty() {
+            None
+        } else {
+            deciding
+                .iter()
+                .map(|c| c.by_reference.as_ref())
+                .collect::<Option<Vec<&ReferenceSplit>>>()
+                .map(|splits| ReferenceSplit::merge(&splits))
+        };
+        ToolCallCounts {
+            total,
+            by_reference,
+        }
+    }
+}
+
+impl ReferenceSplit {
+    /// Several splits taken together: references merged by name, in the
+    /// order each name first appears, and unattached calls added up.
+    fn merge(splits: &[&ReferenceSplit]) -> ReferenceSplit {
+        let mut merged = ReferenceSplit::default();
+        for split in splits {
+            merged.unattached = merged.unattached.saturating_add(split.unattached);
+            for reference in &split.references {
+                match merged
+                    .references
+                    .iter_mut()
+                    .find(|r| r.name == reference.name)
+                {
+                    Some(r) => r.calls = r.calls.saturating_add(reference.calls),
+                    None => merged.references.push(reference.clone()),
+                }
+            }
+        }
+        merged
+    }
+}
+
+/// One patch's tool calls on the activity poll, summed over its current run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PatchToolCalls {
+    pub patch_id: i64,
+    /// Review rows in the patch's current run; more than one when the run
+    /// was retried.
+    pub attempts: u32,
+    #[serde(flatten)]
+    pub counts: ToolCallCounts,
+}
+
+/// One review row of a patch, as far as telling its runs apart needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewAttempt {
+    pub review_id: i64,
+    /// The retry the row was for, or `None` for a row that is no attempt of
+    /// the retry loop: a Skipped patch's, or one written before attempts
+    /// were recorded.
+    pub attempt: Option<u32>,
+}
+
+/// One patch's review rows split into runs, each run its review ids in id
+/// order, the runs oldest first.
+///
+/// A run is one pass of the daemon's retry loop over the patch. A row for
+/// attempt 1, or with no attempt, starts a new run, and a row for a later
+/// attempt continues the run before it. Rows are taken in id order whatever
+/// order they are given in, because ids are the order the rows were created
+/// in and a retry's row is always created after the row it retries.
+pub fn review_runs(rows: &[ReviewAttempt]) -> Vec<Vec<i64>> {
+    let mut rows = rows.to_vec();
+    rows.sort_by_key(|row| row.review_id);
+    let mut runs: Vec<Vec<i64>> = Vec::new();
+    for row in rows {
+        let continues = row.attempt.is_some_and(|attempt| attempt > 1);
+        match runs.last_mut() {
+            Some(run) if continues => run.push(row.review_id),
+            _ => runs.push(vec![row.review_id]),
+        }
+    }
+    runs
 }
 
 #[cfg(test)]
@@ -735,5 +846,149 @@ mod tests {
         let back: ToolCallCounts =
             serde_json::from_value(serde_json::to_value(&wire).unwrap()).unwrap();
         assert_eq!(back, wire);
+    }
+
+    /// An older daemon sends no tool calls on the activity poll; its answer
+    /// still reads, with none. A newer one sends each patch's counts flat
+    /// beside its patch id and attempts, and they read back as sent.
+    #[test]
+    fn activity_tool_calls_are_optional_and_flat() {
+        let older: PatchsetActivityResponse =
+            serde_json::from_value(serde_json::json!({"live": true, "entries": []})).unwrap();
+        assert!(older.tool_calls.is_empty());
+
+        let patch = PatchToolCalls {
+            patch_id: 20,
+            attempts: 2,
+            counts: counts(47, &[("kernel", 3)], 0),
+        };
+        let wire = serde_json::to_value(&patch).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "patch_id": 20,
+                "attempts": 2,
+                "total": 47,
+                "by_reference": {"references": [{"name": "kernel", "calls": 3}], "unattached": 0},
+            })
+        );
+        let back: PatchToolCalls = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, patch);
+
+        // A patch whose split is unknown may be sent without one.
+        let unknown: PatchToolCalls =
+            serde_json::from_value(serde_json::json!({"patch_id": 21, "attempts": 1, "total": 5}))
+                .unwrap();
+        assert_eq!(unknown.counts.by_reference, None);
+    }
+
+    /// Review rows of one patch, as (id, attempt) pairs.
+    fn attempts(rows: &[(i64, Option<u32>)]) -> Vec<ReviewAttempt> {
+        rows.iter()
+            .map(|&(review_id, attempt)| ReviewAttempt { review_id, attempt })
+            .collect()
+    }
+
+    #[test]
+    fn review_runs_start_at_attempt_one_or_no_attempt() {
+        // One run retried three times.
+        assert_eq!(
+            review_runs(&attempts(&[
+                (1, Some(1)),
+                (2, Some(2)),
+                (3, Some(3)),
+                (4, Some(4))
+            ])),
+            vec![vec![1, 2, 3, 4]]
+        );
+        // Two runs of one attempt each: a rerun.
+        assert_eq!(
+            review_runs(&attempts(&[(1, Some(1)), (2, Some(1))])),
+            vec![vec![1], vec![2]]
+        );
+        // A row with no attempt starts a run that its retry continues.
+        assert_eq!(
+            review_runs(&attempts(&[(1, None), (2, Some(2))])),
+            vec![vec![1, 2]]
+        );
+        // A rerun after a retried run: the latest run is the last row alone,
+        // even before it has made a call.
+        assert_eq!(
+            review_runs(&attempts(&[(1, Some(1)), (2, Some(2)), (3, Some(1))])),
+            vec![vec![1, 2], vec![3]]
+        );
+        // Two rows with no attempt are two runs.
+        assert_eq!(
+            review_runs(&attempts(&[(1, None), (2, None)])),
+            vec![vec![1], vec![2]]
+        );
+    }
+
+    #[test]
+    fn review_runs_follow_id_order_and_survive_odd_rows() {
+        // Given out of order, the rows are still read in the order they were
+        // created in.
+        assert_eq!(
+            review_runs(&attempts(&[(3, Some(1)), (2, Some(2)), (1, Some(1))])),
+            vec![vec![1, 2], vec![3]]
+        );
+        // A retry whose earlier rows are gone (a rerun deletes failed rows
+        // that never reached the model) is a run of its own.
+        assert_eq!(review_runs(&attempts(&[(5, Some(2))])), vec![vec![5]]);
+        assert!(review_runs(&[]).is_empty());
+    }
+
+    fn unknown(total: u64) -> ToolCallCounts {
+        ToolCallCounts {
+            total,
+            by_reference: None,
+        }
+    }
+
+    #[test]
+    fn summed_counts_add_up_and_merge_references_by_name() {
+        // Three attempts with 40, 0 and 7 calls.
+        let run = [
+            counts(40, &[("kernel", 10)], 1),
+            counts(0, &[("kernel", 0)], 0),
+            counts(7, &[("kernel", 2)], 0),
+        ];
+        assert_eq!(ToolCallCounts::sum(&run), counts(47, &[("kernel", 12)], 1));
+
+        // Attempts with different references merge by name, in the order
+        // each name first appears.
+        let run = [
+            counts(5, &[("kernel", 3)], 0),
+            counts(6, &[("rdma-core", 1), ("kernel", 2)], 2),
+        ];
+        assert_eq!(
+            ToolCallCounts::sum(&run),
+            counts(11, &[("kernel", 5), ("rdma-core", 1)], 2)
+        );
+    }
+
+    #[test]
+    fn a_summed_split_is_unknown_when_an_attempt_with_calls_had_none() {
+        // An attempt that made calls without a known split may have read any
+        // reference, so the run's split is unknown.
+        let run = [counts(5, &[("kernel", 3)], 0), unknown(4)];
+        assert_eq!(ToolCallCounts::sum(&run), unknown(9));
+
+        // An attempt with no split that made no call changes nothing.
+        let run = [counts(5, &[("kernel", 3)], 0), unknown(0)];
+        assert_eq!(ToolCallCounts::sum(&run), counts(5, &[("kernel", 3)], 0));
+    }
+
+    #[test]
+    fn a_summed_run_without_calls_keeps_its_references() {
+        // A run that has not made its first call reads as its attempt does.
+        let fresh = counts(0, &[("kernel", 0)], 0);
+        assert_eq!(ToolCallCounts::sum([&fresh]), fresh);
+        assert_eq!(
+            ToolCallCounts::sum(&[fresh.clone(), unknown(0)]),
+            unknown(0)
+        );
+        // Nothing to sum is nothing known.
+        assert_eq!(ToolCallCounts::sum(&[]), unknown(0));
     }
 }

@@ -338,14 +338,18 @@ pub fn build_router(
         .route("/api/review_log", get(get_review_log))
         // Read-only and public, like the patchset and review routes beside
         // them. They carry progress metadata only -- stage and tool names, turn
-        // counts, redacted remote URLs, one-line failure reasons with any
-        // quoted model output removed (`activity::public_reason`) -- and no
+        // counts, tool call counts per patch with the names of the references
+        // attached to it, redacted remote URLs, one-line failure reasons with
+        // any quoted model output removed (`activity::public_reason`) -- and no
         // review text, so they need no capability, embargoed patchsets
-        // included. That has to be revisited if live conversation text is ever
-        // added to these payloads. The live conversation itself is kept out by
-        // `activity::progress_update`, which discards every `LogEntry`, so it
-        // never reaches the registry these read; it is served as `live_log`
-        // from the review routes above instead.
+        // included. Reference names come from the operator's configuration,
+        // and which are attached follows from the patch's file list, which
+        // the patchset page already shows. That has to be revisited if live
+        // conversation text is ever added to these payloads. The live
+        // conversation itself is kept out by `activity::progress_update`,
+        // which discards every `LogEntry`, so it never reaches the
+        // registry these read; it is served as `live_log` from the review
+        // routes above instead.
         .route("/api/activity", get(get_activity))
         .route("/api/patchset/activity", get(get_patchset_activity))
         .route("/api/stats", get(get_stats))
@@ -1283,11 +1287,48 @@ async fn get_patchset_activity(
     }
 
     crate::activity::sort_for_display(&mut entries, project);
+    let tool_calls = activity_tool_calls(&state.db, query.id, &entries).await;
     Ok(Json(crate::api::PatchsetActivityResponse {
         live,
         entries,
         finished: !unfinished,
+        tool_calls,
     }))
+}
+
+/// Tool calls of each patch the activity entries name, over the patch's
+/// current run.
+///
+/// Only the patches with an entry are counted, because the counts sit on
+/// their stage tables and a patch with no entry has no table to show them
+/// on. With no entry nothing is read, so polling a finished patchset costs
+/// nothing more than before.
+///
+/// The counts are advisory: a database error is logged and gives none, so
+/// the stage tables they sit beside are still served.
+async fn activity_tool_calls(
+    db: &Database,
+    patchset_id: i64,
+    entries: &[crate::api::ActivityEntry],
+) -> Vec<crate::api::PatchToolCalls> {
+    let patch_ids: Vec<i64> = entries
+        .iter()
+        .filter_map(|e| e.patch_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if patch_ids.is_empty() {
+        return Vec::new();
+    }
+    db.patch_tool_calls(patchset_id, &patch_ids)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(
+                "Failed to count the tool calls of patchset {}: {}",
+                patchset_id, e
+            );
+            Vec::new()
+        })
 }
 
 /// Gives every review in a patchset payload the stage order and labels the
@@ -3527,6 +3568,150 @@ mod tests {
         // Last: a cancelled patchset never leaves that status.
         db.update_patchset_status(ps, "Cancelled").await.unwrap();
         assert!(patchset_activity(addr, ps).await.finished);
+    }
+
+    /// A patchset of two patches, each with one review on its first attempt
+    /// and kernel attached, and each review with these calls to kernel and
+    /// to the code under review. Returns (patchset, patches).
+    async fn two_reviewed_patches(
+        db: &Database,
+        root: &str,
+        calls: [(usize, usize); 2],
+    ) -> (i64, [i64; 2]) {
+        let thread_id = db.create_thread(root, "Subject", 1000).await.unwrap();
+        let ps = db
+            .create_patchset(
+                thread_id, None, root, "Subject", "Author", 1000, 2, 2, "", "", None, 1, None,
+                false, None, None,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let record = serde_json::json!({
+            "attached": [{"name": "kernel", "kind": "kernel", "revision": "v6.18",
+                          "commit": "0".repeat(40), "why": "always"}],
+            "dormant": [],
+        })
+        .to_string();
+        let mut patches = [0; 2];
+        for (index, (kernel, review_tree)) in calls.into_iter().enumerate() {
+            let part = u32::try_from(index).unwrap() + 1;
+            let msg = format!("{root}_p{part}");
+            db.create_message(
+                &msg, thread_id, None, "Author", "Subject", 1000, "Body", "", "", None, None,
+            )
+            .await
+            .unwrap();
+            patches[index] = db.create_patch(ps, &msg, part, "diff").await.unwrap();
+            let review = db
+                .create_review(
+                    ps,
+                    Some(patches[index]),
+                    "mock",
+                    "mock",
+                    None,
+                    None,
+                    Some(1),
+                )
+                .await
+                .unwrap();
+            db.set_review_reference_repos(review, &record)
+                .await
+                .unwrap();
+            let kernel_calls = std::iter::repeat_n(r#"{"pattern":"k","repo":"kernel"}"#, kernel);
+            let review_calls = std::iter::repeat_n(r#"{"pattern":"r"}"#, review_tree);
+            for arguments in kernel_calls.chain(review_calls) {
+                db.create_tool_usage(crate::db::ToolUsage {
+                    review_id: review,
+                    provider: "mock".to_string(),
+                    model: "mock".to_string(),
+                    tool_name: "git_grep".to_string(),
+                    arguments: Some(arguments.to_string()),
+                    output_length: 0,
+                })
+                .await
+                .unwrap();
+            }
+        }
+        (ps, patches)
+    }
+
+    /// The poll carries the tool calls of the patches its entries name, from
+    /// the database, and of no other patch.
+    #[tokio::test]
+    async fn test_patchset_activity_carries_tool_calls_of_patches_with_entries() {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase};
+
+        let activity = ActivityRegistry::new();
+        let (addr, db) = serve_activity(activity.clone()).await;
+        let (ps, [first, _]) = two_reviewed_patches(&db, "tc_live", [(3, 4), (5, 6)]).await;
+        db.update_patchset_status(ps, "In Review").await.unwrap();
+        activity.update(
+            ActivityKey::PatchsetStage {
+                patchset_id: ps,
+                patch_id: first,
+                stage: "goal".to_string(),
+            },
+            Phase::Queued,
+        );
+
+        let resp = patchset_activity(addr, ps).await;
+        assert!(resp.live);
+        assert_eq!(
+            resp.tool_calls,
+            [crate::api::PatchToolCalls {
+                patch_id: first,
+                attempts: 1,
+                counts: crate::api::ToolCallCounts {
+                    total: 7,
+                    by_reference: Some(crate::api::ReferenceSplit {
+                        references: vec![crate::api::ReferenceCalls {
+                            name: "kernel".to_string(),
+                            calls: 3,
+                        }],
+                        unattached: 0,
+                    }),
+                },
+            }]
+        );
+    }
+
+    /// With no entry there is no stage table to put counts on, so none are
+    /// sent, however many calls the reviews made.
+    #[tokio::test]
+    async fn test_patchset_activity_without_entries_carries_no_tool_calls() {
+        let (addr, db) = serve_activity(crate::activity::ActivityRegistry::new()).await;
+        let (ps, _) = two_reviewed_patches(&db, "tc_idle", [(1, 2), (3, 4)]).await;
+        db.update_patchset_status(ps, "Reviewed").await.unwrap();
+
+        let resp = patchset_activity(addr, ps).await;
+        assert!(resp.entries.is_empty());
+        assert!(resp.tool_calls.is_empty());
+    }
+
+    /// The counts are advisory: when they cannot be read the stage table is
+    /// still served, with no counts.
+    #[tokio::test]
+    async fn test_patchset_activity_survives_a_failed_tool_call_count() {
+        use crate::activity::{ActivityKey, ActivityRegistry, Phase};
+
+        let activity = ActivityRegistry::new();
+        let (addr, db) = serve_activity(activity.clone()).await;
+        let (ps, [first, _]) = two_reviewed_patches(&db, "tc_fail", [(1, 1), (1, 1)]).await;
+        activity.update(
+            ActivityKey::PatchsetStage {
+                patchset_id: ps,
+                patch_id: first,
+                stage: "goal".to_string(),
+            },
+            Phase::Queued,
+        );
+        // Without the table the count fails.
+        db.conn.execute("DROP TABLE tool_usages", ()).await.unwrap();
+
+        let resp = patchset_activity(addr, ps).await;
+        assert_eq!(resp.entries.len(), 1);
+        assert!(resp.tool_calls.is_empty());
     }
 
     /// Recorded stage rows carry the order and label live entries carry, from
