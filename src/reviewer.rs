@@ -1845,25 +1845,9 @@ impl Reviewer {
                 patchset_id, index, patch_id
             );
 
-            let review_id = if let Some(id) = ctx
-                .db
-                .take_pending_review_id(patchset_id, Some(patch_id))
-                .await?
-            {
-                id
-            } else {
-                ctx.db
-                    .create_review(
-                        patchset_id,
-                        Some(patch_id),
-                        &ctx.settings.ai.provider,
-                        &ctx.settings.ai.model,
-                        baseline_id,
-                        prompts_hash,
-                        None,
-                    )
-                    .await?
-            };
+            let review_id =
+                Self::skipped_review_row(ctx, patchset_id, patch_id, baseline_id, prompts_hash)
+                    .await?;
 
             let _ = ctx
                 .db
@@ -1996,6 +1980,49 @@ impl Reviewer {
         }
     }
 
+    /// Gives a patch skipped for touching only ignored files its review row,
+    /// and returns the row's id.
+    ///
+    /// A Skipped row is not an attempt of the retry loop, so it carries no
+    /// attempt number. A new row gets none from its INSERT. A row an
+    /// interrupted run left Pending still carries that run's number, which
+    /// would make `crate::api::review_runs` count this result as part of the
+    /// interrupted run, so the number is cleared. A failed clear is only
+    /// logged, because the attempt is a statistic and must not stop the
+    /// patch from being recorded as skipped.
+    async fn skipped_review_row(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        patch_id: i64,
+        baseline_id: Option<i64>,
+        prompts_hash: Option<&str>,
+    ) -> Result<i64> {
+        if let Some(id) = ctx
+            .db
+            .take_pending_review_id(patchset_id, Some(patch_id))
+            .await?
+        {
+            if let Err(e) = ctx.db.set_review_attempt(id, None).await {
+                warn!(
+                    "Failed to clear the attempt of skipped review {}: {}",
+                    id, e
+                );
+            }
+            return Ok(id);
+        }
+        ctx.db
+            .create_review(
+                patchset_id,
+                Some(patch_id),
+                &ctx.settings.ai.provider,
+                &ctx.settings.ai.model,
+                baseline_id,
+                prompts_hash,
+                None,
+            )
+            .await
+    }
+
     /// Gives one attempt its review row, stamped with the attempt number and
     /// set In Review, and returns the row's id.
     ///
@@ -2014,7 +2041,7 @@ impl Reviewer {
     ) -> Result<i64> {
         let review_id = match reused_review_id {
             Some(id) => {
-                if let Err(e) = ctx.db.set_review_attempt(id, attempt).await {
+                if let Err(e) = ctx.db.set_review_attempt(id, Some(attempt)).await {
                     warn!(
                         "Failed to stamp review {} as attempt {}: {}",
                         id, attempt, e
@@ -6559,6 +6586,50 @@ fi
             // So we should find at least one review.
         }
 
+        Ok(())
+    }
+
+    /// A Pending row left by an interrupted run's second attempt is reused for
+    /// the Skipped result without its attempt number, so the result starts a
+    /// run of its own rather than continuing the interrupted one.
+    #[tokio::test]
+    async fn a_reused_row_for_a_skipped_patch_drops_its_attempt() -> Result<()> {
+        let mut settings = Settings::new()?;
+        settings.review.ignore_files = vec!["ignored.txt".to_string()];
+        let harness = SkipHarness::new(settings).await?;
+        let db = harness.ctx.db.clone();
+        let diff = "diff --git a/ignored.txt b/ignored.txt\nindex ...";
+        let p_id = harness.add_patch(1, diff).await?;
+        let left_pending = db
+            .create_review(
+                harness.patchset_id,
+                Some(p_id),
+                "p",
+                "m",
+                None,
+                None,
+                Some(2),
+            )
+            .await?;
+
+        harness.review(p_id, 1, diff).await?;
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT id, status, attempt FROM reviews WHERE patch_id = ?",
+                libsql::params![p_id],
+            )
+            .await?;
+        let row = rows.next().await?.ok_or_else(|| anyhow!("no review row"))?;
+        assert_eq!(
+            row.get::<i64>(0)?,
+            left_pending,
+            "the Pending row is reused"
+        );
+        assert_eq!(row.get::<String>(1)?, "Skipped");
+        assert_eq!(row.get::<Option<i64>>(2)?, None);
+        assert!(rows.next().await?.is_none(), "no second row is created");
         Ok(())
     }
 
