@@ -1188,6 +1188,62 @@ fn add_tool_calls(
     }
 }
 
+/// The retry a review row was for, from its stored `attempt` column.
+///
+/// An attempt that does not fit a `u32` cannot have been written by the
+/// retry loop, and reads as no attempt.
+#[cfg(feature = "server")]
+fn attempt_from_column(raw: Option<i64>) -> Option<u32> {
+    raw.and_then(|attempt| u32::try_from(attempt).ok())
+}
+
+/// One review row of a patchset as a rerun sees it: its patch, the attempt
+/// it was for, and whether the rerun deletes it.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy)]
+struct RerunReviewRow {
+    patch_id: Option<i64>,
+    review: crate::api::ReviewAttempt,
+    deleted: bool,
+}
+
+/// The new attempt of each review row that a rerun keeps and whose attempt
+/// changes, as (review id, attempt).
+///
+/// Readers split a patch's rows into runs with [`crate::api::review_runs`],
+/// where a row for a later attempt continues the run before it. Deleting a
+/// run's first or a middle attempt would leave a later attempt continuing
+/// whatever older run precedes it, so the surviving rows of each run, split
+/// before the deletion, are numbered again from 1 in id order. That keeps
+/// every run's boundary where it was. A row with no attempt keeps none,
+/// because such a row only ever starts a run, which it still does.
+#[cfg(feature = "server")]
+fn renumbered_attempts(rows: &[RerunReviewRow]) -> Vec<(i64, u32)> {
+    let mut by_patch: std::collections::BTreeMap<Option<i64>, Vec<crate::api::ReviewAttempt>> =
+        std::collections::BTreeMap::new();
+    for row in rows {
+        by_patch.entry(row.patch_id).or_default().push(row.review);
+    }
+    let by_id: std::collections::HashMap<i64, &RerunReviewRow> =
+        rows.iter().map(|row| (row.review.review_id, row)).collect();
+    let mut renumbered = Vec::new();
+    for run in by_patch
+        .values()
+        .flat_map(|rows| crate::api::review_runs(rows))
+    {
+        let survivors = run
+            .iter()
+            .filter_map(|id| by_id.get(id))
+            .filter(|row| !row.deleted);
+        for (row, position) in survivors.zip(1u32..) {
+            if row.review.attempt.is_some_and(|old| old != position) {
+                renumbered.push((row.review.review_id, position));
+            }
+        }
+    }
+    renumbered
+}
+
 /// Renders the summary of a bug as it appears embedded in a patchset or review
 /// payload.
 ///
@@ -2818,10 +2874,7 @@ impl Database {
     }
 
     /// The review rows of each of these patches of a patchset, by patch, each
-    /// with the attempt it was for.
-    ///
-    /// An attempt that does not fit a `u32` cannot have been written by the
-    /// retry loop, and reads as no attempt.
+    /// with the attempt it was for, as [`attempt_from_column`] reads it.
     async fn patch_review_attempts(
         &self,
         patchset_id: i64,
@@ -2839,9 +2892,7 @@ impl Database {
         let mut by_patch: std::collections::HashMap<i64, Vec<crate::api::ReviewAttempt>> =
             std::collections::HashMap::new();
         while let Some(row) = rows.next().await? {
-            let attempt = row
-                .get::<Option<i64>>(2)?
-                .and_then(|a| u32::try_from(a).ok());
+            let attempt = attempt_from_column(row.get(2)?);
             by_patch
                 .entry(row.get::<i64>(1)?)
                 .or_default()
@@ -9663,33 +9714,66 @@ impl Database {
         // with them.
         self.clear_held_outcomes(id).await?;
 
-        // 5. Delete associated tool usages and findings for failed reviews that block retrying
-        self.conn
-            .execute(
-                "DELETE FROM tool_usages WHERE review_id IN (
-                    SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
-                )",
-                libsql::params![id],
+        // 5. Failed reviews that never reached the model (infra failures)
+        // block retrying, so they go.
+        self.delete_unreached_failed_reviews(id).await
+    }
+
+    /// Deletes a patchset's failed reviews that never reached the model,
+    /// with their tool usages and findings, and numbers the attempts of the
+    /// reviews left again with [`renumbered_attempts`], so that no surviving
+    /// retry joins an earlier run.
+    ///
+    /// One immediate transaction, so the rows read are the rows deleted and
+    /// renumbered, and a failure part way leaves no retry orphaned.
+    async fn delete_unreached_failed_reviews(&self, patchset_id: i64) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(libsql::TransactionBehavior::Immediate)
+            .await?;
+        let mut rows = Vec::new();
+        let mut cursor = tx
+            .query(
+                "SELECT id, patch_id, attempt,
+                        status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
+                 FROM reviews WHERE patchset_id = ?",
+                libsql::params![patchset_id],
             )
             .await?;
+        while let Some(row) = cursor.next().await? {
+            rows.push(RerunReviewRow {
+                patch_id: row.get(1)?,
+                review: crate::api::ReviewAttempt {
+                    review_id: row.get(0)?,
+                    attempt: attempt_from_column(row.get(2)?),
+                },
+                deleted: row.get::<i64>(3)? != 0,
+            });
+        }
+        drop(cursor);
 
-        self.conn
-            .execute(
-                "DELETE FROM findings WHERE review_id IN (
-                    SELECT id FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL
-                )",
-                libsql::params![id],
+        let deleted: Vec<i64> = rows
+            .iter()
+            .filter(|row| row.deleted)
+            .map(|row| row.review.review_id)
+            .collect();
+        let deleted = serde_json::to_string(&deleted)?;
+        for statement in [
+            "DELETE FROM tool_usages WHERE review_id IN (SELECT value FROM json_each(?))",
+            "DELETE FROM findings WHERE review_id IN (SELECT value FROM json_each(?))",
+            "DELETE FROM reviews WHERE id IN (SELECT value FROM json_each(?))",
+        ] {
+            tx.execute(statement, libsql::params![deleted.as_str()])
+                .await?;
+        }
+        for (review_id, attempt) in renumbered_attempts(&rows) {
+            tx.execute(
+                "UPDATE reviews SET attempt = ? WHERE id = ?",
+                libsql::params![attempt, review_id],
             )
             .await?;
-
-        // 6. Delete failed reviews that block retrying (infra failures)
-        self.conn
-            .execute(
-                "DELETE FROM reviews WHERE patchset_id = ? AND status IN ('Failed', 'FailedToApply') AND interaction_id IS NULL",
-                libsql::params![id],
-            )
-            .await?;
-
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -22891,6 +22975,142 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Ends a review with this status, with an interaction when it reached
+    /// the model.
+    async fn end_review(db: &Database, review_id: i64, status: &str, interaction: Option<&str>) {
+        if let Some(id) = interaction {
+            db.create_ai_interaction(AiInteractionParams {
+                id,
+                parent_id: None,
+                workflow_id: None,
+                provider: "mock",
+                model: "mock",
+                input: "",
+                output: "",
+                tokens_in: 0,
+                tokens_out: 0,
+                tokens_cached: 0,
+            })
+            .await
+            .unwrap();
+        }
+        db.complete_review(review_id, status, "done", None, interaction, None, None)
+            .await
+            .unwrap();
+    }
+
+    /// Whether a review row still exists.
+    async fn review_exists(db: &Database, review_id: i64) -> bool {
+        db.conn
+            .query(
+                "SELECT 1 FROM reviews WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .is_some()
+    }
+
+    /// Each patch's (id, attempts, total calls) over its current run.
+    async fn current_runs(db: &Database, ps_id: i64, patches: &[i64]) -> Vec<(i64, u32, u64)> {
+        db.patch_tool_calls(ps_id, patches)
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| (p.patch_id, p.attempts, p.counts.total))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn rerun_keeps_a_surviving_retry_out_of_an_earlier_run() {
+        let db = setup_db().await;
+        let (ps_id, patches) = patchset_with_patches(&db, "rerun_runs", 1).await;
+        let patch = patches[0];
+
+        // An earlier run, finished.
+        let earlier = review_attempt(&db, ps_id, patch, Some(1)).await;
+        record_calls_to(&db, earlier, None, 100).await;
+        end_review(&db, earlier, "Reviewed", Some("int_earlier")).await;
+        // The current run: a first attempt that never reached the model, then
+        // a retry that did.
+        let unreached = review_attempt(&db, ps_id, patch, Some(1)).await;
+        end_review(&db, unreached, "Failed", None).await;
+        let retry = review_attempt(&db, ps_id, patch, Some(2)).await;
+        record_calls_to(&db, retry, None, 7).await;
+        end_review(&db, retry, "Reviewed", Some("int_retry")).await;
+        assert_eq!(current_runs(&db, ps_id, &[patch]).await, [(patch, 2, 7)]);
+
+        db.rerun_patchset(ps_id).await.unwrap();
+
+        // The retry is the first attempt of its run now, so it does not
+        // continue the earlier run and the earlier run's calls stay out.
+        assert!(!review_exists(&db, unreached).await);
+        assert_eq!(current_runs(&db, ps_id, &[patch]).await, [(patch, 1, 7)]);
+        assert_eq!(stored_attempt(&db, retry).await, Some(1));
+        assert_eq!(stored_attempt(&db, earlier).await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn rerun_closes_the_gap_of_a_deleted_middle_attempt() {
+        let db = setup_db().await;
+        let (ps_id, patches) = patchset_with_patches(&db, "rerun_middle", 1).await;
+        let patch = patches[0];
+
+        let first = review_attempt(&db, ps_id, patch, Some(1)).await;
+        record_calls_to(&db, first, None, 4).await;
+        end_review(&db, first, "Failed", Some("int_first")).await;
+        let middle = review_attempt(&db, ps_id, patch, Some(2)).await;
+        end_review(&db, middle, "FailedToApply", None).await;
+        let last = review_attempt(&db, ps_id, patch, Some(3)).await;
+        record_calls_to(&db, last, None, 5).await;
+        end_review(&db, last, "Reviewed", Some("int_last")).await;
+
+        db.rerun_patchset(ps_id).await.unwrap();
+
+        assert!(!review_exists(&db, middle).await);
+        assert_eq!(stored_attempt(&db, first).await, Some(1));
+        assert_eq!(stored_attempt(&db, last).await, Some(2));
+        assert_eq!(current_runs(&db, ps_id, &[patch]).await, [(patch, 2, 9)]);
+    }
+
+    fn rerun_row(
+        review_id: i64,
+        patch_id: i64,
+        attempt: Option<u32>,
+        deleted: bool,
+    ) -> RerunReviewRow {
+        RerunReviewRow {
+            patch_id: Some(patch_id),
+            review: crate::api::ReviewAttempt { review_id, attempt },
+            deleted,
+        }
+    }
+
+    #[test]
+    fn renumbered_attempts_keep_each_patchs_runs_apart() {
+        let rows = [
+            // Patch 1: a run started by a row with no attempt, its middle
+            // retry deleted; the row with no attempt keeps none.
+            rerun_row(1, 1, None, false),
+            rerun_row(3, 1, Some(2), true),
+            rerun_row(5, 1, Some(3), false),
+            // Patch 2, interleaved by id: a run whose only attempt is
+            // deleted, then a run untouched by the rerun.
+            rerun_row(2, 2, Some(1), true),
+            rerun_row(4, 2, Some(1), false),
+            rerun_row(6, 2, Some(2), false),
+            // Patch 1 again: a run whose first attempt is deleted.
+            rerun_row(7, 1, Some(1), true),
+            rerun_row(8, 1, Some(2), false),
+            rerun_row(9, 1, Some(3), false),
+        ];
+        assert_eq!(renumbered_attempts(&rows), [(5, 2), (8, 1), (9, 2)]);
+        assert!(renumbered_attempts(&[]).is_empty());
     }
 
     #[tokio::test]
