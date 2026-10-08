@@ -68,6 +68,7 @@ const NAMES = ['escapeHtml', 'renderReviewReferences', 'renderReviewCard', 'getS
                'renderFindingsBadges', 'renderPatchsetListStatus', 'countNewFindings',
                'maxFindingCounts', 'maxOfRunsNote', 'patchSummaryStatus', 'renderStatCard', 'renderReviewStatCards',
                'reviewOutcomeColor',
+               'isCallCount', 'toolCallBreakdown', 'toolCallsText', 'toolCallsTitle', 'reviewToolCallsValue',
                'renderStageRow', 'stageTableParts', 'hostForPatch', 'paintStageProgress',
                'refreshActivity', 'startActivityPolling', 'stopActivityPolling',
                'renderInteractionLogEntries', 'formatJsonExpandable', 'formatFuncCallExpandable',
@@ -544,6 +545,118 @@ console.log('case 10: stage table heading');
     });
     check('a single stage just states its duration',
         one.includes('Stages (1 stage, 90s)'), one.slice(0, 400));
+}
+
+// ---- case 11: tool calls -----------------------------------------------------
+// How much looking a review did, and where. Every attached reference is named
+// once the review has made a call, a zero included, because "0 to kernel" on a
+// review that looked elsewhere is the reading the count exists for. With no
+// call, or no record of which references the review had, there is no clause.
+// A card counts its own attempt and says so on a retry.
+const KERNEL_AND_RDMA = { total: 350, by_reference: { references: [
+    { name: 'kernel', calls: 72 }, { name: 'rdma-core', calls: 0 }], unattached: 0 } };
+const split = (references, unattached = 0) => ({ references, unattached });
+
+function toolCallWordingChecks(fns, expect) {
+    const text = (counts, attempts) => fns.toolCallsText(counts, attempts);
+    expect('wording: one call is singular', text({ total: 1 }) === '1 tool call');
+    expect('wording: many calls are plural', text({ total: 350 }) === '350 tool calls');
+    expect('wording: every reference in order, zeros included',
+        text(KERNEL_AND_RDMA) === '350 tool calls (72 to kernel, 0 to rdma-core)');
+    const kernel = [{ name: 'kernel', calls: 72 }];
+    expect('wording: calls to unattached repositories are added',
+        fns.toolCallBreakdown({ total: 80, by_reference: split(kernel, 3) })
+            === ' (72 to kernel; 3 to unattached repositories)');
+    expect('wording: one call to an unattached repository is singular',
+        fns.toolCallBreakdown({ total: 80, by_reference: split(kernel, 1) })
+            === ' (72 to kernel; 1 to an unattached repository)');
+    expect('wording: no unattached clause at zero',
+        fns.toolCallBreakdown({ total: 80, by_reference: split(kernel, 0) }) === ' (72 to kernel)');
+    expect('wording: unattached calls with nothing attached',
+        fns.toolCallBreakdown({ total: 3, by_reference: split([], 3) }) === ' (3 to unattached repositories)');
+    expect('wording: nothing attached and nothing unattached gives no clause',
+        fns.toolCallBreakdown({ total: 3, by_reference: split([], 0) }) === '');
+    expect('wording: no call gives no clause, references or not',
+        text({ total: 0, by_reference: split([{ name: 'kernel', calls: 0 }]) }) === '0 tool calls');
+    expect('wording: an unknown split gives the total alone',
+        text({ total: 350, by_reference: null }) === '350 tool calls'
+        && text({ total: 350 }) === '350 tool calls');
+    expect('wording: a run of several attempts says so',
+        text({ total: 47 }, 3) === '47 tool calls over 3 attempts');
+    expect('wording: a run of one attempt does not',
+        text({ total: 47 }, 1) === '47 tool calls' && text({ total: 47 }) === '47 tool calls');
+    const evil = text({ total: 2, by_reference: split([{ name: '<script>x</script>', calls: 2 }]) });
+    expect('wording: a reference name is escaped',
+        !evil.includes('<script>') && evil.includes('2 to &lt;script&gt;x&lt;/script&gt;'));
+    const clauses = [text(KERNEL_AND_RDMA), fns.toolCallBreakdown({ total: 3, by_reference: split([], 3) }),
+                     fns.toolCallBreakdown({ total: 3, by_reference: split([], 1) }), fns.toolCallsTitle()];
+    expect('wording: nothing is called refused', clauses.every(c => !/refused/i.test(c)));
+}
+
+function toolCallMalformedChecks(fns, expect) {
+    const quiet = f => { try { return f(); } catch (e) { return `THREW ${e}`; } };
+    const bad = [null, undefined, 'three', { total: -1 }, { total: 1.5 }, { total: '3' }];
+    expect('malformed: bad counts render nothing',
+        bad.every(c => quiet(() => fns.toolCallsText(c, 1)) === ''
+            && quiet(() => fns.toolCallBreakdown(c)) === ''));
+    expect('malformed: references that are not a list give no clause',
+        quiet(() => fns.toolCallsText({ total: 4, by_reference: { references: 'kernel', unattached: 0 } }))
+            === '4 tool calls');
+    expect('malformed: an entry with no name or a bad count is skipped',
+        quiet(() => fns.toolCallBreakdown({ total: 4, by_reference: split([{ calls: 2 },
+            { name: 'kernel', calls: -1 }, null, { name: 'rdma-core', calls: 2 }]) })) === ' (2 to rdma-core)');
+}
+
+// The value of a card's "Tool calls:" line, or null when the card has none.
+const toolCallsLine = card => {
+    const m = /<strong>Tool calls:<\/strong>([^<]*)<\/div>/.exec(card);
+    return m ? m[1].trim() : null;
+};
+
+function toolCallCardChecks(fns, expect) {
+    const card = r => { try { return String(fns.renderReviewCard(r)); } catch (e) { return `THREW ${e}`; } };
+    const reviewed = card({ id: 1, status: 'Reviewed', patch_id: 10, tool_calls: KERNEL_AND_RDMA });
+    expect('card: shows the line', toolCallsLine(reviewed) === '350 (72 to kernel, 0 to rdma-core)');
+    expect('card: the line explains itself',
+        /title="([^"]*)">\s*<strong>Tool calls:/.exec(reviewed)?.[1] === fns.escapeHtml(fns.toolCallsTitle()));
+    const seven = { total: 7, by_reference: split([{ name: 'kernel', calls: 2 }]) };
+    expect('card: a retry counts its own attempt',
+        toolCallsLine(card({ id: 2, status: 'Failed', attempt: 3, tool_calls: seven }))
+            === '7 on this attempt (2 to kernel)');
+    expect('card: a first attempt carries no marker',
+        toolCallsLine(card({ id: 2, status: 'Failed', attempt: 1, tool_calls: seven })) === '7 (2 to kernel)'
+        && toolCallsLine(card({ id: 2, status: 'Failed', tool_calls: seven })) === '7 (2 to kernel)');
+    expect('card: no call gives no per-reference zero',
+        toolCallsLine(card({ id: 3, status: 'Failed', tool_calls:
+            { total: 0, by_reference: split([{ name: 'kernel', calls: 0 }]) } })) === '0');
+    expect('card: Partial and Failed cards show the line',
+        toolCallsLine(card({ id: 4, status: 'Partial', tool_calls: seven })) === '7 (2 to kernel)'
+        && toolCallsLine(card({ id: 4, status: 'Failed', tool_calls: seven })) === '7 (2 to kernel)');
+    expect('card: In Review and Cancelled cards do not',
+        !card({ id: 5, status: 'In Review', tool_calls: seven }).includes('Tool calls')
+        && !card({ id: 5, status: 'Cancelled', tool_calls: seven }).includes('Tool calls'));
+    expect('card: no counts from the daemon shows a dash',
+        toolCallsLine(card({ id: 6, status: 'Reviewed' })) === '—'
+        && toolCallsLine(card({ id: 6, status: 'Reviewed', tool_calls: null })) === '—');
+    const recorded = card({ id: 7, status: 'Reviewed', patch_id: 10, tool_calls: KERNEL_AND_RDMA,
+        stage_durations: [{ stage: 'goal', order: ORDER.goal, seconds: 60, turns: 2 }] });
+    const recordedSummary = /data-stage-recorded[\s\S]*?<summary[^>]*>([\s\S]*?)<\/summary>/.exec(recorded);
+    expect('card: the recorded stage table carries no tool-call text',
+        recordedSummary !== null && !/tool call|to kernel/.test(recordedSummary[1]));
+}
+
+function toolCallChecks(fns) {
+    const failed = [];
+    const expect = (name, cond) => { if (!cond) failed.push(name); };
+    for (const group of [toolCallWordingChecks, toolCallMalformedChecks, toolCallCardChecks]) {
+        try { group(fns, expect); } catch (e) { failed.push(`${group.name}: threw ${e}`); }
+    }
+    return failed;
+}
+console.log('case 11: tool calls');
+{
+    const toolCallFailures = toolCallChecks(ctx);
+    check('every tool-call check passes', toolCallFailures.length === 0, toolCallFailures.join(', '));
 }
 
 // ---- case 12: a failed review must not claim to have succeeded ------------
@@ -1848,8 +1961,12 @@ function referenceChecks(fns) {
     expect('present: name and revision', line.includes('kernel @ v6.18'));
     expect('present: short commit', line.includes(`(${SHA.slice(0, 12)})`)
         && line.includes(`(${RDMA_SHA.slice(0, 12)})`));
-    expect('present: read count', line.includes('34 reads'));
-    expect('present: one read is singular', line.includes('1 read') && !line.includes('1 reads'));
+    // The per-reference count is on the "Tool calls:" line, from the same rows
+    // as the live figure. A read count the record still carries must not be
+    // shown beside it as a second, possibly different, count.
+    const shown = html => html.replace(/title="[^"]*"/g, '');
+    expect('present: the line shows no read count', !/\bread/.test(shown(line))
+        && !shown(line).includes('34'));
     // A reference the patch was outside of is kept in the record, not shown:
     // named on every such patch it was noise.
     expect('present: dormant references are not named', !line.includes('iproute2')
@@ -1874,12 +1991,14 @@ function referenceChecks(fns) {
         plain === card({ id: 1, status: 'Reviewed', reference_repos: null }));
     expect('absent: empty lists render nothing', render({ attached: [], dormant: [] }) === '');
 
-    // missing reads: the review did not finish
+    // reads: whether or not the record carries them, the hover says nothing
+    // about them, since the line no longer shows any
+    const titles = html => [...html.matchAll(/title="([^"]*)"/g)].map(m => m[1]).join(' ');
     const early = render({ attached: [{ name: 'kernel', kind: 'kernel', revision: 'v6.18',
         commit: SHA, why: 'always' }] });
-    expect('missing reads: no count', early.includes('kernel @ v6.18') && !/\bread/.test(
-        early.replace(/title="[^"]*"/g, '')));
-    expect('missing reads: title says not reported', early.includes('read count not reported'));
+    expect('reads: the title says nothing about reads', early.includes('kernel @ v6.18')
+        && titles(early) !== '' && !/\bread/.test(titles(early))
+        && titles(line) !== '' && !/\bread/.test(titles(line)));
 
     // escaping
     const evil = '<script>x</script>"onerror=alert(1)';
@@ -1935,6 +2054,41 @@ const mutate = (name, from, to) => {
     check('a renderer that does not escape is caught', referenceChecks(unescaped).length > 0);
     check('a renderer that returns nothing is caught', referenceChecks(empty).length > 0);
     check('a card that drops the line is caught', referenceChecks(unwired).length > 0);
+    const SHORT_COMMIT = '(${escapeHtml(commit.slice(0, 12))})`;';
+    const stillReads = mutate('renderReviewReferences', SHORT_COMMIT,
+        '(${escapeHtml(commit.slice(0, 12))}), ${a.reads} reads`;');
+    check('a References line that still shows reads is caught', referenceChecks(stillReads).length > 0);
+
+    const toolCallMutations = [
+        ['a breakdown that drops zero references is caught',
+            mutate('toolCallBreakdown', 'const references = split.references',
+                'const references = split.references.filter(r => r && r.calls > 0)')],
+        ['a breakdown shown for a review with no call is caught',
+            mutate('toolCallBreakdown', 'if (!isCallCount(counts.total) || counts.total === 0) return',
+                'if (!isCallCount(counts.total)) return')],
+        ['a breakdown that does not escape the name is caught',
+            mutate('toolCallBreakdown', '${escapeHtml(r.name)}', '${r.name}')],
+        ['an unattached clause shown at zero is caught',
+            mutate('toolCallBreakdown', "!isCallCount(n) || n === 0 ? ''", "!isCallCount(n) ? ''")],
+        ['an attempts note for a run of one attempt is caught',
+            mutate('toolCallsText', 'attempts > 1', 'attempts >= 1')],
+        ['an attempts note that never shows is caught',
+            mutate('toolCallsText', 'Number.isSafeInteger(attempts) && attempts > 1', 'false')],
+        ['a card that drops the on-this-attempt marker is caught',
+            mutate('reviewToolCallsValue', 'r.attempt > 1', 'false')],
+        ['a card that marks a first attempt is caught',
+            mutate('reviewToolCallsValue', 'r.attempt > 1', 'r.attempt >= 1')],
+        ['a card without the tool-call line is caught',
+            mutate('renderReviewCard', '<strong>Tool calls:</strong> ${reviewToolCallsValue(r)}', '')],
+        ['a tool-call line without its explanation is caught',
+            mutate('renderReviewCard', ' title="${escapeHtml(toolCallsTitle())}"', '')],
+        ['a recorded stage table that repeats the counts is caught',
+            mutate('renderReviewCard', '${parts.summaryHtml}</summary>',
+                '${parts.summaryHtml} — ${toolCallsText(r.tool_calls, 1)}</summary>')],
+    ];
+    for (const [name, broken] of toolCallMutations) {
+        check(name, toolCallChecks(broken).length > 0);
+    }
 
     const rowUnescaped = load({ ...sources,
         renderStageRow: sources.renderStageRow.replaceAll('escapeHtml(', 'String(') });
