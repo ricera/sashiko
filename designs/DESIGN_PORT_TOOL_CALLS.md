@@ -1,7 +1,10 @@
 # Design: Port Step 5 -- How Much Looking Each Patch Review Did, by Repository
 
-Status: approved, revision 2, 2026-10-07: the user accepted D1 to D8 as
-recommended and answered Q1. Nothing in it is built yet. Revision 2 corrects the facts a review of revision 1 found wrong
+Status: built, 2026-10-07, in f70b032f5f61..f806eeb8baf1 (§9). The user
+accepted D1 to D8 as recommended and answered Q1 in revision 2. The
+sections below describe what was built; §9 lists the commits, the
+follow-ups an independent review asked for, and the gaps it accepted.
+Revision 2 corrects the facts a review of revision 1 found wrong
 (duplicate-call guard, what a reused row's duration and tokens cover, the
 rerun and retry data, p90) and changes four decisions as a result: D4 (no
 per-reference clause on a review that made no calls), D7 (a reused row
@@ -145,6 +148,9 @@ Three later fork commits touch this code, none of them in substance:
   - the rerun path, which deletes the rows of Failed reviews that have no
     interaction (`db.rs:9356`);
   - `update_tool_usage_length`, above.
+
+  This step adds two: `Database::tool_call_counts` (§4.2) and
+  `Database::patch_tool_calls`, which reads through it (§4.5).
 - **The activity poll is typed.** `PatchsetActivityResponse {live,
   entries, finished}` lives in `src/api.rs:450`. It is served by
   `server.rs:985` and also deserialized by `sashiko-cli`
@@ -395,8 +401,13 @@ pub fn tool_reads_repo(tool_name: &str) -> bool;
   A `LazyLock` holds the set of tool names whose `parameters()` declare
   `REPO_ARG`. A tool added later is classified correctly without an edit
   here.
-- `ToolBox::call` itself is not changed. A test drives one toolbox and
-  `call_target` with the same calls and checks that they agree (§6.1).
+- `ToolBox::call` behaves as before, but it now reads the call through
+  the helpers `call_target` uses. `normalize_tool_name` normalises the
+  tool name, `declares_repo` checks the schema for `repo`, and
+  `named_reference` (used by `repo_target`) reads the `repo` argument.
+  Each helper is the expression it replaced, so the toolbox and the
+  counts cannot drift apart. A test drives one toolbox and `call_target`
+  with the same calls and checks that they agree (§6.1).
 - Only the top-level `repo` counts. The five driver-a rows with `repo`
   inside `files[]` (§1.3) are `Review`, which is what was served.
 
@@ -425,11 +436,11 @@ stand as written. If D1 (b) is chosen instead, §4.7 says what changes.
 
 ```sql
 SELECT tu.review_id,
-       tu.tool_name,
-       CASE WHEN json_valid(tu.arguments) THEN
+       CAST(tu.tool_name AS BLOB),
+       CAST(CASE WHEN json_valid(tu.arguments) THEN
            CASE WHEN json_type(tu.arguments, '$.repo') = 'text'
                 THEN json_extract(tu.arguments, '$.repo') END
-       END AS repo,
+       END AS BLOB) AS repo,
        COUNT(*)
 FROM tool_usages tu
 WHERE tu.review_id IN (SELECT value FROM json_each(?))
@@ -445,6 +456,19 @@ GROUP BY 1, 2, 3
 - Grouping by tool name and repo keeps the result small: a review has about
   ten tools and one to three repo values, so a few dozen rows rather than
   hundreds.
+- The tool name and the repo are selected as blobs (567bfc631917). libsql
+  reads a text column only up to its first NUL, so a `git_grep` whose
+  `repo` was `kernel`, a NUL and `x` would read back as a kernel read,
+  although the toolbox refused it because no reference has that exact
+  name. A tool name with a NUL in it would likewise count as the tool
+  named by the bytes before the NUL. A new helper,
+  `text_from_column_bytes`, decodes the full bytes. Bytes that are not
+  UTF-8 become replacement characters rather than failing the query;
+  SQLite produces them from an unpaired surrogate escape such as `\ud800`
+  in the model's JSON. The full value then goes through `call_target`, so
+  a call the toolbox refused counts as unattached or as reading no
+  repository, and the per-patch figures, summed from the same counts,
+  follow.
 
 The reviews' attached names come from `reviews.reference_repos`, parsed
 with `references::parse_record`. A record that is missing or does not parse
@@ -484,7 +508,10 @@ each group through `call_target`:
 set `"tool_calls"` on each review object to the serialized counts. The
 summary and details queries filter by the patches on the current page, so
 the counts cover the same reviews and no others. Under embargo the reviews
-array is emptied as today, and the counts go with it.
+array is emptied as today, and the counts go with it. The three payloads
+share one helper, `attach_tool_call_counts`. When the count fails, it
+logs a warning and sets `tool_calls` to null on every review, as for a
+daemon that counts no calls, rather than failing the payload.
 
 ### 4.3 API types and the activity poll
 
@@ -554,10 +581,18 @@ Also in `src/api.rs`, shared by the server and the CLI (§4.5, §4.6):
   one; references merge by name, in the order each name first appears,
   and `unattached` adds up. Otherwise it is `None`: a run with an attempt
   whose split is unknown has an unknown split, rather than a zero that
-  attempt might contradict. Reviews with no calls are ignored for this
-  purpose; they add nothing to any count.
+  attempt might contradict. Reviews with no calls add nothing to any
+  count and do not decide whether the split is known. Only when no
+  summed review made a call do they decide it, by the same rule, so a
+  run that has not made its first call yet still carries the references
+  its attempt has. Summing nothing gives total 0 and `by_reference`
+  `None`.
+- `ReviewAttempt { review_id: i64, attempt: Option<u32> }`, one review
+  row as far as telling runs apart needs. `attempt` is `None` for a
+  Skipped row or a row from before migration 015.
 - `review_runs(rows: &[ReviewAttempt]) -> Vec<Vec<i64>>`, one patch's
-  review ids, in id order, split into runs (§4.5).
+  review ids split into runs (§4.5), oldest run first. It sorts its input
+  by id itself, so callers may pass the rows in any order.
 - `ToolCallCounts::breakdown(&self) -> String`, the plain-text clause the
   CLI prints. It returns an empty string when `total` is 0, when
   `by_reference` is `None`, or when the split has no references and
@@ -592,9 +627,13 @@ shows. Neither is review text.
 
 **Wording, one place.** Two new functions next to `stageTableParts`:
 
+- `isCallCount(n)` is true when `n` is a non-negative safe integer. Every
+  count the page prints passes it first, because the payloads are
+  untyped JSON.
 - `toolCallBreakdown(counts)` returns `''` or an escaped clause. It returns
   `''` when `counts.total` is not a positive safe integer (D4), or when
-  `counts.by_reference` is not an object. Otherwise:
+  `counts.by_reference` is not an object with a `references` array.
+  Otherwise:
   - ` (72 to kernel, 0 to rdma-core)` — every entry of
     `by_reference.references`, in order, zeros included;
   - ` (72 to kernel, 0 to rdma-core; 3 to unattached repositories)` —
@@ -614,24 +653,32 @@ shows. Neither is review text.
   session declined to run (a repeat of the call just before it, or a call
   on the final turn). N to a reference: calls aimed at that reference,
   cache hits and calls git rejected included. To unattached repositories:
-  calls naming a repository this review did not have; they were refused
-  and read nothing. The rest went to the code under review or to tools
-  that read no repository."
+  calls naming a repository this review did not have; they read nothing.
+  The rest went to the code under review or to tools that read no
+  repository." It does not say "refused" (§6.3).
+- `reviewToolCallsValue(r)` returns the card's value (below).
+- `toolCallsByPatch(list)` turns the poll's `tool_calls` into a `Map`
+  keyed by numeric `patch_id` (below).
 
 **Live** (Goal 1).
 - `stageTableParts(rows, live, toolCalls)` takes the patch's
   `PatchToolCalls` (or `null`). When `toolCallsText` is non-empty it
   appends ` — ${text}` to `summaryHtml`. A reader sees:
-  "Stage progress (2 running, 3 done) — 120 tool calls over 2 attempts
-  (30 to kernel, 0 to rdma-core)".
+  "Stages (2 running, 3 done) — 120 tool calls over 2 attempts
+  (30 to kernel, 0 to rdma-core)". It returns `{summaryHtml, bodyHtml,
+  showsToolCalls}`; `showsToolCalls` says whether the summary carries the
+  count.
 - `paintStageProgress(host, entries, live, toolCalls)` passes it through.
-  When the text is non-empty, the summary's title gains a second sentence:
-  "Tool calls: this patch's current run, every attempt." followed by
-  `toolCallsTitle()`. With no counts the title is exactly today's.
-- `refreshActivity` builds a `Map` from `data.tool_calls`, if it is an
-  array, keyed by `Number(patch_id)`, and gives each host its patch's
-  entry. A response with no `tool_calls`, from an older daemon, paints
-  exactly as today.
+  When `showsToolCalls` is true, the summary's title gains a second
+  sentence: "Tool calls: this patch's current run, every attempt."
+  followed by `toolCallsTitle()`. With no counts the title is exactly
+  today's.
+- `refreshActivity` builds its `Map` with `toolCallsByPatch(data.tool_calls)`
+  and gives each host its patch's entry. `toolCallsByPatch` gives an empty
+  map when `tool_calls` is not an array, and skips entries that are not
+  objects or whose `patch_id` does not convert to a finite number. A
+  null `patch_id` converts to 0, which matches no host. A response with no `tool_calls`,
+  from an older daemon, paints exactly as today.
 - The persisted ("stopped") table shows the counts too. They come from the
   database, so they are still true after a restart.
 - `renderReviewCard`'s recorded table passes `null` (as fork 670636505f34
@@ -642,9 +689,11 @@ shows. Neither is review text.
 - Under "Tokens used:", inside the same `showDetails` block (Reviewed,
   Partial, Failed, Skipped; a timed-out review's row is Failed), add:
   `<strong>Tool calls:</strong> 350 (72 to kernel, 0 to rdma-core)`.
-- The value is `r.tool_calls.total`, then ` on this attempt` when
-  `r.attempt > 1`, then `toolCallBreakdown`. It is "—" when `r.tool_calls`
-  is missing (an older daemon). The attempt marker mirrors the duration's
+- The value, from `reviewToolCallsValue(r)`, is `r.tool_calls.total`, then
+  ` on this attempt` when `r.attempt > 1`, then `toolCallBreakdown`. It is
+  "—" when `r.tool_calls` is missing (an older daemon) or its total is not
+  a count (`isCallCount`); the served value is never echoed. The attempt
+  marker mirrors the duration's
   " total" on the same card: the duration covers the run, the tokens, the
   stage table and the tool calls cover this attempt.
 - Its title is `toolCallsTitle()`.
@@ -702,10 +751,26 @@ runs. A row whose `attempt` is NULL or 1 starts a new run; a row with
 before migration 015 or a Skipped row (§4.5.1 removes the in-flight NULL),
 and each of those is a whole run.
 
+**A rerun keeps every run's boundary** (225028c5be0a). A rerun deletes
+Failed rows that never reached the model and keeps the later attempts of
+the same run. The rule above then broke: a retry whose attempt 1, or a
+middle attempt, was deleted continued whatever older run came before it,
+and its calls were summed with that run's (a run of 7 calls read as 107).
+The fix is at the deletion site, `delete_unreached_failed_reviews`. In one
+immediate transaction with the deletes, it reads the patchset's reviews,
+splits each patch's rows into runs with `review_runs`, and numbers each
+run's surviving rows again from 1 in id order (`renumbered_attempts`). A
+row with no attempt keeps none, since it only ever starts a run. The
+visible effect: a surviving retry renumbered to attempt 1 loses every
+note that depends on a later attempt, in the web UI and the CLI alike.
+Its card no longer says "on this attempt" or "succeeded on attempt N",
+and its duration is no longer labelled "total". The duration itself is
+unchanged, so it still includes the time of the deleted attempt.
+
 **The live figure counts the current run** (D5).
 `Database::patch_tool_calls(patchset_id, patch_ids)`:
-1. Reads `id, patch_id, attempt` for the reviews of those patches, ordered
-   by `id`.
+1. Reads `id, patch_id, attempt` for the reviews of those patches, in any
+   order; `review_runs` sorts them by id.
 2. Takes the last run of each patch from `review_runs`.
 3. Sums `tool_call_counts` over that run's rows with
    `ToolCallCounts::sum`; `attempts` is the number of rows in the run.
@@ -726,20 +791,38 @@ with it, and show "0 tool calls" for a run that has made many. So
 `create_review` takes the attempt and writes it in the `INSERT`:
 `create_review(..., prompts_hash, attempt: Option<u32>)`. The retry loop
 passes `Some(retries + 1)`; the Skipped path and the tests pass `None`.
-`set_review_attempt` stays for a reused Pending row. No in-flight row is
-ever NULL after this.
+No in-flight row is ever NULL after this.
+
+`set_review_attempt(review_id, attempt: Option<u32>)` stays for a reused
+Pending row, which still carries the interrupted run's number. The steps
+that give an attempt its row (create or reuse, stamp, set In Review) live
+in a helper, `begin_attempt_row`, which restamps a reused row with
+`Some(attempt)`. A Skipped patch that reuses a Pending row restamps it
+with `None` (e0efd576c0f1); kept, the old number would make
+`review_runs` count the Skipped result as part of the interrupted run. A
+failed restamp, in either path, is logged with `warn!` and the review
+goes on.
 
 #### 4.5.2 A row reused after a restart (D7)
 
 When the retry loop, or the Skipped path, takes a Pending row a restart
 left behind, it deletes that row's `tool_usages` before stamping it. The
 getter `get_pending_review_id` becomes `take_pending_review_id`, which
-returns the id and deletes the row's tool usages; its two callers are the
-only ones. A row not reused has none to delete.
+returns the id, deletes the row's tool usages and sets its
+`reviews.reference_repos` to NULL; its two callers are the only ones. A
+row not reused has none to delete. The record is cleared because the new
+run replaces it only when it stores a hand-off, and it stores none when no
+references are configured any more or when storing fails. A kept record
+would split the new run's calls against references it never had, where
+NULL correctly reports the split as unknown. Each statement that fails is
+logged with `warn!`, and the row is still returned: these are statistics
+and must not stop the patch's review. The statements need no
+transaction, because only the worker reviewing the patch takes its row.
 
 After this, everything a reused row reports describes the new run: its
 tokens, its stage table, its live log (cleared at worker start today), its
-reference record (overwritten by the new hand-off), and its tool calls.
+reference record (cleared at the take and replaced by the new hand-off
+when one is stored), and its tool calls.
 That includes the classification: the calls are judged against the record
 of the run that made them, even when the restart was the one that applied
 a `[[git.references]]` change. The interrupted run's calls leave
@@ -754,7 +837,8 @@ a `[[git.references]]` change. The interrupted run's calls leave
   number now appears for a review whose `reads` were never reported.
 - **Failed, retried.** Each row is counted on its own card. A rerun deletes
   Failed rows with no interaction together with their calls (`db.rs:9356`),
-  so they leave both the card and the live run.
+  so they leave both the card and the live run. The surviving rows of
+  each run are renumbered from 1 (§4.5, Runs).
 - **Cancelled.** Counted live while it runs. Its card shows no details, as
   today.
 
@@ -768,7 +852,10 @@ line under each patch's stage table (D6):
 ```
 
 - When the patch has live entries, the line uses the activity response's
-  `PatchToolCalls` for the patch, the current run.
+  `PatchToolCalls` for the patch, the current run, and nothing else. When
+  the poll has no counts for the patch, no line is printed: there is no
+  fallback to a recorded run, whose figure under a live table would
+  describe other work.
 - Otherwise it uses the run that contains the review
   `find_best_review_for_patch_refs` picks, the same review whose recorded
   stage table it prints. The CLI already has every review of the patch,
@@ -776,10 +863,20 @@ line under each patch's stage table (D6):
   `api::review_runs` and sums with `ToolCallCounts::sum`, as the daemon
   does. A run of all-failed attempts therefore prints "N over 4 attempts",
   not the last attempt's 0, during the run and after it alike.
+- The recorded run is found among every review of the patchset, not only
+  the ones the command shows, so `--since` hiding the run's first
+  attempts does not shrink it. `print_patch_timings` takes these as a
+  new argument, `all_reviews`.
+- No line is printed for a recorded run when any of its attempts carries
+  no `tool_calls` (an older daemon, or a count that failed), because a
+  partial sum would understate the run.
 - ` over K attempts` is added when the run has more than one row.
-- No line is printed when neither source has counts (an older daemon).
 - `PatchActivity` gains `tool_calls: HashMap<i64, PatchToolCalls>`.
 - The breakdown comes from `ToolCallCounts::breakdown`.
+- New functions: `patch_timing_lines`, which returns what is printed
+  under one patch's heading (stage table, then the line) so tests can
+  read it; `recorded_run_tool_calls`, which finds and sums the recorded
+  run; and `tool_calls_line`, which formats the line.
 
 When the resume port (fork eaa5f78b889b) lands, a resumed review is a new
 row that reuses completed stages without re-running their calls. That step
@@ -809,7 +906,7 @@ For the record, so a reviewer can compare. This is not the recommendation.
   §4.2 ("017 stays open") and §4.6 (the 017 file names) are amended in this
   step's design commit.
 
-### 4.8 The daemon stops storing `reads`
+### 4.8 The daemon stops storing reads
 
 After D3 (a) nothing in the repository reads a daemon review's
 `reference_repos[].reads`: the page stops rendering it, and `sashiko-cli`
@@ -841,7 +938,7 @@ awaited inline before the final line is handled.
 | One review's counts | `api::ToolCallCounts { total, by_reference: Option<ReferenceSplit> }` | fork's untyped `{total, reference}` |
 | Whether the split is known | `by_reference: None` vs `Some(ReferenceSplit { references, unattached })` | a zero that meant both "none" and "not known" |
 | One patch's live counts | `api::PatchToolCalls { patch_id, attempts, counts }` on `PatchsetActivityResponse.tool_calls` | fork's `json!` field, `{}` on error |
-| A patch's runs | `api::review_runs`: a row with attempt NULL or 1 starts a run; no in-flight row is NULL | fork: every review of the patch |
+| A patch's runs | `api::review_runs` over `api::ReviewAttempt { review_id, attempt: Option<u32> }`: a row with attempt NULL or 1 starts a run; no in-flight row is NULL; a rerun renumbers survivors from 1 | fork: every review of the patch |
 
 The page reads JSON. Its type is the shape `toolCallBreakdown` and
 `toolCallsText` agree on, and the verifier tests it.
@@ -850,7 +947,12 @@ The page reads JSON. Its type is the shape `toolCallBreakdown` and
 
 Run `make check-pr` from a throwaway clone, not under a git hook (AGENTS.md,
 Testing). After each web commit, run `scripts/verify_stage_progress_ui.sh`.
-After the step, run the ignored server tests as well.
+After the step, run the ignored server tests as well. The activity poll
+tests this step adds are not among them; they are ordinary tests that
+`make check-pr` runs.
+
+The lists below are the tests as built, by file. A test named here that
+the plan did not name is marked with the commit that added it.
 
 ### 6.1 Rust
 
@@ -909,6 +1011,28 @@ After the step, run the ignored server tests as well.
   merge by name. A run in which one attempt with calls has no record gives
   `by_reference` `None`; one in which only a zero-call attempt has no
   record keeps the split. Only the patches passed in are returned.
+- `tool_calls_of_a_review_with_every_reference_dormant_are_unattached`
+  (74d325214e94): a record with nothing attached counts calls naming a
+  dormant reference as unattached.
+- `review_payloads_survive_a_failed_tool_call_count` (74d325214e94): a
+  count that fails leaves the payload served, with `tool_calls` null.
+- `taking_a_pending_review_survives_a_failed_cleanup` (a04ddd4833ff): a
+  delete that fails still returns the row.
+- `rerun_keeps_a_surviving_retry_out_of_an_earlier_run` and
+  `rerun_closes_the_gap_of_a_deleted_middle_attempt` (225028c5be0a): after
+  a rerun deletes a run's attempt 1, or a middle attempt, the surviving
+  rows are numbered from 1 and the run is not joined to an older one.
+- `renumbered_attempts_keep_each_patchs_runs_apart` (225028c5be0a): the
+  pure renumbering splits rows by patch before it splits them into runs.
+- `tool_calls_with_a_nul_are_classified_as_the_toolbox_served_them`
+  (567bfc631917): a NUL in the tool name or in the repo does not credit
+  the tool or reference named by the bytes before it.
+- `tool_call_with_an_unpaired_surrogate_repo_counts_as_unattached`
+  (567bfc631917): a repo that SQLite decodes to bytes that are not UTF-8
+  is counted, as unattached, and the query does not fail.
+- `column_bytes_decode_whole_and_never_fail` (567bfc631917): the
+  `text_from_column_bytes` helper keeps bytes after a NUL and replaces
+  bytes that are not UTF-8.
 
 `src/reviewer.rs` tests:
 - `recorded_arguments_keep_the_repo_argument`. `record_tool_calls` on a
@@ -916,36 +1040,75 @@ After the step, run the ignored server tests as well.
   `json_extract(arguments, '$.repo')` is `rdma-core`. This pins the storage
   contract §4.2 reads, so a later change that truncates or compresses
   `arguments` fails here.
-- The tests of `store_final_reference_repos` go with it (§4.8). A test
-  that a worker's final output carrying `reads` leaves the stored record
-  without them replaces them.
+- The tests of `store_final_reference_repos` go with it (§4.8). Two tests
+  replace them: `test_final_output_leaves_reference_reads_unstored` (a
+  final output carrying `reads` leaves the stored record without them)
+  and `test_final_output_alone_stores_no_reference_record` (a final output
+  with no hand-off before it stores no record, the fallback §4.8 gives
+  up).
+- `tool_calls_in_a_truncated_response_are_not_recorded` is an existing
+  test (0fb32ac47c7d), not one this step added. It pins that
+  `record_tool_calls` skips a truncated response. 74d325214e94 moved its
+  setup onto the shared helpers `database_with_a_review` and
+  `grep_response`, which the repo-argument test above also uses.
+- `test_a_reused_pending_review_is_restamped_with_its_attempt`
+  (3ecbd3ef42cd): a reused Pending row keeps its id and is restamped with
+  the new attempt.
+- `a_reused_row_for_a_skipped_patch_drops_its_attempt` (e0efd576c0f1): a
+  Pending row left by an interrupted run's attempt 2 is reused for a
+  Skipped result with no attempt, so it starts a run of its own.
+- `test_a_retry_row_carries_its_attempt_from_creation` (2b0f52629006): the
+  mock worker fails attempt 1 and, with two retries allowed, holds
+  attempt 2 until the test has read the second row. That row already
+  carries attempt 2, the review succeeds, and the stored rows end as a
+  failed attempt 1 and a reviewed attempt 2. Before this test, stamping
+  every new row in `begin_attempt_row` as attempt 1 left the suite green.
 
 `src/api.rs` tests:
-- An activity response without `tool_calls` (an older daemon) still
-  deserializes, with an empty list. A review's `tool_calls` without
-  `by_reference` deserializes with `None`.
-- `review_runs` (pure): `[1, 2, 3, 4]` is one run of four; `[1, 1]` gives
-  two runs; `[NULL, 2]` is one run; `[1, 2, 1]` gives the last row alone;
-  a freshly created attempt-1 row with no calls after a finished run is a
-  run of its own.
-- `ToolCallCounts::sum`: the merge rules of §4.3.
-- `ToolCallCounts::breakdown` gives `(72 to kernel, 0 to rdma-core)`,
-  `(72 to kernel; 3 to unattached repositories)`, `(1 to an unattached
-  repository)`, and `""` for total 0, for `by_reference` `None`, and for
-  an empty split.
+- `activity_tool_calls_are_optional_and_flat`: an activity response
+  without `tool_calls` (an older daemon) still deserializes, with an empty
+  list, and `PatchToolCalls` serializes its counts flattened.
+  `tool_call_counts_without_a_split_read_as_unknown`: a review's
+  `tool_calls` without `by_reference` deserializes with `None`.
+- `review_runs` (pure), in `review_runs_start_at_attempt_one_or_no_attempt`
+  and `review_runs_follow_id_order_and_survive_odd_rows`: `[1, 2, 3, 4]`
+  is one run of four; `[1, 1]` gives two runs; `[NULL, 2]` is one run;
+  `[1, 2, 1]` gives the last row alone; a freshly created attempt-1 row
+  with no calls after a finished run is a run of its own; unordered input
+  is taken in id order; a lone attempt-2 row, whose earlier rows are
+  gone, is a run of its own; no rows give no runs.
+- `ToolCallCounts::sum`, in `summed_counts_add_up_and_merge_references_by_name`,
+  `a_summed_split_is_unknown_when_an_attempt_with_calls_had_none` and
+  `a_summed_run_without_calls_keeps_its_references`: the rules of §4.3.
+- `ToolCallCounts::breakdown`, in
+  `tool_call_breakdown_names_every_attached_reference` and
+  `tool_call_breakdown_is_empty_without_a_known_split_or_calls`: it gives
+  `(72 to kernel, 0 to rdma-core)`, `(72 to kernel; 3 to unattached
+  repositories)`, `(1 to an unattached repository)`, and `""` for total
+  0, for `by_reference` `None`, and for an empty split.
 
-`src/bin/sashiko-cli.rs` test:
-- `tool_calls_line_sums_the_chosen_review_run`: four Failed attempts,
+`src/bin/sashiko-cli.rs` tests:
+- `test_tool_calls_line_sums_the_chosen_review_run`: four Failed attempts,
   only the first with calls, print `Tool calls: 120 over 4 attempts (30 to
   kernel)` with no live entries. A Reviewed review from an earlier run
   plus a failed newer run prints the earlier run's figure, under the
   earlier run's stage table.
+- `test_tool_calls_line_needs_every_attempt_counted`: a run whose split is
+  not known prints the total alone, and a run with an attempt that
+  carries no counts prints no line.
+- `test_live_tool_calls_come_from_the_activity_response`: a live table
+  takes its line from the activity response only, and prints none when
+  the response has no counts for the patch.
 
-`src/server.rs` tests (ignored, run by hand like the others):
-- `/api/patchset/activity` for a patchset with a live stage entry for one
+`src/server.rs` tests (ordinary `#[tokio::test]`s, not ignored):
+- `test_patchset_activity_carries_tool_calls_of_patches_with_entries`:
+  `/api/patchset/activity` for a patchset with a live stage entry for one
   of two patches carries `tool_calls` for that patch only, with the counts
   from the database.
-- A patchset with no entries carries an empty list.
+- `test_patchset_activity_without_entries_carries_no_tool_calls`: a
+  patchset with no entries carries an empty list.
+- `test_patchset_activity_survives_a_failed_tool_call_count`: when the
+  count fails, the entries are still served, with an empty list.
 
 ### 6.2 Migration
 
@@ -956,9 +1119,10 @@ D1 (b) is chosen, add:
   and `review` values) with the same values after normalization;
 - a test that running it twice changes nothing.
 
-### 6.3 UI verifier (`scripts/verify_stage_progress_ui.mjs`)
+### 6.3 UI verifier (scripts/verify_stage_progress_ui.mjs)
 
-- Add `toolCallBreakdown`, `toolCallsText` and `toolCallsTitle` to
+- Add `isCallCount`, `toolCallBreakdown`, `toolCallsText`,
+  `toolCallsTitle`, `reviewToolCallsValue` and `toolCallsByPatch` to
   `NAMES`. `stageTableParts`, `paintStageProgress`, `refreshActivity` and
   `renderReviewCard` are already there.
 - Add a `toolCallChecks(fns)` group, run as **case 11: tool calls**.
@@ -975,6 +1139,8 @@ Wording:
 - `by_reference: null` gives the total alone.
 - `attempts: 3` adds ` over 3 attempts`; `attempts: 1` adds nothing.
 - A name `<script>` is escaped.
+- References given out of alphabetical order keep that order
+  (f806eeb8baf1).
 - The word "refused" appears nowhere in the clause or the title.
 - Malformed input renders nothing and does not throw: `null`, a string,
   `{total: -1}`, `{total: 1.5}`, `{total: '3'}`, a `by_reference` whose
@@ -991,7 +1157,10 @@ Live:
 - `refreshActivity`, with a fetch stub that returns entries for patches 20
   and 21 and `tool_calls` for both, puts each count on its own host.
 - A response with no `tool_calls` leaves both summaries as the label alone.
-- A `tool_calls` that is not an array is ignored without throwing.
+- A `tool_calls` that is not an array is ignored without throwing, and so
+  is an entry in it that is not an object.
+- A reference named `a&b<c` appears in the live summary escaped exactly
+  once (f806eeb8baf1).
 
 Card:
 - A Reviewed card with `tool_calls: {total: 350, by_reference:
@@ -1005,6 +1174,11 @@ Card:
 - Partial and Failed cards show the line. In Review and Cancelled cards do
   not.
 - A card with no `tool_calls` shows "Tool calls:" with "—".
+- A card whose total is not a count (a string, markup, a negative, a
+  fraction, NaN, Infinity, null or an object) shows "—" and never echoes
+  the value (f806eeb8baf1).
+- A reference named `a&b<c` appears on the card escaped exactly once
+  (f806eeb8baf1).
 - The recorded stage table's summary carries no tool-call text.
 
 References line (reworks the existing `referenceChecks`):
@@ -1015,20 +1189,37 @@ References line (reworks the existing `referenceChecks`):
   about reads".
 - Every other reference check stays.
 
-Mutations, each of which must fail `toolCallChecks`:
-- zero references dropped (`.filter(r => r.calls > 0)` added): caught by
-  `0 to rdma-core`;
-- the total > 0 condition removed: caught by the total-0 card;
+Mutations, each of which must fail `toolCallChecks`, as built. Eleven
+landed with the card (commit 7, 8913e10667ff), with the References
+mutation below as its twelfth:
+- zero references dropped: caught by `0 to rdma-core`;
+- a breakdown shown for a review with no call: caught by the total-0 card;
 - `escapeHtml` removed from the name;
 - the unattached clause shown when it is 0;
 - the attempts note shown for one attempt, and never shown;
 - the card's "on this attempt" marker removed, and shown on attempt 1;
-- `stageTableParts` ignoring its `toolCalls` argument;
-- the live title left unchanged when counts are present;
-- `refreshActivity` passing `null` to every host;
-- `refreshActivity` keying by `review_id` instead of `patch_id`;
 - the card line removed from `renderReviewCard`;
-- the recorded table passed the counts.
+- the card line without its `toolCallsTitle()` explanation;
+- a recorded stage table that repeats the counts.
+
+Ten landed with the live summary (commit 9, 6caae3bd91bd):
+- the recorded table passed the counts (planned for commit 7; it needs
+  the `toolCalls` argument that commit 9 adds to `stageTableParts`);
+- `stageTableParts` ignoring its `toolCalls` argument;
+- `stageTableParts` dropping the run's attempts;
+- a persisted table that drops the counts;
+- the live title left unchanged when counts are present;
+- the live title explaining counts that are not there;
+- `refreshActivity` passing no counts to every host;
+- `toolCallsByPatch` keying by `review_id` instead of `patch_id`;
+- `toolCallsByPatch` trusting `tool_calls` to be a list;
+- `toolCallsByPatch` trusting each entry to be an object.
+
+Four landed with the follow-up f806eeb8baf1:
+- a breakdown that sorts the references by name;
+- a card that prints any total it is served;
+- a live summary that escapes the counts twice;
+- a card that escapes the counts twice.
 
 And one that must fail `referenceChecks`: `renderReviewReferences` still
 appending `${a.reads} reads`.
@@ -1109,7 +1300,8 @@ terminal.
 
 ## 8. Open Decisions
 
-Each decision has options and a recommendation. None is chosen yet.
+Each decision has options and a recommendation. Each was chosen as
+recommended in revision 2 and built that way (§9).
 
 **D1. Where the repository of a call is stored.**
 - (a) Nowhere new. Read the top-level `repo` from `arguments` at query time
@@ -1279,6 +1471,91 @@ to have had a reference, and get no record, so they show the total only
   from the API? Resolved 2026-10-07: the user knows of none, and nothing in
   this repository reads it besides the page (§1.2). So §4.8 lands as
   written.
+
+## 9. What Was Built
+
+### 9.1 Commits
+
+The plan of §7, commits 1 to 10, in order:
+
+1. f70b032f5f61 designs: plan the port of per-review tool call counts
+2. 2e8f1bd9728f toolbox: say which repository a tool call is aimed at
+3. 3ecbd3ef42cd reviewer: stamp a review's attempt when its row is created
+4. a04ddd4833ff reviewer: start a reused review's tool calls afresh
+5. 74d325214e94 db: count each review's tool calls by repository
+6. e0efd576c0f1 api: carry each patch's tool calls on the activity poll
+7. 8913e10667ff web: show a review's tool calls on its card
+8. 9aa4186eb980 reviewer: stop storing reference reads on daemon reviews
+9. 6caae3bd91bd web: show a patch's tool calls while it is reviewed
+10. b52b9e453d12 cli: print each patch's tool calls
+
+Follow-ups from an independent review of commits 2 to 10:
+
+- 225028c5be0a db: keep a rerun from joining a retry onto an earlier run.
+  A rerun renumbers the surviving attempts of each run from 1 (§4.5,
+  Runs).
+- 567bfc631917 db: count a tool call with a NUL in it as the toolbox
+  does. The count query reads the tool name and repo as blobs (§4.2).
+- 2b0f52629006 reviewer: test that a retry row carries its attempt from
+  creation (§6.1).
+- f806eeb8baf1 scripts: check tool call order, card totals and escaping
+  on the page (§6.3).
+
+Commit 11 of §7 is the commit that updates this document.
+
+### 9.2 Differences from the plan
+
+The sections above are updated in place. In short:
+- `ToolBox::call` was refactored onto shared helpers, with no change in
+  behaviour (§4.1).
+- `take_pending_review_id` also clears the reused row's reference record
+  (§4.5.2).
+- `set_review_attempt` takes `Option<u32>`, and a Skipped patch that
+  reuses a Pending row clears its attempt (§4.5.1).
+- `ToolCallCounts::sum` lets zero-call attempts decide whether the split
+  is known when no attempt made a call (§4.3).
+- The review payloads serve `tool_calls` null when the count fails
+  (§4.2).
+- A rerun renumbers each run's surviving attempts (§4.5).
+- The count query reads names as blobs, for NULs and bytes that are not
+  UTF-8 (§4.2).
+- The CLI's live table never falls back to a recorded run, and the
+  recorded run is summed over the whole patchset (§4.6).
+- The page gained `isCallCount`, `reviewToolCallsValue` and
+  `toolCallsByPatch`, and the title says "they read nothing" (§4.4).
+- The activity poll's server tests are ordinary tests (§6.1).
+
+### 9.3 Known gaps, accepted
+
+The review found these and accepted them without a fix:
+- **A NULL tool name fails the count.** `tool_usages.tool_name` is a
+  nullable column, and the count reads it as bytes, which a NULL is not.
+  The whole count for the payload or poll then fails, and is served as
+  null or an empty list (§4.2, §4.3). It is unreachable today:
+  `record_tool_calls` always writes the call's name.
+- **Query cost.** Measured in a debug build, the count takes about 7.5 ms
+  for a review of 1000 calls, and about 350 ms for 50 patches of 1000
+  calls each. It runs on every activity poll that has entries, so a large
+  patchset under review costs that much per poll. The deployment maximum
+  is 813 calls per review (§1.3).
+- **A cancel right after a take.** When the patchset is found cancelled
+  right after `take_pending_review_id` has cleared a reused row, before
+  any new attempt starts, the row is marked Cancelled. It keeps the
+  interrupted run's attempt number, so the run's attempt count does not
+  change. Its calls and reference record are gone, so the interrupted
+  run's figure lacks that attempt's calls. The check reads the patchset
+  status, so a cancel made before the take has the same effect.
+- **Two Pending rows for one patch.** When writing a row's In Review status
+  fails (logged, not fatal), the row stays Pending, and a patch can be
+  left with two Pending rows. `take_pending_review_id` takes one of them
+  (`LIMIT 1`), and which one is not defined.
+
+### 9.4 Unrelated test failures
+
+The `kiro_cli` tests `test_generate_content_with_fake_acp_server` and
+`test_generate_content_includes_redacted_stderr_on_startup_exit` fail
+intermittently with "Text file busy". They are flaky and unrelated to
+this step.
 
 ## Feynman Summary
 
