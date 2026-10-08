@@ -620,6 +620,9 @@ pub enum PlaceholderState {
     /// The row was left as it was: Incomplete, Pending, In Review,
     /// Skipped or Reviewed.
     Kept(ReviewStatus),
+    /// The row was left as it was, because its status is neither Fetching
+    /// nor any ReviewStatus. No writer stores one today; NULL reads as "".
+    KeptUnknown { status: String },
 }
 
 pub struct FetchingPlaceholder { pub id: i64, pub state: PlaceholderState }
@@ -802,6 +805,13 @@ Order of checks:
    | `AlreadyFetching` | `AlreadyInProgress` | yes (recovers a lost request) |
    | `Kept(Incomplete \| Pending \| InReview)` | `AlreadyInProgress` | no |
    | `Kept(Reviewed \| Skipped)` | `AlreadyFinished`; under `RerunHead`, `rerun_patchset(id)` and `RerunQueued` | no |
+   | `KeptUnknown { status }` | `AlreadyInProgress`, `previous_status` the stored value (`""` for NULL) | no |
+
+   `KeptUnknown` exists because `Kept(ReviewStatus)` cannot hold a NULL
+   or unrecognised status, and failing on one would change what
+   `create_fetching_patchset` does today, which leaves such a row as it
+   is. Such a row is not known to have finished, so the route reports it
+   as in progress and, like every other kept row, sends no fetch.
 
    An error from `rerun_patchset` (for example a status it does not
    rerun) is a 409 with its message.
@@ -1671,7 +1681,7 @@ part of the request except the hex prefix.
 | The repository a number belongs to | `ForgeRepo {host, owner, name}` from `forge.github_repository` | gh inferring it from git |
 | What gh reported | `ResolvedPullRequest` with `CommitId` base and head | `serde_json::Value` |
 | Why gh failed | `GhError::{NotInstalled, NotAuthenticated, TimedOut, Failed{detail}, Invalid{reason}}` | a raw stderr string |
-| What queuing a placeholder found | `FetchingPlaceholder {id, state: PlaceholderState::{Created, Reset{was}, AlreadyFetching, Kept(ReviewStatus)}}` | the webhook's discarded id |
+| What queuing a placeholder found | `FetchingPlaceholder {id, state: PlaceholderState::{Created, Reset{was}, AlreadyFetching, Kept(ReviewStatus), KeptUnknown{status}}}` | the webhook's discarded id |
 | Whether an existing row is fetched again | `ExistingRevision::{Refetch, Leave}` | -- |
 | A cover letter | `CoverLetter {source: CoverLetterSource, text}` | reviewer `body` sent as-is |
 | A PR description | `Option<String>`, never `Some("")`, at most 64 KiB | -- |
@@ -1714,7 +1724,9 @@ All Rust tests run in a throwaway clone, never under a git hook or
 **6b.**
 - `queue_fetching_patchset_reports_what_it_found`: Created; Reset from
   each resubmittable status; AlreadyFetching on a second call; Kept for
-  Incomplete, Pending, In Review, Skipped, Reviewed.
+  Incomplete, Pending, In Review, Skipped, Reviewed; KeptUnknown for an
+  unknown status and NULL. A re-queue with different columns rewrites a
+  reset or fetching row and leaves a kept one as it was.
 - `the_webhook_still_refetches_and_the_manual_path_does_not` (one test
   per `ExistingRevision`, counting `FetchRequest`s on the channel).
 - `github_repository_setting_parses` (`owner/name`, `host/owner/name`;
