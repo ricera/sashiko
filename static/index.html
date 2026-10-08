@@ -4614,6 +4614,80 @@
                 + `</td></tr>`;
         }
 
+        // Whether a served value is a call count the page can print. The review
+        // payloads are untyped JSON, so a count is used only when it is a
+        // non-negative safe integer.
+        function isCallCount(n) {
+            return Number.isSafeInteger(n) && n >= 0;
+        }
+
+        // Where a review's tool calls went, as " (72 to kernel, 0 to rdma-core)",
+        // escaped. ToolCallCounts::breakdown in src/api.rs builds the same
+        // clause in plain text, and tests on both sides pin the same strings,
+        // so the two read alike.
+        //
+        // Empty with no calls: a zero for a reference only means "never looked
+        // there" once the review was looking somewhere, and on an attempt that
+        // failed before its first call it would raise that alarm falsely. Empty
+        // too when the split is unknown (no reference record), so no reader is
+        // shown a zero the review may not have earned. Every attached reference
+        // is named once there are calls, zeros included, because the zero is
+        // the reading this exists to show.
+        function toolCallBreakdown(counts) {
+            if (!counts || typeof counts !== 'object') return '';
+            if (!isCallCount(counts.total) || counts.total === 0) return '';
+            const split = counts.by_reference;
+            if (!split || typeof split !== 'object' || !Array.isArray(split.references)) return '';
+            const references = split.references
+                .filter(r => r && typeof r.name === 'string' && isCallCount(r.calls))
+                .map(r => `${r.calls} to ${escapeHtml(r.name)}`)
+                .join(', ');
+            const n = split.unattached;
+            const unattached = !isCallCount(n) || n === 0 ? ''
+                : n === 1 ? '1 to an unattached repository' : `${n} to unattached repositories`;
+            const clause = [references, unattached].filter(part => part !== '').join('; ');
+            return clause ? ` (${clause})` : '';
+        }
+
+        // "47 tool calls over 2 attempts (3 to kernel)", escaped, for counts
+        // summed over a run of this many attempts. Empty when the counts are
+        // missing or malformed, so an older daemon's page reads as before.
+        function toolCallsText(counts, attempts) {
+            if (!counts || typeof counts !== 'object' || !isCallCount(counts.total)) return '';
+            const calls = counts.total === 1 ? '1 tool call' : `${counts.total} tool calls`;
+            const over = Number.isSafeInteger(attempts) && attempts > 1 ? ` over ${attempts} attempts` : '';
+            return calls + over + toolCallBreakdown(counts);
+        }
+
+        // What a tool-call count covers, for the hover of every place one is
+        // shown. The count is of calls the daemon recorded, which is not quite
+        // the calls the toolbox ran, and a reader comparing it with the log has
+        // to know which calls differ. Calls to unattached repositories are not
+        // called refused: a reference's own count includes calls git rejected,
+        // and one word must not mean two things.
+        function toolCallsTitle() {
+            return 'Tool calls the model made, as the daemon recorded them, including any the session'
+                + ' declined to run (a repeat of the call just before it, or a call on the final turn).'
+                + ' N to a reference: calls aimed at that reference, cache hits and calls git rejected'
+                + ' included. To unattached repositories: calls naming a repository this review did'
+                + ' not have; they read nothing. The rest went to the code under review or to tools'
+                + ' that read no repository.';
+        }
+
+        // The value of a finished card's "Tool calls:" line, escaped.
+        //
+        // A card describes one review row, which is one attempt, so it counts
+        // that attempt's calls and says so when the attempt was a retry: the
+        // run's other attempts have cards of their own, and the cards of a run
+        // add up to the figure shown while it ran. A dash when the daemon
+        // served no counts.
+        function reviewToolCallsValue(r) {
+            const counts = r.tool_calls;
+            if (!counts || typeof counts !== 'object' || !isCallCount(counts.total)) return '—';
+            const retry = typeof r.attempt === 'number' && r.attempt > 1 ? ' on this attempt' : '';
+            return `${counts.total}${retry}${toolCallBreakdown(counts)}`;
+        }
+
         // The two halves of the table, for the two ways it gets mounted.
         //
         // renderReviewCard builds a string; paintStageProgress assigns into an
@@ -5327,13 +5401,14 @@
         }
 
         // One line naming the reference repositories a review had: which tree,
-        // at which configured revision and commit, and how many tool calls named
-        // it. The reason it was attached goes in the hover text, and configured
-        // references the patch left dormant follow in muted text, so a reader can
-        // tell "not offered" from "offered and unused". Everything shown comes
-        // from the review row, and the matched file name from the patch itself,
-        // so every value is escaped. Returns '' for a review with no record, so
-        // such a card renders exactly as before.
+        // at which configured revision and commit. The reason it was attached
+        // goes in the hover text. How many calls each one received is on the
+        // card's "Tool calls:" line, counted from the same rows as the live
+        // figure; a read count an older record carries is not shown, because
+        // two per-reference counts from two sources could disagree. Everything
+        // shown comes from the review row, and the matched file name from the
+        // patch itself, so every value is escaped. Returns '' for a review with
+        // no record, so such a card renders exactly as before.
         function renderReviewReferences(refs) {
             try {
                 if (typeof refs === 'string') refs = JSON.parse(refs);
@@ -5347,17 +5422,13 @@
 
                 const entries = attached.map(a => {
                     const commit = String(a.commit || '');
-                    let text = `${escapeHtml(a.name)} @ ${escapeHtml(a.revision)} (${escapeHtml(commit.slice(0, 12))})`;
-                    const hasReads = typeof a.reads === 'number';
-                    if (hasReads) text += `, ${a.reads} read${a.reads === 1 ? '' : 's'}`;
+                    const text = `${escapeHtml(a.name)} @ ${escapeHtml(a.revision)} (${escapeHtml(commit.slice(0, 12))})`;
                     // Stored JSON is untyped, so a reason is only spelled out
                     // when the fields it names are actually there.
                     const why = a.why === 'match' && typeof a.file === 'string' && typeof a.glob === 'string'
                         ? `attached because ${a.file} matches ${a.glob}`
                         : a.why === 'always' ? 'attached to every patch' : 'attached';
-                    const title = [why, `kind ${a.kind}`, `commit ${commit}`,
-                        hasReads ? 'reads count tool calls that named it, cache hits and refused calls included'
-                                 : 'read count not reported: the review did not finish'].join('; ');
+                    const title = [why, `kind ${a.kind}`, `commit ${commit}`].join('; ');
                     return `<span title="${escapeHtml(title)}">${text}</span>`;
                 });
 
@@ -5751,6 +5822,9 @@
                         ${emailHtml}
                         <div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; margin-top: 2px;">
                             <strong>Tokens used:</strong> ${tokenStr}
+                        </div>
+                        <div style="font-size: 0.9em; color: var(--text-muted); line-height: 1.4; margin-top: 2px;" title="${escapeHtml(toolCallsTitle())}">
+                            <strong>Tool calls:</strong> ${reviewToolCallsValue(r)}
                         </div>
                     </div>
                     ` : ''}
