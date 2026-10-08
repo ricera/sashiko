@@ -138,6 +138,31 @@ fn timed_out(error: &anyhow::Error) -> bool {
     error.downcast_ref::<GitTimedOut>().is_some()
 }
 
+/// A ref under which a forge publishes the head of a pull or merge request
+/// on the base repository, where a head pushed to a fork is found too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForgeHeadRef {
+    /// GitHub's `refs/pull/N/head`.
+    Pull,
+    /// GitLab's `refs/merge-requests/N/head`.
+    MergeRequest,
+}
+
+impl ForgeHeadRef {
+    /// The order the refs are tried in. GitHub's comes first because it is
+    /// the forge the deployments use; each is its own fetch, so the other
+    /// forge's ref costs one failed command only when the first fails.
+    const ORDER: [Self; 2] = [Self::Pull, Self::MergeRequest];
+
+    /// The full ref name for request `number`.
+    fn name(self, number: i64) -> String {
+        match self {
+            Self::Pull => format!("refs/pull/{}/head", number),
+            Self::MergeRequest => format!("refs/merge-requests/{}/head", number),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FetchRequest {
     pub repo_url: Option<String>,
@@ -161,6 +186,10 @@ pub struct FetchAgent {
     /// The limit each `GitOp` runs under: `GitOp::limit`, except in tests
     /// that need a hung fetch to time out in milliseconds.
     git_limit: fn(GitOp) -> Duration,
+    /// The arguments after the remote name of every `git fetch` run, in
+    /// order, so tests can tell which fallbacks ran and in what order.
+    #[cfg(test)]
+    fetches: std::sync::Mutex<Vec<Vec<String>>>,
 }
 
 /// The fetch activity of one repository's batch, cleared when the batch is
@@ -225,6 +254,95 @@ impl BatchRequest {
     }
 }
 
+/// The batch requests for one pull or merge request, whose head the forge
+/// also publishes under a ref (`ForgeHeadRef`) on the repository fetched
+/// from. Several requests share a number when an older head of the pull
+/// request is still queued beside the newer one, and the ref is fetched
+/// once for all of them.
+struct ForgeHead<'a> {
+    number: i64,
+    requests: Vec<&'a BatchRequest>,
+}
+
+impl ForgeHead<'_> {
+    /// Every endpoint of the requests, each once, in request order.
+    fn endpoints(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        self.requests
+            .iter()
+            .flat_map(|request| &request.endpoints)
+            .filter(|endpoint| seen.insert(endpoint.as_str()))
+            .cloned()
+            .collect()
+    }
+}
+
+/// What fetching one pull request's forge refs came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForgeHeadFetch {
+    /// Every request for the pull request has all its commits.
+    Complete,
+    /// The forge served this ref, but a request still misses a commit: an
+    /// older head that was force-pushed away, which the ref no longer
+    /// names, or a base the head does not reach, left to the heads fetch.
+    /// The forge answered, so read access is not what is missing.
+    Served(ForgeHeadRef),
+    /// Every ref fetch failed, and a request still misses a commit.
+    Refused,
+}
+
+impl ForgeHeadFetch {
+    /// The outcome once the refs were tried: `served` is the ref the forge
+    /// answered, if any, and `complete` whether every request now has all
+    /// its commits.
+    fn after(served: Option<ForgeHeadRef>, complete: bool) -> Self {
+        match (complete, served) {
+            (true, _) => Self::Complete,
+            (false, Some(kind)) => Self::Served(kind),
+            (false, None) => Self::Refused,
+        }
+    }
+
+    /// Logs what an operator can act on: a WARN with the credentials fix
+    /// when the forge refused every ref, since then the daemon's user may
+    /// lack read access, and an info line when a served ref still left a
+    /// commit missing, since credentials cannot help there.
+    fn report(self, remote: &str, number: i64) {
+        match self {
+            Self::Complete => {}
+            Self::Served(kind) => info!(
+                "{} from {} did not bring every commit of pull request {}: the head of an \
+                 older request was force-pushed away, or the base is left to the heads fetch.",
+                kind.name(number),
+                remote,
+                number
+            ),
+            Self::Refused => warn!(
+                "Could not fetch the head of pull request {} from {}: the forge refused the \
+                 fetch by SHA and both {} and {}. The daemon's user needs read credentials \
+                 for {}: run gh auth setup-git as that user, or add a \
+                 url.<ssh-url>.insteadOf {} rule.",
+                number,
+                remote,
+                ForgeHeadRef::Pull.name(number),
+                ForgeHeadRef::MergeRequest.name(number),
+                remote,
+                remote
+            ),
+        }
+    }
+}
+
+/// The configured remote one batch fetches from, and the budget of each
+/// fetch attempt against it.
+struct FetchSource<'a> {
+    /// The `fetcher-<hash>` remote git fetches through.
+    remote_name: &'a str,
+    /// The remote's URL with any secret redacted, for logs and activity.
+    remote: &'a str,
+    op: GitOp,
+}
+
 impl FetchAgent {
     pub fn new(
         repo_path: PathBuf,
@@ -242,6 +360,8 @@ impl FetchAgent {
                 gitlab_token,
                 activity,
                 git_limit: GitOp::limit,
+                #[cfg(test)]
+                fetches: std::sync::Mutex::new(Vec::new()),
             },
             tx,
         )
@@ -310,11 +430,18 @@ impl FetchAgent {
         let requests: Vec<BatchRequest> = commit_list.into_iter().map(BatchRequest::new).collect();
         let missing = self.missing_endpoints(&requests).await;
 
-        let requests = match self.fetch_missing(url_opt, &missing, &marks).await {
+        let requests = match self
+            .fetch_missing(url_opt, &requests, &missing, &marks)
+            .await
+        {
             Ok(()) => requests,
             Err(e) => {
                 error!("{}", e);
-                self.fail_unfetched(requests, &missing, &e.to_string())
+                // A pull request head fetched through its forge ref before a
+                // later attempt failed is present now, so only the requests
+                // still missing a commit fail.
+                let unfetched = self.still_missing(&missing).await;
+                self.fail_unfetched(requests, &unfetched, &e.to_string())
                     .await
             }
         };
@@ -335,13 +462,52 @@ impl FetchAgent {
     /// once, in request order. This is the union the batch fetches.
     async fn missing_endpoints(&self, requests: &[BatchRequest]) -> Vec<String> {
         let mut checked = HashSet::new();
+        let endpoints: Vec<String> = requests
+            .iter()
+            .flat_map(|r| &r.endpoints)
+            .filter(|endpoint| checked.insert(endpoint.as_str()))
+            .cloned()
+            .collect();
+        self.still_missing(&endpoints).await
+    }
+
+    /// Those of `endpoints` that are not in the repository, in order.
+    async fn still_missing(&self, endpoints: &[String]) -> Vec<String> {
         let mut missing = Vec::new();
-        for endpoint in requests.iter().flat_map(|r| &r.endpoints) {
-            if checked.insert(endpoint.as_str()) && !self.is_present(endpoint).await {
+        for endpoint in endpoints {
+            if !self.is_present(endpoint).await {
                 missing.push(endpoint.clone());
             }
         }
         missing
+    }
+
+    /// The requests that name a pull or merge request and need one of the
+    /// `missing` commits, grouped by number in order of first appearance. A
+    /// number that is not positive names no forge ref and is left out.
+    fn forge_heads<'a>(
+        &self,
+        requests: &'a [BatchRequest],
+        missing: &[String],
+    ) -> Vec<ForgeHead<'a>> {
+        let numbered = requests
+            .iter()
+            .filter(|request| request.needs_any(missing))
+            .filter_map(|request| {
+                let number = self.mr_fields(&request.commit_or_range).2?;
+                (number > 0).then_some((number, request))
+            });
+        let mut heads: Vec<ForgeHead<'a>> = Vec::new();
+        for (number, request) in numbered {
+            match heads.iter_mut().find(|head| head.number == number) {
+                Some(head) => head.requests.push(request),
+                None => heads.push(ForgeHead {
+                    number,
+                    requests: vec![request],
+                }),
+            }
+        }
+        heads
     }
 
     /// Brings the missing endpoints in from the batch's remote.
@@ -349,10 +515,13 @@ impl FetchAgent {
     /// Returns `Ok` without fetching when nothing is missing or there is no
     /// other repository to fetch from; a request whose commits are still
     /// absent then fails on its own when it is submitted. An `Err` carries
-    /// the wording that every request needing a missing commit fails with.
+    /// the wording that every request still missing a commit when the fetch
+    /// ends fails with; a request whose commits an earlier attempt brought
+    /// is submitted all the same.
     async fn fetch_missing(
         &self,
         url_opt: Option<&str>,
+        requests: &[BatchRequest],
         missing: &[String],
         marks: &BatchMarks<'_>,
     ) -> Result<()> {
@@ -391,9 +560,13 @@ impl FetchAgent {
             .await
             .map_err(|e| anyhow!("Failed to set up remote {}: {}", remote, e))?;
 
-        let fetched = self
-            .fetch_from(&remote_name, &remote, setup.fetch_op(), missing, marks)
-            .await;
+        let source = FetchSource {
+            remote_name: &remote_name,
+            remote: &remote,
+            op: setup.fetch_op(),
+        };
+        let forge_heads = self.forge_heads(requests, missing);
+        let fetched = self.fetch_from(&source, missing, &forge_heads, marks).await;
         if let Err(e) = &fetched
             && setup == RemoteSetup::Added
             && !timed_out(e)
@@ -410,23 +583,25 @@ impl FetchAgent {
     }
 
     /// Fetches the missing commits from an already configured remote, each
-    /// attempt under `op`'s limit, falling back to every head when fetching
-    /// the commits by SHA fails for any reason other than a timeout. The
-    /// error is the last attempt's own, so the caller can tell a timeout.
+    /// attempt under the source's limit: first the commits by SHA; when that
+    /// fails for any reason other than a timeout, each pull request head in
+    /// `forge_heads` through its forge refs, then every head. The error is
+    /// the last attempt's own, so the caller can tell a timeout.
     async fn fetch_from(
         &self,
-        remote_name: &str,
-        remote: &str,
-        op: GitOp,
+        source: &FetchSource<'_>,
         missing: &[String],
+        forge_heads: &[ForgeHead<'_>],
         marks: &BatchMarks<'_>,
     ) -> Result<()> {
-        // 1. Try optimistic fetch (fetch specific commits)
         marks.mark(Phase::Fetching {
-            remote: remote.to_string(),
+            remote: source.remote.to_string(),
             commits: missing.len(),
         });
-        let Err(e) = self.fetch_commits(remote_name, missing, op).await else {
+        let Err(e) = self
+            .fetch_wants(source.remote_name, missing, source.op)
+            .await
+        else {
             return Ok(());
         };
         // A remote that did not answer a fetch of a few commits will not
@@ -436,16 +611,84 @@ impl FetchAgent {
             return Err(e);
         }
         warn!(
-            "Optimistic fetch failed for {}: {}. Falling back to full fetch.",
-            remote, e
+            "Optimistic fetch failed for {}: {}. Falling back to any pull request refs, then every head.",
+            source.remote, e
         );
 
-        // 2. Fallback: Fetch everything (heads)
+        // One refused want fails the whole fetch above, and the heads below
+        // never hold a head pushed to a fork, so each pull request's head is
+        // asked for by the ref its forge publishes it under.
+        self.fetch_forge_heads(source, forge_heads, marks).await?;
+
         marks.mark(Phase::Fetching {
-            remote: format!("{} (all heads)", remote),
+            remote: format!("{} (all heads)", source.remote),
+            commits: self.still_missing(missing).await.len(),
+        });
+        self.fetch_all(source.remote_name, source.op).await
+    }
+
+    /// Fetches the head of each pull request in `forge_heads` whose requests
+    /// still miss a commit through its forge refs, and reports each outcome.
+    /// Only a timeout is an error, and it stops the rest: a remote that did
+    /// not answer one ref will not answer the next.
+    async fn fetch_forge_heads(
+        &self,
+        source: &FetchSource<'_>,
+        forge_heads: &[ForgeHead<'_>],
+        marks: &BatchMarks<'_>,
+    ) -> Result<()> {
+        for head in forge_heads {
+            self.fetch_forge_head(source, head, marks)
+                .await?
+                .report(source.remote, head.number);
+        }
+        Ok(())
+    }
+
+    /// Fetches one pull request's head through its forge refs when any of
+    /// its requests still misses a commit, and says what that came to.
+    async fn fetch_forge_head(
+        &self,
+        source: &FetchSource<'_>,
+        head: &ForgeHead<'_>,
+        marks: &BatchMarks<'_>,
+    ) -> Result<ForgeHeadFetch> {
+        let endpoints = head.endpoints();
+        let missing = self.still_missing(&endpoints).await;
+        if missing.is_empty() {
+            return Ok(ForgeHeadFetch::Complete);
+        }
+        marks.mark(Phase::Fetching {
+            remote: format!("{} (pull request {} head)", source.remote, head.number),
             commits: missing.len(),
         });
-        self.fetch_all(remote_name, op).await
+        let served = self.fetch_first_forge_ref(source, head.number).await?;
+        let complete = self.still_missing(&endpoints).await.is_empty();
+        Ok(ForgeHeadFetch::after(served, complete))
+    }
+
+    /// Fetches the forge refs of pull request `number` in `ForgeHeadRef`
+    /// order until the forge serves one, and returns that one, or `None`
+    /// when it refuses them all. A forge that served one ref is not the
+    /// forge the others belong to, so they are not tried after it. Each ref
+    /// is its own command because a ref the forge does not have fails the
+    /// whole fetch. A ref fetch names no destination, so it writes only
+    /// `FETCH_HEAD`, as the fetch by SHA does, and leaves no ref behind.
+    async fn fetch_first_forge_ref(
+        &self,
+        source: &FetchSource<'_>,
+        number: i64,
+    ) -> Result<Option<ForgeHeadRef>> {
+        for kind in ForgeHeadRef::ORDER {
+            let refname = kind.name(number);
+            let wants = std::slice::from_ref(&refname);
+            match self.fetch_wants(source.remote_name, wants, source.op).await {
+                Ok(()) => return Ok(Some(kind)),
+                Err(e) if timed_out(&e) => return Err(e),
+                Err(e) => info!("Fetching {} from {} failed: {}", refname, source.remote, e),
+            }
+        }
+        Ok(None)
     }
 
     /// Whether `url` names the fetcher's own repository, which has nothing
@@ -460,9 +703,11 @@ impl FetchAgent {
         }
     }
 
-    /// Fails every request that needed a commit the failed fetch was to
-    /// bring, and returns the rest, whose commits were all present already
-    /// and can still be submitted.
+    /// Fails every request that needs one of the `missing` commits, those
+    /// still absent when the failed fetch ended, and returns the rest, whose
+    /// commits are all present now, either from before the fetch or brought
+    /// by an attempt that succeeded before a later one failed, and which
+    /// can still be submitted.
     async fn fail_unfetched(
         &self,
         requests: Vec<BatchRequest>,
@@ -743,6 +988,10 @@ impl FetchAgent {
         let mut dropped_graph = false;
 
         loop {
+            #[cfg(test)]
+            if let Ok(mut fetches) = self.fetches.lock() {
+                fetches.push(args.iter().skip(1).map(|a| a.to_string()).collect());
+            }
             let mut cmd = crate::git_cmd::in_dir_async(&self.repo_path);
             cmd.args(fetch_args(args));
             let output = self.run_git(cmd, op, "git fetch").await?;
@@ -768,19 +1017,21 @@ impl FetchAgent {
         }
     }
 
-    async fn fetch_commits(&self, remote: &str, commits: &[String], op: GitOp) -> Result<()> {
+    /// Fetches `wants`, commit SHAs or ref names, from `remote` in one
+    /// command with no destination, so only `FETCH_HEAD` is written.
+    async fn fetch_wants(&self, remote: &str, wants: &[String], op: GitOp) -> Result<()> {
         let mut args = vec![remote];
-        for commit in commits {
-            if commit.is_empty()
-                || commit.chars().any(char::is_whitespace)
-                || commit.starts_with('-')
-                || commit.starts_with('+')
-                || commit.contains(':')
+        for want in wants {
+            if want.is_empty()
+                || want.chars().any(char::is_whitespace)
+                || want.starts_with('-')
+                || want.starts_with('+')
+                || want.contains(':')
             {
-                warn!("Skipping invalid commit ref in fetch batch: {}", commit);
+                warn!("Skipping invalid commit ref in fetch batch: {}", want);
                 continue;
             }
-            args.push(commit.as_str());
+            args.push(want.as_str());
         }
         if args.len() == 1 {
             return Err(anyhow!("No valid commit refs to fetch"));
@@ -965,7 +1216,11 @@ mod tests {
             requests.iter().map(|r| r.to_string()).collect(),
         );
         agent.process_queue(&mut queue).await;
+        drain(rx)
+    }
 
+    /// Every event waiting on `rx`, in order.
+    fn drain(rx: &mut mpsc::Receiver<Event>) -> Vec<Event> {
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
@@ -1387,6 +1642,12 @@ mod tests {
 
     impl HungRemote {
         async fn start() -> Result<Self> {
+            Self::start_after_refusing(0).await
+        }
+
+        /// A remote that closes its first `refused` connections at once, so
+        /// those fetches fail without a timeout, and hangs on the rest.
+        async fn start_after_refusing(refused: usize) -> Result<Self> {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let url = format!("http://{}/hung.git", listener.local_addr()?);
             let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1396,8 +1657,9 @@ mod tests {
                 // that never comes.
                 let mut held = Vec::new();
                 while let Ok((stream, _)) = listener.accept().await {
-                    held.push(stream);
-                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= refused {
+                        held.push(stream);
+                    }
                 }
             });
             Ok(Self {
@@ -1520,5 +1782,442 @@ mod tests {
         assert_eq!(GitOp::FirstFetch.limit(), Duration::from_secs(1800));
         assert_eq!(RemoteSetup::Added.fetch_op(), GitOp::FirstFetch);
         assert_eq!(RemoteSetup::Existing.fetch_op(), GitOp::Fetch);
+    }
+
+    /// Runs git with `args` in `dir` and returns its trimmed output, as an
+    /// error when git fails, so a broken fixture stops the test at once.
+    async fn git_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+        let output = crate::git_cmd::in_dir_async(dir)
+            .args(args)
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
+    }
+
+    /// Clones `daemon` into `forge` and adds one commit on top that only
+    /// `refname` names, as a forge holds the head of a pull request from a
+    /// fork on the base repository: no branch reaches it, so fetching every
+    /// head never brings it. Returns that commit.
+    async fn forge_with_head_under(
+        daemon: &std::path::Path,
+        forge: &std::path::Path,
+        refname: &str,
+    ) -> Result<String> {
+        let (Some(daemon_path), Some(forge_path)) = (daemon.to_str(), forge.to_str()) else {
+            return Err(anyhow!("test paths must be UTF-8"));
+        };
+        git_in(daemon, &["clone", "--quiet", daemon_path, forge_path]).await?;
+        let head = commit_file(forge, "change.txt", "Pull request change").await?;
+        git_in(forge, &["update-ref", refname, &head]).await?;
+        git_in(forge, &["reset", "--quiet", "--hard", "HEAD~1"]).await?;
+        Ok(head)
+    }
+
+    /// Commits a file named `name` holding `message` on the branch checked
+    /// out in `dir`, and returns the commit.
+    async fn commit_file(dir: &std::path::Path, name: &str, message: &str) -> Result<String> {
+        std::fs::write(dir.join(name), format!("{}\n", message))?;
+        git_in(dir, &["add", name]).await?;
+        git_in(
+            dir,
+            &[
+                "-c",
+                "user.name=Test User",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                message,
+            ],
+        )
+        .await?;
+        git_in(dir, &["rev-parse", "HEAD"]).await
+    }
+
+    /// An agent on a new repository at `daemon`, with the forge `forge`
+    /// holding a pull request head under refs/pull/7/head that no branch
+    /// reaches. Returns the agent, its events, the repository's one commit
+    /// and the head.
+    async fn agent_with_pull_head(
+        daemon: &std::path::Path,
+        forge: &std::path::Path,
+    ) -> Result<(FetchAgent, mpsc::Receiver<Event>, String, String)> {
+        let base = init_repo_with_commit(daemon).await?;
+        let head = forge_with_head_under(daemon, forge, "refs/pull/7/head").await?;
+        let (tx, rx) = mpsc::channel(16);
+        let (agent, _) = FetchAgent::new(daemon.to_path_buf(), tx, None, ActivityRegistry::new());
+        Ok((agent, rx, base, head))
+    }
+
+    /// The wants of every `git fetch` the agent ran, in order, with the
+    /// first one's sorted: a batch's queue is a set, so the order of its
+    /// SHAs varies from run to run.
+    fn recorded_fetches(agent: &FetchAgent) -> Vec<Vec<String>> {
+        let mut fetches = agent
+            .fetches
+            .lock()
+            .map(|fetches| fetches.clone())
+            .unwrap_or_default();
+        if let Some(first) = fetches.first_mut() {
+            first.sort();
+        }
+        fetches
+    }
+
+    /// `wants` sorted, to compare with a recorded SHA attempt.
+    fn sorted(wants: &[&str]) -> Vec<String> {
+        let mut wants: Vec<String> = wants.iter().map(|w| w.to_string()).collect();
+        wants.sort();
+        wants
+    }
+
+    /// The main case of the forge-ref fallback, on real git. One request in
+    /// the batch is an older head the forge no longer has, which fails the
+    /// multi-want fetch by SHA as a whole; the pull request head is held
+    /// only under refs/pull/7/head, so the heads fallback alone would not
+    /// bring it, and the ref fetch does. It leaves no ref of its own.
+    #[tokio::test]
+    async fn a_pull_request_head_is_fetched_through_its_ref_when_the_batch_fails() -> Result<()> {
+        let daemon = tempfile::tempdir()?;
+        let forge_dir = tempfile::tempdir()?;
+        let forge = forge_dir.path().join("forge");
+        let (mut agent, mut rx, base, head) = agent_with_pull_head(daemon.path(), &forge).await?;
+        let range = format!("{}..{}", base, head);
+        agent
+            .mr_metadata
+            .insert(range.clone(), (None, None, Some(7)));
+
+        let url = forge.to_string_lossy().to_string();
+        let events = run_batch(&agent, &mut rx, &url, &[&range, MISSING_HEAD]).await;
+
+        assert_eq!(submitted_ids(&events), [format!("mr-7-{}", range)]);
+        assert_eq!(failed_ids(&events), [MISSING_HEAD]);
+        assert_eq!(
+            recorded_fetches(&agent),
+            [
+                sorted(&[&head, MISSING_HEAD]),
+                vec!["refs/pull/7/head".to_string()],
+                vec![],
+            ]
+        );
+        let naming_head = git_in(daemon.path(), &["for-each-ref", "--points-at", &head]).await?;
+        assert_eq!(naming_head, "", "a ref names the fetched head");
+        let left = git_in(
+            daemon.path(),
+            &["for-each-ref", "refs/sashiko", "refs/pull"],
+        )
+        .await?;
+        assert_eq!(left, "", "the ref fetch left refs behind");
+        Ok(())
+    }
+
+    /// The ref fetch runs only after the fetch by SHA failed, before the
+    /// heads fallback, and GitLab's ref after GitHub's: a remote that
+    /// refuses every connection makes each attempt fail, so all of them run.
+    #[tokio::test]
+    async fn a_ref_fetch_follows_a_failed_sha_attempt() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        init_repo_with_commit(temp_dir.path()).await?;
+        let (tx, mut rx) = mpsc::channel(16);
+        let (mut agent, _) = FetchAgent::new(
+            temp_dir.path().to_path_buf(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+        );
+        let range = format!("{}..{}", MISSING_BASE, MISSING_HEAD);
+        agent
+            .mr_metadata
+            .insert(range.clone(), (None, None, Some(7)));
+
+        let events = run_refused_batch(&agent, &mut rx, &[&range]).await;
+
+        assert_eq!(failed_ids(&events), [format!("mr-7-{}", range)]);
+        assert_eq!(
+            recorded_fetches(&agent),
+            [
+                sorted(&[MISSING_BASE, MISSING_HEAD]),
+                vec!["refs/pull/7/head".to_string()],
+                vec!["refs/merge-requests/7/head".to_string()],
+                vec![],
+            ]
+        );
+        Ok(())
+    }
+
+    /// A forge that publishes the head only under GitLab's ref is reached
+    /// once GitHub's ref has failed.
+    #[tokio::test]
+    async fn a_merge_request_head_is_tried_after_the_pull_ref() -> Result<()> {
+        let daemon = tempfile::tempdir()?;
+        let forge_dir = tempfile::tempdir()?;
+        let forge = forge_dir.path().join("forge");
+        let base = init_repo_with_commit(daemon.path()).await?;
+        let head =
+            forge_with_head_under(daemon.path(), &forge, "refs/merge-requests/7/head").await?;
+        let (tx, mut rx) = mpsc::channel(16);
+        let (mut agent, _) = FetchAgent::new(
+            daemon.path().to_path_buf(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+        );
+        let range = format!("{}..{}", base, head);
+        agent
+            .mr_metadata
+            .insert(range.clone(), (None, None, Some(7)));
+
+        let url = forge.to_string_lossy().to_string();
+        let events = run_batch(&agent, &mut rx, &url, &[&range, MISSING_HEAD]).await;
+
+        assert_eq!(submitted_ids(&events), [format!("mr-7-{}", range)]);
+        assert_eq!(
+            recorded_fetches(&agent)[1..],
+            [
+                vec!["refs/pull/7/head".to_string()],
+                vec!["refs/merge-requests/7/head".to_string()],
+                vec![],
+            ]
+        );
+        Ok(())
+    }
+
+    /// A ref fetch that times out ends the fallbacks, as a timed-out fetch
+    /// by SHA does: neither GitLab's ref nor every head is fetched after it.
+    #[tokio::test]
+    async fn a_ref_fetch_timeout_stops_the_fallbacks() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let (mut agent, mut rx) = agent_with_short_limits(temp_dir.path()).await?;
+        // The fetch by SHA fails at once on the refused connection; the ref
+        // fetch after it hangs.
+        let remote = HungRemote::start_after_refusing(1).await?;
+        let range = format!("{}..{}", MISSING_BASE, MISSING_HEAD);
+        agent
+            .mr_metadata
+            .insert(range.clone(), (None, None, Some(7)));
+
+        let events = run_batch(&agent, &mut rx, &remote.url, &[&range]).await;
+
+        let reasons = failure_reasons(&events);
+        assert_eq!(reasons.len(), 1, "got: {:?}", reasons);
+        assert!(reasons[0].contains("timed out"), "got: {:?}", reasons);
+        assert_eq!(
+            recorded_fetches(&agent),
+            [
+                sorted(&[MISSING_BASE, MISSING_HEAD]),
+                vec!["refs/pull/7/head".to_string()],
+            ]
+        );
+        assert_eq!(remote.connections().await, 2);
+        Ok(())
+    }
+
+    /// A request that names no pull request has no forge ref to try, so the
+    /// heads fallback follows the fetch by SHA directly, as before.
+    #[tokio::test]
+    async fn a_request_without_a_number_skips_the_ref_fetch() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        init_repo_with_commit(temp_dir.path()).await?;
+        let (tx, mut rx) = mpsc::channel(16);
+        let (agent, _) = FetchAgent::new(
+            temp_dir.path().to_path_buf(),
+            tx,
+            None,
+            ActivityRegistry::new(),
+        );
+        let range = format!("{}..{}", MISSING_BASE, MISSING_HEAD);
+
+        let events = run_refused_batch(&agent, &mut rx, &[&range]).await;
+
+        assert_eq!(failed_ids(&events), [range.as_str()]);
+        assert_eq!(
+            recorded_fetches(&agent),
+            [sorted(&[MISSING_BASE, MISSING_HEAD]), vec![]]
+        );
+        Ok(())
+    }
+
+    /// A pull request head brought by its ref is still submitted when the
+    /// heads fallback after it fails; only the request still missing a
+    /// commit fails. A ref at refs/remotes/<remote> makes the heads fetch
+    /// fail, since git cannot create the remote's branches beneath it,
+    /// while a fetch with no destination is unaffected.
+    #[tokio::test]
+    async fn a_head_fetched_through_its_ref_survives_a_failed_heads_fetch() -> Result<()> {
+        let daemon = tempfile::tempdir()?;
+        let forge_dir = tempfile::tempdir()?;
+        let forge = forge_dir.path().join("forge");
+        let (mut agent, mut rx, base, head) = agent_with_pull_head(daemon.path(), &forge).await?;
+        let range = format!("{}..{}", base, head);
+        agent
+            .mr_metadata
+            .insert(range.clone(), (None, None, Some(7)));
+        let url = forge.to_string_lossy().to_string();
+        let blocker = format!("refs/remotes/{}", agent.get_remote_name(&url));
+        git_in(daemon.path(), &["update-ref", &blocker, &base]).await?;
+
+        let events = run_batch(&agent, &mut rx, &url, &[&range, MISSING_HEAD]).await;
+
+        assert_eq!(submitted_ids(&events), [format!("mr-7-{}", range)]);
+        assert_eq!(failed_ids(&events), [MISSING_HEAD]);
+        let reasons = failure_reasons(&events);
+        assert!(
+            reasons[0].starts_with("Failed to fetch from"),
+            "the reason should be the heads fetch's error, got: {:?}",
+            reasons
+        );
+        Ok(())
+    }
+
+    /// A base that moved on the target branch is not reached by the pull
+    /// request head, so the served refs/pull/7/head leaves it missing.
+    /// GitLab's ref is not tried after GitHub's was served, and the heads
+    /// fetch brings the base, so the pull request is submitted.
+    #[tokio::test]
+    async fn a_base_the_pull_ref_does_not_reach_is_left_to_the_heads_fetch() -> Result<()> {
+        let daemon = tempfile::tempdir()?;
+        let forge_dir = tempfile::tempdir()?;
+        let forge = forge_dir.path().join("forge");
+        let (mut agent, mut rx, _, head) = agent_with_pull_head(daemon.path(), &forge).await?;
+        let moved_base = commit_file(&forge, "target.txt", "Target branch change").await?;
+        let range = format!("{}..{}", moved_base, head);
+        agent
+            .mr_metadata
+            .insert(range.clone(), (None, None, Some(7)));
+
+        let url = forge.to_string_lossy().to_string();
+        let events = run_batch(&agent, &mut rx, &url, &[&range, MISSING_HEAD]).await;
+
+        assert_eq!(submitted_ids(&events), [format!("mr-7-{}", range)]);
+        assert_eq!(failed_ids(&events), [MISSING_HEAD]);
+        assert_eq!(
+            recorded_fetches(&agent),
+            [
+                sorted(&[&moved_base, &head, MISSING_HEAD]),
+                vec!["refs/pull/7/head".to_string()],
+                vec![],
+            ]
+        );
+        Ok(())
+    }
+
+    /// An older request for pull request 7, whose head was force-pushed
+    /// away, shares the newer request's ref fetch: refs/pull/7/head is
+    /// fetched once and GitLab's ref never, whichever request the batch
+    /// lists first. The newer head is submitted and the older one fails.
+    /// The batch is run directly, in each order, because the queue is a set
+    /// whose order varies from run to run.
+    #[tokio::test]
+    async fn an_older_head_of_a_pull_request_shares_its_ref_fetch() -> Result<()> {
+        for newer_first in [true, false] {
+            let daemon = tempfile::tempdir()?;
+            let forge_dir = tempfile::tempdir()?;
+            let forge = forge_dir.path().join("forge");
+            let (mut agent, mut rx, base, head) =
+                agent_with_pull_head(daemon.path(), &forge).await?;
+            let newer = format!("{}..{}", base, head);
+            let older = format!("{}..{}", base, MISSING_HEAD);
+            for range in [&newer, &older] {
+                agent
+                    .mr_metadata
+                    .insert(range.clone(), (None, None, Some(7)));
+            }
+            let mut batch = vec![newer.clone(), older.clone()];
+            if !newer_first {
+                batch.reverse();
+            }
+
+            let url = forge.to_string_lossy().to_string();
+            agent.process_batch(Some(&url), batch).await;
+            let events = drain(&mut rx);
+
+            assert_eq!(submitted_ids(&events), [format!("mr-7-{}", newer)]);
+            assert_eq!(failed_ids(&events), [format!("mr-7-{}", older)]);
+            assert_eq!(
+                recorded_fetches(&agent),
+                [
+                    sorted(&[&head, MISSING_HEAD]),
+                    vec!["refs/pull/7/head".to_string()],
+                    vec![],
+                ],
+                "newer first: {}",
+                newer_first
+            );
+        }
+        Ok(())
+    }
+
+    /// Fetches pull request 7's forge refs for `ranges` from `url` as a
+    /// batch whose fetch by SHA failed would, and returns the outcome.
+    async fn forge_head_outcome(
+        agent: &FetchAgent,
+        url: &str,
+        ranges: &[&str],
+    ) -> Result<ForgeHeadFetch> {
+        let remote_name = agent.get_remote_name(url);
+        let setup = agent.ensure_remote(&remote_name, url).await?;
+        let requests: Vec<BatchRequest> = ranges
+            .iter()
+            .map(|range| BatchRequest::new(range.to_string()))
+            .collect();
+        let head = ForgeHead {
+            number: 7,
+            requests: requests.iter().collect(),
+        };
+        let source = FetchSource {
+            remote_name: &remote_name,
+            remote: url,
+            op: setup.fetch_op(),
+        };
+        let activity = ActivityRegistry::new();
+        let marks = BatchMarks {
+            activity: &activity,
+            commits: Vec::new(),
+        };
+        agent.fetch_forge_head(&source, &head, &marks).await
+    }
+
+    /// A forge that served refs/pull/7/head has answered, so a request it
+    /// left short of a commit, an older head force-pushed away, is not
+    /// reported as a refusal with the credentials advice. A forge that
+    /// refuses both refs is.
+    #[tokio::test]
+    async fn a_served_ref_that_leaves_a_commit_missing_is_not_a_refusal() -> Result<()> {
+        let daemon = tempfile::tempdir()?;
+        let forge_dir = tempfile::tempdir()?;
+        let forge = forge_dir.path().join("forge");
+        let (agent, _rx, base, _) = agent_with_pull_head(daemon.path(), &forge).await?;
+        let older = format!("{}..{}", base, MISSING_HEAD);
+
+        let url = forge.to_string_lossy().to_string();
+        assert_eq!(
+            forge_head_outcome(&agent, &url, &[&older]).await?,
+            ForgeHeadFetch::Served(ForgeHeadRef::Pull)
+        );
+        assert_eq!(
+            forge_head_outcome(&agent, REFUSING_REMOTE, &[&older]).await?,
+            ForgeHeadFetch::Refused
+        );
+        assert_eq!(
+            forge_head_outcome(&agent, &url, &[&format!("{}..{}", base, base)]).await?,
+            ForgeHeadFetch::Complete
+        );
+        assert_eq!(
+            recorded_fetches(&agent),
+            [
+                vec!["refs/pull/7/head".to_string()],
+                vec!["refs/pull/7/head".to_string()],
+                vec!["refs/merge-requests/7/head".to_string()],
+            ]
+        );
+        Ok(())
     }
 }
