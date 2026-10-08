@@ -16,9 +16,10 @@ use crate::ai::AiTool;
 use crate::toolbox::framework::ToolRegistry;
 use anyhow::Result;
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 pub mod command;
 pub mod framework;
@@ -185,9 +186,8 @@ impl SashikoToolContext {
     /// the driver returns "no matches", which the model reads as a fact about
     /// the kernel. The error lists every valid name, so the retry can be right.
     pub fn repo_target(&self, args: &Value) -> Result<RepoTarget> {
-        let name = match args[REPO_ARG].as_str() {
-            None | Some(REPO_ARG_REVIEW) => return Ok(RepoTarget::Review),
-            Some(name) => name,
+        let Some(name) = named_reference(args[REPO_ARG].as_str()) else {
+            return Ok(RepoTarget::Review);
         };
         if let Some(index) = self.references.iter().position(|r| r.name == name) {
             return Ok(RepoTarget::Reference(index));
@@ -307,6 +307,104 @@ impl SashikoToolContext {
     }
 }
 
+/// The reference a `repo` argument names, or `None` when it selects the code
+/// under review: absent, not a string, or `"review"`.
+///
+/// Shared by [`SashikoToolContext::repo_target`] and [`call_target`], so the
+/// toolbox and the counts read the argument by one rule.
+fn named_reference(repo: Option<&str>) -> Option<&str> {
+    repo.filter(|name| *name != REPO_ARG_REVIEW)
+}
+
+/// The name a tool is registered under, from the name the model gave it.
+/// Models vary the case and padding of tool names, and the registry keys
+/// on the trimmed lower-case form.
+fn normalize_tool_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
+/// Whether a tool's parameter schema declares the `repo` argument. That
+/// declaration, not the tool's name, is what makes [`ToolBox::call`] treat
+/// the tool as reading a repository chosen by `repo`.
+fn declares_repo(parameters: &Value) -> bool {
+    parameters["properties"].get(REPO_ARG).is_some()
+}
+
+/// The tools a review offers. Built in one place so that [`ToolBox::new`]
+/// and [`tool_reads_repo`] cannot disagree about which tools exist.
+/// read_prompt is registered only when there is a prompt directory for it
+/// to read.
+fn review_registry(with_prompts: bool) -> ToolRegistry<SashikoToolContext> {
+    let mut registry = ToolRegistry::new();
+    registry.register(git_read_files::GitReadFilesTool);
+    registry.register(git_blame::GitBlameTool);
+    registry.register(git_diff::GitDiffTool);
+    registry.register(git_show::GitShowTool);
+    registry.register(git_log::GitLogTool);
+    registry.register(git_ls::GitLsTool);
+    registry.register(git_grep::GitGrepTool);
+    registry.register(git_find_files::GitFindFilesTool);
+    if with_prompts {
+        registry.register(read_prompt::ReadPromptTool);
+    }
+    registry
+}
+
+/// Names of the review tools whose schemas declare `repo`. Read from the
+/// registry itself rather than kept as a list, so a tool added later is
+/// classified correctly without an edit here.
+static REPO_READING_TOOLS: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
+    review_registry(true)
+        .declarations()
+        .iter()
+        .filter(|decl| declares_repo(&decl["parameters"]))
+        .filter_map(|decl| decl["name"].as_str().map(str::to_owned))
+        .collect()
+});
+
+/// Whether a tool, named as the model named it, takes the `repo` argument.
+/// The name is normalised as [`ToolBox::call`] normalises it.
+pub fn tool_reads_repo(tool_name: &str) -> bool {
+    REPO_READING_TOOLS.contains(&normalize_tool_name(tool_name))
+}
+
+/// Which repository a recorded tool call was aimed at, by the rule
+/// [`ToolBox::call`] applies to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallTarget {
+    /// The tool reads no repository (read_prompt, an unknown tool name). A
+    /// stray repo argument on it is ignored, as the toolbox ignores it.
+    NoRepository,
+    /// The code under review: repo absent, "review", or not a string.
+    Review,
+    /// The attached reference at this index of the list passed in.
+    Reference(usize),
+    /// A name the review did not have attached: dormant, unknown, or any
+    /// name when nothing is attached. The toolbox refuses these calls.
+    Unattached,
+}
+
+/// Classifies one recorded call. `repo` is the top-level repo argument when
+/// it is a JSON string; `attached` is the review's attached reference names
+/// in configured order.
+///
+/// A call is judged from what was recorded about it, without a toolbox, so
+/// a finished review's calls can be counted long after its toolbox is gone.
+/// It reaches the same answer [`SashikoToolContext::repo_target`] reaches
+/// for the same call, which a test checks call by call.
+pub fn call_target(tool_name: &str, repo: Option<&str>, attached: &[&str]) -> CallTarget {
+    if !tool_reads_repo(tool_name) {
+        return CallTarget::NoRepository;
+    }
+    let Some(name) = named_reference(repo) else {
+        return CallTarget::Review;
+    };
+    attached
+        .iter()
+        .position(|attached| *attached == name)
+        .map_or(CallTarget::Unattached, CallTarget::Reference)
+}
+
 /// Placeholder JSON-schema fragment for the `repo` argument, embedded in the
 /// static parameters of every tool that reads a repository.
 ///
@@ -422,19 +520,7 @@ impl ToolBox {
             cache: cache.clone(),
         };
 
-        let mut registry = ToolRegistry::new();
-        registry.register(git_read_files::GitReadFilesTool);
-        registry.register(git_blame::GitBlameTool);
-        registry.register(git_diff::GitDiffTool);
-        registry.register(git_show::GitShowTool);
-        registry.register(git_log::GitLogTool);
-        registry.register(git_ls::GitLsTool);
-        registry.register(git_grep::GitGrepTool);
-        registry.register(git_find_files::GitFindFilesTool);
-
-        if context.prompts_path.is_some() {
-            registry.register(read_prompt::ReadPromptTool);
-        }
+        let registry = review_registry(context.prompts_path.is_some());
 
         Self {
             context,
@@ -591,7 +677,7 @@ impl ToolBox {
     /// It handles argument normalization, caching of final results, and dispatches
     /// the execution to the corresponding tool struct.
     pub async fn call(&self, name: &str, args: Value) -> Result<Value> {
-        let name_normalized = name.trim().to_lowercase();
+        let name_normalized = normalize_tool_name(name);
         let should_cache = name_normalized != "todowrite";
         let args = utils::normalize_json_numbers(args);
 
@@ -604,7 +690,7 @@ impl ToolBox {
         let takes_repo = self
             .registry
             .parameters(&name_normalized)
-            .is_some_and(|p| p["properties"].get(REPO_ARG).is_some());
+            .is_some_and(|p| declares_repo(&p));
 
         // Pin the repository into the cache key centrally rather than in eight
         // `normalize_args` bodies: a tool that forgot would serve the review
