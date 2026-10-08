@@ -565,6 +565,13 @@ function toolCallWordingChecks(fns, expect) {
     expect('wording: many calls are plural', text({ total: 350 }) === '350 tool calls');
     expect('wording: every reference in order, zeros included',
         text(KERNEL_AND_RDMA) === '350 tool calls (72 to kernel, 0 to rdma-core)');
+    // KERNEL_AND_RDMA is already alphabetical, so it cannot tell the configured
+    // order from a sorted one. These are not, so a page that sorts is caught.
+    expect('wording: references keep their configured order, not their alphabetical one',
+        text({ total: 9, by_reference: split([{ name: 'rdma-core', calls: 4 }, { name: 'kernel', calls: 0 }]) })
+            === '9 tool calls (4 to rdma-core, 0 to kernel)'
+        && text({ total: 5, by_reference: split([{ name: 'zeta', calls: 2 }, { name: 'alpha', calls: 3 }]) })
+            === '5 tool calls (2 to zeta, 3 to alpha)');
     const kernel = [{ name: 'kernel', calls: 72 }];
     expect('wording: calls to unattached repositories are added',
         fns.toolCallBreakdown({ total: 80, by_reference: split(kernel, 3) })
@@ -640,6 +647,21 @@ function toolCallCardChecks(fns, expect) {
     expect('card: no counts from the daemon shows a dash',
         toolCallsLine(card({ id: 6, status: 'Reviewed' })) === '—'
         && toolCallsLine(card({ id: 6, status: 'Reviewed', tool_calls: null })) === '—');
+    // The payload is untyped JSON, so a total is printed only when it is a
+    // count. Anything else, markup included, is a dash and never the value.
+    const badTotals = ['3', '<img src=x>', -1, 1.5, NaN, Infinity, null, {}];
+    const badCards = badTotals.map(total => card({ id: 8, status: 'Reviewed',
+        tool_calls: { total, by_reference: split([{ name: 'kernel', calls: 2 }]) } }));
+    expect('card: a total that is not a count shows a dash',
+        badCards.every(c => toolCallsLine(c) === '—'));
+    expect('card: a total that is not a count is never printed',
+        !badCards[1].includes('<img src=x>') && !badCards[1].includes('&lt;img'));
+    // The breakdown is escaped once where it is built; escaping it again on
+    // the way into the card would show the entities to the reader.
+    const oddName = card({ id: 9, status: 'Reviewed',
+        tool_calls: { total: 1, by_reference: split([{ name: 'a&b<c', calls: 1 }]) } });
+    expect('card: a reference name is escaped exactly once',
+        toolCallsLine(oddName) === '1 (1 to a&amp;b&lt;c)');
     const recorded = card({ id: 7, status: 'Reviewed', patch_id: 10, tool_calls: KERNEL_AND_RDMA,
         stage_durations: [{ stage: 'goal', order: ORDER.goal, seconds: 60, turns: 2 }] });
     const recordedSummary = /data-stage-recorded[\s\S]*?<summary[^>]*>([\s\S]*?)<\/summary>/.exec(recorded);
@@ -694,6 +716,11 @@ function toolCallPaintChecks(fns, expect) {
         by_reference: split([{ name: 'kernel', calls: 0 }]) });
     expect('live: no call yet shows the zero total and no per-reference zero',
         before.text === 'Stages (1 running) — 0 tool calls');
+    // The summary is assigned as markup, so the name must arrive escaped, and
+    // escaped once: a second pass would show "&amp;" to the reader.
+    paint(true, { patch_id: 20, attempts: 1, total: 1, by_reference: split([{ name: 'a&b<c', calls: 1 }]) });
+    expect('live: a reference name is escaped exactly once',
+        summaryOf(h20).innerHTML === 'Stages (1 running) — 1 tool call (1 to a&amp;b&lt;c)');
 }
 
 async function toolCallRoutingChecks(fns, expect) {
@@ -2187,6 +2214,17 @@ const mutate = (name, from, to) => {
             mutate('toolCallsByPatch', 'if (!Array.isArray(list)) return new Map();', '')],
         ['a poll that trusts each tool_calls entry to be an object is caught',
             mutate('toolCallsByPatch', "c && typeof c === 'object' && ", '')],
+        ['a breakdown that sorts the references by name is caught',
+            mutate('toolCallBreakdown', 'const references = split.references',
+                'const references = [...split.references]'
+                + '.sort((a, b) => String(a && a.name).localeCompare(String(b && b.name)))')],
+        ['a card that prints any total it is served is caught',
+            mutate('reviewToolCallsValue', "typeof counts !== 'object' || !isCallCount(counts.total)",
+                "typeof counts !== 'object'")],
+        ['a live summary that escapes the counts twice is caught',
+            mutate('stageTableParts', '` — ${calls}`', '` — ${escapeHtml(calls)}`')],
+        ['a card that escapes the counts twice is caught',
+            mutate('renderReviewCard', '${reviewToolCallsValue(r)}', '${escapeHtml(reviewToolCallsValue(r))}')],
     ];
     for (const [name, broken] of toolCallMutations) {
         check(name, (await toolCallChecks(broken)).length > 0);
