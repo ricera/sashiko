@@ -1546,6 +1546,158 @@ mod tests {
         assert_eq!(toolbox.reference_reads(), [3, 1]);
     }
 
+    /// Whether a toolbox error is the refusal of a repo name, as opposed to
+    /// an unknown tool or a git failure. Matched on the three messages
+    /// repo_target writes.
+    fn is_repo_refusal(err: &anyhow::Error) -> bool {
+        let text = err.to_string();
+        [
+            "Unknown repo",
+            "configured but not attached",
+            "No reference repositories are attached",
+        ]
+        .iter()
+        .any(|needle| text.contains(needle))
+    }
+
+    /// call_target judges a recorded call without a toolbox, so the counts
+    /// shown for a review are only right if it reaches the toolbox's own
+    /// answer. Each call goes through both: the per-reference tallies must
+    /// equal the toolbox's reads, and a call is Unattached exactly when the
+    /// toolbox refused its repo.
+    #[test]
+    fn call_target_agrees_with_the_toolbox() {
+        use crate::toolbox::{CallTarget, call_target};
+        let (_review_dir, review_path) = setup_test_repo();
+        let (_kernel_dir, kernel_path) = setup_reference_repo();
+        let (_rdma_dir, rdma_path) = setup_rdma_reference_repo();
+        let prompts_dir = tempfile::tempdir().unwrap();
+        std::fs::write(prompts_dir.path().join("a.md"), "prompt").unwrap();
+        let toolbox = ToolBox::new(review_path, Some(prompts_dir.path().to_path_buf()))
+            .with_references([pinned_reference(kernel_path), pinned_rdma(rdma_path)])
+            .with_dormant_references([dormant("iproute2", &["ip/**"])]);
+        let attached: Vec<String> = toolbox
+            .references()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        let attached: Vec<&str> = attached.iter().map(String::as_str).collect();
+        assert_eq!(attached, ["kernel", "rdma-core"]);
+
+        let grep = |repo: Option<serde_json::Value>| {
+            let mut args = json!({ "revision": "HEAD", "pattern": "x" });
+            if let Some(repo) = repo {
+                args["repo"] = repo;
+            }
+            ("git_grep", args)
+        };
+        let calls = [
+            grep(None),
+            grep(Some(json!("review"))),
+            grep(Some(json!("kernel"))),
+            // The same call again, served from the cache.
+            grep(Some(json!("kernel"))),
+            grep(Some(json!("rdma-core"))),
+            grep(Some(json!("iproute2"))),
+            grep(Some(json!("nope"))),
+            grep(Some(json!(""))),
+            grep(Some(json!(5))),
+            ("read_prompt", json!({ "name": "a.md", "repo": "kernel" })),
+            ("git_frobnicate", json!({ "repo": "kernel" })),
+            (
+                "GIT_GREP",
+                json!({ "repo": "kernel", "revision": "HEAD", "pattern": "y" }),
+            ),
+        ];
+
+        let rt = Runtime::new().unwrap();
+        let mut tallies = vec![0u64; attached.len()];
+        for (tool, args) in calls {
+            let outcome = rt.block_on(toolbox.call(tool, args.clone()));
+            let target = call_target(tool, args["repo"].as_str(), &attached);
+            let refused = outcome.as_ref().is_err_and(is_repo_refusal);
+            assert_eq!(
+                target == CallTarget::Unattached,
+                refused,
+                "{tool} {args}: classified {target:?}, toolbox gave {outcome:?}"
+            );
+            if let CallTarget::Reference(index) = target {
+                tallies[index] += 1;
+            }
+        }
+        assert_eq!(tallies, [3, 1]);
+        assert_eq!(toolbox.reference_reads(), tallies);
+    }
+
+    /// With nothing attached, every name is one the review does not have,
+    /// and the toolbox refuses it; a tool that reads no repository still
+    /// ignores the argument.
+    #[test]
+    fn call_target_with_nothing_attached() {
+        use crate::toolbox::{CallTarget, call_target};
+        for name in ["kernel", "rdma-core", "nope", ""] {
+            assert_eq!(
+                call_target("git_grep", Some(name), &[]),
+                CallTarget::Unattached,
+                "{name:?}"
+            );
+            assert_eq!(
+                call_target("read_prompt", Some(name), &[]),
+                CallTarget::NoRepository,
+                "{name:?}"
+            );
+        }
+        assert_eq!(call_target("git_grep", None, &[]), CallTarget::Review);
+        assert_eq!(
+            call_target("git_grep", Some("review"), &[]),
+            CallTarget::Review
+        );
+
+        let toolbox = ToolBox::new(PathBuf::from("."), None);
+        let rt = Runtime::new().unwrap();
+        let err = rt
+            .block_on(toolbox.call(
+                "git_grep",
+                json!({ "repo": "kernel", "revision": "HEAD", "pattern": "x" }),
+            ))
+            .expect_err("nothing is attached, so no name can be served");
+        assert!(is_repo_refusal(&err), "{err}");
+    }
+
+    /// tool_reads_repo is derived from the registered schemas, so it must
+    /// say yes exactly for the tools that declare repo, under any case or
+    /// padding the model uses.
+    #[test]
+    fn tool_reads_repo_matches_every_declaration() {
+        use crate::toolbox::tool_reads_repo;
+        let declarations = crate::toolbox::review_registry(true).declarations();
+        let mut reading = Vec::new();
+        for decl in &declarations {
+            let name = decl["name"].as_str().unwrap();
+            let declares = decl["parameters"]["properties"].get("repo").is_some();
+            assert_eq!(tool_reads_repo(name), declares, "{name}");
+            if declares {
+                reading.push(name);
+            }
+        }
+        assert_eq!(
+            reading,
+            [
+                "git_blame",
+                "git_diff",
+                "git_find_files",
+                "git_grep",
+                "git_log",
+                "git_ls",
+                "git_read_files",
+                "git_show",
+            ]
+        );
+        assert!(!tool_reads_repo("read_prompt"));
+        assert!(tool_reads_repo("  GIT_GREP "));
+        assert!(!tool_reads_repo("git_frobnicate"));
+    }
+
     /// Naming a dormant reference says it exists, why it is not attached, and
     /// what is; a name that is not configured at all is still unknown.
     #[test]
