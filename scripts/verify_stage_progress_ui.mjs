@@ -69,6 +69,7 @@ const NAMES = ['escapeHtml', 'renderReviewReferences', 'renderReviewCard', 'getS
                'maxFindingCounts', 'maxOfRunsNote', 'patchSummaryStatus', 'renderStatCard', 'renderReviewStatCards',
                'reviewOutcomeColor',
                'isCallCount', 'toolCallBreakdown', 'toolCallsText', 'toolCallsTitle', 'reviewToolCallsValue',
+               'toolCallsByPatch',
                'renderStageRow', 'stageTableParts', 'hostForPatch', 'paintStageProgress',
                'refreshActivity', 'startActivityPolling', 'stopActivityPolling',
                'renderInteractionLogEntries', 'formatJsonExpandable', 'formatFuncCallExpandable',
@@ -552,7 +553,8 @@ console.log('case 10: stage table heading');
 // once the review has made a call, a zero included, because "0 to kernel" on a
 // review that looked elsewhere is the reading the count exists for. With no
 // call, or no record of which references the review had, there is no clause.
-// A card counts its own attempt and says so on a retry.
+// A card counts its own attempt and says so on a retry. The live stage table
+// counts the patch's current run, every attempt of it, and says how many.
 const KERNEL_AND_RDMA = { total: 350, by_reference: { references: [
     { name: 'kernel', calls: 72 }, { name: 'rdma-core', calls: 0 }], unattached: 0 } };
 const split = (references, unattached = 0) => ({ references, unattached });
@@ -645,17 +647,96 @@ function toolCallCardChecks(fns, expect) {
         recordedSummary !== null && !/tool call|to kernel/.test(recordedSummary[1]));
 }
 
-function toolCallChecks(fns) {
+// The live stage table: the count of the patch's current run sits in the
+// summary beside the stage counts, from the activity poll, and the hover says
+// what it sums. Patches 20 and 21 have hosts of their own, so the routing of
+// each patch's count to its own table is visible.
+const h20 = mkHost(20), h21 = mkHost(21);
+const LIVE_STAGES = 'What each review stage of this patch is doing right now.';
+const RUN_SENTENCE = "Tool calls: this patch's current run, every attempt.";
+const runningStage = pid => ({ key: `patchset:7/patch:${pid}/stage:goal`, patch_id: pid, stage: 'goal',
+    order: ORDER.goal, phase: { kind: 'stage', stage: 'goal', turn: 2, max_turns: 50, waiting: { on: 'model' } },
+    description: 'stage goal, turn 2/50 (awaiting model)', age_seconds: 30, idle_seconds: 2 });
+const RUN_OF_TWO = { patch_id: 20, attempts: 2, total: 47,
+    by_reference: split([{ name: 'kernel', calls: 3 }]) };
+const summaryOf = host => host.querySelector('summary');
+
+// Paints hosts 20 and 21 through refreshActivity with this response, from a
+// blank summary, so a variant that paints nothing cannot pass on what an
+// earlier run left there.
+async function pollBoth(fns, body) {
+    for (const host of [h20, h21]) { summaryOf(host).innerHTML = ''; summaryOf(host).title = ''; }
+    respond = () => body;
+    try { await fns.refreshActivity(7, fns.state().activityPoll.generation); }
+    finally { respond = () => payload; }
+    return [h20, h21].map(host => summaryOf(host).textContent);
+}
+
+function toolCallPaintChecks(fns, expect) {
+    const paint = (live, counts) => {
+        fns.paintStageProgress(h20, [runningStage(20)], live, counts);
+        return { text: summaryOf(h20).textContent, title: summaryOf(h20).title };
+    };
+    const counted = paint(true, RUN_OF_TWO);
+    expect('live: the summary carries the run\'s count',
+        counted.text === 'Stages (1 running) — 47 tool calls over 2 attempts (3 to kernel)');
+    expect('live: the title keeps its sentence and says what the count sums',
+        counted.title.startsWith(LIVE_STAGES) && counted.title.includes(RUN_SENTENCE)
+        && counted.title.includes(fns.toolCallsTitle()));
+    const bare = paint(true, null);
+    expect('live: no counts paints exactly as before',
+        bare.text === 'Stages (1 running)' && bare.title === LIVE_STAGES);
+    const persisted = paint(false, RUN_OF_TWO);
+    expect('live: a persisted table keeps the count',
+        persisted.text.endsWith(' — 47 tool calls over 2 attempts (3 to kernel)')
+        && persisted.title.includes(RUN_SENTENCE));
+    const before = paint(true, { patch_id: 20, attempts: 1, total: 0,
+        by_reference: split([{ name: 'kernel', calls: 0 }]) });
+    expect('live: no call yet shows the zero total and no per-reference zero',
+        before.text === 'Stages (1 running) — 0 tool calls');
+}
+
+async function toolCallRoutingChecks(fns, expect) {
+    const entries = [runningStage(20), runningStage(21)];
+    // Listed in the opposite order to the entries, so only the patch id can
+    // put each count on its host.
+    const both = await pollBoth(fns, { live: true, entries, tool_calls: [
+        { patch_id: 21, attempts: 1, total: 12, by_reference: null }, RUN_OF_TWO] });
+    expect('routing: each patch\'s count lands on its own table',
+        both[0] === 'Stages (1 running) — 47 tool calls over 2 attempts (3 to kernel)'
+        && both[1] === 'Stages (1 running) — 12 tool calls');
+    const older = await pollBoth(fns, { live: true, entries });
+    expect('routing: a response without counts paints the label alone',
+        older.every(text => text === 'Stages (1 running)'));
+    for (const odd of [{}, 'calls', 7]) {
+        const shown = await pollBoth(fns, { live: true, entries, tool_calls: odd })
+            .catch(e => [`THREW ${e}`]);
+        expect(`routing: tool_calls of ${JSON.stringify(odd)} is ignored`,
+            shown.length === 2 && shown.every(text => text === 'Stages (1 running)'));
+    }
+    // A list is not proof that its entries are objects with a patch id; a
+    // malformed entry is skipped and the well-formed one still lands.
+    const mixed = await pollBoth(fns, { live: true, entries, tool_calls: [
+        null, 5, 'x', { patch_id: 'abc', total: 9 }, RUN_OF_TWO] })
+        .catch(e => [`THREW ${e}`]);
+    expect('routing: malformed entries in tool_calls are skipped',
+        mixed.length === 2
+        && mixed[0] === 'Stages (1 running) — 47 tool calls over 2 attempts (3 to kernel)'
+        && mixed[1] === 'Stages (1 running)');
+}
+
+async function toolCallChecks(fns) {
     const failed = [];
     const expect = (name, cond) => { if (!cond) failed.push(name); };
-    for (const group of [toolCallWordingChecks, toolCallMalformedChecks, toolCallCardChecks]) {
-        try { group(fns, expect); } catch (e) { failed.push(`${group.name}: threw ${e}`); }
+    for (const group of [toolCallWordingChecks, toolCallMalformedChecks, toolCallCardChecks,
+                         toolCallPaintChecks, toolCallRoutingChecks]) {
+        try { await group(fns, expect); } catch (e) { failed.push(`${group.name}: threw ${e}`); }
     }
     return failed;
 }
 console.log('case 11: tool calls');
 {
-    const toolCallFailures = toolCallChecks(ctx);
+    const toolCallFailures = await toolCallChecks(ctx);
     check('every tool-call check passes', toolCallFailures.length === 0, toolCallFailures.join(', '));
 }
 
@@ -2085,9 +2166,30 @@ const mutate = (name, from, to) => {
         ['a recorded stage table that repeats the counts is caught',
             mutate('renderReviewCard', '${parts.summaryHtml}</summary>',
                 '${parts.summaryHtml} — ${toolCallsText(r.tool_calls, 1)}</summary>')],
+        ['a recorded stage table passed the counts is caught',
+            mutate('renderReviewCard', 'stageTableParts(recordedRows, false, null)',
+                'stageTableParts(recordedRows, false, r.tool_calls)')],
+        ['a stage table that ignores its counts is caught',
+            mutate('stageTableParts', 'const calls = toolCalls &&', 'const calls = null &&')],
+        ['a stage table that drops the run\'s attempts is caught',
+            mutate('stageTableParts', 'toolCallsText(toolCalls, toolCalls.attempts)', 'toolCallsText(toolCalls, 1)')],
+        ['a persisted stage table that drops the counts is caught',
+            mutate('stageTableParts', 'const calls = toolCalls &&', 'const calls = live && toolCalls &&')],
+        ['a live title that does not explain the counts is caught',
+            mutate('paintStageProgress', 'summary.title = parts.showsToolCalls', 'summary.title = false')],
+        ['a live title that explains counts that are not there is caught',
+            mutate('paintStageProgress', 'summary.title = parts.showsToolCalls', 'summary.title = true')],
+        ['a poll that paints every host without counts is caught',
+            mutate('refreshActivity', 'toolCalls.get(pid) || null', 'null')],
+        ['a poll that keys the counts by review is caught',
+            load({ ...sources, toolCallsByPatch: sources.toolCallsByPatch.replaceAll('c.patch_id', 'c.review_id') })],
+        ['a poll that trusts tool_calls to be a list is caught',
+            mutate('toolCallsByPatch', 'if (!Array.isArray(list)) return new Map();', '')],
+        ['a poll that trusts each tool_calls entry to be an object is caught',
+            mutate('toolCallsByPatch', "c && typeof c === 'object' && ", '')],
     ];
     for (const [name, broken] of toolCallMutations) {
-        check(name, toolCallChecks(broken).length > 0);
+        check(name, (await toolCallChecks(broken)).length > 0);
     }
 
     const rowUnescaped = load({ ...sources,
