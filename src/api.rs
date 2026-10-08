@@ -932,8 +932,9 @@ mod tests {
             review_runs(&attempts(&[(3, Some(1)), (2, Some(2)), (1, Some(1))])),
             vec![vec![1, 2], vec![3]]
         );
-        // A retry whose earlier rows are gone (a rerun deletes failed rows
-        // that never reached the model) is a run of its own.
+        // A retry whose earlier rows are gone is a run of its own. Reruns
+        // made before reruns renumbered the rows they keep could leave such
+        // a row behind.
         assert_eq!(review_runs(&attempts(&[(5, Some(2))])), vec![vec![5]]);
         assert!(review_runs(&[]).is_empty());
     }
