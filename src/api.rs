@@ -466,6 +466,76 @@ pub struct PatchsetActivityQuery {
     pub id: i64,
 }
 
+/// Tool calls recorded for one review attempt, or summed over one run.
+///
+/// Served as `tool_calls` on every review of the review payloads. Counted
+/// from `tool_usages`, so it covers the calls the model made as the daemon
+/// recorded them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolCallCounts {
+    /// Every call the model made that the daemon recorded, of every tool, to
+    /// every repository, including calls to unattached repositories and the
+    /// few the session declined to run.
+    pub total: u64,
+    /// The calls split by reference, or `None` when it is not known which
+    /// references the review had: no reference record (none configured, a
+    /// row from before migration 014, a fork row, a lost hand-off).
+    #[serde(default)]
+    pub by_reference: Option<ReferenceSplit>,
+}
+
+/// How a review's calls fell across the references it had.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceSplit {
+    /// One entry per reference attached to the review, in configured order,
+    /// zero counts included. Empty when every reference was dormant.
+    pub references: Vec<ReferenceCalls>,
+    /// Calls naming a repository the review did not have attached. The
+    /// toolbox refused them; they read nothing.
+    pub unattached: u64,
+}
+
+/// The calls one attached reference received.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceCalls {
+    pub name: String,
+    /// Calls aimed at this reference: cache hits and calls git rejected
+    /// included.
+    pub calls: u64,
+}
+
+impl ToolCallCounts {
+    /// The plain-text clause that says where the calls went, such as
+    /// "(72 to kernel, 0 to rdma-core)".
+    ///
+    /// Empty when there is nothing a reader could rely on: no calls (a zero
+    /// for a reference only means "never looked there" once the review was
+    /// looking somewhere), an unknown split, or a split with no attached
+    /// reference and no call to an unattached repository.
+    pub fn breakdown(&self) -> String {
+        let Some(split) = self.by_reference.as_ref().filter(|_| self.total > 0) else {
+            return String::new();
+        };
+        let references = split
+            .references
+            .iter()
+            .map(|r| format!("{} to {}", r.calls, r.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let unattached = match split.unattached {
+            0 => String::new(),
+            1 => "1 to an unattached repository".to_string(),
+            n => format!("{n} to unattached repositories"),
+        };
+        match (references.is_empty(), unattached.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => format!("({references})"),
+            (true, false) => format!("({unattached})"),
+            (false, false) => format!("({references}; {unattached})"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,5 +645,74 @@ mod tests {
         let mut expected = ReviewLogEntry::new(Some("goal"), tool_message());
         expected.stage_label = Some("Goal".to_string());
         assert_eq!(promoted, expected);
+    }
+
+    fn counts(total: u64, references: &[(&str, u64)], unattached: u64) -> ToolCallCounts {
+        ToolCallCounts {
+            total,
+            by_reference: Some(ReferenceSplit {
+                references: references
+                    .iter()
+                    .map(|(name, calls)| ReferenceCalls {
+                        name: (*name).to_string(),
+                        calls: *calls,
+                    })
+                    .collect(),
+                unattached,
+            }),
+        }
+    }
+
+    /// The clause names every attached reference, zeros included, and adds
+    /// calls to unattached repositories only when there are some.
+    #[test]
+    fn tool_call_breakdown_names_every_attached_reference() {
+        assert_eq!(
+            counts(350, &[("kernel", 72), ("rdma-core", 0)], 0).breakdown(),
+            "(72 to kernel, 0 to rdma-core)"
+        );
+        assert_eq!(
+            counts(350, &[("kernel", 72)], 3).breakdown(),
+            "(72 to kernel; 3 to unattached repositories)"
+        );
+        assert_eq!(
+            counts(5, &[], 1).breakdown(),
+            "(1 to an unattached repository)"
+        );
+        assert_eq!(
+            counts(5, &[], 3).breakdown(),
+            "(3 to unattached repositories)"
+        );
+    }
+
+    /// No clause where it would mislead: a review that made no call, an
+    /// unknown split, or a split with nothing in it.
+    #[test]
+    fn tool_call_breakdown_is_empty_without_a_known_split_or_calls() {
+        assert_eq!(counts(0, &[("kernel", 0)], 0).breakdown(), "");
+        let unknown = ToolCallCounts {
+            total: 12,
+            by_reference: None,
+        };
+        assert_eq!(unknown.breakdown(), "");
+        assert_eq!(counts(12, &[], 0).breakdown(), "");
+    }
+
+    /// A review served by a daemon that knows no split, or written before
+    /// one existed, reads as an unknown split rather than failing.
+    #[test]
+    fn tool_call_counts_without_a_split_read_as_unknown() {
+        let read: ToolCallCounts = serde_json::from_value(serde_json::json!({"total": 4})).unwrap();
+        assert_eq!(
+            read,
+            ToolCallCounts {
+                total: 4,
+                by_reference: None
+            }
+        );
+        let wire = counts(9, &[("kernel", 2)], 1);
+        let back: ToolCallCounts =
+            serde_json::from_value(serde_json::to_value(&wire).unwrap()).unwrap();
+        assert_eq!(back, wire);
     }
 }
