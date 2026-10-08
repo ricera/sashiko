@@ -3324,7 +3324,7 @@ mod tests {
             .unwrap();
         let patch = db.create_patch(ps, &msg, 1, "diff").await.unwrap();
         let review = db
-            .create_review(ps, Some(patch), "mock", "mock", None, None)
+            .create_review(ps, Some(patch), "mock", "mock", None, None, None)
             .await
             .unwrap();
         (ps, patch, review)
@@ -6170,7 +6170,15 @@ F:	net/
             .await
             .unwrap();
         let review_id = db
-            .create_review(ps_id, Some(patch_id), "gemini", "gemini-2.5", None, None)
+            .create_review(
+                ps_id,
+                Some(patch_id),
+                "gemini",
+                "gemini-2.5",
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         db.complete_review(

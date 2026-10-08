@@ -110,11 +110,11 @@ async fn test_findings_sum_across_patches() {
 
     // 4. Create Reviews
     let r1_id = db
-        .create_review(ps_id, Some(p1_id), "provider", "model", None, None)
+        .create_review(ps_id, Some(p1_id), "provider", "model", None, None, None)
         .await
         .unwrap();
     let r2_id = db
-        .create_review(ps_id, Some(p2_id), "provider", "model", None, None)
+        .create_review(ps_id, Some(p2_id), "provider", "model", None, None, None)
         .await
         .unwrap();
 

@@ -3820,7 +3820,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let rev_id = db
-            .create_review(ps_id, None, "gemini", "mock", None, None)
+            .create_review(ps_id, None, "gemini", "mock", None, None, None)
             .await
             .unwrap();
 
@@ -4633,7 +4633,7 @@ mod tests {
         ]);
 
         let rev_id = db
-            .create_review(ps_id, None, "gemini", "mock", None, None)
+            .create_review(ps_id, None, "gemini", "mock", None, None, None)
             .await
             .unwrap();
 
@@ -4791,7 +4791,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let rev_id = db
-            .create_review(ps_id, None, "gemini", "mock", None, None)
+            .create_review(ps_id, None, "gemini", "mock", None, None, None)
             .await
             .unwrap();
 
@@ -6219,7 +6219,7 @@ F:	drivers/net/ethernet/intel/e1000/
             .unwrap()
             .unwrap();
         let review_id = db
-            .create_review(ps_id, None, "mock", "mock", None, None)
+            .create_review(ps_id, None, "mock", "mock", None, None, None)
             .await
             .unwrap();
 
