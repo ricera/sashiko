@@ -2409,7 +2409,24 @@ impl Database {
         Ok(lists)
     }
 
-    pub async fn get_pending_review_id(
+    /// Takes the Pending review row of a patch for reuse, and returns its id.
+    ///
+    /// A Pending row that already exists was left by an earlier run of the
+    /// patch, normally one a restart interrupted: reset_reviewing_status
+    /// puts an In Review row back to Pending. The run that takes the row
+    /// reports only its own work on it (tokens, duration, stage table, live
+    /// log, reference record), so the earlier run's tool calls are deleted
+    /// here too. Kept, they would be the one figure on the row that covered
+    /// both runs, and they would be judged against the new run's reference
+    /// record, which the restart may have changed.
+    ///
+    /// The two statements need no transaction: only the worker reviewing
+    /// this patch takes its row, and nothing records a tool call against a
+    /// row until that worker has taken it and started an attempt on it.
+    ///
+    /// A failed delete is only logged, because tool calls are statistics
+    /// and must not stop the patch's review; the row is still returned.
+    pub async fn take_pending_review_id(
         &self,
         patchset_id: i64,
         patch_id: Option<i64>,
@@ -2422,11 +2439,23 @@ impl Database {
                 self.conn.query("SELECT id FROM reviews WHERE patchset_id = ? AND patch_id IS NULL AND status = 'Pending' LIMIT 1", libsql::params![patchset_id]).await?
             }
         };
-        if let Ok(Some(row)) = rows.next().await {
-            Ok(Some(row.get(0)?))
-        } else {
-            Ok(None)
+        let review_id: i64 = match rows.next().await {
+            Ok(Some(row)) => row.get(0)?,
+            _ => return Ok(None),
+        };
+        if let Err(e) = self
+            .execute(
+                "DELETE FROM tool_usages WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await
+        {
+            warn!(
+                "Failed to clear the tool calls of reused review {}: {}",
+                review_id, e
+            );
         }
+        Ok(Some(review_id))
     }
 
     /// Inserts a Pending review row and returns its id.
@@ -24751,6 +24780,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored_attempt(&db, skipped).await, None);
+    }
+
+    /// Records one git_grep call per pattern against a review.
+    async fn record_greps(db: &Database, review_id: i64, patterns: &[&str]) {
+        for pattern in patterns {
+            db.create_tool_usage(ToolUsage {
+                review_id,
+                provider: "mock".to_string(),
+                model: "mock".to_string(),
+                tool_name: "git_grep".to_string(),
+                arguments: Some(serde_json::json!({ "pattern": pattern }).to_string()),
+                output_length: 0,
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    /// The arguments of a review's recorded tool calls, in recording order.
+    async fn recorded_arguments(db: &Database, review_id: i64) -> Vec<String> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT arguments FROM tool_usages WHERE review_id = ? ORDER BY id",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        let mut arguments = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            arguments.push(row.get::<String>(0).unwrap());
+        }
+        arguments
+    }
+
+    #[tokio::test]
+    async fn taking_a_pending_review_clears_its_tool_calls() {
+        let db = setup_db().await;
+        let (ps_id, p_id, earlier) = reviewed_patchset(&db, "take_pending").await;
+
+        // An earlier run of the patch finished; its calls are its own and
+        // must survive a later run taking a different row.
+        record_greps(&db, earlier, &["earlier"]).await;
+        db.complete_review(earlier, "Reviewed", "ok", None, None, None, None)
+            .await
+            .unwrap();
+
+        // A run that a restart interrupted: it was In Review with calls
+        // recorded, and startup put it back to Pending.
+        let interrupted = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None, Some(1))
+            .await
+            .unwrap();
+        db.update_review_status(interrupted, "In Review", None)
+            .await
+            .unwrap();
+        record_greps(&db, interrupted, &["a", "b", "c"]).await;
+        db.reset_reviewing_status().await.unwrap();
+
+        let taken = db.take_pending_review_id(ps_id, Some(p_id)).await.unwrap();
+        assert_eq!(taken, Some(interrupted));
+        assert!(
+            recorded_arguments(&db, interrupted).await.is_empty(),
+            "the interrupted run's calls must not be counted for the new run"
+        );
+        assert_eq!(
+            recorded_arguments(&db, earlier).await,
+            vec![r#"{"pattern":"earlier"}"#.to_string()]
+        );
+
+        // The new run's calls are the only ones the row then holds.
+        record_greps(&db, interrupted, &["new"]).await;
+        assert_eq!(
+            recorded_arguments(&db, interrupted).await,
+            vec![r#"{"pattern":"new"}"#.to_string()]
+        );
+
+        // A patch with no Pending row has nothing to take.
+        db.complete_review(interrupted, "Reviewed", "ok", None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.take_pending_review_id(ps_id, Some(p_id)).await.unwrap(),
+            None
+        );
+        assert_eq!(recorded_arguments(&db, interrupted).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn taking_a_pending_review_survives_a_failed_cleanup() {
+        let db = setup_db().await;
+        let (ps_id, p_id, pending) = reviewed_patchset(&db, "take_pending_cleanup").await;
+
+        // Without the table the delete fails, which must not stop the take.
+        db.conn.execute("DROP TABLE tool_usages", ()).await.unwrap();
+        assert_eq!(
+            db.take_pending_review_id(ps_id, Some(p_id)).await.unwrap(),
+            Some(pending)
+        );
     }
 
     #[tokio::test]

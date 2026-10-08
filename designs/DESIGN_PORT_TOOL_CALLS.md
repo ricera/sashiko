@@ -1075,6 +1075,10 @@ commit.
    - `Database::tool_call_counts`, and `tool_calls` on the reviews of the
      three review payloads.
    - The db, reviewer and `breakdown` tests.
+   - The second half of `taking_a_pending_review_clears_its_tool_calls`
+     (§6.1): a taken row whose record then attaches a different reference
+     counts new calls against the new record only. It moved here from
+     commit 4 because it needs `tool_call_counts`.
 6. **api: carry each patch's tool calls on the activity poll.**
    - `PatchToolCalls`, `review_runs`, `ToolCallCounts::sum`,
      `Database::patch_tool_calls`.
