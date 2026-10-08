@@ -4694,12 +4694,35 @@
         // element that already exists and must keep existing. That difference is
         // in the DOM, not in the table, so it is the only thing the two callers
         // do differently.
-        function stageTableParts(rows, live) {
-            const summaryHtml = escapeHtml(stageTableLabel(rows, live));
+        //
+        // toolCalls is the patch's entry from the activity poll's tool_calls,
+        // summed over its current run, or null. The live table carries it in its
+        // summary so a reader watches the count rise. The recorded table passes
+        // null: its card has a "Tool calls:" line of its own, for its attempt,
+        // and a second figure beside it would count a different set of calls.
+        // showsToolCalls says whether the summary carries the count, so the
+        // caller explains it only when it is there.
+        function stageTableParts(rows, live, toolCalls) {
+            const calls = toolCalls && typeof toolCalls === 'object'
+                ? toolCallsText(toolCalls, toolCalls.attempts) : '';
+            const summaryHtml = escapeHtml(stageTableLabel(rows, live)) + (calls ? ` — ${calls}` : '');
             const bodyHtml = `<table style="margin:6px 0 0 12px; border-collapse:collapse;">`
                 + rows.map(renderStageRow).join('')
                 + `</table>`;
-            return { summaryHtml, bodyHtml };
+            return { summaryHtml, bodyHtml, showsToolCalls: calls !== '' };
+        }
+
+        // The activity poll's tool_calls as a map from numeric patch id to that
+        // patch's entry. Keyed by patch, because the stage tables are: a run of
+        // several attempts has one table and one figure, whichever review row
+        // is current. A response without the list, from an older daemon, or with
+        // something other than a list, gives an empty map, so the tables paint
+        // as they did before the counts existed.
+        function toolCallsByPatch(list) {
+            if (!Array.isArray(list)) return new Map();
+            return new Map(list
+                .filter(c => c && typeof c === 'object' && Number.isFinite(Number(c.patch_id)))
+                .map(c => [Number(c.patch_id), c]));
         }
 
         // The element that holds one patch's live progress.
@@ -4751,20 +4774,27 @@
         // a stage does not change shape as it stops being live. The only thing
         // this adds is the mounting: the element already exists and has to keep
         // existing, because refreshActivity finds it again on the next poll.
-        function paintStageProgress(host, entries, live) {
+        function paintStageProgress(host, entries, live, toolCalls) {
             const summary = host.querySelector('summary');
             const body = host.querySelector('.stage-progress-body');
             if (!summary || !body) return;
 
-            const parts = stageTableParts(stageRowsFromActivity(entries, live), live);
+            const parts = stageTableParts(stageRowsFromActivity(entries, live), live, toolCalls);
             summary.innerHTML = parts.summaryHtml;
             // Persisted entries describe what the work *was* doing when the
             // daemon stopped. Worth keeping -- it says where a failed patch got
             // to -- but phrased as an observation, not a cause.
-            summary.title = live
+            const stages = live
                 ? 'What each review stage of this patch is doing right now.'
                 : 'Last activity recorded before the daemon stopped. This is where'
                   + ' the work got to, not necessarily why it failed.';
+            // The count beside the stages covers every attempt of the run, while
+            // the table shows only the current attempt's stages, so the hover
+            // says which calls it sums. A persisted table keeps its count: it
+            // comes from the database, and is still true after a restart.
+            summary.title = parts.showsToolCalls
+                ? `${stages} Tool calls: this patch's current run, every attempt. ${toolCallsTitle()}`
+                : stages;
 
             body.innerHTML = parts.bodyHtml;
             host.style.display = '';
@@ -4803,6 +4833,7 @@
 
             const entries = Array.isArray(data.entries) ? data.entries : [];
             const live = data.live !== false;
+            const toolCalls = toolCallsByPatch(data.tool_calls);
 
             // Activity only moves to its patch if that patch is on screen. Patch
             // lists paginate, so a patch on another page has no host here;
@@ -4829,8 +4860,10 @@
                     general.push(entry);
                     return;
                 }
-                if (!byPatch.has(host)) byPatch.set(host, []);
-                byPatch.get(host).push(entry);
+                // The patch id travels with the host's entries, so the host is
+                // painted with its own patch's tool calls.
+                if (!byPatch.has(host)) byPatch.set(host, { pid, patchEntries: [] });
+                byPatch.get(host).patchEntries.push(entry);
             });
 
             // A patch with nothing to report this time round is hidden, or it
@@ -4838,7 +4871,8 @@
             document.querySelectorAll('[data-stage-progress]').forEach(host => {
                 if (!byPatch.has(host)) host.style.display = 'none';
             });
-            byPatch.forEach((patchEntries, host) => paintStageProgress(host, patchEntries, live));
+            byPatch.forEach(({ pid, patchEntries }, host) =>
+                paintStageProgress(host, patchEntries, live, toolCalls.get(pid) || null));
 
             if (general.length === 0) {
                 row.style.display = 'none';
@@ -5581,7 +5615,7 @@
                 // table beside it from the registry's copy of the same numbers.
                 // An attribute rather than an id: a retried patch has a finished
                 // card per attempt, and one id across them would be a duplicate.
-                const parts = stageTableParts(recordedRows, false);
+                const parts = stageTableParts(recordedRows, false, null);
                 stageTimingHtml = `<details`
                     + (patchId != null ? ` data-stage-recorded="${patchId}"` : '')
                     + ` style="margin:6px 0; font-size:0.9em;">`
