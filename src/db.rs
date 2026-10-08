@@ -2182,6 +2182,13 @@ impl Database {
         }
     }
 
+    /// Inserts a Pending review row and returns its id.
+    ///
+    /// `attempt` is the retry this row is for, or None for a row that is not
+    /// an attempt of the retry loop (a Skipped patch). It is written by the
+    /// INSERT itself, so no reader ever sees a retry's row without its
+    /// attempt number and mistakes it for the start of a new run.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_review(
         &self,
         patchset_id: i64,
@@ -2190,12 +2197,13 @@ impl Database {
         model: &str,
         baseline_id: Option<i64>,
         prompts_hash: Option<&str>,
+        attempt: Option<u32>,
     ) -> Result<i64> {
         let mut rows = self
             .conn
             .query(
-                "INSERT INTO reviews (patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash)
-             VALUES (?, ?, 'Pending', ?, ?, ?, ?, ?) RETURNING id",
+                "INSERT INTO reviews (patchset_id, patch_id, status, created_at, provider, model, baseline_id, prompts_hash, attempt)
+             VALUES (?, ?, 'Pending', ?, ?, ?, ?, ?, ?) RETURNING id",
                 libsql::params![
                     patchset_id,
                     patch_id,
@@ -2205,7 +2213,8 @@ impl Database {
                     provider,
                     model,
                     baseline_id,
-                    prompts_hash
+                    prompts_hash,
+                    attempt
                 ],
             )
             .await?;
@@ -8246,9 +8255,12 @@ impl Database {
 
     /// Records which retry produced this review row.
     ///
-    /// Stamped before the attempt runs, so a row that never reaches a terminal
-    /// state still says which attempt it was; the live attempt counter in the
-    /// activity view disappears the moment the review finishes.
+    /// A new row gets its attempt from `create_review`. This restamps a row
+    /// that already exists: a Pending row an interrupted run left behind,
+    /// which the next run reuses for its own attempt. It is stamped before
+    /// the attempt runs, so a row that never reaches a terminal state still
+    /// says which attempt it was; the live attempt counter in the activity
+    /// view disappears the moment the review finishes.
     pub async fn set_review_attempt(&self, review_id: i64, attempt: u32) -> Result<()> {
         self.conn
             .execute(
@@ -10879,7 +10891,7 @@ mod tests {
             .await?
             .unwrap();
         let rev_id = db
-            .create_review(ps_id, None, "gemini", "test-model", None, None)
+            .create_review(ps_id, None, "gemini", "test-model", None, None, None)
             .await?;
 
         let bug = NewBug {
@@ -11935,7 +11947,7 @@ mod tests {
             .await
             .unwrap();
 
-        db.create_review(ps_id, None, "gemini", "test-model", None, None)
+        db.create_review(ps_id, None, "gemini", "test-model", None, None, None)
             .await
             .unwrap();
 
@@ -12025,7 +12037,7 @@ mod tests {
             .await
             .unwrap();
         let review_id = db
-            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None, None)
             .await
             .unwrap();
         db.complete_review(
@@ -12150,7 +12162,7 @@ mod tests {
         status: &str,
     ) -> i64 {
         let review_id = db
-            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None, None)
             .await
             .unwrap();
         db.complete_review(review_id, status, "done", Some("s"), None, Some("i"), None)
@@ -12193,7 +12205,7 @@ mod tests {
         let db = setup_db().await;
         let (ps_id, patch_id) = one_part_series(&db, "msg_partial_gates", 72000).await;
         let review = db
-            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None, None)
             .await
             .unwrap();
         db.complete_review(
@@ -12235,7 +12247,7 @@ mod tests {
         );
 
         let reviewed = db
-            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None, None)
             .await
             .unwrap();
         db.complete_review(reviewed, "Reviewed", "ok", Some("s"), None, Some("i"), None)
@@ -12317,7 +12329,7 @@ mod tests {
         ] {
             finished_review_with_a_finding(&db, ps_id, patch_id, status).await;
         }
-        db.create_review(ps_id, Some(patch_id), "test", "test", None, None)
+        db.create_review(ps_id, Some(patch_id), "test", "test", None, None, None)
             .await
             .unwrap();
 
@@ -12493,7 +12505,7 @@ mod tests {
             .await
             .unwrap();
         let reviewed = db
-            .create_review(ps_id, Some(first), "test", "test", None, None)
+            .create_review(ps_id, Some(first), "test", "test", None, None, None)
             .await
             .unwrap();
         db.complete_review(reviewed, "Reviewed", "ok", Some("s"), None, Some("i"), None)
@@ -12610,7 +12622,7 @@ mod tests {
             .await
             .unwrap();
         let review_id = db
-            .create_review(ps_id, Some(patch_id), "test", "test", None, None)
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None, None)
             .await
             .unwrap();
         db.complete_review(
@@ -13300,7 +13312,7 @@ mod tests {
 
         // 2. Add dependencies to ps1 (Review, Tag, Subsystem)
         let review_id = db
-            .create_review(ps1, None, "gemini", "test-model", None, None)
+            .create_review(ps1, None, "gemini", "test-model", None, None, None)
             .await
             .unwrap();
 
@@ -13541,7 +13553,15 @@ mod tests {
 
         // 2. Failed Review (No interaction) -> Should be detected
         let review_id = db
-            .create_review(ps_id, Some(patch_id), "gemini", "test-model", None, None)
+            .create_review(
+                ps_id,
+                Some(patch_id),
+                "gemini",
+                "test-model",
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         db.update_review_status(review_id, "FailedToApply", None)
@@ -13672,6 +13692,7 @@ mod tests {
                 "gemini-2.5",
                 Some(baseline_id),
                 Some("hash123"),
+                None,
             )
             .await
             .unwrap();
@@ -13824,7 +13845,7 @@ mod tests {
 
         // Add a failed review without interaction (infra failure) to ps_failed
         let review_infra = db
-            .create_review(ps_failed, Some(patch_id), "p", "m", None, None)
+            .create_review(ps_failed, Some(patch_id), "p", "m", None, None, None)
             .await
             .unwrap();
         db.update_review_status(review_infra, "FailedToApply", None)
@@ -13833,7 +13854,7 @@ mod tests {
 
         // Add a failed review WITH interaction (AI failure) to ps_failed
         let review_ai = db
-            .create_review(ps_failed, Some(patch_id), "p", "m", None, None)
+            .create_review(ps_failed, Some(patch_id), "p", "m", None, None, None)
             .await
             .unwrap();
         db.create_ai_interaction(AiInteractionParams {
@@ -14002,7 +14023,7 @@ mod tests {
             .await
             .unwrap();
         let salvaged = db
-            .create_review(ps_id, Some(partial), "p", "m", None, None)
+            .create_review(ps_id, Some(partial), "p", "m", None, None, None)
             .await
             .unwrap();
         db.complete_review(
@@ -14522,7 +14543,7 @@ mod tests {
             .unwrap();
 
         let review_id = db
-            .create_review(ps_id, None, "gemini", "test-model", None, None)
+            .create_review(ps_id, None, "gemini", "test-model", None, None, None)
             .await
             .unwrap();
 
@@ -18358,7 +18379,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let review_id = db
-            .create_review(ps_id, None, "gemini", "model", None, None)
+            .create_review(ps_id, None, "gemini", "model", None, None, None)
             .await
             .unwrap();
 
@@ -18505,11 +18526,11 @@ mod tests {
             .await
             .unwrap();
         let first = db
-            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None, None)
             .await
             .unwrap();
         let second = db
-            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None, None)
             .await
             .unwrap();
         (ps_id, first, second)
@@ -21270,7 +21291,7 @@ mod tests {
             .unwrap();
         db.update_patchset_status(v4, "In Review").await.unwrap();
         let v4_review_id = db
-            .create_review(v4, None, "gemini", "pro", None, None)
+            .create_review(v4, None, "gemini", "pro", None, None, None)
             .await
             .unwrap();
         db.update_review_status(v4_review_id, "In Review", None)
@@ -22054,7 +22075,7 @@ mod tests {
             .expect("patchset");
         let p_id = db.create_patch(ps_id, &msg, 1, "diff").await.unwrap();
         let review_id = db
-            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None, None)
             .await
             .unwrap();
         (ps_id, p_id, review_id)
@@ -22085,6 +22106,44 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(review_in(&summary, review_id)["attempt"], 3);
+    }
+
+    /// Reads a review's attempt column as stored, with no other write in
+    /// between, so a test sees exactly what the INSERT left.
+    async fn stored_attempt(db: &Database, review_id: i64) -> Option<i64> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT attempt FROM reviews WHERE id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("review row");
+        row.get::<Option<i64>>(0).unwrap()
+    }
+
+    #[tokio::test]
+    async fn create_review_stamps_the_attempt() {
+        let db = setup_db().await;
+        let (ps_id, p_id, _) = reviewed_patchset(&db, "stamped").await;
+
+        // A retry's row must carry its attempt from the moment it exists, or
+        // a reader in the window before a later stamp would take it for the
+        // first row of a new run.
+        let retry = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None, Some(2))
+            .await
+            .unwrap();
+        assert_eq!(stored_attempt(&db, retry).await, Some(2));
+
+        // A row that is no attempt of the retry loop, such as a Skipped
+        // patch's, has no attempt number.
+        let skipped = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(stored_attempt(&db, skipped).await, None);
     }
 
     #[tokio::test]

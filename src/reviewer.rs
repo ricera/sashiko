@@ -1860,6 +1860,7 @@ impl Reviewer {
                         &ctx.settings.ai.model,
                         baseline_id,
                         prompts_hash,
+                        None,
                     )
                     .await?
             };
@@ -1920,35 +1921,15 @@ impl Reviewer {
                 return Ok(PatchResult::Cancelled);
             }
 
-            let review_id = if let Some(id) = existing_pending_review_id.take() {
-                id
-            } else {
-                ctx.db
-                    .create_review(
-                        patchset_id,
-                        Some(patch_id),
-                        &ctx.settings.ai.provider,
-                        &ctx.settings.ai.model,
-                        baseline_id,
-                        prompts_hash,
-                    )
-                    .await?
-            };
-
-            if let Err(e) = ctx
-                .db
-                .update_review_status(review_id, ReviewStatus::InReview.as_str(), None)
-                .await
-            {
-                warn!(
-                    "Failed to update review {} status to In Review: {}",
-                    review_id, e
-                );
-            }
-
-            // Stamped before the work runs, not after, so a row that never
-            // reaches a terminal state still records which attempt it was.
-            let _ = ctx.db.set_review_attempt(review_id, retries + 1).await;
+            let review_id = Self::begin_attempt_row(
+                ctx,
+                &patch,
+                existing_pending_review_id.take(),
+                retries + 1,
+                baseline_id,
+                prompts_hash,
+            )
+            .await?;
 
             // Owned here rather than by the run, so what it saw of the stages
             // outlives a run that ended in an error.
@@ -2013,6 +1994,60 @@ impl Reviewer {
                 }
             }
         }
+    }
+
+    /// Gives one attempt its review row, stamped with the attempt number and
+    /// set In Review, and returns the row's id.
+    ///
+    /// The attempt is stamped before the work runs, not after, so a row that
+    /// never reaches a terminal state still records which attempt it was. A
+    /// new row carries it from its INSERT. A row an interrupted run left
+    /// Pending already exists and still carries that run's number, so it is
+    /// restamped for this one.
+    async fn begin_attempt_row(
+        ctx: &ReviewContext,
+        patch: &PatchUnderReview<'_>,
+        reused_review_id: Option<i64>,
+        attempt: u32,
+        baseline_id: Option<i64>,
+        prompts_hash: Option<&str>,
+    ) -> Result<i64> {
+        let review_id = match reused_review_id {
+            Some(id) => {
+                if let Err(e) = ctx.db.set_review_attempt(id, attempt).await {
+                    warn!(
+                        "Failed to stamp review {} as attempt {}: {}",
+                        id, attempt, e
+                    );
+                }
+                id
+            }
+            None => {
+                ctx.db
+                    .create_review(
+                        patch.patchset_id,
+                        Some(patch.patch_id),
+                        &ctx.settings.ai.provider,
+                        &ctx.settings.ai.model,
+                        baseline_id,
+                        prompts_hash,
+                        Some(attempt),
+                    )
+                    .await?
+            }
+        };
+
+        if let Err(e) = ctx
+            .db
+            .update_review_status(review_id, ReviewStatus::InReview.as_str(), None)
+            .await
+        {
+            warn!(
+                "Failed to update review {} status to In Review: {}",
+                review_id, e
+            );
+        }
+        Ok(review_id)
     }
 
     /// Records how an attempt ended on its review row, and decides what
@@ -5378,7 +5413,7 @@ mod tests {
             .create_patch(ps_id, "msg_id_p1", 1, "diff --git a/foo.c b/foo.c\n+int x;")
             .await?;
         let review_id = db
-            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None, None)
             .await?;
         if let Some(content) = stale_log {
             let message = json!({"role": "user", "content": content}).to_string();
@@ -6094,7 +6129,7 @@ sleep 30
             .create_patch(ps_id, "msg_id_p1", 1, "diff --git a/a b/a\n")
             .await?;
         let review_id = db
-            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None, None)
             .await?;
 
         let completed = tokio::time::timeout(
@@ -6684,7 +6719,7 @@ echo '{"patchset_id": 1, "patches": [{"index": 1, "status": "applied"}]}'
             .create_patch(ps_id, "msg_id_p1", 1, "diff --git a/foo.c b/foo.c\n+int x;")
             .await?;
         let review_id = db
-            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None, None)
             .await?;
 
         run_review_tool_with_cmd(
@@ -6994,7 +7029,7 @@ inline review content 2\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         // Setup for Scenario 4: Linked newly discovered preexisting bug with slug
         let rev_id = db
-            .create_review(ps_id, Some(p_id_3), "provider", "model", None, None)
+            .create_review(ps_id, Some(p_id_3), "provider", "model", None, None, None)
             .await?;
         let bug_id = db
             .create_bug(&crate::db::NewBug {
@@ -7281,7 +7316,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .await?
             .ok_or_else(|| anyhow::anyhow!("patchset was not created"))?;
         let review_id = db
-            .create_review(patchset_id, None, "prov", "model", None, None)
+            .create_review(patchset_id, None, "prov", "model", None, None, None)
             .await?;
 
         let mut resp = AiResponse {
@@ -8553,6 +8588,42 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert_eq!(
             patch_status(&run.db, run.patch_id).await?.as_deref(),
             Some("Failed")
+        );
+        Ok(())
+    }
+
+    /// A review that finds a Pending row an interrupted run left behind
+    /// reuses that row instead of creating another, and restamps it with
+    /// this run's attempt number. Without the restamp the row would keep the
+    /// interrupted run's number and be counted as part of that run.
+    #[tokio::test]
+    async fn test_a_reused_pending_review_is_restamped_with_its_attempt() -> Result<()> {
+        let reviewing =
+            worker_reporting_then(&[], &format!("echo '{}'\n", reviewed_output(json!([]))));
+        let fixture = WorkerFixture::new(&reviewing, Arc::new(MockProvider), |_| {}).await?;
+        let db = &fixture.ctx.db;
+        let left_behind = db
+            .create_review(
+                fixture.patchset_id,
+                Some(fixture.patch_id),
+                "mock",
+                "mock",
+                None,
+                None,
+                Some(3),
+            )
+            .await?;
+
+        assert!(matches!(fixture.review().await?, PatchResult::Success));
+
+        let reviews = review_rows(db, fixture.patch_id).await?;
+        assert_eq!(reviews.len(), 1, "the row was reused: {reviews:?}");
+        assert_eq!(reviews[0]["id"], left_behind, "{}", reviews[0]);
+        assert_eq!(reviews[0]["status"], "Reviewed", "{}", reviews[0]);
+        assert_eq!(
+            reviews[0]["attempt"], 1,
+            "the row is this run's first attempt: {}",
+            reviews[0]
         );
         Ok(())
     }
@@ -10135,7 +10206,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             .await?
             .ok_or_else(|| anyhow!("patchset was not created"))?;
         let review_id = db
-            .create_review(patchset_id, None, "p", "m", None, None)
+            .create_review(patchset_id, None, "p", "m", None, None, None)
             .await?;
 
         assert_eq!(

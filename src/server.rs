@@ -2711,7 +2711,7 @@ mod tests {
             .unwrap();
         let patch = db.create_patch(ps, &msg, 1, "diff").await.unwrap();
         let review = db
-            .create_review(ps, Some(patch), "mock", "mock", None, None)
+            .create_review(ps, Some(patch), "mock", "mock", None, None, None)
             .await
             .unwrap();
         (ps, patch, review)
