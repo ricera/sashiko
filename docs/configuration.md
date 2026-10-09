@@ -44,6 +44,7 @@ Optional. Controls forge (GitHub/GitLab) webhook integration.
 | `provider` | string | -- | Forge provider: `"github"` or `"gitlab"`. |
 | `webhook_secret` | string | -- | Webhook signing token or shared secret for authenticating incoming requests. When configured, requests are authenticated via signature verification, which is the only way a forge can authenticate. See the [Webhook Security Guide](WEBHOOK_SECURITY.md). |
 | `api_token` | string | -- | Forge API token (for future API-based features). |
+| `github_repository` | string | -- | The GitHub repository whose pull requests are reviewed by number (`sashiko-cli submit '#N'`, `rerun --pr N`), as `"owner/name"` on github.com or `"host/owner/name"` for GitHub Enterprise. It names the base repository, not a fork. Each part holds only letters, digits, `_`, `.` and `-`; any other value stops the daemon at startup. Unset, review by number is refused. Webhooks do not need it. See [Review a Pull Request by Number](GITHUB_SETUP.md#review-a-pull-request-by-number). |
 
 > **Security:** When `Settings.toml` contains secrets, restrict file
 > permissions: `chmod 600 Settings.toml`.

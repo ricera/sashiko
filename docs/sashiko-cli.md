@@ -43,8 +43,38 @@ sashiko-cli submit [OPTIONS] [INPUT]
 
 **Arguments:**
 
-- `INPUT` -- Revision range, commit SHA, mbox file path, or lore.kernel.org
-  URL. Defaults to `HEAD` if in a git repo, or reads mbox from stdin if piped.
+- `INPUT` -- Revision range, commit SHA, mbox file path, lore.kernel.org
+  URL, or pull request reference. Defaults to `HEAD` if in a git repo, or
+  reads mbox from stdin if piped.
+
+**Pull requests:** without `--type`, `INPUT` is first checked for a pull
+request reference: `#N`, `pr/N`, `pr#N`, `pr-N` or `prN` (in any case), or
+an `http(s)` pull request URL such as
+`https://github.com/owner/repo/pull/N`. The number must be at least 1; a
+bare number, `#0` or `#abc` is not a reference, so `submit 1234` still
+means the git revision `1234`. Quote `#N`, since the shell reads an
+unquoted `#` as the start of a comment.
+
+A reference asks the daemon to review the pull request's current head
+(`POST /api/pr/review`). The daemon resolves the number with gh in the
+repository `forge.github_repository` names, and a URL must name that same
+repository. `--repo`, `--baseline`, `--skip-subject` and `--only-subject`
+are refused with a reference, because the daemon fetches the pull request
+into its own repository and reviews every commit of it. The setup is in
+[GITHUB_SETUP.md](GITHUB_SETUP.md#review-a-pull-request-by-number).
+
+It prints one line, or the daemon's reply with `--format json`:
+
+| Outcome | Example |
+|---------|---------|
+| Queued | `Queued PR #967 (head 1a2b3c4d) as patchset 41` |
+| Queued again | `PR #967 head 1a2b3c4d had Failed as patchset 41, v3; queued again` |
+| Already in progress | `PR #967 head 1a2b3c4d is already being reviewed as patchset 41 (Pending)` |
+| Already finished | `PR #967 head 1a2b3c4d already finished as patchset 41 (Reviewed); use rerun --pr 967 to review it again` |
+
+A refusal exits non-zero with the HTTP status and the daemon's reason, for
+example `Could not review PR #967 (422 Unprocessable Entity): set
+forge.github_repository to review a pull request by number`.
 
 **Options:**
 
@@ -73,6 +103,10 @@ git format-patch --stdout HEAD~2..HEAD | sashiko-cli submit
 
 # Review a lore.kernel.org thread
 sashiko-cli submit https://lore.kernel.org/linux-kernel/some-msgid/
+
+# Review the current head of pull request 967
+sashiko-cli submit '#967'
+sashiko-cli submit https://github.com/example-org/driver-a/pull/967
 ```
 
 ### status
@@ -132,9 +166,19 @@ Request a re-review of a completed patchset.
 
 ```
 sashiko-cli rerun <ID>
+sashiko-cli rerun --pr <N>
 ```
 
-`ID` is a numeric patchset ID.
+`ID` is a numeric patchset ID. Give it or `--pr`, not both.
+
+`--pr N` reruns the current head of pull request N of the repository
+`forge.github_repository` names. If that head has finished (Reviewed or
+Skipped), it is rerun and the command prints `Rerun of PR #N queued as
+patchset 41`; if it is new here, or still being fetched or reviewed, the
+command does what `submit '#N'` does. It needs both the Ingest and Review
+rights, which the local operator token holds. If gh cannot resolve the
+number, the error names the newest revision of the pull request already
+known here, which `sashiko-cli rerun <ID>` reruns by its patchset id.
 
 ### cancel
 
