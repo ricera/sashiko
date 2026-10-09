@@ -1953,7 +1953,9 @@ pub struct ConsolidationStage {
     /// Whether the prompt carries what earlier revisions of the pull request
     /// were told. Only verification's builder places the placeholder; a test
     /// checks every stage's rendered prompt against this flag. See
-    /// [`PRIOR_REVIEWS_PLACEHOLDER`].
+    /// [`PRIOR_REVIEWS_PLACEHOLDER`]. The report is not shown that block; it
+    /// is given only the earlier findings its findings link to, through
+    /// [`PRIOR_LINKS_PLACEHOLDER`].
     pub wants_prior_reviews: bool,
 }
 
@@ -2125,6 +2127,53 @@ defect you report is not the one the link names, because you refined the candida
 defect, add \"prior\": null to that finding. When you report a linked candidate, keep \"problem\" \
 free of its history and put that sentence in \"severity_explanation\", at the end of its \
 Triggering path. Keep the Consequence first, as the rules above ask.";
+
+/// Marks where the report's prompt carries the earlier findings that its
+/// findings' `prior` links name, then the rules for stating those links.
+///
+/// The report is not shown the block of earlier findings: it states links
+/// verification made, so it is given only the findings they name, with the
+/// commit, location and consequence a comment needs to say what came back
+/// or what not to undo. It is filled from the review's state rather than
+/// declared in the stage tables, since what it holds depends on the
+/// findings verification kept, not on the stage. Without a link it is
+/// empty, so a report with no linked finding gets the prompt it had before.
+/// Both workflows share the state type, so they share this placeholder and
+/// [`with_prior_links`]; each passes its own rules.
+pub const PRIOR_LINKS_PLACEHOLDER: &str = "{{prior_links_section}}";
+
+/// Fills [`PRIOR_LINKS_PLACEHOLDER`] with the block of the earlier findings
+/// that the review's findings link to, followed by `rules`, the report's
+/// instructions for stating the links. Both are left out when no finding
+/// links to an earlier one.
+pub(crate) fn with_prior_links(
+    template: PromptTemplate<LinuxPatchReviewState>,
+    rules: &'static str,
+) -> PromptTemplate<LinuxPatchReviewState> {
+    template.with_var("prior_links_section", move |s: &LinuxPatchReviewState| {
+        s.prior_reviews
+            .as_ref()
+            .and_then(|context| context.render_linked(&s.findings))
+            .map(|block| format!("\n\n{block}\n\n{rules}"))
+            .unwrap_or_default()
+    })
+}
+
+/// How the Linux report states a finding's link to an earlier finding: the
+/// inline comment opens with it, and a fix regression's suggested fix may
+/// not undo the fix for the earlier finding. A finding without a link says
+/// nothing about earlier revisions.
+pub(crate) const PRIOR_LINKS_REPORT_RULES: &str = "PRIOR REVISION RULES: A finding may carry \
+     \"prior\", linking it to a finding reported on an earlier revision of this pull request, \
+     listed above. In these rules, <revision> and <earlier_problem> are the values of that \
+     finding's \"prior\".
+- \"relation\": \"repeat\": begin that comment by saying the issue was raised on <revision> \
+     (\"<earlier_problem>\") and is still present.
+- \"relation\": \"fix_regression\": begin that comment by saying the issue appears to come \
+     from the change made for <revision>'s \"<earlier_problem>\". Any fix you suggest must \
+     resolve both this issue and the earlier one; do not suggest going back to the code the \
+     earlier finding was about.
+Findings without \"prior\" are new; do not mention earlier revisions for them.";
 
 /// Whether an item was marked as present before the patchset.
 fn is_preexisting(item: &Value) -> bool {
@@ -2981,18 +3030,21 @@ pub fn report_stage_with_effort(
     Stage::builder(REPORT.name)
         .system_prompt(linux_system_prompt(true))
         .user_prompt(
-            PromptTemplate::<LinuxPatchReviewState>::new(format!(
-                r#"{STAGE_REPORT_INSTRUCTION}
+            with_prior_links(
+                PromptTemplate::<LinuxPatchReviewState>::new(format!(
+                    r#"{STAGE_REPORT_INSTRUCTION}{PRIOR_LINKS_PLACEHOLDER}
 
 Findings:
 {{{{findings}}}}
 
 Return raw text output, not JSON."#
-            ))
-            .include_file("inline-template.md")
-            .with_var("findings", |s: &LinuxPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
-            }),
+                ))
+                .include_file("inline-template.md")
+                .with_var("findings", |s: &LinuxPatchReviewState| {
+                    serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+                }),
+                PRIOR_LINKS_REPORT_RULES,
+            ),
         )
         .output_format(OutputFormat::text_with_validator(
             validate_inline_format,
@@ -5288,15 +5340,20 @@ mod tests {
     /// case resolves the post-verification fan-out, so its stage is
     /// rendered too.
     fn user_prompts(prior_reviews: Option<PriorReviewContext>) -> Vec<(String, String)> {
-        use crate::workflows::sashiko_patch_review::build_sashiko_patch_review_workflow;
-        let state = LinuxPatchReviewState {
+        user_prompts_for(&LinuxPatchReviewState {
             prior_reviews,
             all_concerns: vec![json!({"description": "a concern"})],
             hard_cases: vec![json!({"id": "H1", "description": "x", "estimated_severity": "High"})],
             ..Default::default()
-        };
-        let linux = build_linux_patch_review_workflow().stage_user_prompts(&state);
-        let sashiko = build_sashiko_patch_review_workflow().stage_user_prompts(&state);
+        })
+    }
+
+    /// Each stage's user prompt for `state`, in both projects, named
+    /// "<project> <stage>".
+    fn user_prompts_for(state: &LinuxPatchReviewState) -> Vec<(String, String)> {
+        use crate::workflows::sashiko_patch_review::build_sashiko_patch_review_workflow;
+        let linux = build_linux_patch_review_workflow().stage_user_prompts(state);
+        let sashiko = build_sashiko_patch_review_workflow().stage_user_prompts(state);
         let tagged = |project: &str, prompts: Vec<(&str, String)>| {
             prompts
                 .into_iter()
@@ -5973,6 +6030,242 @@ mod tests {
                 "{project}: the candidate shows its link"
             );
             assert!(!prompt.contains("revision_head"), "{project}: {prompt}");
+        }
+    }
+
+    /// A block of earlier findings that shows three findings on the earlier
+    /// version of the patch under review, each with a consequence and a
+    /// location, under v2, whose patch has a recorded commit.
+    fn three_earlier_findings() -> PriorReviewContext {
+        use crate::finding_view::FindingLocation;
+        use crate::prior_revisions::{
+            PriorFinding, PriorPatch, PriorReviewTarget, PriorRevision, build_prior_review_context,
+        };
+        let finding = |problem: &str, function: &str, consequence: &str| PriorFinding {
+            severity: crate::db::Severity::High,
+            problem: problem.to_string(),
+            consequence: Some(consequence.to_string()),
+            locations: vec![FindingLocation {
+                file: Some("drivers/frob/ring.c".to_string()),
+                function_or_symbol: Some(function.to_string()),
+                line: Some(812),
+            }],
+            prior: None,
+        };
+        let revision = PriorRevision {
+            label: "v2".to_string(),
+            head: None,
+            same_base: None,
+            patches: vec![PriorPatch {
+                index: 1,
+                subject: "frob: refill the ring".to_string(),
+                commit: crate::baseline::CommitId::parse(&"ab".repeat(20)),
+                same_change_as: None,
+                diff: None,
+                findings: vec![
+                    finding("frob: ring stall", "frob_stall", "the ring stops."),
+                    finding("frob: refill leaks pages", "frob_refill", "a page leaks."),
+                    finding("frob: doorbell race", "frob_ring", "the doorbell is lost."),
+                ],
+            }],
+        };
+        let target = PriorReviewTarget {
+            index: 1,
+            subject: "frob: refill the ring",
+            diff: "diff --git a/drivers/frob/ring.c b/drivers/frob/ring.c\n+frob_refill();\n",
+        };
+        build_prior_review_context(&[revision], target).expect("findings to show")
+    }
+
+    /// The report prompts of both projects for `state`, by project name.
+    fn report_prompts(state: &LinuxPatchReviewState) -> Vec<(String, String)> {
+        let prompts: Vec<(String, String)> = user_prompts_for(state)
+            .into_iter()
+            .filter(|(name, _)| name.ends_with(" report"))
+            .collect();
+        assert_eq!(prompts.len(), 2, "one report per project");
+        prompts
+    }
+
+    /// Each project's rules for stating a link in its report.
+    fn report_rules(name: &str) -> &'static str {
+        if name.starts_with("linux") {
+            PRIOR_LINKS_REPORT_RULES
+        } else {
+            crate::workflows::sashiko_patch_review::PRIOR_LINKS_REPORT_RULES
+        }
+    }
+
+    /// The report is given only the earlier findings that verification's
+    /// grounded links name, with the commit, location and consequence a
+    /// comment needs, and its rules right after them; the other earlier
+    /// findings and the block verification was shown stay out of it. A
+    /// report whose findings link to nothing gets the prompt it had before
+    /// the links existed, history or not.
+    #[test]
+    fn the_report_sees_only_linked_earlier_findings() {
+        let context = three_earlier_findings();
+        let mut state = LinuxPatchReviewState {
+            prior_reviews: Some(context.clone()),
+            ..Default::default()
+        };
+        let linked = json!({
+            "problem": "frob: refill still leaks",
+            "severity": "High",
+            "preexisting": false,
+            "prior": {"relation": "fix_regression", "revision": "V2",
+                      "earlier_problem": "frob: refill leaks pages"},
+        });
+        let unlinked =
+            json!({"problem": "frob: new race", "severity": "Low", "preexisting": false});
+        let mut hard_case = json!({
+            "id": "H1",
+            "description": "frob: doorbell may race",
+            "prior": {"relation": "repeat", "revision": "v2",
+                      "earlier_problem": "frob: doorbell race"},
+        });
+        ground_prior_link(&mut hard_case, state.prior_reviews.as_ref());
+        let outcome = crate::workflow::stage::StageOutcome::default();
+        apply_verification_stage_output(
+            &mut state,
+            VerificationOutput {
+                findings: vec![linked, unlinked.clone()],
+                hard_cases: vec![],
+                dismissed_concerns: vec![],
+            },
+            &outcome,
+            analysis_stage_by_name,
+        );
+        // Post-verification's finding inherits its candidate's link.
+        apply_post_verification_stage_output(
+            &mut state,
+            POST_VERIFICATION_STAGE_NAMES[0],
+            &[hard_case],
+            PostVerificationOutput {
+                findings: vec![json!({
+                    "source_ids": ["H1"],
+                    "problem": "frob: doorbell still races",
+                    "severity": "Medium",
+                    "preexisting": false,
+                })],
+                dismissed_concerns: vec![],
+            },
+            &outcome,
+            analysis_stage_by_name,
+        );
+        let block = context
+            .render_linked(&state.findings)
+            .expect("one finding links to an earlier one");
+        let verification_block = context.rendered.lines().next().expect("an opening line");
+        let bare_state = LinuxPatchReviewState {
+            prior_reviews: None,
+            ..state.clone()
+        };
+        let bare = report_prompts(&bare_state);
+        for ((name, prompt), (_, bare)) in report_prompts(&state).iter().zip(&bare) {
+            for shown in [
+                "  - v2: frob: refill leaks pages\n",
+                &format!("    Commit: {}\n", "ab".repeat(20)),
+                "    At: drivers/frob/ring.c:812 (frob_refill)\n",
+                "    Consequence: a page leaks.\n",
+                "  - v2: frob: doorbell race\n",
+            ] {
+                assert!(prompt.contains(shown), "{name} lacks {shown:?}: {prompt}");
+            }
+            for unshown in ["frob: ring stall", verification_block] {
+                assert!(!prompt.contains(unshown), "{name} shows {unshown:?}");
+            }
+            let inserted = format!("\n\n{block}\n\n{}", report_rules(name));
+            assert_eq!(&prompt.replacen(&inserted, "", 1), bare, "{name}");
+        }
+
+        let unlinked_prompts = |history: Option<PriorReviewContext>| {
+            report_prompts(&LinuxPatchReviewState {
+                prior_reviews: history,
+                findings: vec![unlinked.clone()],
+                ..Default::default()
+            })
+        };
+        let without_history = unlinked_prompts(None);
+        for (name, prompt) in &without_history {
+            assert!(!prompt.contains(PRIOR_LINKS_PLACEHOLDER), "{name}");
+            assert!(!prompt.contains("PRIOR REVISION RULES"), "{name}");
+            assert!(!prompt.contains("Earlier Findings Named"), "{name}");
+        }
+        assert_eq!(unlinked_prompts(Some(context)), without_history);
+    }
+
+    /// The Linux report reads the linked findings and their rules right
+    /// after its instruction and before the findings they explain, and a
+    /// prompt without them is the instruction followed by the findings, as
+    /// before.
+    #[test]
+    fn the_linux_report_reads_the_linked_findings_after_its_instruction() {
+        let context = three_earlier_findings();
+        let findings = vec![json!({
+            "problem": "frob: ring stall again",
+            "prior": {"relation": "repeat", "revision": "v2",
+                      "earlier_problem": "frob: ring stall"},
+        })];
+        let block = context.render_linked(&findings).expect("a linked finding");
+        let state = LinuxPatchReviewState {
+            prior_reviews: Some(context),
+            findings,
+            ..Default::default()
+        };
+        let stage = report_stage(1, 1.0);
+        assert!(stage.user_prompt_for_log(&state).starts_with(&format!(
+            "{STAGE_REPORT_INSTRUCTION}\n\n{block}\n\n{PRIOR_LINKS_REPORT_RULES}\n\nFindings:\n"
+        )));
+        let without = LinuxPatchReviewState {
+            prior_reviews: None,
+            ..state
+        };
+        assert!(
+            stage
+                .user_prompt_for_log(&without)
+                .starts_with(&format!("{STAGE_REPORT_INSTRUCTION}\n\nFindings:\n"))
+        );
+    }
+
+    /// Both reports state a repeat and a fix regression by the link's own
+    /// label and title, tell a fix regression's fix not to undo the earlier
+    /// fix, and say nothing about earlier revisions for an unlinked finding;
+    /// the Sashiko report puts its note right after the severity marker.
+    /// Neither asks for the revision head, which only the page shows.
+    #[test]
+    fn the_reports_state_each_link_as_their_rules_ask() {
+        for rules in [report_rules("linux"), report_rules("sashiko")] {
+            for asked in [
+                "PRIOR REVISION RULES: A finding may carry \"prior\", linking it to a finding \
+                 reported on an earlier revision of this pull request, listed above.",
+                "\n- \"relation\": \"repeat\": ",
+                "\n- \"relation\": \"fix_regression\": ",
+                "the issue was raised on <revision> (\"<earlier_problem>\") and is still present.",
+                "the issue appears to come from the change made for <revision>'s \
+                 \"<earlier_problem>\". Any fix you suggest must resolve both this issue and the \
+                 earlier one; do not suggest going back to the code the earlier finding was about.",
+                "\nFindings without \"prior\" are new; do not mention earlier revisions for them.",
+            ] {
+                assert!(rules.contains(asked), "{asked}: {rules}");
+            }
+            assert!(!rules.contains("revision_head"), "{rules}");
+            assert!(
+                !rules.contains('`'),
+                "the reports use no backticks: {rules}"
+            );
+        }
+        assert!(
+            PRIOR_LINKS_REPORT_RULES.contains("begin that comment by saying the issue was raised")
+        );
+        let sashiko = report_rules("sashiko");
+        for note in [
+            "write \"(repeat of <revision>)\" right after the severity marker of that finding's \
+             bullet, as in \"- [HIGH] (repeat of v3) ...\"",
+            "write \"(caused by the fix for <revision>)\" right after the severity marker of that \
+             finding's bullet, as in \"- [MEDIUM] (caused by the fix for v3) ...\"",
+        ] {
+            assert!(sashiko.contains(note), "{note}: {sashiko}");
         }
     }
 }

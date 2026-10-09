@@ -29,17 +29,18 @@ use crate::workflow::{
 use crate::workflows::guard::{normalize_guide_name, normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
-    PRIOR_LINK_POST_VERIFICATION_RULES, PRIOR_REVIEWS_VERIFICATION_RULES, PlanningOutput,
-    PostVerificationOutput, PrescreenOutput, PriorHistory, SERIES_CONTEXT_PLACEHOLDER,
-    StageConcernsOutput, VerificationOutput, append_stage_dismissed_concerns_with_prompts,
-    append_stage_items_with_prompts, apply_planning_stage_output,
-    apply_post_verification_stage_output, apply_verification_stage_output,
-    batch_hard_cases_by_severity, build_stage_efforts_schema, candidates_for_prompt,
-    collect_stage_prompts, cover_letter_placeholder, extra_prompt_paths_for_items,
-    extra_prompt_paths_for_state, format_planning_feedback, format_post_verification_feedback,
-    has_valid_proof_location, prior_link_section, prior_reviews_placeholder, resolve_stage_effort,
-    validate_planning_stage_efforts, validate_post_verification_batch_items,
-    verification_output_checks, with_prior_reviews,
+    PRIOR_LINK_POST_VERIFICATION_RULES, PRIOR_LINKS_PLACEHOLDER, PRIOR_REVIEWS_VERIFICATION_RULES,
+    PlanningOutput, PostVerificationOutput, PrescreenOutput, PriorHistory,
+    SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput, VerificationOutput,
+    append_stage_dismissed_concerns_with_prompts, append_stage_items_with_prompts,
+    apply_planning_stage_output, apply_post_verification_stage_output,
+    apply_verification_stage_output, batch_hard_cases_by_severity, build_stage_efforts_schema,
+    candidates_for_prompt, collect_stage_prompts, cover_letter_placeholder,
+    extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_planning_feedback,
+    format_post_verification_feedback, has_valid_proof_location, prior_link_section,
+    prior_reviews_placeholder, resolve_stage_effort, validate_planning_stage_efforts,
+    validate_post_verification_batch_items, verification_output_checks, with_prior_links,
+    with_prior_reviews,
 };
 
 /// State container for a Sashiko patch review run.
@@ -285,6 +286,26 @@ Generate the plain-text inline review report following the exact formatting rule
 - If any finding has `"preexisting": true`, state explicitly in its explanation that the issue was not introduced by this change.
 - Do NOT include `Summary:` or `Findings:` headers (the summary is generated and displayed separately in the UI).
 - Do NOT use backticks, markdown code blocks, or markdown headings. Wrap all lines at 78 characters or fewer."#;
+
+/// How the Sashiko report states a finding's link to an earlier finding: a
+/// note right after the bullet's severity marker, where
+/// github-summary-template.md places "(pre-existing)", and the bullet says
+/// what came back or what caused it; a fix regression's suggested fix may
+/// not undo the fix for the earlier finding. A finding without a link says
+/// nothing about earlier revisions.
+pub(crate) const PRIOR_LINKS_REPORT_RULES: &str =
+    "PRIOR REVISION RULES: A finding may carry \"prior\", \
+     linking it to a finding reported on an earlier revision of this pull request, listed above. \
+     In these rules, <revision> and <earlier_problem> are the values of that finding's \"prior\".
+- \"relation\": \"repeat\": write \"(repeat of <revision>)\" right after the severity marker of \
+     that finding's bullet, as in \"- [HIGH] (repeat of v3) ...\", and say in the bullet that the \
+     issue was raised on <revision> (\"<earlier_problem>\") and is still present.
+- \"relation\": \"fix_regression\": write \"(caused by the fix for <revision>)\" right after the \
+     severity marker of that finding's bullet, as in \"- [MEDIUM] (caused by the fix for v3) \
+     ...\", and say in the bullet that the issue appears to come from the change made for \
+     <revision>'s \"<earlier_problem>\". Any fix you suggest must resolve both this issue and the \
+     earlier one; do not suggest going back to the code the earlier finding was about.
+Findings without \"prior\" are new; do not mention earlier revisions for them.";
 
 const STAGE_SUMMARY_INSTRUCTION: &str = r#"# Summarize the proposed change
 
@@ -1243,9 +1264,9 @@ pub fn report_stage_with_effort(
 ) -> Stage<SashikoPatchReviewState, String> {
     Stage::builder(REPORT.name)
         .system_prompt(sashiko_system_prompt(true))
-        .user_prompt(
+        .user_prompt(with_prior_links(
             PromptTemplate::<SashikoPatchReviewState>::new(format!(
-                r#"{STAGE_REPORT_INSTRUCTION}
+                r#"{STAGE_REPORT_INSTRUCTION}{PRIOR_LINKS_PLACEHOLDER}
 
 <report_template>
 @include("github-summary-template.md")
@@ -1260,7 +1281,8 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
             .with_var("findings", |s: &SashikoPatchReviewState| {
                 serde_json::to_string_pretty(&s.findings).unwrap_or_default()
             }),
-        )
+            PRIOR_LINKS_REPORT_RULES,
+        ))
         .output_format(OutputFormat::text_with_validator(
             validate_github_summary_format,
             format_github_summary_feedback,
@@ -1561,6 +1583,87 @@ mod tests {
         assert!(validate_summary_format("Summary: prefixed summary.", &state).is_err());
         assert!(validate_summary_format("# Top-level heading in summary", &state).is_err());
         assert!(validate_summary_format(&long_line, &state).is_err());
+    }
+
+    /// A bullet carries its link to an earlier finding as a note right
+    /// after the severity marker, where the template puts "(pre-existing)",
+    /// so the report's validator accepts it and the formatter keeps it as
+    /// written.
+    #[test]
+    fn a_bullet_with_an_earlier_revision_note_passes_the_summary_validator() {
+        let state = SashikoPatchReviewState {
+            findings: vec![
+                json!({"severity": "High", "problem": "db: a repeat"}),
+                json!({"severity": "Medium", "problem": "db: a fix regression"}),
+            ],
+            ..Default::default()
+        };
+        let report = "- [HIGH] (repeat of v3) In src/db.rs (store_review_findings), the\n  \
+                      link is still stored unchecked, as raised on v3 (\"db: link stored\n  \
+                      unchecked\").\n\n\
+                      - [MEDIUM] (caused by the fix for patchset 41) In src/db.rs (prior),\n  \
+                      the check added for patchset 41's \"db: link stored unchecked\" drops\n  \
+                      valid links.";
+        assert_eq!(validate_github_summary_format(report, &state), Ok(()));
+        assert_eq!(format_sashiko_inline_findings(report), report);
+    }
+
+    /// The Sashiko report reads the linked findings and their rules right
+    /// after its instruction and before its template and the findings they
+    /// explain, and a prompt without them is the instruction followed by
+    /// the template, as before.
+    #[test]
+    fn the_sashiko_report_reads_the_linked_findings_after_its_instruction() {
+        use crate::prior_revisions::{
+            PriorFinding, PriorPatch, PriorReviewTarget, PriorRevision, build_prior_review_context,
+        };
+        let revision = PriorRevision {
+            label: "v1".to_string(),
+            head: None,
+            same_base: None,
+            patches: vec![PriorPatch {
+                index: 1,
+                subject: "db: store links".to_string(),
+                commit: None,
+                same_change_as: None,
+                diff: None,
+                findings: vec![PriorFinding {
+                    severity: crate::db::Severity::High,
+                    problem: "db: link stored unchecked".to_string(),
+                    consequence: None,
+                    locations: Vec::new(),
+                    prior: None,
+                }],
+            }],
+        };
+        let target = PriorReviewTarget {
+            index: 1,
+            subject: "db: store links",
+            diff: "",
+        };
+        let context = build_prior_review_context(&[revision], target).expect("a finding");
+        let findings = vec![json!({
+            "problem": "db: link still unchecked",
+            "prior": {"relation": "repeat", "revision": "v1",
+                      "earlier_problem": "db: link stored unchecked"},
+        })];
+        let block = context.render_linked(&findings).expect("a linked finding");
+        let state = SashikoPatchReviewState {
+            prior_reviews: Some(context),
+            findings,
+            ..Default::default()
+        };
+        let stage = report_stage(1, 1.0);
+        assert!(stage.user_prompt_for_log(&state).starts_with(&format!(
+            "{STAGE_REPORT_INSTRUCTION}\n\n{block}\n\n{PRIOR_LINKS_REPORT_RULES}\n\n<report_template>\n"
+        )));
+        let without = SashikoPatchReviewState {
+            prior_reviews: None,
+            ..state
+        };
+        assert!(stage.user_prompt_for_log(&without).starts_with(&format!(
+            "{STAGE_REPORT_INSTRUCTION}\n\n<report_template>\n"
+        )));
     }
 
     #[test]
