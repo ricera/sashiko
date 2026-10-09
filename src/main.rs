@@ -1169,6 +1169,7 @@ async fn run_daemon(
         local_token,
         email_worker_heartbeat: email_worker_heartbeat.clone(),
         activity: activity.clone(),
+        pull_request_resolver: Arc::new(sashiko::forge::GhCli),
     };
     let api_handle = tokio::spawn(async move {
         if let Err(e) =

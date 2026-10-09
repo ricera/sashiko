@@ -252,6 +252,71 @@ pub struct SubmitResponse {
     pub id: String,
 }
 
+/// A request to review a pull request of the daemon's GitHub repository by
+/// its number (`POST /api/pr/review`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrReviewRequest {
+    pub number: i64,
+    /// "owner/name" when the operator gave a pull request URL. It must name
+    /// the repository forge.github_repository names, or the request is
+    /// refused, because a number means a pull request of that repository
+    /// only.
+    #[serde(default)]
+    pub repo: Option<String>,
+    #[serde(default)]
+    pub mode: PrReviewMode,
+}
+
+/// What a request to review a pull request by number asks for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrReviewMode {
+    /// Review the pull request's current head, unless that revision is
+    /// already queued, running or reviewed.
+    #[default]
+    ReviewHead,
+    /// As ReviewHead, and review the head revision again if it already
+    /// finished. A rerun is the act /api/patchset/rerun performs, so it
+    /// needs the Review permission as well as Ingest.
+    RerunHead,
+}
+
+/// What a request to review a pull request by number did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrReviewOutcome {
+    /// The head revision is new, or its last attempt ended without a
+    /// review, and its fetch was queued.
+    Queued,
+    /// The head revision is already being fetched, waiting for review or
+    /// under review.
+    AlreadyInProgress,
+    /// The head revision was already reviewed or skipped; nothing was
+    /// queued.
+    AlreadyFinished,
+    /// The head revision had finished and was queued for review again.
+    RerunQueued,
+}
+
+/// The reply to a request to review a pull request by number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrReviewResponse {
+    pub outcome: PrReviewOutcome,
+    /// The patchset of the pull request's head revision.
+    pub patchset_id: i64,
+    pub number: i64,
+    /// The head commit the forge reported, in full.
+    pub head: String,
+    /// The patchset's status before this request ("Fetching" for one that
+    /// was still being fetched); absent when the request created it. It
+    /// explains the outcome to a reader and is not a state to act on.
+    #[serde(default)]
+    pub previous_status: Option<String>,
+    /// One line for the operator, saying what happened.
+    pub message: String,
+}
+
 /// Input payload representing a candidate Linux kernel defect.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BugInput {
@@ -735,6 +800,65 @@ mod tests {
             fields.remove("created_at");
         }
         assert_eq!(serde_json::to_value(&stored).unwrap(), without_position);
+    }
+
+    /// A request to review a pull request by number needs only the number;
+    /// the mode defaults to reviewing the head and is spelt in snake case,
+    /// and a key the server does not know is refused rather than ignored.
+    #[test]
+    fn pr_review_request_wire_format() {
+        let parse = |value: serde_json::Value| serde_json::from_value::<PrReviewRequest>(value);
+        assert_eq!(
+            parse(serde_json::json!({ "number": 7 })).unwrap(),
+            PrReviewRequest {
+                number: 7,
+                repo: None,
+                mode: PrReviewMode::ReviewHead,
+            }
+        );
+        assert_eq!(
+            parse(serde_json::json!({
+                "number": 7,
+                "repo": "acme/widget",
+                "mode": "rerun_head",
+            }))
+            .unwrap(),
+            PrReviewRequest {
+                number: 7,
+                repo: Some("acme/widget".to_string()),
+                mode: PrReviewMode::RerunHead,
+            }
+        );
+        assert!(parse(serde_json::json!({ "number": 7, "mode": "rerun" })).is_err());
+        assert!(parse(serde_json::json!({ "number": 7, "stale": true })).is_err());
+    }
+
+    /// The reply names its outcome in snake case and survives the trip to
+    /// the CLI unchanged.
+    #[test]
+    fn pr_review_response_wire_format() {
+        let response = PrReviewResponse {
+            outcome: PrReviewOutcome::AlreadyInProgress,
+            patchset_id: 41,
+            number: 7,
+            head: "1a2b3c4d".repeat(5),
+            previous_status: Some("In Review".to_string()),
+            message: "PR #7 head 1a2b3c4d is already being reviewed".to_string(),
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["outcome"], "already_in_progress");
+        assert_eq!(value["previous_status"], "In Review");
+        assert_eq!(
+            serde_json::from_value::<PrReviewResponse>(value).unwrap(),
+            response
+        );
+        for (outcome, wire) in [
+            (PrReviewOutcome::Queued, "queued"),
+            (PrReviewOutcome::AlreadyFinished, "already_finished"),
+            (PrReviewOutcome::RerunQueued, "rerun_queued"),
+        ] {
+            assert_eq!(serde_json::to_value(outcome).unwrap(), wire);
+        }
     }
 
     /// A stored log entry holds the message and its stage, and nothing of the

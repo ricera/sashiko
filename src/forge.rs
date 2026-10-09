@@ -925,6 +925,11 @@ pub enum GhError {
     /// gh succeeded, but what it printed is not the pull request asked for.
     #[error("gh's answer is not usable: {reason}")]
     Invalid { reason: String },
+    /// The server was built without a resolver, so gh was not run.
+    #[error(
+        "this server is not set up to resolve pull request numbers; the daemon resolves them with gh"
+    )]
+    NotConfigured,
 }
 
 impl GhError {
@@ -965,6 +970,23 @@ impl PullRequestResolver for GhCli {
             number,
         )
         .await
+    }
+}
+
+/// Resolves no pull request, and runs nothing. It is the resolver of a
+/// server built without a daemon behind it, such as a test's router, so
+/// that nothing such a server serves can run gh or reach the network.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoResolver;
+
+#[async_trait::async_trait]
+impl PullRequestResolver for NoResolver {
+    async fn resolve(
+        &self,
+        _repo: &ForgeRepo,
+        _number: i64,
+    ) -> Result<ResolvedPullRequest, GhError> {
+        Err(GhError::NotConfigured)
     }
 }
 
