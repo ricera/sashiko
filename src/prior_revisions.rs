@@ -474,9 +474,17 @@ fn quoted_ascii(text: &str) -> String {
 }
 
 /// The key two spellings of one revision label or one title are compared
-/// under: made one line and case-folded, as `literal_duplicate_key` compares
-/// two stored problems, so a link that differs from what the block listed
-/// only in case, spacing or an invisible character still names it.
+/// under, the rule `literal_duplicate_key` compares two stored problems
+/// under. `one_line` turns each run of whitespace, control characters and
+/// the other marks `is_unsafe_for_terminal` names (line and paragraph
+/// separators, the zero-width and directional marks U+200B to U+200F, and
+/// the bidirectional embeddings, overrides and isolates U+202A to U+202E
+/// and U+2066 to U+2069) into one space and leaves none at either end; the
+/// result is then lower-cased. A link that differs from what the block
+/// listed only in those characters or in case still names it. Any other
+/// invisible character, such as a word joiner (U+2060), a soft hyphen or a
+/// byte order mark, is compared as written, and one of the marks above
+/// inside a word splits that word in two; either makes the two differ.
 fn match_key(text: &str) -> String {
     literal_duplicate_key(text)
 }
