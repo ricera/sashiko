@@ -2219,8 +2219,8 @@ impl ExistingRevision {
 /// and queues its fetch when `existing` says so.
 ///
 /// The webhook and the manual review route both come through here, so a
-/// revision reaches one placeholder id, subject and slug whichever way it
-/// arrived. The placeholder id is built only here.
+/// revision reaches one placeholder id, subject, slug and description
+/// whichever way it arrived. The placeholder id is built only here.
 async fn enqueue_pull_request(
     state: &AppState,
     forge_name: &str,
@@ -2249,6 +2249,7 @@ async fn enqueue_pull_request(
             Some(subject),
             Some(metadata.pr_number),
             slug.as_deref(),
+            metadata.pr_body.as_deref(),
         )
         .await
         .map_err(|e| {
@@ -3084,6 +3085,7 @@ mod tests {
             pr_title: Some("Fix the widget".to_string()),
             pr_url: Some(format!("https://github.com/acme/widget/pull/{number}")),
             author: None,
+            pr_body: None,
         }
     }
 
@@ -3121,22 +3123,29 @@ mod tests {
             .unwrap();
         assert_eq!(first.state, crate::db::PlaceholderState::Created);
         assert_eq!(fetches_sent(fetch_rx), 1, "a new revision is fetched");
-        if let Some(status) = status {
-            state
-                .db
-                .conn
-                .execute(
-                    "UPDATE patchsets SET status = ? WHERE id = ?",
-                    libsql::params![status, first.id],
-                )
-                .await
-                .unwrap();
-        }
+        store_status(state, first.id, status).await;
         let again = enqueue_pull_request(state, "GitHub", &metadata, existing)
             .await
             .unwrap();
         assert_eq!(again.id, first.id, "one revision has one row");
         (again.state, fetches_sent(fetch_rx))
+    }
+
+    /// Stores `status` on patchset `id` when one is given, as the stage
+    /// that would have moved the row there does; `None` leaves it Fetching.
+    async fn store_status(state: &AppState, id: i64, status: Option<&str>) {
+        let Some(status) = status else {
+            return;
+        };
+        state
+            .db
+            .conn
+            .execute(
+                "UPDATE patchsets SET status = ? WHERE id = ?",
+                libsql::params![status, id],
+            )
+            .await
+            .unwrap();
     }
 
     /// The stored statuses a revision is queued again from, with whether
@@ -3188,6 +3197,108 @@ mod tests {
                 usize::from(fetches_again),
                 "{status:?} was found as {found:?}"
             );
+        }
+    }
+
+    /// A revision is queued with its pull request's description on its
+    /// placeholder. Queued again, a new description replaces the stored one
+    /// and a delivery without one leaves it, on both paths. A head that a
+    /// newer revision outranks keeps the description it had, because the
+    /// one sent now describes the pull request at its newer head.
+    #[tokio::test]
+    async fn a_queued_revision_records_its_description() {
+        let (state, mut fetch_rx) = pull_request_state().await;
+        let description = |id| {
+            let db = state.db.clone();
+            async move { db.get_patchset_mr_body(id).await.unwrap() }
+        };
+        let mut earlier = widget_pull_request(7);
+        earlier.pr_body = Some("First description.".to_string());
+        let id = enqueue_pull_request(&state, "GitHub", &earlier, ExistingRevision::Refetch)
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(description(id).await.as_deref(), Some("First description."));
+
+        earlier.pr_body = None;
+        enqueue_pull_request(&state, "GitHub", &earlier, ExistingRevision::Leave)
+            .await
+            .unwrap();
+        assert_eq!(description(id).await.as_deref(), Some("First description."));
+
+        earlier.pr_body = Some("Edited description.".to_string());
+        enqueue_pull_request(&state, "GitHub", &earlier, ExistingRevision::Leave)
+            .await
+            .unwrap();
+        assert_eq!(
+            description(id).await.as_deref(),
+            Some("Edited description.")
+        );
+
+        let mut pushed = widget_pull_request(7);
+        pushed.head_sha = format!("{:040x}", 0x99);
+        pushed.pr_body = Some("Newest description.".to_string());
+        let newer = enqueue_pull_request(&state, "GitHub", &pushed, ExistingRevision::Refetch)
+            .await
+            .unwrap()
+            .id;
+        assert_eq!(
+            description(newer).await.as_deref(),
+            Some("Newest description.")
+        );
+
+        earlier.pr_body = Some("Late description.".to_string());
+        let outranked = enqueue_pull_request(&state, "GitHub", &earlier, ExistingRevision::Refetch)
+            .await
+            .unwrap();
+        assert_eq!(outranked.id, id);
+        assert_eq!(
+            outranked.standing.superseded_by.map(|revision| revision.id),
+            Some(newer)
+        );
+        assert_eq!(
+            description(id).await.as_deref(),
+            Some("Edited description.")
+        );
+        assert_eq!(
+            description(newer).await.as_deref(),
+            Some("Newest description.")
+        );
+        fetches_sent(&mut fetch_rx);
+    }
+
+    /// A revision queued again from any stored status, on either path,
+    /// records the description it is queued with, whether its row is kept
+    /// or reset, so that a rerun of a reviewed head reads the description
+    /// as of the latest delivery.
+    #[tokio::test]
+    async fn a_requeued_revision_records_its_new_description_in_every_status() {
+        let (state, mut fetch_rx) = pull_request_state().await;
+        let cases = requeued_statuses().into_iter().flat_map(|(status, _)| {
+            [ExistingRevision::Refetch, ExistingRevision::Leave].map(|path| (status, path))
+        });
+        for (number, (status, existing)) in (1..).zip(cases) {
+            let mut metadata = widget_pull_request(number);
+            metadata.pr_body = Some("Queued description.".to_string());
+            let id = enqueue_pull_request(&state, "GitHub", &metadata, existing)
+                .await
+                .unwrap()
+                .id;
+            store_status(&state, id, status).await;
+            metadata.pr_body = Some("Requeued description.".to_string());
+            let again = enqueue_pull_request(&state, "GitHub", &metadata, existing)
+                .await
+                .unwrap();
+            assert_eq!(again.id, id, "one revision has one row");
+            assert_eq!(
+                state.db.get_patchset_mr_body(id).await.unwrap().as_deref(),
+                Some("Requeued description."),
+                "{status:?} on the {existing:?} path was found as {:?}",
+                again.state
+            );
+            // The fetch channel is bounded, so each case takes its fetches
+            // off before the next one queues more.
+            fetches_sent(&mut fetch_rx);
         }
     }
 

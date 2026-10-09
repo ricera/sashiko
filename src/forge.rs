@@ -171,6 +171,41 @@ pub struct ForgeMetadata {
     pub pr_title: Option<String>,
     pub pr_url: Option<String>,
     pub author: Option<String>,
+    /// The pull request's description as [`request_description`] reads
+    /// it: trimmed, capped, and `None` when the forge sent none or a blank
+    /// one. It is written by whoever opened the pull request, so it is
+    /// untrusted text.
+    pub pr_body: Option<String>,
+}
+
+/// The most of a pull request description that is kept, in bytes.
+///
+/// GitHub caps a description at 65536 characters, but a GitLab
+/// description can be about 1 MB and an unsigned delivery is bounded only
+/// by the request body limit, so the cap is applied here to keep every
+/// stored revision, and every later rendering of it, bounded.
+pub const MAX_DESCRIPTION_BYTES: usize = 65536;
+
+/// What ends a description cut at [`MAX_DESCRIPTION_BYTES`].
+const DESCRIPTION_TRUNCATED: &str = "\n[truncated]";
+
+/// Reads a pull or merge request description from its JSON value.
+///
+/// The text is trimmed, and a value that is null, absent, not a string or
+/// blank is `None`, so a stored description is never empty. Text longer
+/// than [`MAX_DESCRIPTION_BYTES`] is cut on a character boundary and ends
+/// with a line saying so, and the result, marker included, is never longer
+/// than the cap.
+pub fn request_description(value: &serde_json::Value) -> Option<String> {
+    let text = value.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.len() <= MAX_DESCRIPTION_BYTES {
+        return Some(text.to_string());
+    }
+    let kept = crate::utils::utf8_prefix(text, MAX_DESCRIPTION_BYTES - DESCRIPTION_TRUNCATED.len());
+    Some(format!("{}{DESCRIPTION_TRUNCATED}", kept.trim_end()))
 }
 
 /// Returns true if the authenticated forge username belongs to Dependabot
@@ -332,6 +367,7 @@ impl ForgeProvider for GitHubForge {
 
         let pr_title = pr["title"].as_str().map(|s| s.to_string());
         let pr_url = pr["html_url"].as_str().map(|s| s.to_string());
+        let pr_body = request_description(&pr["body"]);
         let author = pr["user"]["login"]
             .as_str()
             .or_else(|| payload["sender"]["login"].as_str())
@@ -355,6 +391,7 @@ impl ForgeProvider for GitHubForge {
             pr_title,
             pr_url,
             author,
+            pr_body,
         };
 
         Ok((action, metadata))
@@ -464,6 +501,7 @@ impl ForgeProvider for GitLabForge {
 
         let pr_title = attrs["title"].as_str().map(|s| s.to_string());
         let pr_url = attrs["url"].as_str().map(|s| s.to_string());
+        let pr_body = request_description(&attrs["description"]);
         let author = payload["user"]["username"].as_str().map(|s| s.to_string());
 
         let repo_url = payload["project"]["git_http_url"]
@@ -484,6 +522,7 @@ impl ForgeProvider for GitLabForge {
             pr_title,
             pr_url,
             author,
+            pr_body,
         };
 
         Ok((action, metadata))
@@ -887,7 +926,7 @@ impl ResolvedPullRequest {
     /// clone_url, in the forge's own spelling, so the fetcher derives the
     /// same fetcher-<hash> remote, and uses the same credentials, as it does
     /// for a webhook-driven review of the same repository. gh is not asked
-    /// for the author, so none is recorded.
+    /// for the author or the description, so neither is recorded.
     pub fn to_forge_metadata(&self) -> ForgeMetadata {
         ForgeMetadata {
             repo_url: Some(format!(
@@ -900,6 +939,7 @@ impl ResolvedPullRequest {
             pr_title: self.title.clone(),
             pr_url: Some(self.url.clone()),
             author: None,
+            pr_body: None,
         }
     }
 }
@@ -1473,6 +1513,96 @@ mod tests {
         let (action, metadata) = forge.parse_payload(&body).unwrap();
         assert_eq!(action, "merge_request");
         assert_eq!(metadata.pr_number, 10);
+    }
+
+    /// The description each parser reads from a delivery whose description
+    /// field is `description`, or that has none when it is `None`.
+    fn parsed_descriptions(description: Option<serde_json::Value>) -> [Option<String>; 2] {
+        let mut github = serde_json::json!({
+            "action": "opened",
+            "pull_request": {
+                "head": {"sha": "a".repeat(40)},
+                "base": {"sha": "b".repeat(40)},
+                "number": 42,
+            },
+            "repository": {"clone_url": "https://github.com/org/repo.git"}
+        });
+        let mut gitlab = serde_json::json!({
+            "object_kind": "merge_request",
+            "object_attributes": {
+                "last_commit": {"id": "c".repeat(40)},
+                "iid": 10,
+            },
+            "project": {"git_http_url": "https://gitlab.com/org/repo.git"}
+        });
+        if let Some(description) = description {
+            github["pull_request"]["body"] = description.clone();
+            gitlab["object_attributes"]["description"] = description;
+        }
+        let parse = |forge: &dyn ForgeProvider, payload: &serde_json::Value| {
+            let body = Bytes::from(serde_json::to_vec(payload).unwrap());
+            forge.parse_payload(&body).unwrap().1.pr_body
+        };
+        [parse(&GitHubForge, &github), parse(&GitLabForge, &gitlab)]
+    }
+
+    #[test]
+    fn request_description_trims_and_treats_blank_as_none() {
+        let text = "Fixes the widget.\r\n\r\n- one\n- two";
+        assert_eq!(
+            parsed_descriptions(Some(serde_json::json!(format!("\n  {text} \n\t")))),
+            [Some(text.to_string()), Some(text.to_string())],
+            "GitHub's body and GitLab's description are read the same way"
+        );
+        for absent in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("  ")),
+            Some(serde_json::json!(" \r\n\t ")),
+            Some(serde_json::json!(42)),
+            Some(serde_json::json!(["a description"])),
+            Some(serde_json::json!({"text": "a description"})),
+        ] {
+            assert_eq!(
+                parsed_descriptions(absent.clone()),
+                [None, None],
+                "{absent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_oversized_description_is_capped() {
+        // A GitLab description of about 1 MB, of a three-byte character
+        // repeated, so that no cut at a fixed byte offset can be assumed to
+        // land on a character boundary.
+        let huge = "\u{20ac}".repeat(350_000);
+        let [github, gitlab] = parsed_descriptions(Some(serde_json::json!(huge)));
+        assert_eq!(github, gitlab);
+        let capped = gitlab.unwrap();
+        assert!(capped.len() <= MAX_DESCRIPTION_BYTES, "{}", capped.len());
+        let kept = capped.strip_suffix("\n[truncated]").unwrap();
+        assert!(kept.chars().all(|c| c == '\u{20ac}'));
+        assert!(
+            MAX_DESCRIPTION_BYTES - capped.len() < '\u{20ac}'.len_utf8(),
+            "the cut keeps every whole character that fits"
+        );
+        assert!(huge.starts_with(kept));
+
+        // The cut in the middle of a character steps back to its start.
+        let budget = MAX_DESCRIPTION_BYTES - DESCRIPTION_TRUNCATED.len();
+        let straddling = format!("{}\u{20ac}{}", "a".repeat(budget - 1), "t".repeat(64));
+        assert!(straddling.len() > MAX_DESCRIPTION_BYTES);
+        let capped = request_description(&serde_json::json!(straddling)).unwrap();
+        assert_eq!(capped, format!("{}\n[truncated]", "a".repeat(budget - 1)));
+
+        // Text at the cap is kept whole.
+        let at_cap = "b".repeat(MAX_DESCRIPTION_BYTES);
+        assert_eq!(
+            request_description(&serde_json::json!(at_cap)).as_deref(),
+            Some(at_cap.as_str())
+        );
     }
 
     // --- HMAC verification tests ---

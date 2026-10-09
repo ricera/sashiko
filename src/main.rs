@@ -4930,6 +4930,7 @@ mod tests {
             Some("Fix the frobnicator"),
             Some(7),
             Some("widget-7"),
+            None,
         )
         .await
         .unwrap()

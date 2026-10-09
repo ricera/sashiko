@@ -378,6 +378,8 @@ mod tests {
             token: String::new(),
         };
         let db = Database::new(&settings).await?;
+        // The skeleton holds what the migrations after 11 touch: migration
+        // 17 indexes patchsets.mr_url.
         db.conn
             .execute_batch(
                 "CREATE TABLE patches (
@@ -388,7 +390,7 @@ mod tests {
                     diff TEXT
                 );
                 CREATE TABLE reviews (id INTEGER PRIMARY KEY);
-                CREATE TABLE patchsets (id INTEGER PRIMARY KEY);
+                CREATE TABLE patchsets (id INTEGER PRIMARY KEY, mr_url TEXT);
                 PRAGMA user_version = 11;",
             )
             .await?;
@@ -415,7 +417,7 @@ mod tests {
 
         let mut version = db.conn.query("PRAGMA user_version", ()).await?;
         let version: u32 = version.next().await?.expect("user version row").get(0)?;
-        assert_eq!(version, 16);
+        assert_eq!(version, crate::db::SCHEMA_VERSION);
         Ok(())
     }
 

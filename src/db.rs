@@ -495,6 +495,25 @@ fn shown_under_embargo(status: Option<String>, is_embargoed: bool) -> Option<Str
     }
 }
 
+/// The schema version [`Database::migrate`] leaves a database at.
+#[cfg(feature = "server")]
+pub(crate) const SCHEMA_VERSION: u32 = 17;
+
+/// Whether `table` has a column named `column`, for migrations that add a
+/// column a database may already have: ALTER TABLE has no IF NOT EXISTS.
+#[cfg(feature = "server")]
+async fn table_has_column(conn: &libsql::Connection, table: &str, column: &str) -> Result<bool> {
+    let mut columns = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await?;
+    while let Some(row) = columns.next().await? {
+        if row.get::<String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(feature = "server")]
 fn get_required_text(row: &libsql::Row, index: i32) -> Result<String> {
     get_optional_text(row, index)?
@@ -2540,8 +2559,37 @@ impl Database {
             tx.commit().await?;
         }
 
-        info!("Database schema is up to date at version 16.");
+        if current_version < 17 {
+            self.migrate_patchsets_mr_body().await?;
+        }
 
+        info!("Database schema is up to date at version {SCHEMA_VERSION}.");
+
+        Ok(())
+    }
+
+    /// Migration 17: the pull request description column and the index on
+    /// mr_url.
+    ///
+    /// The column is added only when it is missing, as 015 adds its
+    /// columns, because the fork's databases already have it and ALTER
+    /// TABLE has no IF NOT EXISTS. The file, which holds only the index,
+    /// runs either way: skipping it with the column, as 014 skips its
+    /// file, would leave a database that has the column but not the index
+    /// without the index.
+    async fn migrate_patchsets_mr_body(&self) -> Result<()> {
+        info!("Applying database migration version 17 (pull request descriptions)...");
+        let tx = self.conn.transaction().await?;
+        if !table_has_column(&tx, "patchsets", "mr_body").await? {
+            // The pull request description as of this revision; NULL when
+            // blank; gzip-compressed when large.
+            tx.execute("ALTER TABLE patchsets ADD COLUMN mr_body TEXT", ())
+                .await?;
+        }
+        tx.execute_batch(include_str!("migrations/017_patchsets_mr_body.sql"))
+            .await?;
+        tx.execute("PRAGMA user_version = 17", ()).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -7517,6 +7565,21 @@ impl Database {
                         .await?;
                     }
 
+                    // A pull request description is written only onto the
+                    // placeholder a revision was queued with, and ingestion
+                    // does not carry it, so the surviving row takes the
+                    // merged row's description when it has none of its own.
+                    tx.execute(
+                        "UPDATE patchsets
+                            SET mr_body = COALESCE(
+                                    mr_body,
+                                    (SELECT mr_body FROM patchsets WHERE id = ?)
+                                )
+                          WHERE id = ?",
+                        libsql::params![merge_from_id, target_id],
+                    )
+                    .await?;
+
                     // Delete the merged patchset
                     tx.execute(
                         "DELETE FROM patchsets WHERE id = ?",
@@ -8098,6 +8161,49 @@ impl Database {
             .pull_request_revisions(number, same_pull_request_repository(mr_url))
             .await?;
         Ok(revision_standing(&revisions, id))
+    }
+
+    /// Stores `description` as the pull request description of patchset
+    /// `id`, replacing any stored one, so that a revision queued again
+    /// records the description as of its latest push.
+    ///
+    /// A blank description changes nothing: a stored description is never
+    /// blank, and a delivery without one says nothing about the description
+    /// a revision was queued with before. A large one is gzip-compressed,
+    /// as message bodies are.
+    pub async fn set_patchset_mr_body(&self, id: i64, description: &str) -> Result<()> {
+        let description = description.trim();
+        if description.is_empty() {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "UPDATE patchsets SET mr_body = ? WHERE id = ?",
+                libsql::params![
+                    crate::compression::compress_string_if_needed(description),
+                    id
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The pull request description stored for patchset `id`, decompressed.
+    /// It is `None` when the patchset has none, holds a blank one, or does
+    /// not exist.
+    pub async fn get_patchset_mr_body(&self, id: i64) -> Result<Option<String>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT mr_body FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await?;
+        let Some(row) = rows.next().await? else {
+            return Ok(None);
+        };
+        let description = crate::compression::get_compressed_string_opt(&row, 0)?;
+        Ok(description.filter(|text| !text.trim().is_empty()))
     }
 
     pub async fn clear_patchset_embargo(&self, id: i64) -> Result<()> {
@@ -10320,6 +10426,7 @@ impl Database {
             mr_title,
             mr_number,
             slug,
+            None,
         )
         .await
         .map(|placeholder| placeholder.id)
@@ -10340,9 +10447,16 @@ impl Database {
     /// only have the auto-cancel cancel it again, and would take the bare
     /// slug from the revision the auto-cancel keeps.
     ///
-    /// Calls are serialised from the lookup through the reconcile, so that
-    /// concurrent requests for one head create a single row between them.
-    /// The lock covers only database work done here.
+    /// `description` is the pull request description the revision is
+    /// queued with, stored as set_patchset_mr_body stores it. An outranked
+    /// row keeps the description it has, because the description sent now
+    /// describes the pull request at its newer head.
+    ///
+    /// Calls are serialised from the lookup through the reconcile and the
+    /// description write, so that concurrent requests for one head create
+    /// a single row between them, and a description is never written onto
+    /// a revision that a head queued in the meantime outranks. The lock
+    /// covers only database work done here.
     #[allow(clippy::too_many_arguments)]
     pub async fn queue_fetching_patchset(
         &self,
@@ -10354,6 +10468,7 @@ impl Database {
         mr_title: Option<&str>,
         mr_number: Option<i64>,
         slug: Option<&str>,
+        description: Option<&str>,
     ) -> Result<FetchingPlaceholder> {
         let _queued = self.pr_revision_writes.lock().await;
         let columns = PlaceholderColumns {
@@ -10391,11 +10506,37 @@ impl Database {
         // An outranked row reports the standing that kept it from being
         // reset, so the caller refuses the head even where the stored row,
         // which keeps its old columns, ranks otherwise.
-        Ok(FetchingPlaceholder {
+        let placeholder = FetchingPlaceholder {
             id,
             state,
             standing: outranked.unwrap_or(reconciled),
-        })
+        };
+        if let Some(text) = description {
+            self.record_queued_description(&placeholder, text).await;
+        }
+        Ok(placeholder)
+    }
+
+    /// Stores `description` on the revision `placeholder` names unless a
+    /// newer revision of its pull request outranks it.
+    ///
+    /// A failure is only logged, because the revision is still reviewed
+    /// without its description, and failing the request would leave the
+    /// placeholder queued but never fetched.
+    async fn record_queued_description(
+        &self,
+        placeholder: &FetchingPlaceholder,
+        description: &str,
+    ) {
+        if placeholder.standing.superseded_by.is_some() {
+            return;
+        }
+        if let Err(e) = self.set_patchset_mr_body(placeholder.id, description).await {
+            warn!(
+                "Failed to store the pull request description of patchset {}: {}",
+                placeholder.id, e
+            );
+        }
     }
 
     /// Resets existing row `id` with `columns`, unless a newer revision of
@@ -18978,7 +19119,7 @@ mod tests {
 
     /// Queues the placeholder `cover` names with no pull request facts.
     async fn queue_placeholder(db: &Database, cover: &str) -> FetchingPlaceholder {
-        db.queue_fetching_patchset(cover, "Fetching", None, None, None, None, None, None)
+        db.queue_fetching_patchset(cover, "Fetching", None, None, None, None, None, None, None)
             .await
             .unwrap()
     }
@@ -18995,6 +19136,7 @@ mod tests {
             cover,
             REQUEUED_SUBJECT,
             Some(&skip),
+            None,
             None,
             None,
             None,
@@ -19129,6 +19271,7 @@ mod tests {
             Some("Widget"),
             Some(7),
             Some("widget-7"),
+            None,
         )
         .await
         .unwrap()
@@ -19357,6 +19500,7 @@ mod tests {
                     Some("Widget"),
                     Some(7),
                     Some("widget-7"),
+                    None,
                 )
                 .await
             });
@@ -19460,6 +19604,7 @@ mod tests {
                     Some("Widget"),
                     Some(number),
                     Some(&slug),
+                    None,
                 )
                 .await
             })
@@ -19491,6 +19636,7 @@ mod tests {
                     Some("Widget"),
                     Some(number),
                     Some(&slug),
+                    None,
                 )
                 .await
                 .unwrap_or_else(|e| panic!("round {round}: {e:#}"));
@@ -20184,7 +20330,7 @@ mod tests {
     #[tokio::test]
     async fn test_migration_adds_review_reference_repos() {
         let db = memory_db().await;
-        assert_eq!(user_version(&db).await, 16);
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
         assert!(reviews_have_reference_repos(&db).await);
 
         // An existing database at version 13: a review row, no column.
@@ -20200,14 +20346,14 @@ mod tests {
         assert!(!reviews_have_reference_repos(&db).await);
 
         db.migrate().await.unwrap();
-        assert_eq!(user_version(&db).await, 16);
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
         assert!(reviews_have_reference_repos(&db).await);
         let review = db.get_review_details(review_id).await.unwrap().unwrap();
         assert!(review["reference_repos"].is_null(), "{review}");
 
         // Up to date: running again changes nothing and does not fail.
         db.migrate().await.unwrap();
-        assert_eq!(user_version(&db).await, 16);
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
 
         // Set back with the column still there, the migration does not try to
         // add it twice, and what was stored survives.
@@ -20219,7 +20365,7 @@ mod tests {
             .await
             .unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(user_version(&db).await, 16);
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
         let review = db.get_review_details(review_id).await.unwrap().unwrap();
         assert_eq!(
             review["reference_repos"],
@@ -25415,7 +25561,7 @@ mod tests {
     #[tokio::test]
     async fn test_migration_adds_activity_and_timing() {
         let db = memory_db().await;
-        assert_eq!(user_version(&db).await, 16);
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
         assert!(has_activity_table(&db).await);
         let reviews = column_names(&db, "reviews").await;
         for column in [
@@ -25450,7 +25596,7 @@ mod tests {
         assert!(!has_activity_table(&db).await);
 
         db.migrate().await.unwrap();
-        assert_eq!(user_version(&db).await, 16);
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
         assert!(has_activity_table(&db).await);
         let review = db.get_review_details(review_id).await.unwrap().unwrap();
         assert!(review["stage_durations"].is_null(), "{review}");
@@ -25467,7 +25613,7 @@ mod tests {
             .await
             .unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(user_version(&db).await, 16);
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
         let review = db.get_review_details(review_id).await.unwrap().unwrap();
         assert_eq!(review["attempt"], 2, "existing data survives");
         assert!(
@@ -25752,7 +25898,7 @@ mod tests {
 
         let mut rows = db.conn.query("PRAGMA user_version", ()).await.unwrap();
         let version: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, i64::from(SCHEMA_VERSION));
 
         let (_, _, review_id) = reviewed_patchset(&db, "log8").await;
         db.append_review_log_entry(
@@ -25795,5 +25941,217 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// The version a migrated database reports is the number of the last
+    /// migration file, so a new migration cannot be added without moving
+    /// SCHEMA_VERSION, which every migration test checks against.
+    #[test]
+    fn test_schema_version_is_the_last_migration() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/migrations");
+        let last = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let name = entry.unwrap().file_name().into_string().unwrap();
+                name.split('_').next()?.parse::<u32>().ok()
+            })
+            .max();
+        assert_eq!(last, Some(SCHEMA_VERSION));
+    }
+
+    async fn has_mr_url_index(db: &Database) -> bool {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_patchsets_mr_url'",
+                (),
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().is_some()
+    }
+
+    async fn has_mr_body(db: &Database) -> bool {
+        column_names(db, "patchsets")
+            .await
+            .iter()
+            .any(|c| c == "mr_body")
+    }
+
+    /// Migration 17 adds patchsets.mr_body and the mr_url index on a fresh
+    /// database and on one at 16 without either. Set back to 16 with both
+    /// present, as a fork database has them, it does not fail and keeps
+    /// what is stored; with the column but not the index, the case that
+    /// skipping the file with the column would miss, it still creates the
+    /// index.
+    #[tokio::test]
+    async fn test_migration_17_adds_the_description_column_and_mr_url_index() {
+        let db = memory_db().await;
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+        assert!(has_mr_body(&db).await);
+        assert!(has_mr_url_index(&db).await);
+
+        let (ps_id, _, _) = reviewed_patchset(&db, "mr_body_migration").await;
+        db.conn
+            .execute_batch(
+                "DROP INDEX idx_patchsets_mr_url;
+                 ALTER TABLE patchsets DROP COLUMN mr_body;
+                 PRAGMA user_version = 16;",
+            )
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+        assert!(has_mr_body(&db).await);
+        assert!(has_mr_url_index(&db).await);
+        assert_eq!(db.get_patchset_mr_body(ps_id).await.unwrap(), None);
+
+        db.set_patchset_mr_body(ps_id, "Kept across the replay.")
+            .await
+            .unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 16", ())
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+        assert_eq!(
+            db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
+            Some("Kept across the replay.")
+        );
+
+        db.conn
+            .execute_batch(
+                "DROP INDEX idx_patchsets_mr_url;
+                 PRAGMA user_version = 16;",
+            )
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        assert!(has_mr_url_index(&db).await);
+        assert_eq!(
+            db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
+            Some("Kept across the replay.")
+        );
+    }
+
+    /// A description is stored as given, a large one compressed, and a
+    /// blank one leaves the stored description alone; reading gives it
+    /// back decompressed, and blank or missing as none.
+    #[tokio::test]
+    async fn test_pull_request_description_is_stored_and_read_back() {
+        let db = setup_db().await;
+        let (ps_id, _, _) = reviewed_patchset(&db, "mr_body_store").await;
+        let stored_type = || async {
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT typeof(mr_body) FROM patchsets WHERE id = ?",
+                    libsql::params![ps_id],
+                )
+                .await
+                .unwrap();
+            rows.next()
+                .await
+                .unwrap()
+                .unwrap()
+                .get::<String>(0)
+                .unwrap()
+        };
+        assert_eq!(db.get_patchset_mr_body(ps_id).await.unwrap(), None);
+
+        db.set_patchset_mr_body(ps_id, "  Fixes the widget.\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
+            Some("Fixes the widget.")
+        );
+        assert_eq!(stored_type().await, "text");
+
+        for blank in ["", "  \r\n\t"] {
+            db.set_patchset_mr_body(ps_id, blank).await.unwrap();
+            assert_eq!(
+                db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
+                Some("Fixes the widget."),
+                "{blank:?} leaves the stored description"
+            );
+        }
+
+        let large = "Ein \u{00fc}berarbeiteter Absatz.\n".repeat(200);
+        db.set_patchset_mr_body(ps_id, &large).await.unwrap();
+        assert_eq!(stored_type().await, "blob");
+        assert_eq!(
+            db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
+            Some(large.trim())
+        );
+
+        db.conn
+            .execute(
+                "UPDATE patchsets SET mr_body = ' \n' WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.get_patchset_mr_body(ps_id).await.unwrap(), None);
+        assert_eq!(db.get_patchset_mr_body(ps_id + 1000).await.unwrap(), None);
+    }
+
+    /// Three parts of one series form two patchsets, and the third part
+    /// merges them into the row created first, as a placeholder and the
+    /// row its patches arrived on are merged. The description is kept
+    /// whichever of the two rows held it, and a surviving row's own
+    /// description wins over the merged row's.
+    #[tokio::test]
+    async fn pull_request_description_survives_a_placeholder_merge() {
+        for (survivor_body, merged_body, kept) in [
+            (None, Some("merged"), Some("merged")),
+            (Some("survivor"), None, Some("survivor")),
+            (Some("survivor"), Some("merged"), Some("survivor")),
+            (None, None, None),
+        ] {
+            let db = setup_db().await;
+            let thread_hi = db
+                .create_thread("root_hi", "Subject", 100_000)
+                .await
+                .unwrap();
+            let thread_lo = db
+                .create_thread("root_lo", "Subject", 250_000)
+                .await
+                .unwrap();
+            let thread_mid = db
+                .create_thread("root_mid", "Subject", 175_000)
+                .await
+                .unwrap();
+            let survivor = add_unthreaded_part(&db, thread_hi, 2, 100_000, None).await;
+            let merged = add_unthreaded_part(&db, thread_lo, 1, 250_000, None).await;
+            assert_ne!(
+                survivor, merged,
+                "the two parts must form separate patchsets"
+            );
+            for (id, body) in [(survivor, survivor_body), (merged, merged_body)] {
+                if let Some(body) = body {
+                    db.set_patchset_mr_body(id, body).await.unwrap();
+                }
+            }
+
+            let ps_id = add_unthreaded_part(&db, thread_mid, 3, 175_000, None).await;
+            assert_eq!(
+                ps_id, survivor,
+                "the merge keeps the patchset created first"
+            );
+            assert!(
+                db.get_patchset_details(merged, None, None)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the merged row is gone"
+            );
+            assert_eq!(
+                db.get_patchset_mr_body(survivor).await.unwrap().as_deref(),
+                kept,
+                "survivor {survivor_body:?}, merged {merged_body:?}"
+            );
+        }
     }
 }
