@@ -156,7 +156,7 @@ const MAX_SAFE_LINE_INT: u64 = 9_007_199_254_740_991;
 /// last two groups can make a bidi-aware terminal draw text in another order
 /// than it was written, so a file name or a title could read differently from
 /// what it is.
-fn is_unsafe_for_terminal(c: char) -> bool {
+pub(crate) fn is_unsafe_for_terminal(c: char) -> bool {
     c.is_control()
         || matches!(
             c,
@@ -205,10 +205,39 @@ fn clip_title(problem: &str) -> String {
     if problem.is_empty() {
         return NO_DESCRIPTION.to_string();
     }
-    match problem.char_indices().nth(TITLE_MAX_CHARS) {
-        Some((cut, _)) => format!("{}…", problem[..cut].trim_end()),
-        None => problem.to_string(),
+    clip_chars(problem, TITLE_MAX_CHARS, "…")
+}
+
+/// Cuts `text` after `max_chars` code points, so a multibyte character is
+/// never split, and ends a cut text with `marker` after dropping the
+/// whitespace the cut left at its end. Text within the limit is returned as
+/// it is.
+fn clip_chars(text: String, max_chars: usize, marker: &str) -> String {
+    match text.char_indices().nth(max_chars) {
+        Some((cut, _)) => format!("{}{marker}", text[..cut].trim_end()),
+        None => text,
     }
+}
+
+/// Reduces text from another program, such as a command's error output, to
+/// one line that is safe to log and to show to an operator: the first line
+/// that still has visible text once `sanitize_text` has replaced each
+/// character `is_unsafe_for_terminal` names with a space, cut after
+/// `max_chars` code points and then ended with "...".
+///
+/// Only the first line is kept because a second line in a log entry would
+/// read as an entry of its own. A carriage return or a Unicode line separator
+/// inside that line becomes a space like any other unsafe character, so it
+/// can neither return the cursor over the text before it nor start a line.
+/// Blank lines are skipped so that leading blank output does not hide the
+/// message after it; text with no visible character gives "".
+pub fn sanitize_one_line(text: &str, max_chars: usize) -> String {
+    let line = text
+        .split('\n')
+        .map(sanitize_text)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    clip_chars(line, max_chars, "...")
 }
 
 /// Formats one location as `file:line (function)`, dropping absent parts.
@@ -595,6 +624,38 @@ mod tests {
             }));
             assert_eq!(written(&line), "  [Medium] title\n", "{speculative}");
         }
+    }
+
+    #[test]
+    fn one_line_is_the_first_visible_line_made_safe() {
+        assert_eq!(
+            sanitize_one_line("error: not found\nhint: try again\n", 200),
+            "error: not found"
+        );
+        assert_eq!(sanitize_one_line("\n \t\n\u{200B}\nreal\n", 200), "real");
+        // ESC, a bidi override, a lone carriage return and a line separator
+        // inside the line each become one space; a newline ends the line.
+        assert_eq!(
+            sanitize_one_line("\u{1b}[31mbad\u{202E}x\ry\u{2028}z\r\nforged entry", 200),
+            "[31mbad x y z"
+        );
+        assert_eq!(sanitize_one_line("", 200), "");
+        assert_eq!(sanitize_one_line("\n\u{1b}\n", 200), "");
+    }
+
+    #[test]
+    fn one_line_is_cut_on_code_points_and_marked() {
+        assert_eq!(
+            sanitize_one_line(&"é".repeat(1000), 200),
+            format!("{}...", "é".repeat(200))
+        );
+        let exact = "x".repeat(200);
+        assert_eq!(sanitize_one_line(&exact, 200), exact);
+        let spaced = format!("{} {}", "a".repeat(199), "b".repeat(10));
+        assert_eq!(
+            sanitize_one_line(&spaced, 200),
+            format!("{}...", "a".repeat(199))
+        );
     }
 
     #[test]

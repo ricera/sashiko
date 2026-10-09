@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::baseline::CommitId;
+use crate::finding_view::sanitize_one_line;
+use crate::settings::ForgeRepo;
 use anyhow::Result;
 use axum::http::{HeaderMap, StatusCode};
 use base64::Engine;
@@ -20,6 +23,7 @@ use hmac::{Hmac, Mac, digest::KeyInit};
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -840,6 +844,323 @@ pub fn extract_mr_version_from_subject(subject: Option<&str>, number: i64) -> Op
     None
 }
 
+/// How long the daemon waits for gh to describe one pull request. gh makes one
+/// API request for it, so a minute means GitHub or the network is stuck, and
+/// kill_on_drop then stops gh.
+const GH_TIME_LIMIT: Duration = Duration::from_secs(60);
+
+/// The longest gh error line, or validation reason, that reaches a log line
+/// or a reply, in code points.
+const GH_DETAIL_MAX_CHARS: usize = 200;
+
+/// gh's documented exit status for "authentication required".
+const GH_EXIT_AUTH_REQUIRED: i32 = 4;
+
+/// The fields asked of gh: exactly what a review of the revision needs.
+const GH_PR_FIELDS: &str = "number,title,url,baseRefOid,headRefOid";
+
+/// What gh reported about one pull request, validated against the request:
+/// the number is the one asked for, the URL names that pull request in
+/// `repo`, and both commits are full commit ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPullRequest {
+    /// The repository the number was resolved in, spelt as the forge spells
+    /// it in `url`, which may differ in case from the setting's spelling.
+    pub repo: ForgeRepo,
+    /// The pull request number, equal to the one asked for.
+    pub number: i64,
+    /// The pull request's https URL, as the url crate normalises it.
+    pub url: String,
+    /// The title as the forge gave it. Like a webhook's, it is only stored
+    /// and shown escaped.
+    pub title: Option<String>,
+    /// The commit the pull request is based on.
+    pub base: CommitId,
+    /// The pull request's head commit.
+    pub head: CommitId,
+}
+
+impl ResolvedPullRequest {
+    /// The metadata a review of this pull request's head is queued with.
+    ///
+    /// The repository URL is the https clone URL GitHub's webhook sends as
+    /// clone_url, in the forge's own spelling, so the fetcher derives the
+    /// same fetcher-<hash> remote, and uses the same credentials, as it does
+    /// for a webhook-driven review of the same repository. gh is not asked
+    /// for the author, so none is recorded.
+    pub fn to_forge_metadata(&self) -> ForgeMetadata {
+        ForgeMetadata {
+            repo_url: Some(format!(
+                "https://{}/{}/{}.git",
+                self.repo.host, self.repo.owner, self.repo.name
+            )),
+            base_sha: self.base.as_str().to_string(),
+            head_sha: self.head.as_str().to_string(),
+            pr_number: self.number,
+            pr_title: self.title.clone(),
+            pr_url: Some(self.url.clone()),
+            author: None,
+        }
+    }
+}
+
+/// Why gh could not resolve a pull request. Each message is safe to log and
+/// to return to the caller: `Failed` and `Invalid` hold one line reduced by
+/// `sanitize_one_line`, never gh's raw output.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum GhError {
+    /// gh could not be started because no such program was found.
+    #[error("gh is not installed on the daemon host, or is not on the daemon's PATH")]
+    NotInstalled,
+    /// gh exited with its documented status for missing authentication.
+    #[error("gh is not logged in as the user that runs the daemon; run gh auth login as that user")]
+    NotAuthenticated,
+    /// gh did not finish within GH_TIME_LIMIT and was stopped.
+    #[error("gh did not answer within {} seconds", GH_TIME_LIMIT.as_secs())]
+    TimedOut,
+    /// gh could not be run to completion, or failed for another reason;
+    /// `detail` is the first line of its error output.
+    #[error("gh failed: {detail}")]
+    Failed { detail: String },
+    /// gh succeeded, but what it printed is not the pull request asked for.
+    #[error("gh's answer is not usable: {reason}")]
+    Invalid { reason: String },
+}
+
+impl GhError {
+    fn failed(detail: &str) -> Self {
+        Self::Failed {
+            detail: sanitize_one_line(detail, GH_DETAIL_MAX_CHARS),
+        }
+    }
+
+    fn invalid(reason: &str) -> Self {
+        Self::Invalid {
+            reason: sanitize_one_line(reason, GH_DETAIL_MAX_CHARS),
+        }
+    }
+}
+
+/// Turns a pull request number into the commits a review of its current head
+/// needs. The daemon holds one as a trait object, so tests can stand in for
+/// gh without running it.
+#[async_trait::async_trait]
+pub trait PullRequestResolver: Send + Sync {
+    /// Resolves pull request `number` of `repo`.
+    async fn resolve(&self, repo: &ForgeRepo, number: i64) -> Result<ResolvedPullRequest, GhError>;
+}
+
+/// Resolves pull requests with the gh command line tool, logged in as the
+/// user that runs the daemon.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GhCli;
+
+#[async_trait::async_trait]
+impl PullRequestResolver for GhCli {
+    async fn resolve(&self, repo: &ForgeRepo, number: i64) -> Result<ResolvedPullRequest, GhError> {
+        resolve_with(
+            gh_pr_view_command(repo, number),
+            GH_TIME_LIMIT,
+            repo,
+            number,
+        )
+        .await
+    }
+}
+
+/// Refuses a number no pull request can have before anything is run with it.
+fn check_pull_request_number(number: i64) -> Result<(), GhError> {
+    if number > 0 {
+        Ok(())
+    } else {
+        Err(GhError::invalid(&format!(
+            "{number} is not a pull request number; they start at 1"
+        )))
+    }
+}
+
+/// Builds `gh pr view` for one pull request.
+///
+/// The repository is named with --repo, in the "host/owner/name" form, so gh
+/// neither reads git remotes nor runs git, and neither the daemon's
+/// repository nor an inherited GIT_DIR plays any part. The value is joined to
+/// the option with "=" so that it can never be read as an option of its own.
+/// resolve_with refuses a number below 1 before the command runs, so the
+/// number cannot be read as one either.
+/// GH_PROMPT_DISABLED keeps gh from waiting for an answer nobody can give.
+fn gh_pr_view_command(repo: &ForgeRepo, number: i64) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("gh");
+    command
+        .arg("pr")
+        .arg("view")
+        .arg(number.to_string())
+        .arg(format!("--repo={}/{}/{}", repo.host, repo.owner, repo.name))
+        .arg("--json")
+        .arg(GH_PR_FIELDS)
+        .env("GH_PROMPT_DISABLED", "1");
+    command
+}
+
+/// Runs a gh command to completion and reads the pull request it prints.
+/// A number no pull request can have is refused before the command runs,
+/// because gh would read a negative one as an option.
+async fn resolve_with(
+    command: tokio::process::Command,
+    time_limit: Duration,
+    repo: &ForgeRepo,
+    number: i64,
+) -> Result<ResolvedPullRequest, GhError> {
+    check_pull_request_number(number)?;
+    let output = run_gh(command, time_limit).await?;
+    check_gh_status(&output)?;
+    parse_gh_pull_request(&output.stdout, repo, number)
+}
+
+/// Runs a gh command with stdin closed, giving up after `time_limit`.
+/// kill_on_drop stops gh when the wait is given up, or when the request that
+/// started it is dropped.
+async fn run_gh(
+    mut command: tokio::process::Command,
+    time_limit: Duration,
+) -> Result<std::process::Output, GhError> {
+    let child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => GhError::NotInstalled,
+            _ => GhError::failed(&format!("could not start gh: {err}")),
+        })?;
+    tokio::time::timeout(time_limit, child.wait_with_output())
+        .await
+        .map_err(|_| GhError::TimedOut)?
+        .map_err(|err| GhError::failed(&format!("could not read gh's output: {err}")))
+}
+
+/// Types a gh run that did not succeed: its documented authentication status
+/// is `NotAuthenticated`, anything else `Failed` with the first line of its
+/// error output, or with its exit status when it wrote none.
+fn check_gh_status(output: &std::process::Output) -> Result<(), GhError> {
+    if output.status.success() {
+        return Ok(());
+    }
+    if output.status.code() == Some(GH_EXIT_AUTH_REQUIRED) {
+        return Err(GhError::NotAuthenticated);
+    }
+    let detail = sanitize_one_line(
+        &String::from_utf8_lossy(&output.stderr),
+        GH_DETAIL_MAX_CHARS,
+    );
+    if detail.is_empty() {
+        return Err(GhError::failed(&format!(
+            "gh {} with no message",
+            output.status
+        )));
+    }
+    Err(GhError::Failed { detail })
+}
+
+/// The JSON object `gh pr view --json` prints for GH_PR_FIELDS.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPullRequest {
+    number: i64,
+    #[serde(default)]
+    title: Option<String>,
+    url: String,
+    base_ref_oid: String,
+    head_ref_oid: String,
+}
+
+/// Reads and validates what gh printed for pull request `number` of `repo`.
+/// gh's output is the forge's data, so nothing in it is trusted until it is
+/// checked: the number must be the one asked for, the commits must be full
+/// commit ids, and the URL must name this pull request of this repository.
+fn parse_gh_pull_request(
+    stdout: &[u8],
+    repo: &ForgeRepo,
+    number: i64,
+) -> Result<ResolvedPullRequest, GhError> {
+    let raw: GhPullRequest = serde_json::from_slice(stdout)
+        .map_err(|err| GhError::invalid(&format!("gh printed no pull request JSON: {err}")))?;
+    if raw.number != number {
+        return Err(GhError::invalid(&format!(
+            "gh described pull request {}, not {number}",
+            raw.number
+        )));
+    }
+    let commit = |role: &str, value: &str| {
+        CommitId::parse(value).ok_or_else(|| {
+            GhError::invalid(&format!(
+                "the {role} commit {value:?} is not a full lowercase commit id"
+            ))
+        })
+    };
+    let base = commit("base", &raw.base_ref_oid)?;
+    let head = commit("head", &raw.head_ref_oid)?;
+    let (url, repo) =
+        pull_request_url(&raw.url, repo, number).map_err(|reason| GhError::invalid(&reason))?;
+    Ok(ResolvedPullRequest {
+        repo,
+        number,
+        url,
+        title: raw.title,
+        base,
+        head,
+    })
+}
+
+/// Checks that `url` is https://<host>/<owner>/<name>/pull/<number> for
+/// `repo`, with no credentials, port, query or fragment. Returns the URL as
+/// the url crate normalises it, and the repository as the URL spells it.
+/// Host, owner and name compare without ASCII case, as GitHub treats them,
+/// because gh prints the repository's own spelling while the setting may
+/// spell it differently.
+fn pull_request_url(
+    url: &str,
+    repo: &ForgeRepo,
+    number: i64,
+) -> Result<(String, ForgeRepo), String> {
+    let expected = format!(
+        "https://{}/{}/{}/pull/{number}",
+        repo.host, repo.owner, repo.name
+    );
+    // The expected URL comes first, so a long foreign URL that is cut to fit a
+    // reply still leaves the operator what the URL had to be.
+    let mismatch = || format!("the pull request URL is not {expected} but {url:?}");
+    let parsed = url::Url::parse(url).map_err(|_| mismatch())?;
+    let plain = parsed.scheme() == "https"
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.port().is_none()
+        && parsed.query().is_none()
+        && parsed.fragment().is_none();
+    let number = number.to_string();
+    let segments: Vec<&str> = parsed
+        .path_segments()
+        .map(Iterator::collect)
+        .unwrap_or_default();
+    let named = match (parsed.host_str(), segments.as_slice()) {
+        (Some(host), [owner, name, "pull", n])
+            if plain
+                && host.eq_ignore_ascii_case(&repo.host)
+                && owner.eq_ignore_ascii_case(&repo.owner)
+                && name.eq_ignore_ascii_case(&repo.name)
+                && *n == number =>
+        {
+            ForgeRepo {
+                host: host.to_string(),
+                owner: owner.to_string(),
+                name: name.to_string(),
+            }
+        }
+        _ => return Err(mismatch()),
+    };
+    Ok((parsed.into(), named))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1657,5 +1978,367 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
         let (_action, metadata) = forge.parse_payload(&body).expect("valid payload");
         assert_eq!(metadata.author.as_deref(), Some("dependabot[bot]"));
         assert!(metadata.author.as_deref().is_some_and(is_dependabot_author));
+    }
+
+    fn ionic() -> ForgeRepo {
+        "example-org/driver-a"
+            .parse()
+            .expect("the repository name is valid")
+    }
+
+    const GH_BASE: &str = "0123456789abcdef0123456789abcdef01234567";
+    const GH_HEAD: &str = "89abcdef0123456789abcdef0123456789abcdef";
+    const GH_URL: &str = "https://github.com/example-org/driver-a/pull/967";
+
+    /// A `gh pr view --json number,title,url,baseRefOid,headRefOid` answer
+    /// in the shape gh prints when stdout is not a terminal: one compact
+    /// object with its keys sorted, then a newline.
+    fn gh_answer(number: i64, url: &str, base: &str, head: &str) -> String {
+        let answer = serde_json::json!({
+            "baseRefOid": base,
+            "headRefOid": head,
+            "number": number,
+            "title": "ionic: fix the \"rx\" ring \u{00e9}",
+            "url": url,
+        });
+        format!("{answer}\n")
+    }
+
+    fn output(raw_status: i32, stdout: &str, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(raw_status),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    /// A wait status for a process that exited with `code`.
+    fn exited(code: i32) -> i32 {
+        code << 8
+    }
+
+    fn sh(script: &str) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(script);
+        command
+    }
+
+    /// What gh 2.102.0 printed, byte for byte, with stdout not a terminal,
+    /// for `gh pr view 14462 --repo=github.com/cli/cli --json
+    /// number,title,url,baseRefOid,headRefOid`. A public repository's pull
+    /// request is recorded so that the source holds no private repository's
+    /// data; the title's quotes show gh's JSON escaping.
+    const GH_RECORDED_ANSWER: &str = r#"{"baseRefOid":"9eb4db2ba89017ea9dbcaed4f712dc4881f7f37b","headRefOid":"189706bccb1686c68fb73c5bd9013358320a9e71","number":14462,"title":"Revert \"Use internal Apple codesign action\"","url":"https://github.com/cli/cli/pull/14462"}
+"#;
+
+    #[test]
+    fn gh_output_is_parsed() {
+        let cli: ForgeRepo = "cli/cli".parse().expect("a valid name");
+        let resolved = parse_gh_pull_request(GH_RECORDED_ANSWER.as_bytes(), &cli, 14462)
+            .expect("the recorded answer describes the pull request asked for");
+        assert_eq!(
+            resolved,
+            ResolvedPullRequest {
+                repo: cli,
+                number: 14462,
+                url: "https://github.com/cli/cli/pull/14462".to_string(),
+                title: Some("Revert \"Use internal Apple codesign action\"".to_string()),
+                base: CommitId::parse("9eb4db2ba89017ea9dbcaed4f712dc4881f7f37b")
+                    .expect("a full commit id"),
+                head: CommitId::parse("189706bccb1686c68fb73c5bd9013358320a9e71")
+                    .expect("a full commit id"),
+            }
+        );
+
+        let untitled = serde_json::json!({
+            "baseRefOid": GH_BASE,
+            "headRefOid": GH_HEAD,
+            "number": 967,
+            "url": GH_URL,
+        })
+        .to_string();
+        let resolved =
+            parse_gh_pull_request(untitled.as_bytes(), &ionic(), 967).expect("a title is optional");
+        assert_eq!(resolved.title, None);
+
+        let enterprise: ForgeRepo = "ghe.example.com/team/repo".parse().expect("a valid name");
+        let answer = gh_answer(
+            5,
+            "https://ghe.example.com/team/repo/pull/5",
+            GH_BASE,
+            GH_HEAD,
+        );
+        assert!(parse_gh_pull_request(answer.as_bytes(), &enterprise, 5).is_ok());
+    }
+
+    /// gh prints the repository's own spelling, which may differ in case from
+    /// the setting's; GitHub treats the two as one repository. The forge's
+    /// spelling is kept, so the clone URL a review is queued with is the one
+    /// GitHub's webhook sends for the same repository.
+    #[test]
+    fn a_resolved_pull_request_is_queued_in_the_forge_spelling() {
+        let setting: ForgeRepo = "GitHub.com/Example-Org/Driver-A"
+            .parse()
+            .expect("a valid name");
+        let answer = gh_answer(967, GH_URL, GH_BASE, GH_HEAD);
+        let resolved = parse_gh_pull_request(answer.as_bytes(), &setting, 967)
+            .expect("names compare without case");
+        assert_eq!(resolved.repo, ionic());
+        assert_eq!(resolved.url, GH_URL);
+
+        let metadata = resolved.to_forge_metadata();
+        assert_eq!(
+            metadata.repo_url.as_deref(),
+            Some("https://github.com/example-org/driver-a.git")
+        );
+        assert_eq!(metadata.base_sha, GH_BASE);
+        assert_eq!(metadata.head_sha, GH_HEAD);
+        assert_eq!(metadata.pr_number, 967);
+        assert_eq!(
+            metadata.pr_title.as_deref(),
+            Some("ionic: fix the \"rx\" ring \u{00e9}")
+        );
+        assert_eq!(metadata.pr_url.as_deref(), Some(GH_URL));
+        assert_eq!(metadata.author, None);
+        assert!(metadata.repo_url.as_deref().is_some_and(is_safe_repo_url));
+    }
+
+    #[test]
+    fn resolved_pull_request_rejects() {
+        let rejected =
+            |answer: String| match parse_gh_pull_request(answer.as_bytes(), &ionic(), 967) {
+                Err(GhError::Invalid { reason }) => reason,
+                other => panic!("{answer} was accepted as {other:?}"),
+            };
+        let short = &GH_HEAD[..12];
+        assert!(rejected(gh_answer(967, GH_URL, GH_BASE, short)).contains("head commit"));
+        assert!(rejected(gh_answer(967, GH_URL, short, GH_HEAD)).contains("base commit"));
+        let upper = GH_HEAD.to_uppercase();
+        assert!(rejected(gh_answer(967, GH_URL, GH_BASE, &upper)).contains("head commit"));
+        assert!(
+            rejected(gh_answer(968, GH_URL, GH_BASE, GH_HEAD))
+                .contains("pull request 968, not 967")
+        );
+        for url in [
+            "https://github.com/example-org/driver-b/pull/967",
+            "https://github.com/other/driver-a/pull/967",
+            "https://gitlab.com/example-org/driver-a/pull/967",
+            "https://github.com/example-org/driver-a/pull/968",
+            "https://github.com/example-org/driver-a/issues/967",
+            "https://github.com/example-org/driver-a/pull/967/files",
+            "http://github.com/example-org/driver-a/pull/967",
+            "git@github.com:example-org/driver-a.git",
+            "https://user:secret@github.com/example-org/driver-a/pull/967",
+            "https://github.com:8443/example-org/driver-a/pull/967",
+            "https://github.com/example-org/driver-a/pull/967?x=1",
+            "https://github.com/example-org/driver-a/pull/967#top",
+            "not a url",
+        ] {
+            let reason = rejected(gh_answer(967, url, GH_BASE, GH_HEAD));
+            assert!(
+                reason.contains("is not https://github.com/example-org/driver-a/pull/967"),
+                "{url}: {reason}"
+            );
+        }
+        assert!(rejected("Not Found\n".to_string()).contains("no pull request JSON"));
+        let no_commits = serde_json::json!({"number": 967, "url": GH_URL}).to_string();
+        assert!(rejected(no_commits).contains("no pull request JSON"));
+    }
+
+    /// A value gh printed reaches a reason only within one sanitised line,
+    /// so a crafted URL can neither forge a log entry nor reorder its text.
+    #[test]
+    fn an_invalid_answer_is_reported_on_one_safe_line() {
+        let url = format!(
+            "https://evil.example/\u{1b}[2J\nINFO forged\u{202E}{}",
+            "x".repeat(500)
+        );
+        let answer = gh_answer(967, &url, GH_BASE, GH_HEAD);
+        let Err(GhError::Invalid { reason }) =
+            parse_gh_pull_request(answer.as_bytes(), &ionic(), 967)
+        else {
+            panic!("a foreign URL must be refused");
+        };
+        assert!(
+            !reason
+                .chars()
+                .any(crate::finding_view::is_unsafe_for_terminal),
+            "{reason:?}"
+        );
+        assert!(reason.ends_with("..."), "{reason:?}");
+        assert_eq!(
+            reason.chars().count(),
+            GH_DETAIL_MAX_CHARS + 3,
+            "{reason:?}"
+        );
+        assert!(
+            reason.starts_with(
+                "the pull request URL is not https://github.com/example-org/driver-a/pull/967 but "
+            ),
+            "{reason:?}"
+        );
+    }
+
+    #[test]
+    fn gh_errors_are_typed_and_sanitized() {
+        assert_eq!(check_gh_status(&output(exited(0), "{}", "")), Ok(()));
+        assert_eq!(
+            check_gh_status(&output(
+                exited(4),
+                "",
+                "To get started with GitHub CLI, please run:  gh auth login\n"
+            )),
+            Err(GhError::NotAuthenticated)
+        );
+        let not_found = "GraphQL: Could not resolve to a PullRequest with the number of 99999. \
+                         (repository.pullRequest)";
+        assert_eq!(
+            check_gh_status(&output(exited(1), "", &format!("{not_found}\n"))),
+            Err(GhError::Failed {
+                detail: not_found.to_string()
+            })
+        );
+        assert_eq!(
+            check_gh_status(&output(
+                exited(1),
+                "",
+                "\u{1b}[31mGraphQL:\u{202E}bad\r\nINFO forged entry\n"
+            )),
+            Err(GhError::Failed {
+                detail: "[31mGraphQL: bad".to_string()
+            })
+        );
+        let long = "x".repeat(1000);
+        assert_eq!(
+            check_gh_status(&output(exited(1), "", &long)),
+            Err(GhError::Failed {
+                detail: format!("{}...", "x".repeat(GH_DETAIL_MAX_CHARS))
+            })
+        );
+        assert_eq!(
+            check_gh_status(&output(exited(1), "", "\n")),
+            Err(GhError::Failed {
+                detail: "gh exit status: 1 with no message".to_string()
+            })
+        );
+        // SIGKILL: no exit code, so never mistaken for status 4.
+        assert!(matches!(
+            check_gh_status(&output(9, "", "")),
+            Err(GhError::Failed { .. })
+        ));
+        assert_eq!(
+            GhError::Failed {
+                detail: not_found.to_string()
+            }
+            .to_string(),
+            format!("gh failed: {not_found}")
+        );
+    }
+
+    #[test]
+    fn gh_is_asked_for_one_pull_request_of_the_named_repository() {
+        let enterprise: ForgeRepo = "ghe.example.com/team/repo".parse().expect("a valid name");
+        for (repo, expected) in [
+            (ionic(), "--repo=github.com/example-org/driver-a"),
+            (enterprise, "--repo=ghe.example.com/team/repo"),
+        ] {
+            let command = gh_pr_view_command(&repo, 967);
+            let command = command.as_std();
+            assert_eq!(command.get_program(), "gh");
+            let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+            assert_eq!(
+                args,
+                ["pr", "view", "967", expected, "--json", GH_PR_FIELDS]
+            );
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == "GH_PROMPT_DISABLED" && value == Some("1".as_ref()))
+            );
+        }
+    }
+
+    /// The refusal is in the path every resolution takes, ahead of any
+    /// process: a stand-in that would answer NotAuthenticated if it ran is
+    /// never asked, and GhCli refuses without running gh.
+    #[tokio::test]
+    async fn a_number_below_one_is_refused_before_gh_runs() {
+        let repo = ionic();
+        let refused = |result: &Result<ResolvedPullRequest, GhError>| {
+            matches!(result, Err(GhError::Invalid { reason })
+                if reason.contains("is not a pull request number"))
+        };
+        for number in [0, -1, i64::MIN] {
+            let stand_in = resolve_with(sh("exit 4"), GH_TIME_LIMIT, &repo, number).await;
+            assert!(refused(&stand_in), "{number}: {stand_in:?}");
+            let gh = GhCli.resolve(&repo, number).await;
+            assert!(refused(&gh), "{number}: {gh:?}");
+        }
+        assert_eq!(check_pull_request_number(1), Ok(()));
+    }
+
+    /// The process handling, run against sh standing in for gh: gh itself is
+    /// never run in tests.
+    #[tokio::test]
+    async fn gh_runs_are_typed() {
+        let repo = ionic();
+        let answer = gh_answer(967, GH_URL, GH_BASE, GH_HEAD);
+        let mut printer = sh("printf '%s' \"$1\"");
+        printer.arg("sh").arg(&answer);
+        let resolved = resolve_with(printer, GH_TIME_LIMIT, &repo, 967)
+            .await
+            .expect("the printed answer resolves");
+        assert_eq!(resolved.head.as_str(), GH_HEAD);
+
+        let resolve = |command| resolve_with(command, GH_TIME_LIMIT, &repo, 967);
+        assert_eq!(resolve(sh("exit 4")).await, Err(GhError::NotAuthenticated));
+        assert_eq!(
+            resolve(sh(
+                "echo 'HTTP 502: Bad Gateway' >&2; echo more >&2; exit 1"
+            ))
+            .await,
+            Err(GhError::Failed {
+                detail: "HTTP 502: Bad Gateway".to_string()
+            })
+        );
+        let missing = tokio::process::Command::new("/nonexistent/sashiko-test/gh");
+        assert_eq!(resolve(missing).await, Err(GhError::NotInstalled));
+    }
+
+    /// A gh that does not answer in time is reported as TimedOut and is
+    /// stopped rather than left running: the stand-in records its process id,
+    /// and that process must be gone, or a zombie waiting to be reaped, soon
+    /// after the wait is given up.
+    #[tokio::test]
+    async fn a_stuck_gh_is_timed_out_and_stopped() {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let pid_file = scratch.path().join("gh.pid");
+        let mut stuck = sh("echo $$ > \"$1\"; exec sleep 30");
+        stuck.arg("sh").arg(&pid_file);
+        let started = std::time::Instant::now();
+        let result = resolve_with(stuck, Duration::from_secs(2), &ionic(), 967).await;
+        assert_eq!(result, Err(GhError::TimedOut));
+        assert!(started.elapsed() < Duration::from_secs(20));
+
+        let pid = std::fs::read_to_string(&pid_file).expect("the stand-in recorded its pid");
+        let pid = pid.trim();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while process_is_running(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in {pid} was left running"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Whether `pid` names a live process. A zombie has already stopped and
+    /// only waits to be reaped.
+    fn process_is_running(pid: &str) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, fields)| !fields.starts_with('Z'))
+        })
     }
 }
