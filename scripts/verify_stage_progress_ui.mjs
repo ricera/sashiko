@@ -1429,7 +1429,10 @@ function findingLocationChecks(fns, expect) {
 }
 
 // What `parseSeverityCalibration` makes of an explanation, as [label, body]
-// pairs, so a check can state the whole split at once.
+// pairs, so a check can state the whole split at once. PAGE_CASES in
+// src/finding_view.rs copies every split stated in the three checks below,
+// so that its splitter and the page apply one rule; a case added or changed
+// here is added or changed there too.
 const calibration = (fns, text) => {
     const r = fns.parseSeverityCalibration(text);
     return r && { preamble: r.preamble, sections: r.sections.map(x => [x.label, x.body]) };
@@ -1472,6 +1475,9 @@ function findingCalibrationLabelChecks(fns, expect) {
         sameSplit(split('Consequence: a.\nConsequence: b.'), '', [['Consequence', 'a.\nConsequence: b.']]));
     expect('calibration: a section with an empty body is dropped',
         sameSplit(split('Consequence:\nTriggering path: b'), '', [['Triggering path', 'b']]));
+    expect('calibration: the short and the long spelling of a heading each open a section',
+        sameSplit(split('Blast radius: a. Blast radius and irreversibility: b.'), '',
+            [['Blast radius', 'a'], ['Blast radius and irreversibility', 'b.']]));
 }
 
 function findingCalibrationShapeChecks(fns, expect) {
@@ -1519,6 +1525,9 @@ function findingCalibrationProseChecks(fns, expect) {
     expect('calibration: a half-bold label is prose',
         sameSplit(split('**Consequence: x'), '**Consequence: x', [])
             && sameSplit(split('Consequence**: x'), 'Consequence**: x', []));
+    expect('calibration: a qualifier that starts with a capital letter is prose',
+        sameSplit(split('Consequence: a.\nTriggering path Verified: b'), '',
+            [['Consequence', 'a.\nTriggering path Verified: b']]));
     expect('calibration: a label with no colon is prose',
         sameSplit(split('Consequence is bad. Reachability is fine.'), 'Consequence is bad. Reachability is fine.', []));
     expect('calibration: an unlabelled numbered list is all preamble',
