@@ -2895,6 +2895,11 @@
         // the same title at the same place.
         const FINDING_TITLE_MAX_CHARS = 160;
 
+        // How long the revision label of a finding's link to an earlier finding
+        // may be. Matches REVISION_LABEL_MAX_CHARS in src/prior_revisions.rs, so
+        // the page tags only the links the database and the CLI read.
+        const PRIOR_REVISION_LABEL_MAX_CHARS = 32;
+
         // The verification stage has no validator, so an entry of a review's
         // findings array can be any JSON value. Every finding helper reads its
         // finding through this, so a string or a number in the array reads as
@@ -3022,11 +3027,59 @@
             return items.length ? `<div>${items.join('')}</div>` : '';
         }
 
-        // The tags shown after a finding's severity. They live in one list so
-        // that a later tag has one place to go. Only a JSON true counts, as in
-        // the CLIs, so a stray string never tags a finding. The speculative tag
-        // shows whatever the severity, because a High finding the reviewer
-        // could not verify breaks the rubric and the reader should see that.
+        // Makes text one line by the rule of one_line in src/finding_view.rs:
+        // whitespace, control characters, and the zero-width and bidi
+        // characters that a terminal would act on all separate words, and the
+        // words are joined by single spaces. Text with nothing visible becomes
+        // empty, so it counts as missing.
+        function oneLine(text) {
+            return String(text)
+                .split(/[\s\p{Cc}\u2028\u2029\u200B-\u200F\u202A-\u202E\u2066-\u2069]+/u)
+                .filter(Boolean)
+                .join(' ');
+        }
+
+        // The tag of a finding that repeats a finding of an earlier revision of
+        // the pull request, or that the fix made for one caused, read from the
+        // finding's "prior" link, or '' when there is none. The link is read by
+        // the rule of PriorLink::from_json in src/prior_revisions.rs, so the page
+        // tags exactly the links the database and the CLI accept: a relation
+        // that is exactly "repeat" or "fix_regression", and a revision label and
+        // an earlier problem with visible text, the label no longer than
+        // PRIOR_REVISION_LABEL_MAX_CHARS. Anything else, including a link that
+        // is not an object, adds no tag, because a tag that misnames the earlier
+        // finding would send the reader to the wrong one.
+        //
+        // The hover names the earlier finding. It also gives the head commit of
+        // the earlier revision when the daemon recorded one, since the head
+        // keeps naming that revision after its slug moves to a newer revision.
+        // A head that is not 7 to 40 hex characters is left out and the rest of
+        // the tag kept, as the Rust reader does. The label and the problem came
+        // from a model and a pull request author, so both are escaped.
+        function priorTag(prior) {
+            if (!prior || typeof prior !== 'object') return '';
+            const relation = prior.relation === 'repeat' ? 'repeat of'
+                : prior.relation === 'fix_regression' ? 'caused by the fix for' : '';
+            const textOf = key => (typeof prior[key] === 'string' ? oneLine(prior[key]) : '');
+            const revision = textOf('revision');
+            const problem = textOf('earlier_problem');
+            if (!relation || !revision || !problem
+                || Array.from(revision).length > PRIOR_REVISION_LABEL_MAX_CHARS) return '';
+            const head = typeof prior.revision_head === 'string'
+                && /^[0-9a-fA-F]{7,40}$/.test(prior.revision_head)
+                ? `, head ${prior.revision_head.toLowerCase()}` : '';
+            const hover = `Earlier finding (${revision}${head}): ${problem}`;
+            return `<span class="finding-tag" title="${escapeHtml(hover)}">`
+                + `(${relation} ${escapeHtml(revision)})</span>`;
+        }
+
+        // The tags shown after a finding's severity, in the order speculative,
+        // preexisting, then the link to an earlier revision's finding. They
+        // live in one list so that a later tag has one place to go. Only a
+        // JSON true counts, as in the CLIs, so a stray string never tags a
+        // finding. The speculative tag shows whatever the severity, because a
+        // High finding the reviewer could not verify breaks the rubric and the
+        // reader should see that.
         function findingTags(finding) {
             const f = findingObject(finding);
             const tags = [];
@@ -3039,6 +3092,8 @@
                 tags.push('<span class="finding-tag"'
                     + ' title="The bug was already in the code before this change">(preexisting)</span>');
             }
+            const prior = priorTag(f.prior);
+            if (prior) tags.push(prior);
             return tags;
         }
 
