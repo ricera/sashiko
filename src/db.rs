@@ -7677,9 +7677,20 @@ impl Database {
         Ok(())
     }
 
+    /// The version K of the pull request revision `root_msg_id` names, as
+    /// its `#N [vK]` subject states it.
+    ///
+    /// A row already stored under `root_msg_id` keeps the version its
+    /// subject carries; otherwise K is one more than the number of earlier
+    /// revisions of the same pull request. A pull request is its number and
+    /// its `mr_url` together, because two repositories reviewed by one
+    /// daemon may each have a pull request with the same number, and
+    /// counting the other repository's revisions would leave gaps in this
+    /// one's versions.
     pub async fn get_mr_version_for_commit_range(
         &self,
         mr_number: i64,
+        mr_url: Option<&str>,
         root_msg_id: &str,
     ) -> Result<u32> {
         let candidates = Self::get_msgid_candidates(root_msg_id);
@@ -7699,35 +7710,41 @@ impl Database {
                 {
                     return Ok(v);
                 }
-                let mut count_rows = self
-                    .conn
-                    .query(
-                        "SELECT COUNT(*) FROM patchsets WHERE mr_number = ? AND id < ?",
-                        libsql::params![mr_number, existing_id],
-                    )
+                let older_count = self
+                    .count_pr_revisions(mr_number, mr_url, Some(existing_id))
                     .await?;
-                let older_count: i64 = if let Ok(Some(crow)) = count_rows.next().await {
-                    crow.get(0).unwrap_or(0)
-                } else {
-                    0
-                };
                 return Ok((older_count + 1) as u32);
             }
         }
 
+        let count = self.count_pr_revisions(mr_number, mr_url, None).await?;
+        Ok((count + 1) as u32)
+    }
+
+    /// How many patchsets are revisions of the pull request with this number
+    /// and `mr_url`, counting only those with an id below `before_id` when
+    /// it is given.
+    ///
+    /// `mr_url IS ?` matches a NULL `mr_url` to a request without one, so a
+    /// caller that knows no URL still counts the revisions that have none.
+    async fn count_pr_revisions(
+        &self,
+        mr_number: i64,
+        mr_url: Option<&str>,
+        before_id: Option<i64>,
+    ) -> Result<i64> {
         let mut rows = self
             .conn
             .query(
-                "SELECT COUNT(*) FROM patchsets WHERE mr_number = ?",
-                libsql::params![mr_number],
+                "SELECT COUNT(*) FROM patchsets
+                 WHERE mr_number = ? AND mr_url IS ? AND (? IS NULL OR id < ?)",
+                libsql::params![mr_number, mr_url, before_id, before_id],
             )
             .await?;
-        let count: i64 = if let Ok(Some(row)) = rows.next().await {
-            row.get(0).unwrap_or(0)
-        } else {
-            0
-        };
-        Ok((count + 1) as u32)
+        Ok(match rows.next().await? {
+            Some(row) => row.get(0)?,
+            None => 0,
+        })
     }
 
     async fn rotate_mr_slug(&self, slug: &str, exclude_id: Option<i64>) -> Result<()> {
@@ -10110,7 +10127,7 @@ impl Database {
         // A failed count names the revision v1 rather than refusing the
         // fetch, because the subject is only a label.
         let version = self
-            .get_mr_version_for_commit_range(number, root_msg_id)
+            .get_mr_version_for_commit_range(number, mr_url, root_msg_id)
             .await
             .unwrap_or(1);
         crate::forge::format_mr_subject(mr_url, number, version, title)
@@ -22000,7 +22017,7 @@ mod tests {
             .unwrap();
         assert_eq!(ps_v1_repeat, ps_v1);
         assert_eq!(
-            db.get_mr_version_for_commit_range(mr_number, clid_v1)
+            db.get_mr_version_for_commit_range(mr_number, Some(mr_url), clid_v1)
                 .await
                 .unwrap(),
             1
@@ -22049,6 +22066,78 @@ mod tests {
         assert_eq!(
             rotated_v1["subject"].as_str(),
             Some("#513: baseline: route iwl-net and iwl-next series to dev-queue")
+        );
+    }
+
+    /// The subject `create_fetching_patchset` writes for one revision of PR
+    /// 7 of `repo`, whose head commit is `head`.
+    async fn queue_pr_7_revision(db: &Database, repo: &str, head: char) -> String {
+        let base = "a".repeat(40);
+        let head = head.to_string().repeat(40);
+        let id = db
+            .create_fetching_patchset(
+                &format!("mr-7-{base}..{head}@sashiko.local"),
+                "Fetching PR #7",
+                None,
+                None,
+                Some(&format!("https://github.com/acme/{repo}/pull/7")),
+                Some("Fix the frobnicator"),
+                Some(7),
+                Some(&format!("{repo}-7")),
+            )
+            .await
+            .unwrap();
+        let details = db.get_patchset_details(id, None, None).await.unwrap();
+        details.unwrap()["subject"].as_str().unwrap().to_string()
+    }
+
+    /// Two repositories with a PR 7 each start at v1, and a second push of
+    /// one of them is its v2, not v3, because only that pull request's own
+    /// revisions are counted.
+    #[tokio::test]
+    async fn versions_count_only_the_same_pull_request() {
+        let db = memory_db().await;
+
+        let first = queue_pr_7_revision(&db, "frob", 'b').await;
+        let other_repo = queue_pr_7_revision(&db, "widget", 'c').await;
+        let second_push = queue_pr_7_revision(&db, "frob", 'd').await;
+
+        assert_eq!(first, "#7: Fix the frobnicator");
+        assert_eq!(other_repo, "#7: Fix the frobnicator");
+        assert_eq!(second_push, "#7 [v2]: Fix the frobnicator");
+    }
+
+    /// A revision counted without a URL counts only the revisions of that
+    /// number that have none, and a revision with a URL does not count them.
+    #[tokio::test]
+    async fn a_revision_without_a_url_counts_only_revisions_without_one() {
+        let db = memory_db().await;
+        let with_url = Some("https://github.com/acme/frob/pull/7");
+        db.create_fetching_patchset(
+            "mr-7-x@sashiko.local",
+            "Fetching PR #7",
+            None,
+            None,
+            None,
+            None,
+            Some(7),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let unknown = "mr-7-y@sashiko.local";
+        assert_eq!(
+            db.get_mr_version_for_commit_range(7, None, unknown)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.get_mr_version_for_commit_range(7, with_url, unknown)
+                .await
+                .unwrap(),
+            1
         );
     }
 
