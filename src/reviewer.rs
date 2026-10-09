@@ -136,12 +136,19 @@ const PR_COMMENT_HEAD_CHARS: usize = 12;
 /// id names. The stored slug cannot serve: the newest revision holds the
 /// bare `<repo>-<N>`, and slug rotation hands it to the next revision, so a
 /// comment linked with it would open a later revision's review once the
-/// pull request is pushed again. `<repo>` is derived from `mr_url` as
-/// ingestion derives the stored slug, so the lookup finds the revision's
-/// row under it. The address is checked to read back as one, so a link is
-/// never handed out in a form the server would not resolve. A row without
-/// a placeholder head, number or repository name falls back to its stored
-/// slug, then to its cover letter id.
+/// pull request is pushed again. `<repo>` is what
+/// [`crate::forge::extract_repo_name_from_mr_url`] reads from `mr_url`,
+/// the function `PrRevisionAddress::owns_row` checks a row's repository
+/// with, so the lookup finds the revision's row under it. Ingestion uses
+/// the same function when it rewrites the slug after a fetch; the
+/// placeholder slug written before it (`server::enqueue_pull_request`)
+/// takes its name from the repository URL through
+/// [`crate::forge::extract_repo_name_from_url`]. Every forge source
+/// Sashiko reads gives the two URLs for the same repository, so both
+/// functions give the same name. The address is checked to read back as
+/// one, so a link is never handed out in a form the server would not
+/// resolve. A row without a placeholder head, number or repository name
+/// falls back to its stored slug, then to its cover letter id.
 fn pr_comment_patchset_address(patchset: &PatchsetRow) -> String {
     let revision_address = || {
         let number = patchset.mr_number?;
