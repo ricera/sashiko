@@ -8730,6 +8730,16 @@ impl Database {
         Ok(())
     }
 
+    /// Records the pull request patchset `id` belongs to, keeping any
+    /// URL, title and number already stored, and then reconciles the pull
+    /// request's superseded revisions.
+    ///
+    /// `slug` is moved onto the row only when no newer revision of its
+    /// pull request outranks it. A fetch of an older head can complete
+    /// after a newer head was queued, from a webhook redelivery or from two
+    /// pushes in one fetch batch, and moving the slug then would take it
+    /// from the revision the auto-cancel keeps. An outranked row keeps the
+    /// slug it has.
     pub async fn update_patchset_mr_metadata(
         &self,
         id: i64,
@@ -8741,22 +8751,50 @@ impl Database {
         // Held through the reconcile so that the slug move, the slug write
         // and the reconcile cannot interleave with a head being queued.
         let _moving = self.lock_pr_revision_writes().await;
-        if let Some(s) = slug {
-            self.rotate_mr_slug(s, Some(id)).await?;
-        }
         self.execute(
             "UPDATE patchsets SET
                     mr_url = COALESCE(mr_url, ?),
                     mr_title = COALESCE(mr_title, ?),
-                    mr_number = COALESCE(mr_number, ?),
-                    slug = COALESCE(?, slug)
+                    mr_number = COALESCE(mr_number, ?)
                  WHERE id = ?",
-            libsql::params![mr_url, mr_title, mr_number, slug, id],
+            libsql::params![mr_url, mr_title, mr_number, id],
         )
         .await?;
+        if let Some(s) = slug
+            && self
+                .standing_of(id, mr_url, mr_number)
+                .await?
+                .superseded_by
+                .is_none()
+        {
+            self.rotate_mr_slug(s, Some(id)).await?;
+            self.execute(
+                "UPDATE patchsets SET slug = ? WHERE id = ?",
+                libsql::params![s, id],
+            )
+            .await?;
+        }
         self.reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
             .await?;
         Ok(())
+    }
+
+    /// Where patchset `id`, as stored, stands among the revisions of pull
+    /// request `mr_number` of the repository `mr_url` names. It is the
+    /// default when no number is given.
+    async fn standing_of(
+        &self,
+        id: i64,
+        mr_url: Option<&str>,
+        mr_number: Option<i64>,
+    ) -> Result<RevisionStanding> {
+        let Some(number) = mr_number else {
+            return Ok(RevisionStanding::default());
+        };
+        let revisions = self
+            .pull_request_revisions(number, same_pull_request_repository(mr_url))
+            .await?;
+        Ok(revision_standing(&revisions, id))
     }
 
     pub async fn clear_patchset_embargo(&self, id: i64) -> Result<()> {
@@ -20214,6 +20252,62 @@ mod tests {
         let mut older_after = older_before;
         older_after[0] = Some(ReviewStatus::Cancelled.as_str().to_string());
         assert_eq!(stored_revision_columns(&db, older).await, older_after);
+        assert_eq!(stored_revision_columns(&db, newer).await, newer_before);
+    }
+
+    /// Records pull request 7 of acme/widget's metadata on patchset `id`,
+    /// as ingestion does once a fetched commit of one of its heads lands.
+    async fn record_widget_metadata(db: &Database, id: i64) {
+        db.update_patchset_mr_metadata(
+            id,
+            Some("https://github.com/acme/widget/pull/7"),
+            Some("Widget"),
+            Some(7),
+            Some("widget-7"),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// Recording the metadata of a revision that a newer revision of its
+    /// pull request outranks leaves both rows as they were, so the newer
+    /// revision keeps the bare slug. Recording the newest revision's
+    /// metadata still moves the bare slug onto it from an older row.
+    #[tokio::test]
+    async fn recording_metadata_of_an_outranked_revision_keeps_the_slugs() {
+        let db = setup_db().await;
+        let older = queue_widget_head(&db, "head1").await.id;
+        db.update_patchset_error("mr-7-base..head1@sashiko.local", "boom")
+            .await
+            .unwrap();
+        let newer = queue_widget_head(&db, "head2").await.id;
+        db.update_patchset_status(newer, ReviewStatus::Reviewed.as_str())
+            .await
+            .unwrap();
+        let (older_before, newer_before) = (
+            stored_revision_columns(&db, older).await,
+            stored_revision_columns(&db, newer).await,
+        );
+        assert_eq!(older_before[2].as_deref(), Some("widget-7-v1"));
+        assert_eq!(newer_before[2].as_deref(), Some("widget-7"));
+
+        record_widget_metadata(&db, older).await;
+        assert_eq!(stored_revision_columns(&db, older).await, older_before);
+        assert_eq!(stored_revision_columns(&db, newer).await, newer_before);
+
+        // The older row holds the bare slug, as one written before
+        // outranked rows were refused it would.
+        for (slug, id) in [(None, newer), (Some("widget-7"), older)] {
+            db.conn
+                .execute(
+                    "UPDATE patchsets SET slug = ? WHERE id = ?",
+                    libsql::params![slug, id],
+                )
+                .await
+                .unwrap();
+        }
+        record_widget_metadata(&db, newer).await;
+        assert_eq!(stored_revision_columns(&db, older).await, older_before);
         assert_eq!(stored_revision_columns(&db, newer).await, newer_before);
     }
 
