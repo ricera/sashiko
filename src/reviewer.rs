@@ -127,17 +127,11 @@ impl PatchsetTally {
     }
 }
 
-/// How many characters of a revision's head commit a pull request comment's
-/// link carries. An address accepts as few as seven; twelve keep the prefix
-/// unique among one pull request's revisions with a wide margin, so a link
-/// handed out once does not turn ambiguous when later revisions arrive.
-const PR_COMMENT_HEAD_CHARS: usize = 12;
-
 /// The patchset address a pull request comment links to.
 ///
 /// A pull request revision is linked as `<repo>-<N>-<head>`, the first
-/// [`PR_COMMENT_HEAD_CHARS`] characters of the head commit its placeholder
-/// id names. The stored slug cannot serve: the newest revision holds the
+/// [`crate::baseline::LINKED_COMMIT_PREFIX_LEN`] characters of the head
+/// commit its placeholder id names. The stored slug cannot serve: the newest revision holds the
 /// bare `<repo>-<N>`, and slug rotation hands it to the next revision, so a
 /// comment linked with it would open a later revision's review once the
 /// pull request is pushed again. `<repo>` is what
@@ -158,10 +152,7 @@ fn pr_comment_patchset_address(patchset: &PatchsetRow) -> String {
         let number = patchset.mr_number?;
         let repo = crate::forge::extract_repo_name_from_mr_url(patchset.mr_url.as_deref()?)?;
         let (_, head) = crate::db::pr_revision_range(patchset.message_id.as_deref()?, number)?;
-        let address = format!(
-            "{repo}-{number}-{}",
-            head.as_str().get(..PR_COMMENT_HEAD_CHARS)?
-        );
+        let address = format!("{repo}-{number}-{}", head.linked_prefix());
         crate::db::PrRevisionAddress::parse(&address).map(|_| address)
     };
     revision_address()

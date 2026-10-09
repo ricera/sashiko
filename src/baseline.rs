@@ -88,11 +88,28 @@ impl CommitId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The first [`LINKED_COMMIT_PREFIX_LEN`] characters of the id: the
+    /// prefix a link to a pull request revision names its head by.
+    pub fn linked_prefix(&self) -> &str {
+        // Every CommitId holds 40 ASCII hex digits, so the cut always falls
+        // on a character boundary inside the id; the whole id is the
+        // fallback only so that no path can panic.
+        self.0.get(..LINKED_COMMIT_PREFIX_LEN).unwrap_or(&self.0)
+    }
 }
 
 /// The fewest hex characters of a commit id that name one commit among a
 /// pull request's revisions. Fewer would match too many commits.
 pub const MIN_COMMIT_PREFIX_LEN: usize = 7;
+
+/// How many characters of a revision's head commit a link to the revision
+/// carries, in a pull request comment's address and in a finding's link to
+/// an earlier finding. An address accepts as few as
+/// [`MIN_COMMIT_PREFIX_LEN`]; twelve keep the prefix unique among one pull
+/// request's revisions with a wide margin, so a link handed out once does not
+/// turn ambiguous when later revisions arrive.
+pub const LINKED_COMMIT_PREFIX_LEN: usize = 12;
 
 /// `text` in lower case when it is the start of a commit id: 7 to 40 hex
 /// characters. `None` otherwise.

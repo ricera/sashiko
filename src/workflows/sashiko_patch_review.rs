@@ -29,9 +29,9 @@ use crate::workflow::{
 use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConflictResolutionOutput, ConsolidationStage, LinuxPatchReviewState,
-    PRIOR_REVIEWS_VERIFICATION_RULES, PlanningOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER,
-    StageConcernsOutput, VerificationOutput, cover_letter_placeholder, prior_reviews_placeholder,
-    with_prior_reviews,
+    PRIOR_REVIEWS_VERIFICATION_RULES, PlanningOutput, PrescreenOutput, PriorHistory,
+    SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput, VerificationOutput, cover_letter_placeholder,
+    prior_reviews_placeholder, reduce_verification, verification_output_checks, with_prior_reviews,
 };
 
 /// State container for a Sashiko patch review run.
@@ -992,6 +992,7 @@ Return ONLY a JSON object with a 'concerns' array containing the remaining conce
 pub fn verification_stage(
     max_turns: usize,
     temperature: f32,
+    history: PriorHistory,
 ) -> Stage<SashikoPatchReviewState, VerificationOutput> {
     let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
     // After the key list and the two guides rather than beside the series
@@ -1019,6 +1020,7 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
             }),
             VERIFICATION.wants_series_context,
         );
+    let (output_format, max_validation_attempts) = verification_output_checks(history);
     Stage::builder(VERIFICATION.name)
         .system_prompt(sashiko_system_prompt(true))
         .user_prompt(with_prior_reviews(
@@ -1026,36 +1028,16 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
             VERIFICATION.wants_prior_reviews,
             PRIOR_REVIEWS_VERIFICATION_RULES,
         ))
-        .output_format(OutputFormat::json())
+        .output_format(output_format)
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
             temperature,
+            max_validation_attempts,
             ..StagePolicy::consolidation()
         })
         .skip_if(|s| s.patch_concerns.is_empty())
-        .reduce(|state, out: VerificationOutput| {
-            let mut new_findings = Vec::new();
-            for finding in out.findings {
-                let is_preexisting = finding
-                    .get("preexisting")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                if is_preexisting {
-                    let concern = json!({
-                        "type": finding.get("problem").and_then(|v| v.as_str()).unwrap_or("Pre-existing Issue"),
-                        "description": finding.get("problem").and_then(|v| v.as_str()).unwrap_or(""),
-                        "reasoning": finding.get("severity_explanation").and_then(|v| v.as_str()).unwrap_or(""),
-                        "preexisting": true,
-                        "locations": finding.get("locations").cloned().unwrap_or(json!([])),
-                    });
-                    state.concerns.push(concern);
-                } else {
-                    new_findings.push(finding);
-                }
-            }
-            state.findings = new_findings;
-        })
+        .reduce(reduce_verification)
         .build()
 }
 
@@ -1132,13 +1114,18 @@ pub fn summary_stage(
 // Complete Sashiko Review Workflow Graph
 // ---------------------------------------------------------------------------
 
+/// The Sashiko review workflow for a patch shown no earlier findings.
 pub fn build_sashiko_patch_review_workflow() -> Workflow<SashikoPatchReviewState> {
-    build_sashiko_patch_review_workflow_with_options(20, 0.0)
+    build_sashiko_patch_review_workflow_with_options(20, 0.0, PriorHistory::NotShown)
 }
 
+/// The Sashiko review workflow with custom per-stage interaction limits and
+/// temperature, for a review whose earlier findings `history` says whether
+/// it is shown.
 pub fn build_sashiko_patch_review_workflow_with_options(
     max_turns: usize,
     temperature: f32,
+    history: PriorHistory,
 ) -> Workflow<SashikoPatchReviewState> {
     Workflow::builder("sashiko_patch_review")
         .stage(prescreen_stage())
@@ -1149,7 +1136,7 @@ pub fn build_sashiko_patch_review_workflow_with_options(
         )
         .stage(deduplication_stage(max_turns, temperature))
         .stage(conflict_resolution_stage(max_turns, temperature))
-        .stage(verification_stage(max_turns, temperature))
+        .stage(verification_stage(max_turns, temperature, history))
         .stage(report_stage(max_turns, temperature))
         .stage(summary_stage(max_turns, temperature))
         .build()
@@ -1428,7 +1415,7 @@ mod tests {
             ..Default::default()
         };
 
-        let stage = verification_stage(1, 0.0);
+        let stage = verification_stage(1, 0.0, PriorHistory::NotShown);
         stage.execute(&env, &mut state, None).await.unwrap();
 
         assert_eq!(state.findings.len(), 1);
@@ -1448,7 +1435,7 @@ mod tests {
     /// gives the mark a place, ahead of the level it caps.
     #[test]
     fn verification_asks_whether_a_finding_is_speculative() {
-        let prompt = verification_stage(10, 1.0)
+        let prompt = verification_stage(10, 1.0, PriorHistory::NotShown)
             .user_prompt
             .render_for_log(&SashikoPatchReviewState::default());
         let start = prompt
@@ -1466,7 +1453,7 @@ mod tests {
 
     #[test]
     fn test_sashiko_verification_keeps_the_speculative_mark() {
-        let stage = verification_stage(1, 0.0);
+        let stage = verification_stage(1, 0.0, PriorHistory::NotShown);
         let mut state = SashikoPatchReviewState::default();
         let output = VerificationOutput {
             findings: vec![

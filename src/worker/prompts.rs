@@ -56,7 +56,8 @@ use crate::prior_revisions::{
 use crate::project::ProjectId;
 use crate::workflow::{StageFailure, StageStopCause, WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use crate::workflows::linux_patch_review::{
-    LinuxPatchReviewState, build_linux_patch_review_workflow_with_options, linux_system_prompt,
+    LinuxPatchReviewState, PriorHistory, build_linux_patch_review_workflow_with_options,
+    linux_system_prompt,
 };
 use crate::workflows::sashiko_patch_review::{
     build_sashiko_patch_review_workflow_with_options, sashiko_system_prompt,
@@ -660,14 +661,19 @@ impl Worker {
             self.global_history.push(ReviewLogEntry::new(None, system));
         }
 
+        // Built after the state, so verification checks the links to
+        // earlier findings only of a review that is shown some.
+        let history = PriorHistory::of(state.prior_reviews.as_ref());
         let workflow = match self.project {
             ProjectId::Linux => build_linux_patch_review_workflow_with_options(
                 self.max_interactions,
                 self.temperature,
+                history,
             ),
             ProjectId::Sashiko => build_sashiko_patch_review_workflow_with_options(
                 self.max_interactions,
                 self.temperature,
+                history,
             ),
         };
         let env = WorkflowEnv {
