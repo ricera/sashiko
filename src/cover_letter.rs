@@ -73,8 +73,15 @@ pub struct CoverLetter {
 ///
 /// CRLF and CR become LF. HTML comments are removed, because the forge does
 /// not show them and a pull request template's instructions usually live in
-/// one. A comment with no end runs to the end of the text, as it does on
-/// the forge. Then every character `is_hidden_from_the_reader` names is
+/// one. A comment with no end hides the rest of the text. The forge hides
+/// the rest when such a comment reaches its HTML parser, as it does at the
+/// start of a block or inside other raw HTML, and shows the rest when the
+/// comment sits in prose such as `Use <!-- to start`. Removing the rest in
+/// every case can drop text the forge shows, and never keeps text the
+/// forge hides. The same holds for `<!-->`, which the forge reads as an
+/// empty comment, and for `--!>`, which its HTML parser reads as a
+/// comment's end: neither ends a comment here, so the text after them is
+/// dropped too. Then every character `is_hidden_from_the_reader` names is
 /// removed, except LF and TAB: such a character draws nothing, or draws
 /// the text around it in another order, so the model would read something
 /// the reader of the pull request did not see. Comments go first so that
@@ -251,6 +258,16 @@ mod tests {
                 "an unterminated comment hides the rest",
                 "Kept <!-- hidden\nstill hidden",
                 "Kept",
+            ),
+            (
+                "an empty comment hides the rest, though the forge shows it",
+                "A <!--> B",
+                "A",
+            ),
+            (
+                "--!> does not end a comment, though the forge ends it there",
+                "A <!-- x --!> B --> C",
+                "A  C",
             ),
             (
                 "a zero-width space cannot close a comment early",
