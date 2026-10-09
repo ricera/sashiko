@@ -3334,6 +3334,11 @@
         //
         // The pattern is built on every call so that no lastIndex carries over
         // from one finding to the next.
+        //
+        // split_severity_explanation in src/finding_view.rs applies the same
+        // rule to summarise an earlier finding for a later review, and its
+        // tests copy the verifier's cases, so a change to this rule is made
+        // there too.
         function parseSeverityCalibration(text) {
             const whole = typeof text === 'string' ? text.trim() : '';
             if (!whole) return null;

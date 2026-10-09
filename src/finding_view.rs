@@ -17,11 +17,16 @@
 //! The verification stage has no validator, so a finding's keys are
 //! free-form JSON. This module reads them once, with one rule per key, so
 //! that `sashiko review` and `sashiko-cli` print the same line for the same
-//! finding and neither reads a key that no workflow emits.
+//! finding and neither reads a key that no workflow emits. It also splits a
+//! finding's `severity_explanation` into the rubric sections the web page
+//! shows, so a summary of an earlier finding can say what it leads to.
 
 use crate::db::Severity;
+use regex::Regex;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io;
+use std::sync::LazyLock;
 use termcolor::{Color, ColorSpec, WriteColor};
 
 /// How long a finding title may be before a one-line view clips it. Matches
@@ -275,6 +280,212 @@ fn format_location(location: &Value) -> Option<String> {
     }
 }
 
+/// A step of the severity rubric that a severity explanation may label: the
+/// kernel rubric's Consequence, Triggering path and Reachability, and the
+/// Sashiko rubric's Blast radius and Likelihood headings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationLabel {
+    Consequence,
+    TriggeringPath,
+    Reachability,
+    BlastRadius,
+    Likelihood,
+}
+
+impl CalibrationLabel {
+    /// Names the step a label's spelling stands for, without its qualifier.
+    /// The Sashiko headings have a short and a long spelling, and both name
+    /// one step.
+    fn from_spelling(spelling: &str) -> Option<Self> {
+        match spelling {
+            "Consequence" => Some(Self::Consequence),
+            "Triggering path" => Some(Self::TriggeringPath),
+            "Reachability" => Some(Self::Reachability),
+            "Blast radius" | "Blast radius and irreversibility" => Some(Self::BlastRadius),
+            "Likelihood" | "Likelihood and preconditions" => Some(Self::Likelihood),
+            _ => None,
+        }
+    }
+}
+
+/// One labelled section of a severity explanation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibrationSection {
+    /// The rubric step the label names.
+    pub label: CalibrationLabel,
+    /// The label as the model wrote it, with its qualifier ("Triggering path
+    /// (verified, not speculative)") and without bold markup, a list number
+    /// or the colon. The web page shows this text.
+    pub written: String,
+    /// The trimmed text between this label and the next one.
+    pub body: String,
+}
+
+/// A severity explanation split at its rubric labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeverityCalibration {
+    /// The trimmed text before the first label; the whole text when no label
+    /// is found.
+    pub preamble: String,
+    /// The labelled sections in the order they appear, without the sections
+    /// whose body is empty.
+    pub sections: Vec<CalibrationSection>,
+}
+
+/// The rubric label rule of `parseSeverityCalibration` in static/index.html,
+/// written the same way so that the two can be compared line by line. A label
+/// is case-sensitive, ends in a colon, may carry a qualifier before the colon
+/// or be written in bold ("**Label**:" or "**Label:**"), and counts only at a
+/// boundary: the start of the text, the start of a line, or after '.', ';' or
+/// ')' and spaces, each optionally followed by a bullet marker or a list
+/// number. Group 1 is the boundary, groups 2 and 4 the label with its
+/// qualifier (bold and plain form), groups 3 and 5 the label's spelling.
+///
+/// The page writes `\d`, which is ASCII in JavaScript, so this pattern writes
+/// `[0-9]`; Rust's `\d` would also match other scripts' digits. One difference
+/// remains: JavaScript counts a qualifier's 1 to 80 and 0 to 47 characters in
+/// UTF-16 code units and this pattern counts code points, so a qualifier
+/// holding characters outside the Basic Multilingual Plane, such as emoji, can
+/// fit here and not on the page. The model writes qualifiers in English, so
+/// the difference is recorded rather than emulated.
+static CALIBRATION_LABEL: LazyLock<Regex> = LazyLock::new(|| {
+    let labels = "(?:Consequence|Triggering path|Reachability\
+                  |Blast radius(?: and irreversibility)?|Likelihood(?: and preconditions)?)";
+    let qualifier = r"(?:[ \t]*\([^()\n]{1,80}\)|,?[ \t]+[a-z][^:;.\n()]{0,47})?";
+    let full = format!("(({labels}){qualifier})");
+    let list_number = r"[0-9]+[.)][ \t]+";
+    let marker = format!(r"(?:[-*][ \t]+|{list_number})");
+    let boundary = format!(r"(^{marker}?|\n[ \t]*{marker}?|[.;)][ \t]+(?:{list_number})?)");
+    let pattern = format!(r"{boundary}(?:\*\*{full}(?::\*\*|\*\*:)|{full}:)");
+    // The pattern is assembled from the constant strings above and nothing
+    // else, so it either always compiles or never does, and the splitter's
+    // tests compile it: a pattern that does not compile fails them, so it
+    // cannot pass the checks a change must pass before it lands.
+    Regex::new(&pattern).expect("the calibration label pattern is a valid constant regex")
+});
+
+/// Trims what JavaScript's `String.prototype.trim` trims, so the preamble and
+/// the bodies match the page's. That set is Rust's whitespace without U+0085
+/// (NEXT LINE), plus U+FEFF (ZERO WIDTH NO-BREAK SPACE).
+fn trim_like_page(text: &str) -> &str {
+    text.trim_matches(|c: char| c == '\u{FEFF}' || (c.is_whitespace() && c != '\u{85}'))
+}
+
+/// Where one label opens its section within the trimmed explanation.
+struct LabelMark<'a> {
+    label: CalibrationLabel,
+    written: &'a str,
+    /// Where the previous text ends: the start of the boundary, or just after
+    /// it when the boundary is a ')' that belongs to the previous text.
+    start: usize,
+    /// Where this label's body starts, just after its colon.
+    body_start: usize,
+}
+
+/// Finds the first occurrence of each label spelling in `whole`. Repeats are
+/// keyed by spelling, as on the page, so "Blast radius:" and "Blast radius
+/// and irreversibility:" each open a section of their own.
+fn label_marks(whole: &str) -> Vec<LabelMark<'_>> {
+    let mut seen = HashSet::new();
+    CALIBRATION_LABEL
+        .captures_iter(whole)
+        .filter_map(|caps| {
+            let spelling = caps.get(3).or_else(|| caps.get(5))?.as_str();
+            if !seen.insert(spelling) {
+                return None;
+            }
+            let matched = caps.get(0)?;
+            // A closing parenthesis ends the previous text, so it stays
+            // there; the other boundary characters are only separators.
+            let keep = usize::from(caps.get(1)?.as_str().starts_with(')'));
+            Some(LabelMark {
+                // The pattern's label alternation holds exactly the spellings
+                // from_spelling names, so this lookup always succeeds.
+                label: CalibrationLabel::from_spelling(spelling)?,
+                written: caps.get(2).or_else(|| caps.get(4))?.as_str(),
+                start: matched.start() + keep,
+                body_start: matched.end(),
+            })
+        })
+        .collect()
+}
+
+/// Splits a severity explanation at its rubric labels, by the rule the web
+/// page's `parseSeverityCalibration` applies (see `CALIBRATION_LABEL`), and
+/// gives `None` for empty or whitespace-only text. Only the first occurrence
+/// of each label opens a section; a later one stays in the body it appears
+/// in. Text with no label is all preamble, so nothing the model wrote is lost.
+pub fn split_severity_explanation(text: &str) -> Option<SeverityCalibration> {
+    let whole = trim_like_page(text);
+    if whole.is_empty() {
+        return None;
+    }
+    let marks = label_marks(whole);
+    let preamble_end = marks.first().map_or(whole.len(), |mark| mark.start);
+    let sections = marks
+        .iter()
+        .enumerate()
+        .map(|(i, mark)| {
+            let end = marks.get(i + 1).map_or(whole.len(), |next| next.start);
+            CalibrationSection {
+                label: mark.label,
+                written: mark.written.to_string(),
+                body: trim_like_page(&whole[mark.body_start..end]).to_string(),
+            }
+        })
+        .filter(|section| !section.body.is_empty())
+        .collect();
+    Some(SeverityCalibration {
+        preamble: trim_like_page(&whole[..preamble_end]).to_string(),
+        sections,
+    })
+}
+
+/// What a one-line summary says a finding leads to: the body of the
+/// Consequence section, else of the Blast radius section (the Sashiko
+/// rubric's nearest step), else the preamble. The text is made one line, with
+/// each character `is_unsafe_for_terminal` names and each run of whitespace
+/// becoming one space, because it comes from a model and is shown inside
+/// another prompt's block, where a line break could start a line that reads
+/// as part of the block's own frame. It is then clipped after at most `chars`
+/// code points at the last word boundary and ended with "…". `None` when the
+/// explanation is empty or the chosen text has nothing visible.
+pub fn consequence_of(text: &str, chars: usize) -> Option<String> {
+    let calibration = split_severity_explanation(text)?;
+    let body_of = |label: CalibrationLabel| {
+        calibration
+            .sections
+            .iter()
+            .find(|section| section.label == label)
+            .map(|section| section.body.as_str())
+    };
+    let said = body_of(CalibrationLabel::Consequence)
+        .or_else(|| body_of(CalibrationLabel::BlastRadius))
+        .unwrap_or(&calibration.preamble);
+    let line = said
+        .split(|c: char| c.is_whitespace() || is_unsafe_for_terminal(c))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!line.is_empty()).then(|| clip_on_word(line, chars))
+}
+
+/// Cuts one-line `text` after at most `max_chars` code points, at the last
+/// space within them so no word is split, and ends a cut text with "…". A
+/// first word longer than the limit is cut inside it, since there is no
+/// earlier boundary. Text within the limit is returned as it is.
+fn clip_on_word(text: String, max_chars: usize) -> String {
+    let Some((cut, next)) = text.char_indices().nth(max_chars) else {
+        return text;
+    };
+    let kept = &text[..cut];
+    let kept = match kept.rfind(' ') {
+        Some(space) if next != ' ' => &kept[..space],
+        _ => kept,
+    };
+    format!("{}…", kept.trim_end())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +500,360 @@ mod tests {
 
     fn location_of(locations: Value) -> Option<String> {
         FindingLine::from_json(&json!({ "locations": locations })).location
+    }
+
+    /// The split as the UI verifier states it: the preamble, then each
+    /// section as its written label and its body.
+    fn split(text: &str) -> Option<(String, Vec<(String, String)>)> {
+        split_severity_explanation(text).map(|calibration| {
+            let sections = calibration
+                .sections
+                .into_iter()
+                .map(|section| (section.written, section.body))
+                .collect();
+            (calibration.preamble, sections)
+        })
+    }
+
+    /// One verifier case: the explanation, its preamble, and its sections as
+    /// (written label, body).
+    type PageCase = (
+        &'static str,
+        &'static str,
+        &'static [(&'static str, &'static str)],
+    );
+
+    /// The verifier's `parseSeverityCalibration` cases
+    /// (findingCalibrationLabelChecks, findingCalibrationShapeChecks and
+    /// findingCalibrationProseChecks in scripts/verify_stage_progress_ui.mjs),
+    /// copied as (explanation, preamble, [(label, body)]). The page's parser
+    /// and the verifier both point here, so a change to the rule or to a
+    /// case on one side is made on the other, and a change to the rule that
+    /// alters any of these splits fails the table of the side it was not
+    /// made on.
+    const PAGE_CASES: &[PageCase] = &[
+        // Labels.
+        (
+            "Consequence: a leak. Triggering path: a caller passes Y. Reachability: ioctl.",
+            "",
+            &[
+                ("Consequence", "a leak"),
+                ("Triggering path", "a caller passes Y"),
+                ("Reachability", "ioctl."),
+            ],
+        ),
+        (
+            "Blast radius and irreversibility: one queue. Likelihood and preconditions: rare.",
+            "",
+            &[
+                ("Blast radius and irreversibility", "one queue"),
+                ("Likelihood and preconditions", "rare."),
+            ],
+        ),
+        (
+            "Blast radius: one queue.\nLikelihood: rare.",
+            "",
+            &[("Blast radius", "one queue."), ("Likelihood", "rare.")],
+        ),
+        (
+            "- **Blast radius and irreversibility**: data loss.\n- **Likelihood and preconditions**: needs root.",
+            "",
+            &[
+                ("Blast radius and irreversibility", "data loss."),
+                ("Likelihood and preconditions", "needs root."),
+            ],
+        ),
+        (
+            "**Consequence:** a. **Triggering path:** b",
+            "",
+            &[("Consequence", "a"), ("Triggering path", "b")],
+        ),
+        (
+            "**Consequence:** a.\n**Triggering path:** b",
+            "",
+            &[("Consequence", "a."), ("Triggering path", "b")],
+        ),
+        (
+            "Consequence: a.\nTriggering path: b.",
+            "",
+            &[("Consequence", "a."), ("Triggering path", "b.")],
+        ),
+        (
+            "Consequence: a.\n\nReachability: c",
+            "",
+            &[("Consequence", "a."), ("Reachability", "c")],
+        ),
+        (
+            "Consequence: a.  Triggering path: b",
+            "",
+            &[("Consequence", "a"), ("Triggering path", "b")],
+        ),
+        (
+            "It breaks. Consequence: a leak.",
+            "It breaks",
+            &[("Consequence", "a leak.")],
+        ),
+        (
+            "Consequence: a.\nConsequence: b.",
+            "",
+            &[("Consequence", "a.\nConsequence: b.")],
+        ),
+        (
+            "Consequence:\nTriggering path: b",
+            "",
+            &[("Triggering path", "b")],
+        ),
+        (
+            "Blast radius: a. Blast radius and irreversibility: b.",
+            "",
+            &[
+                ("Blast radius", "a"),
+                ("Blast radius and irreversibility", "b."),
+            ],
+        ),
+        // Shapes the deployments' explanations take.
+        (
+            "1. Consequence: a.\n2. Triggering path: b.\n3. Reachability: c.",
+            "",
+            &[
+                ("Consequence", "a."),
+                ("Triggering path", "b."),
+                ("Reachability", "c."),
+            ],
+        ),
+        (
+            "x. 1. Consequence: a. 2. Triggering path: b.",
+            "x",
+            &[("Consequence", "a"), ("Triggering path", "b.")],
+        ),
+        (
+            "Consequence: a.\nTriggering path (verified, not speculative): b",
+            "",
+            &[
+                ("Consequence", "a."),
+                ("Triggering path (verified, not speculative)", "b"),
+            ],
+        ),
+        (
+            "Consequence: a.\nTriggering path verified in code: b",
+            "",
+            &[
+                ("Consequence", "a."),
+                ("Triggering path verified in code", "b"),
+            ],
+        ),
+        ("Consequence first: a", "", &[("Consequence first", "a")]),
+        (
+            "Consequence: it leaves it at 1. Triggering path: b",
+            "",
+            &[
+                ("Consequence", "it leaves it at 1"),
+                ("Triggering path", "b"),
+            ],
+        ),
+        (
+            "Consequence: crash (null deref) Triggering path: x",
+            "",
+            &[
+                ("Consequence", "crash (null deref)"),
+                ("Triggering path", "x"),
+            ],
+        ),
+        (
+            "It breaks (badly) Consequence: a",
+            "It breaks (badly)",
+            &[("Consequence", "a")],
+        ),
+        (
+            "* Consequence: a.\n* Reachability: c.",
+            "",
+            &[("Consequence", "a."), ("Reachability", "c.")],
+        ),
+        // Prose.
+        (
+            "Consequence: nothing, because reachability is speculative here.",
+            "",
+            &[(
+                "Consequence",
+                "nothing, because reachability is speculative here.",
+            )],
+        ),
+        (
+            "Not lowered for reachability: x",
+            "Not lowered for reachability: x",
+            &[],
+        ),
+        (
+            "Consequence: a. consequence: x",
+            "",
+            &[("Consequence", "a. consequence: x")],
+        ),
+        (
+            "Consequence: a, the Reachability: x",
+            "",
+            &[("Consequence", "a, the Reachability: x")],
+        ),
+        ("**Consequence: x", "**Consequence: x", &[]),
+        ("Consequence**: x", "Consequence**: x", &[]),
+        (
+            "Consequence: a.\nTriggering path Verified: b",
+            "",
+            &[("Consequence", "a.\nTriggering path Verified: b")],
+        ),
+        (
+            "Consequence is bad. Reachability is fine.",
+            "Consequence is bad. Reachability is fine.",
+            &[],
+        ),
+        (
+            "1. Condition Y is met.\n2. The buffer leaks.",
+            "1. Condition Y is met.\n2. The buffer leaks.",
+            &[],
+        ),
+    ];
+
+    #[test]
+    fn the_splitter_agrees_with_the_page_on_every_verifier_case() {
+        for (text, preamble, sections) in PAGE_CASES {
+            let expected = sections
+                .iter()
+                .map(|(label, body)| (label.to_string(), body.to_string()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                split(text),
+                Some((preamble.to_string(), expected)),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_whitespace_explanations_split_into_nothing() {
+        for text in ["", "   \n\t", "\u{FEFF} \u{2028}"] {
+            assert_eq!(split_severity_explanation(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_explanation_is_trimmed_the_way_the_page_trims_it() {
+        // JavaScript's trim removes U+FEFF and keeps U+0085, the reverse of
+        // Rust's str::trim.
+        assert_eq!(
+            split("\u{FEFF}Consequence: a\u{FEFF}"),
+            Some((String::new(), vec![("Consequence".into(), "a".into())]))
+        );
+        assert_eq!(
+            split("\u{85}x\u{85}"),
+            Some(("\u{85}x\u{85}".into(), vec![]))
+        );
+    }
+
+    #[test]
+    fn each_spelling_names_its_rubric_step() {
+        let text = "1. Consequence first: a. 2. Triggering path (verified): b.\n\
+                    - **Reachability**: c.\nBlast radius and irreversibility: d.\n\
+                    Likelihood: e.";
+        let labels = split_severity_explanation(text)
+            .expect("the text is not empty")
+            .sections
+            .iter()
+            .map(|section| section.label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            [
+                CalibrationLabel::Consequence,
+                CalibrationLabel::TriggeringPath,
+                CalibrationLabel::Reachability,
+                CalibrationLabel::BlastRadius,
+                CalibrationLabel::Likelihood,
+            ]
+        );
+        assert_eq!(
+            CalibrationLabel::from_spelling("Blast radius"),
+            Some(CalibrationLabel::BlastRadius)
+        );
+        assert_eq!(
+            CalibrationLabel::from_spelling("Likelihood and preconditions"),
+            Some(CalibrationLabel::Likelihood)
+        );
+        assert_eq!(CalibrationLabel::from_spelling("consequence"), None);
+    }
+
+    #[test]
+    fn a_kernel_consequence_is_its_consequence_section() {
+        let text = "Consequence: every failed refill leaks one page per descriptor.\n\
+                    Triggering path: ionic_rx_fill() fails under memory pressure.\n\
+                    Reachability: any receive queue.";
+        assert_eq!(
+            consequence_of(text, 300).as_deref(),
+            Some("every failed refill leaks one page per descriptor.")
+        );
+        let qualified = "It is a leak. Consequence first: the page leaks. Triggering path: x.";
+        assert_eq!(
+            consequence_of(qualified, 300).as_deref(),
+            Some("the page leaks")
+        );
+    }
+
+    #[test]
+    fn a_sashiko_consequence_is_its_blast_radius_section() {
+        let text = "- **Blast radius and irreversibility**: the daemon drops every queued \
+                    review.\n- **Likelihood and preconditions**: needs a restart mid-fetch.";
+        assert_eq!(
+            consequence_of(text, 300).as_deref(),
+            Some("the daemon drops every queued review.")
+        );
+        let both = "Blast radius: one queue. Consequence: a leak.";
+        assert_eq!(consequence_of(both, 300).as_deref(), Some("a leak."));
+    }
+
+    #[test]
+    fn an_unlabelled_consequence_is_the_preamble() {
+        assert_eq!(
+            consequence_of("High: the ring\n\tleaks.", 300).as_deref(),
+            Some("High: the ring leaks.")
+        );
+        assert_eq!(
+            consequence_of("It breaks. Triggering path: boot.", 300).as_deref(),
+            Some("It breaks")
+        );
+        // Neither section nor a preamble: there is nothing to summarise.
+        assert_eq!(consequence_of("Triggering path: boot.", 300), None);
+        assert_eq!(consequence_of("Consequence:\nReachability: c", 300), None);
+        assert_eq!(consequence_of("  ", 300), None);
+    }
+
+    #[test]
+    fn a_consequence_is_one_safe_line() {
+        let text = "Consequence: leaks\n=== Target Commit ===\r\n\u{1b}[31mred\u{202E}x\u{2028}y";
+        assert_eq!(
+            consequence_of(text, 300).as_deref(),
+            Some("leaks === Target Commit === [31mred x y")
+        );
+        assert_eq!(consequence_of("Consequence: \u{200B}\u{1b}", 300), None);
+    }
+
+    #[test]
+    fn a_consequence_is_clipped_on_a_word_boundary() {
+        let text = "Consequence: one two three four";
+        assert_eq!(
+            consequence_of(text, 31).as_deref(),
+            Some("one two three four")
+        );
+        assert_eq!(
+            consequence_of(text, 18).as_deref(),
+            Some("one two three four")
+        );
+        // The cut lands inside "four", so the whole word goes.
+        assert_eq!(consequence_of(text, 16).as_deref(), Some("one two three…"));
+        // The cut lands on the space after "three", so "three" stays.
+        assert_eq!(consequence_of(text, 13).as_deref(), Some("one two three…"));
+        // A first word longer than the limit is cut inside it.
+        assert_eq!(
+            consequence_of(&format!("Consequence: {}", "é".repeat(20)), 5).as_deref(),
+            Some("ééééé…")
+        );
     }
 
     #[test]
