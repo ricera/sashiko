@@ -4347,6 +4347,78 @@ mod tests {
         assert!(reply.message.contains(&requeued), "{}", reply.message);
     }
 
+    /// Concurrent requests to the route for one pull request head share one
+    /// placeholder: one is queued, every other reports the fetch in
+    /// progress, none fails, and a later request still finds the head in
+    /// progress instead of being refused. Each round asks about a pull
+    /// request of its own, so that each is a new head.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_pr_requests_for_one_head_share_one_placeholder() {
+        const ROUNDS: i64 = 50;
+        const CALLERS: usize = 8;
+        let gh = Arc::new(FakeResolver::default());
+        let (state, mut fetch_rx) = pr_route_state(gh, |_| {}).await;
+        for number in 1..=ROUNDS {
+            let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+            let mut callers = tokio::task::JoinSet::new();
+            for _ in 0..CALLERS {
+                let state = state.clone();
+                let barrier = Arc::clone(&barrier);
+                callers.spawn(async move {
+                    barrier.wait().await;
+                    ask_for_pr(&state, pr_request(number, PrReviewMode::ReviewHead)).await
+                });
+            }
+            let replies: Vec<PrReviewResponse> = callers
+                .join_all()
+                .await
+                .into_iter()
+                .map(|reply| reply.unwrap_or_else(|e| panic!("PR {number}: {e:?}")))
+                .collect();
+            fetches_sent(&mut fetch_rx);
+
+            let outcomes =
+                |wanted: PrReviewOutcome| replies.iter().filter(|r| r.outcome == wanted).count();
+            assert_eq!(outcomes(PrReviewOutcome::Queued), 1, "PR {number}");
+            assert_eq!(
+                outcomes(PrReviewOutcome::AlreadyInProgress),
+                CALLERS - 1,
+                "PR {number}"
+            );
+            let id = replies[0].patchset_id;
+            assert!(
+                replies.iter().all(|r| r.patchset_id == id),
+                "PR {number}: {replies:?}"
+            );
+            let rows: i64 = state
+                .db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM patchsets WHERE mr_number = ?",
+                    libsql::params![number],
+                )
+                .await
+                .unwrap()
+                .next()
+                .await
+                .unwrap()
+                .expect("a count")
+                .get(0)
+                .unwrap();
+            assert_eq!(rows, 1, "PR {number}");
+
+            let later = ask_for_pr(&state, pr_request(number, PrReviewMode::ReviewHead))
+                .await
+                .unwrap_or_else(|e| panic!("PR {number} asked again: {e:?}"));
+            assert_eq!(
+                (later.outcome, later.patchset_id),
+                (PrReviewOutcome::AlreadyInProgress, id),
+                "PR {number}"
+            );
+            fetches_sent(&mut fetch_rx);
+        }
+    }
+
     /// The rerun under RerunHead leaves the finished row Pending for the
     /// reviewer, as /api/patchset/rerun does.
     #[tokio::test]
