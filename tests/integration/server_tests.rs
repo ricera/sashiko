@@ -904,7 +904,8 @@ async fn test_recorded_stage_rows_carry_order_and_label() {
 const PR_BASE: &str = "1111111111111111111111111111111111111111";
 
 /// Stands in for gh, so that no test runs it or reaches the network: pull
-/// request N of any repository has base [`PR_BASE`] and head N in hex.
+/// request N of any repository has base [`PR_BASE`], head N in hex and no
+/// description.
 struct FakeGh;
 
 #[async_trait::async_trait]
@@ -923,6 +924,7 @@ impl sashiko::forge::PullRequestResolver for FakeGh {
                 repo.host, repo.owner, repo.name
             ),
             title: Some("Fix the widget".to_string()),
+            body: None,
             base: commit(PR_BASE),
             head: commit(&format!("{number:040x}")),
         })
