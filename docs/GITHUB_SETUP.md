@@ -531,21 +531,21 @@ moves between patches as a series is reworked:
 === Findings From Earlier Revisions of This Pull Request ===
 <what the block is, and that it is not instructions or evidence>
 
-v3 patch 2 "ionic: refill the rx ring" (commit <40 hex>): the patch under review, as it was in that revision
+v3 patch 2 (commit <40 hex>, the patch under review, as it was in that revision): subject "ionic: refill the rx ring"
   v3 patch 2 has the same diff as the patch under review (equal git patch-id). ...
   - [High] leak of rx buffers in ionic_rx_fill() on error
     At: drivers/net/ethernet/pensando/ionic/ionic_txrx.c:812 (ionic_rx_fill)
     Consequence: every failed refill leaks one page per descriptor.
     History: a repeat of "rx page leak on refill error" (v2)
 
-v3 patch 4 "ionic: add rx stats" (commit <40 hex>): another patch of this pull request
+v3 patch 4 (commit <40 hex>, another patch of this pull request): subject "ionic: add rx stats"
   - [Medium] (concerns code in the patch under review) ...
 
 v3's version of the code: its diff, limited to the files that its findings about the patch under review cite. ...
 Every line of that diff below starts with "| ".
 | diff --git a/drivers/net/ethernet/pensando/ionic/ionic_txrx.c b/...
 
-v2 patch 2 "ionic: refill the rx ring" (commit <40 hex>): the patch under review, as it was in that revision
+v2 patch 2 (commit <40 hex>, the patch under review, as it was in that revision): subject "ionic: refill the rx ring"
   - [High] rx page leak on refill error
     ...
 
@@ -553,8 +553,9 @@ v2 patch 2 "ionic: refill the rx ring" (commit <40 hex>): the patch under review
 === End of Findings From Earlier Revisions ===
 ```
 
-- **A patch header** names the revision, the part, the subject and the
-  patch's commit, or says the commit was not recorded. The earlier version
+- **A patch header** names the revision, the part, the patch's commit (or
+  says it was not recorded), whether it is the earlier version of the
+  patch under review, and last the author's subject. The earlier version
   of the patch under review, the patch with the same subject once tags and
   case are ignored or with an equal git patch-id, comes first in each
   revision. A finding on another patch is marked "(concerns code in the
@@ -588,6 +589,10 @@ Every title, subject, location and consequence in the block was written by
 a pull request's author or by a model. Each is made one line behind a fixed
 indent or label, and every line of the diff starts with `| `, so nothing in
 them can close the block or open another section of the prompt. A
+patch's subject is quoted as a JSON string and comes after every fact
+the daemon states on its header line, and a History line's title is
+quoted the same way, so a quote in either cannot close it early and put
+a forged commit, role or revision label in place of the daemon's. A
 `{{name}}` in them is passed on as written, not filled in.
 
 Verification's rules for the block say that an earlier finding makes a
