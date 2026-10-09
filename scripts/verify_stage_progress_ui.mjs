@@ -1,8 +1,9 @@
 // Checks the web UI's review card and the findings it lists, the per-patch
 // stage table (live and recorded), how live activity is routed and polled, the
 // live conversation log, the line naming the reference repositories each review
-// had, and how partial and timed-out reviews read in the list, the summary
-// table, the card and the statistics.
+// had, how partial and timed-out reviews read in the list, the summary table,
+// the card and the statistics, and the address a patchset page keeps paging and
+// the reason it shows when that address finds nothing.
 //
 // static/index.html has no build step and no other test coverage, so this is the
 // only thing standing between a bad edit and a page that silently renders
@@ -1796,6 +1797,188 @@ console.log('activity polling');
     respond = () => payload;
 }
 
+// ---- the address a patchset page was opened at -------------------------------
+// A pull request revision can be opened by its head commit, <repo>-<N>-<sha>.
+// Its paging controls must keep that address rather than the slug the reply
+// carries, which moves to the next revision when one is pushed; and an address
+// that finds no single revision must show the daemon's reason, escaped,
+// instead of "404 Not Found".
+//
+// renderPatchsetView is loaded in a scope of its own, with the helpers it calls
+// and a fetch of its own, because the main scope stands a stub in for it (the
+// activity poll's redraw is checked against that stub). Only its failed-read
+// path runs here: the rest of it draws the whole page.
+const PV_NAMES = ['escapeHtml', 'patchsetLoadError', 'patchsetPath', 'renderPatchsetPagination',
+                  'renderPatchPermalink', 'viewErrorHtml', 'renderPatchsetView', 'renderBaselineLogView'];
+const pvSources = Object.fromEntries(PV_NAMES.map(n => [n, grab(n)]));
+function loadPatchsetView(srcs) {
+    const out = { requests: [], reply: null };
+    new Function('out', 'fetch',
+        grabConst('PATCHSET_REASON_MAX_CHARS') + '\nlet viewGeneration = 0;\n\n'
+        + PV_NAMES.map(n => srcs[n]).join('\n\n')
+        + '\n;' + PV_NAMES.map(n => `out.${n} = ${n};`).join(''))(
+        out, async url => { out.requests.push(url); return out.reply; });
+    return out;
+}
+const mutatePv = (name, from, to) => {
+    if (!pvSources[name].includes(from)) throw new Error(`mutation target missing in ${name}: ${from}`);
+    return loadPatchsetView({ ...pvSources, [name]: pvSources[name].replace(from, to) });
+};
+
+// A failed fetch Response, as patchsetLoadError reads one.
+const failedReply = (status, statusText, type, body) => ({
+    ok: false, status, statusText,
+    headers: { get: name => (name.toLowerCase() === 'content-type' ? type : null) },
+    text: async () => {
+        if (body instanceof Error) throw body;
+        return body;
+    },
+});
+const PLAIN = 'text/plain; charset=utf-8';
+const ADDRESS = 'driver-b-27-1a2b3c4';
+const NO_HEAD = 'no revision of this pull request has a head commit starting 1a2b3c4';
+
+// The data-href targets and the onclick handlers of the paging buttons, with
+// the attribute escaping undone as a browser would.
+const unescapeAttr = v => v.replace(/&quot;/g, '"').replace(/&#039;/g, "'").replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+const attrOf = (attrs, name) => {
+    const m = new RegExp(`\\s${name}="([^"]*)"`).exec(attrs);
+    return m ? unescapeAttr(m[1]) : null;
+};
+const pagingButtons = html => [...html.matchAll(/<button\b([^>]*)>([^<]*)<\/button>/g)].map(m => ({
+    label: m[2],
+    href: attrOf(m[1], 'data-href'),
+    onclick: attrOf(m[1], 'onclick'),
+    disabled: /\sdisabled(\s|$)/.test(m[1]),
+}));
+
+function patchsetPagingChecks(pv, expect) {
+    const buttons = pagingButtons(pv.renderPatchsetPagination(ADDRESS, 2, 50, 160));
+    expect('paging: First, Prev, Next and Last, in that order',
+        buttons.map(b => b.label).join() === 'First,Prev,Next,Last');
+    const targets = buttons.map(b => b.href);
+    expect('paging: every button keeps the address it was opened at',
+        targets.join(' ') === [1, 1, 3, 4].map(p => `#/patchset/${ADDRESS}?page=${p}&limit=50`).join(' '));
+    expect('paging: a middle page disables nothing', buttons.every(b => !b.disabled));
+    const first = pagingButtons(pv.renderPatchsetPagination(ADDRESS, 1, 50, 160));
+    expect('paging: the first page disables First and Prev only',
+        first.map(b => b.disabled).join() === 'true,true,false,false');
+    const last = pagingButtons(pv.renderPatchsetPagination(ADDRESS, 4, 50, 160));
+    expect('paging: the last page disables Next and Last only',
+        last.map(b => b.disabled).join() === 'false,false,true,true');
+    expect('paging: one page draws no controls', pv.renderPatchsetPagination(ADDRESS, 1, 50, 50) === '');
+    expect('paging: the page count is shown',
+        pv.renderPatchsetPagination(ADDRESS, 2, 50, 160).includes('Page 2 of 4 (160 total)'));
+
+    // An address is the caller's text. A Message-ID may hold an apostrophe,
+    // which encodeURIComponent leaves alone; pasted into a handler as a string
+    // literal it would end the literal.
+    const hostile = "x'-alert(1)-'\"<b>@lists.example";
+    const evil = pagingButtons(pv.renderPatchsetPagination(hostile, 2, 50, 160));
+    expect('paging: the handler is a constant',
+        evil.length === 4 && evil.every(b => b.onclick === 'navigate(this.dataset.href)'));
+    expect('paging: a hostile address still reaches the target intact',
+        evil.length === 4 && evil[0].href === `#/patchset/${encodeURIComponent(hostile)}?page=1&limit=50`);
+}
+
+// The patch permalink carries the same address, so it gets the same hostile
+// one: its handler must stay a constant and its copy target must be intact.
+function patchPermalinkChecks(pv, expect) {
+    const link = `https://sashiko.example/#/patchset/${encodeURIComponent("x'-alert(1)-'\"<b>@lists.example")}?part=1`;
+    const m = /^<a\b([^>]*)>/.exec(pv.renderPatchPermalink(link));
+    const attrs = m ? m[1] : '';
+    expect('permalink: the handler is a constant',
+        attrOf(attrs, 'onclick') === 'copyToClipboard(this.dataset.copy); return false;');
+    expect('permalink: a hostile address is copied intact', attrOf(attrs, 'data-copy') === link);
+    expect('permalink: a hostile address is linked intact', attrOf(attrs, 'href') === link);
+}
+
+async function patchsetLoadErrorChecks(pv, expect) {
+    const reason = async (...args) => {
+        try { return await pv.patchsetLoadError(failedReply(...args)); } catch (e) { return `THREW ${e}`; }
+    };
+    expect('reason: a 404 reason is shown in place of the status line',
+        await reason(404, 'Not Found', PLAIN, NO_HEAD + '\n') === NO_HEAD);
+    expect('reason: the content type is matched without regard to case',
+        await reason(404, 'Not Found', 'Text/Plain', NO_HEAD) === NO_HEAD);
+    expect('reason: an empty 404 reads as the status line',
+        await reason(404, 'Not Found', PLAIN, '') === '404 Not Found');
+    expect('reason: a blank 404 reads as the status line',
+        await reason(404, 'Not Found', PLAIN, '  \n') === '404 Not Found');
+    expect('reason: an HTML error page reads as the status line',
+        await reason(404, 'Not Found', 'text/html', '<h1>nginx</h1>') === '404 Not Found');
+    expect('reason: a reply without a content type reads as the status line',
+        await reason(404, 'Not Found', null, NO_HEAD) === '404 Not Found');
+    expect('reason: another status reads as the status line',
+        await reason(500, 'Internal Server Error', PLAIN, 'database is locked') === '500 Internal Server Error');
+    expect('reason: a body that cannot be read reads as the status line',
+        await reason(404, 'Not Found', PLAIN, new Error('aborted')) === '404 Not Found');
+    expect('reason: only the first line is shown',
+        await reason(404, 'Not Found', PLAIN, 'first line\nsecond line') === 'first line');
+    const long = 'é'.repeat(400);
+    const cut = await reason(404, 'Not Found', PLAIN, long);
+    expect('reason: a long reason is cut by characters, with a mark',
+        cut === 'é'.repeat(300) + '…');
+    expect('reason: a reason of exactly the limit is not cut',
+        await reason(404, 'Not Found', PLAIN, 'x'.repeat(300)) === 'x'.repeat(300));
+}
+
+async function patchsetViewFailureChecks(pv, expect) {
+    // The page's own failed read: the request names the address, and what the
+    // router puts on the page is the reason, escaped.
+    const hostile = 'no revision <img src=x onerror=alert(1)> & co';
+    for (const [view, call] of [['patchset view', () => pv.renderPatchsetView(ADDRESS, {}, 0)],
+                                ['baseline log view', () => pv.renderBaselineLogView(ADDRESS, 0)]]) {
+        pv.requests.length = 0;
+        pv.reply = failedReply(404, 'Not Found', PLAIN, hostile);
+        let thrown = null;
+        try { await call(); } catch (e) { thrown = e; }
+        expect(`${view}: the request names the address`,
+            pv.requests.length === 1 && pv.requests[0].startsWith(`/api/patchset?id=${ADDRESS}`));
+        expect(`${view}: a failed read throws the reason`, thrown !== null && thrown.message === hostile);
+        const line = thrown ? pv.viewErrorHtml(thrown.message) : '';
+        expect(`${view}: the reason is escaped where it meets the page`,
+            !line.includes('<img') && line.includes('&lt;img src=x onerror=alert(1)&gt; &amp; co'));
+    }
+    expect('the error line is labelled', pv.viewErrorHtml('x') === '<div class="error">Error: x</div>');
+}
+
+// The wiring that only runs in a fully drawn page, read from the source.
+function patchsetWiringChecks(pv, expect, psvSource = pvSources.renderPatchsetView) {
+    expect('wiring: the paging controls get the address the page was opened at',
+        /renderPatchsetPagination\(\s*state\.patchsetId,\s*data\.page,\s*data\.limit,\s*data\.total_patches_in_db\)/
+            .test(psvSource));
+    expect('wiring: the paging controls never page the reply\'s slug', !/data\.slug/.test(psvSource));
+    expect('wiring: the address is recorded before anything is drawn',
+        psvSource.indexOf('state.patchsetId = id;') > 0
+        && psvSource.indexOf('state.patchsetId = id;') < psvSource.indexOf('renderPatchsetPagination('));
+    expect('wiring: router() draws the error line through viewErrorHtml',
+        /app\.innerHTML = viewErrorHtml\(e\.message\);/.test(grab('router')));
+    expect('wiring: the patch permalink is drawn by renderPatchPermalink',
+        /header \+= renderPatchPermalink\(patchLink\);/.test(psvSource)
+        && !/copyToClipboard\(\s*['"`]/.test(psvSource));
+    const keyboardPaging = script.match(/const basePath = patchsetPath\(state\.patchsetId\);/g) || [];
+    expect('wiring: keyboard paging keeps the address too', keyboardPaging.length === 2);
+}
+
+async function patchsetAddressChecks(pv, psvSource) {
+    const failed = [];
+    const expect = (name, cond) => { if (!cond) failed.push(name); };
+    const groups = [patchsetPagingChecks, patchPermalinkChecks, patchsetLoadErrorChecks,
+                    patchsetViewFailureChecks];
+    for (const group of groups) {
+        try { await group(pv, expect); } catch (e) { failed.push(`${group.name}: threw ${e}`); }
+    }
+    try { patchsetWiringChecks(pv, expect, psvSource); } catch (e) { failed.push(`wiring: threw ${e}`); }
+    return failed;
+}
+console.log('the address a patchset page was opened at');
+{
+    const addressFailures = await patchsetAddressChecks(loadPatchsetView(pvSources));
+    check('every patchset address check passes', addressFailures.length === 0, addressFailures.join(', '));
+}
+
 // ---- the log ---------------------------------------------------------------
 const MESSAGES = [
     { role: 'system', content: 'You are a reviewer.' },
@@ -2388,6 +2571,55 @@ const mutate = (name, from, to) => {
         + " : renderInteractionLogEntries(logs)}");
     check('a live log drawn by its own renderer is caught', (await logChecks(ownRenderer)).length > 0);
     ownRenderer.stopLogPolling();
+
+    const SLUG_PAGING = pvSources.renderPatchsetView.replace(
+        'state.patchsetId, data.page', '(data.slug || data.id) || data.id || data.message_id, data.page');
+    const addressMutations = [
+        ['paging that follows the reply\'s slug is caught',
+            loadPatchsetView(pvSources), SLUG_PAGING],
+        ['paging that pastes its target into the handler is caught',
+            mutatePv('renderPatchsetPagination',
+                '`<button data-href="${escapeHtml(`${base}?page=${target}&limit=${limit}`)}"`\n'
+                + '                + ` onclick="navigate(this.dataset.href)" ',
+                '`<button onclick="navigate(\'${base}?page=${target}&limit=${limit}\')" `\n'
+                + '                + ` ')],
+        ['a permalink that pastes its link into the handler is caught',
+            mutatePv('renderPatchPermalink',
+                '` onclick="copyToClipboard(this.dataset.copy); return false;"',
+                '` onclick="copyToClipboard(\'${link}\'); return false;"')],
+        ['a patchset view that pastes the permalink into the handler is caught',
+            loadPatchsetView(pvSources), pvSources.renderPatchsetView.replace(
+                'header += renderPatchPermalink(patchLink);',
+                'header += `<a href="${patchLink}" onclick="copyToClipboard(\'${patchLink}\'); return false;"></a>`;')],
+        ['paging that ignores the address it is given is caught',
+            mutatePv('renderPatchsetPagination', 'const base = patchsetPath(id);',
+                "const base = patchsetPath('1');")],
+        ['paging whose Next stays enabled on the last page is caught',
+            mutatePv('renderPatchsetPagination', "button('Next', page + 1, page >= totalPages)",
+                "button('Next', page + 1, false)")],
+        ['a page that drops the reason for the status line is caught',
+            mutatePv('renderPatchsetView', 'throw new Error(await patchsetLoadError(res));',
+                'throw new Error(`${res.status} ${res.statusText}`);')],
+        ['a baseline log view that drops the reason is caught',
+            mutatePv('renderBaselineLogView', 'throw new Error(await patchsetLoadError(res));',
+                'throw new Error(`${res.status} ${res.statusText}`);')],
+        ['a reason read from an HTML page is caught',
+            mutatePv('patchsetLoadError', " || !type.toLowerCase().startsWith('text/plain')", '')],
+        ['a reason read from a non-404 reply is caught',
+            mutatePv('patchsetLoadError', 'res.status !== 404 || ', '')],
+        ['a reason read without the first-line cut is caught',
+            mutatePv('patchsetLoadError', ".split('\\n')[0]", '')],
+        ['a reason that is never clipped is caught',
+            mutatePv('patchsetLoadError', 'reason.length > PATCHSET_REASON_MAX_CHARS', 'false')],
+        ['an unreadable body that throws past the status line is caught',
+            mutatePv('patchsetLoadError', 'body = await res.text();\n            } catch (e) {\n                return statusLine;',
+                'body = await res.text();\n            } catch (e) {\n                throw e;')],
+        ['an error line that does not escape is caught',
+            mutatePv('viewErrorHtml', '${escapeHtml(message)}', '${message}')],
+    ];
+    for (const [name, broken, psvSource] of addressMutations) {
+        check(name, (await patchsetAddressChecks(broken, psvSource)).length > 0);
+    }
 }
 
 console.log(failures ? `\n${failures} FAILURE(S)` : '\nALL CHECKS PASSED');
