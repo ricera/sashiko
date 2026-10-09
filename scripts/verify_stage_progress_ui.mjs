@@ -59,10 +59,10 @@ function grabConst(name) {
 }
 
 const LETS = ['activityPoll', 'viewGeneration', 'logView', 'logTimer'];
-const CONSTS = ['FINDING_TITLE_MAX_CHARS'];
+const CONSTS = ['FINDING_TITLE_MAX_CHARS', 'PRIOR_REVISION_LABEL_MAX_CHARS'];
 const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'renderReviewCard', 'getSeverityColor',
                'findingObject', 'findingTitle', 'parseSeverityCalibration', 'renderSeverityCalibration',
-               'renderFindingLocations', 'findingTags', 'renderFindingRow', 'renderFindingsList',
+               'renderFindingLocations', 'oneLine', 'priorTag', 'findingTags', 'renderFindingRow', 'renderFindingsList',
                'formatDuration', 'describeStageWait', 'summarizeReason', 'compareStageRows',
                'stageTableLabel', 'stageRowsFromRecord', 'stageStopCause', 'stageStopLabel',
                'stoppedStageStatus', 'stageRowsFromActivity',
@@ -1620,6 +1620,98 @@ function findingSpeculativeChecks(fns, expect) {
         !findingsCard(fns, []).includes(NOTE));
 }
 
+// The tag of a finding linked to a finding of an earlier revision: which links
+// tag a finding, what the tag says, and where it goes among the other tags.
+const PRIOR_REPEAT = { relation: 'repeat', revision: 'v3',
+    earlier_problem: 'ionic: rx page leak on refill error', revision_head: '1a2b3c4d5e6f' };
+function findingPriorTagChecks(fns, expect) {
+    const tagText = f => fns.findingTags(f).join('');
+    const tagOf = prior => tagText({ prior });
+    expect('prior: a repeat reads "(repeat of v3)"',
+        visibleText(tagOf(PRIOR_REPEAT)).trim() === '(repeat of v3)');
+    expect('prior: a fix regression reads "(caused by the fix for v3)"',
+        visibleText(tagOf({ ...PRIOR_REPEAT, relation: 'fix_regression' })).trim()
+            === '(caused by the fix for v3)');
+    expect('prior: the tag is styled as the other tags are',
+        tagOf(PRIOR_REPEAT).startsWith('<span class="finding-tag" title="'));
+    const malformed = [
+        ['an unknown relation', { ...PRIOR_REPEAT, relation: 'duplicate' }],
+        ['a padded relation', { ...PRIOR_REPEAT, relation: ' repeat' }],
+        ['a relation in another case', { ...PRIOR_REPEAT, relation: 'Repeat' }],
+        ['a relation that is not a string', { ...PRIOR_REPEAT, relation: ['repeat'] }],
+        ['a missing relation', { ...PRIOR_REPEAT, relation: undefined }],
+        ['a missing revision', { ...PRIOR_REPEAT, revision: undefined }],
+        ['a blank revision', { ...PRIOR_REPEAT, revision: ' \n\t ' }],
+        ['an invisible revision', { ...PRIOR_REPEAT, revision: '\u200B\u202E' }],
+        ['a revision of control characters', { ...PRIOR_REPEAT, revision: '\u001b\u0000\u0085' }],
+        ['a revision that is not a string', { ...PRIOR_REPEAT, revision: 3 }],
+        ['a revision label over the limit', { ...PRIOR_REPEAT, revision: 'v'.repeat(33) }],
+        ['a missing earlier problem', { ...PRIOR_REPEAT, earlier_problem: undefined }],
+        ['a blank earlier problem', { ...PRIOR_REPEAT, earlier_problem: '   ' }],
+        ['the fork\'s headline form', { relation: 'repeat', revision: 'v3', headline: 'leak' }],
+    ];
+    for (const [what, prior] of malformed) {
+        expect(`prior: ${what} adds no tag`, fns.findingTags({ prior }).length === 0);
+    }
+    expect('prior: a link that is a string, an array, a number or null adds no tag',
+        ['repeat of v3', ['repeat', 'v3', 'leak'], 7, null, true].every(prior =>
+            fns.findingTags({ prior }).length === 0));
+    expect('prior: a label at the limit, counted in code points, is kept',
+        visibleText(tagOf({ ...PRIOR_REPEAT, revision: '😀'.repeat(32) })).includes('😀'.repeat(32)));
+    expect('prior: a padded or broken label is shown as one trimmed line',
+        visibleText(tagOf({ ...PRIOR_REPEAT, revision: '  v3\n  (fixup) ' })).trim()
+            === '(repeat of v3 (fixup))');
+    expect('prior: a control character in a label splits it as a space does',
+        visibleText(tagOf({ ...PRIOR_REPEAT, revision: 'v3\u001b[31m' })).trim()
+            === '(repeat of v3 [31m)');
+    const all = tagText({ speculative: true, preexisting: true, prior: PRIOR_REPEAT });
+    expect('prior: the order is speculative, preexisting, then the earlier finding',
+        fns.findingTags({ speculative: true, preexisting: true, prior: PRIOR_REPEAT }).length === 3
+            && all.indexOf('(speculative)') < all.indexOf('(preexisting)')
+            && all.indexOf('(preexisting)') < all.indexOf('(repeat of v3)'));
+    const row = findingsBlock(findingsCard(fns, [
+        { severity: 'High', problem: 'h-one', prior: PRIOR_REPEAT },
+        { severity: 'Low', problem: 'l-one' }]));
+    expect('prior: the row shows the tag before its title, and only on the linked finding',
+        row.split('(repeat of v3)').length === 2
+            && row.indexOf('(repeat of v3)') < row.indexOf('>h-one<')
+            && row.indexOf('>h-one<') < row.indexOf('>l-one<'));
+}
+
+// The hover of the earlier-finding tag: the earlier finding, the head commit
+// of its revision when that is a commit prefix, and nothing unescaped.
+function findingPriorHoverChecks(fns, expect) {
+    const hoverOf = prior => {
+        const m = /title="([^"]*)"/.exec(fns.findingTags({ prior }).join(''));
+        return m ? m[1] : null;
+    };
+    expect('prior hover: names the revision, its head and the earlier finding',
+        hoverOf(PRIOR_REPEAT)
+            === 'Earlier finding (v3, head 1a2b3c4d5e6f): ionic: rx page leak on refill error');
+    const { revision_head: _, ...headless } = PRIOR_REPEAT;
+    expect('prior hover: without a head it names the revision alone',
+        hoverOf(headless) === 'Earlier finding (v3): ionic: rx page leak on refill error');
+    for (const [what, head] of [['six hex characters', '1a2b3c'], ['41 hex characters', 'a'.repeat(41)],
+                                ['a character that is not hex', '1a2b3c4d5e6g'],
+                                ['padding', ' 1a2b3c4d5e6f'], ['a number', 1234567]]) {
+        expect(`prior hover: a head with ${what} is left out and the tag kept`,
+            hoverOf({ ...PRIOR_REPEAT, revision_head: head })
+                === 'Earlier finding (v3): ionic: rx page leak on refill error');
+    }
+    expect('prior hover: heads of 7 and 40 hex characters are shown, in lower case',
+        hoverOf({ ...PRIOR_REPEAT, revision_head: 'ABCDEF1' }).includes('(v3, head abcdef1)')
+            && hoverOf({ ...PRIOR_REPEAT, revision_head: 'f'.repeat(40) }).includes(`head ${'f'.repeat(40)})`));
+    expect('prior hover: an earlier problem over several lines is one line',
+        hoverOf({ ...PRIOR_REPEAT, earlier_problem: ' leak\n\n  on refill ' })
+            === 'Earlier finding (v3, head 1a2b3c4d5e6f): leak on refill');
+    const evil = '<script>x</script>"onmouseover=alert(1)\'';
+    const tag = fns.findingTags({ prior: { ...PRIOR_REPEAT, revision: 'v3"><b', earlier_problem: evil } }).join('');
+    expect('prior escaping: the earlier problem and the label never break out of the tag',
+        tag.length > 0 && !tag.includes('<script>') && !tag.includes('"onmouseover')
+            && !tag.includes('"><b') && tag.includes('&lt;script&gt;')
+            && tag.split('&quot;&gt;&lt;b').length === 3);
+}
+
 // The Findings button must open the block it sits beside. The id is built in
 // two places of one template, so a typo in either leaves a button that does
 // nothing and no error anywhere.
@@ -1706,6 +1798,7 @@ function findingChecks(fns) {
                     findingEscapingChecks, findingLocationChecks, findingCalibrationLabelChecks,
                     findingCalibrationShapeChecks, findingCalibrationProseChecks,
                     findingCalibrationRenderChecks, findingSpeculativeChecks,
+                    findingPriorTagChecks, findingPriorHoverChecks,
                     findingToggleChecks, findingLocationTrimChecks, findingLineNumberChecks,
                     findingBlankSeverityChecks, findingRowLayoutChecks];
     for (const group of groups) {
@@ -2565,6 +2658,47 @@ const mutate = (name, from, to) => {
             mutate('renderFindingRow',
                 "const head = `<span class=\"finding-severity\" style=\"color:${getSeverityColor(severity)};\">`\n                + `${escapeHtml(severity)}</span>`\n                + findingTags(f).map(tag => `${tag} `).join('')\n                + `<span title=\"${escapeHtml(title)}\">${escapeHtml(title)}</span>`;",
                 "const head = findingTags(f).map(tag => `${tag} `).join('')\n                + `<span title=\"${escapeHtml(title)}\">${escapeHtml(title)}</span>`\n                + `<span class=\"finding-severity\" style=\"color:${getSeverityColor(severity)};\">`\n                + `${escapeHtml(severity)}</span>`;")],
+        ['an earlier-finding tag that does not escape is caught',
+            load({ ...sources, priorTag: sources.priorTag.replaceAll('escapeHtml(', 'String(') })],
+        ['an earlier-finding tag that escapes only its text, not its hover, is caught',
+            mutate('priorTag', 'title="${escapeHtml(hover)}"', 'title="${hover}"')],
+        ['findingTags without the earlier-finding tag is caught',
+            mutate('findingTags', 'if (prior) tags.push(prior);', '')],
+        ['an earlier-finding tag before the others is caught',
+            mutate('findingTags', 'if (prior) tags.push(prior);', 'if (prior) tags.unshift(prior);')],
+        ['an earlier-finding tag for any relation is caught',
+            mutate('priorTag', "'caused by the fix for' : ''", "'caused by the fix for' : 'repeat of'")],
+        ['an earlier-finding tag that reads every relation as a repeat is caught',
+            mutate('priorTag', "prior.relation === 'fix_regression' ? 'caused by the fix for'",
+                "prior.relation === 'fix_regression' ? 'repeat of'")],
+        ['an earlier-finding tag without a revision is caught',
+            mutate('priorTag', '!relation || !revision || !problem', '!relation || !problem')],
+        ['an earlier-finding tag without an earlier problem is caught',
+            mutate('priorTag', '!relation || !revision || !problem', '!relation || !revision')],
+        ['an earlier-finding tag with no limit on the label is caught',
+            mutate('priorTag', 'Array.from(revision).length > PRIOR_REVISION_LABEL_MAX_CHARS', 'false')],
+        ['an earlier-finding label limit counted in UTF-16 units is caught',
+            mutate('priorTag', 'Array.from(revision).length', 'revision.length')],
+        ['an earlier-finding tag that reads any value as text is caught',
+            mutate('priorTag', "typeof prior[key] === 'string' ? oneLine(prior[key]) : ''",
+                "prior[key] == null ? '' : oneLine(prior[key])")],
+        ['an earlier-finding tag that throws on a null link is caught',
+            mutate('priorTag', "if (!prior || typeof prior !== 'object') return '';", '')],
+        ['a one-line rule that keeps invisible characters is caught',
+            mutate('oneLine', '\\p{Cc}\\u2028\\u2029\\u200B-\\u200F\\u202A-\\u202E\\u2066-\\u2069', '')],
+        ['a one-line rule that keeps control characters is caught',
+            mutate('oneLine', '\\p{Cc}', '')],
+        ['an earlier-finding label that is not made one line is caught',
+            mutate('priorTag', "typeof prior[key] === 'string' ? oneLine(prior[key])",
+                "typeof prior[key] === 'string' ? prior[key].trim()")],
+        ['an earlier-finding hover that shows any head is caught',
+            mutate('priorTag', '/^[0-9a-fA-F]{7,40}$/.test(prior.revision_head)', 'true')],
+        ['an earlier-finding hover that accepts a head of any length is caught',
+            mutate('priorTag', '{7,40}', '+')],
+        ['an earlier-finding hover that shows a head as written is caught',
+            mutate('priorTag', 'prior.revision_head.toLowerCase()', 'prior.revision_head')],
+        ['an earlier-finding hover without the head is caught',
+            mutate('priorTag', "? `, head ${prior.revision_head.toLowerCase()}` : ''", "? '' : ''")],
     ];
     for (const [name, broken] of findingMutations) {
         check(name, findingChecks(broken).length > 0);

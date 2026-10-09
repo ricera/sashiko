@@ -50,7 +50,8 @@ pub const MAX_PRIOR_LOCATIONS: usize = 2;
 /// label the daemon gives a revision is "patchset " and an i64 id, 29 code
 /// points, so a longer one was never shown and cannot name a revision. The
 /// bound also keeps a label a model made up from crowding real findings out
-/// of the block of earlier findings.
+/// of the block of earlier findings. Matches PRIOR_REVISION_LABEL_MAX_CHARS
+/// in static/index.html, which tags a finding by the same rule.
 pub const REVISION_LABEL_MAX_CHARS: usize = 32;
 
 /// One earlier revision of a pull request and the findings its reviews
@@ -207,7 +208,8 @@ impl PriorLink {
     /// else is `None`, among them the fork's `{headline, relation,
     /// revision}`, which names no earlier finding. A `revision_head` that is not 7 to 40 hex
     /// characters is left out and the link kept, since the head only adds to
-    /// what the link already names.
+    /// what the link already names. The page's priorTag in static/index.html
+    /// reads a link by the same rule, so a change to it is made there too.
     pub fn from_json(value: &Value) -> Option<Self> {
         let text_of = |key: &str| {
             value
