@@ -317,6 +317,113 @@ pub fn pr_revision_range(
     ))
 }
 
+/// A revision of a pull request, as its patchset row names it.
+#[cfg(feature = "server")]
+struct PrRevisionRow {
+    id: i64,
+    subject: Option<String>,
+    mr_number: Option<i64>,
+    cover_id: Option<String>,
+}
+
+#[cfg(feature = "server")]
+impl PrRevisionRow {
+    /// The columns `from_row` reads, in its order.
+    const COLUMNS: &'static str = "id, subject, mr_number, cover_letter_message_id";
+
+    fn from_row(row: &libsql::Row) -> Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            subject: get_optional_text(row, 1)?,
+            mr_number: get_optional_integer(row, 2)?,
+            cover_id: get_optional_text(row, 3)?,
+        })
+    }
+
+    /// The revision's base and head, from its placeholder id, which a
+    /// revision keeps whether or not its fetch succeeded.
+    fn range(&self) -> Option<(crate::baseline::CommitId, crate::baseline::CommitId)> {
+        self.mr_number
+            .zip(self.cover_id.as_deref())
+            .and_then(|(number, cover_id)| pr_revision_range(cover_id, number))
+    }
+
+    /// The earlier revision with its listed patches. Its label is `vK`, the
+    /// version its subject and its pull request comment carry, or
+    /// `patchset <id>` when its subject has no `#N`/`!N` prefix. Whether it
+    /// has the base of the revision under review, `current_base`, is known
+    /// only when both bases are.
+    fn into_prior_revision(
+        self,
+        current_base: Option<&crate::baseline::CommitId>,
+        patches: Vec<crate::prior_revisions::PriorPatch>,
+    ) -> crate::prior_revisions::PriorRevision {
+        let version = self.mr_number.and_then(|number| {
+            crate::forge::extract_mr_version_from_subject(self.subject.as_deref(), number)
+        });
+        let range = self.range();
+        crate::prior_revisions::PriorRevision {
+            label: version.map_or_else(|| format!("patchset {}", self.id), |k| format!("v{k}")),
+            same_base: range
+                .as_ref()
+                .zip(current_base)
+                .map(|((base, _), current)| base == current),
+            head: range.map(|(_, head)| head),
+            patches,
+        }
+    }
+}
+
+/// The patch a row of the prior-findings query is about, without findings:
+/// columns 1 to 4 are its part index, subject, message id and git
+/// patch-id. A message id that is a commit id names the patch's forge
+/// commit, as a git-fetched patch's id is.
+#[cfg(feature = "server")]
+fn prior_patch_of_row(
+    row: &libsql::Row,
+    current: &[(i64, Option<String>)],
+) -> Result<crate::prior_revisions::PriorPatch> {
+    let git_patch_id = get_optional_text(row, 4)?;
+    Ok(crate::prior_revisions::PriorPatch {
+        index: get_optional_integer(row, 1)?.unwrap_or(0),
+        subject: crate::finding_view::sanitize_text(
+            &get_optional_text(row, 2)?.unwrap_or_default(),
+        ),
+        commit: get_optional_text(row, 3)?.and_then(|id| crate::baseline::CommitId::parse(&id)),
+        same_change_as: crate::prior_revisions::same_change_as(git_patch_id.as_deref(), current),
+        diff: None,
+        findings: Vec::new(),
+    })
+}
+
+/// The finding of a row of the prior-findings query, from columns 5 to 8:
+/// severity, problem, severity explanation and locations, with the key its
+/// stored `problem` gives it among literal duplicates. Locations that are
+/// not JSON read as none. `None` for a finding with no title.
+#[cfg(feature = "server")]
+fn prior_finding_of_row(
+    row: &libsql::Row,
+) -> Result<Option<(String, crate::prior_revisions::PriorFinding)>> {
+    let severity = get_optional_integer(row, 5)?
+        .and_then(|level| i32::try_from(level).ok())
+        .map_or(Severity::Unknown, Severity::from_i32);
+    let problem = get_optional_text(row, 6)?.unwrap_or_default();
+    let locations = get_optional_text(row, 8)?
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let finding = crate::prior_revisions::PriorFinding::from_stored(
+        severity,
+        &problem,
+        get_optional_text(row, 7)?.as_deref(),
+        locations.as_ref(),
+    );
+    Ok(finding.map(|finding| {
+        (
+            crate::prior_revisions::literal_duplicate_key(&problem),
+            finding,
+        )
+    }))
+}
+
 /// The fewest hex characters of a head commit an address may give. Fewer
 /// would match too many commits to name one revision.
 #[cfg(feature = "server")]
@@ -9390,6 +9497,180 @@ impl Database {
             }
         }
         Ok(RevisionLookup::from_matches(known, &matches))
+    }
+
+    /// The findings of a pull request's earlier revisions, newest revision
+    /// first, cut down to what the review of a later revision is shown of
+    /// them (see [`crate::prior_revisions`]).
+    ///
+    /// The lineage is every patchset with this one's `mr_url` and a lower
+    /// id, of any status: each push of a pull request is a patchset of its
+    /// own, and an exact URL names one repository. A patchset without a URL,
+    /// such as a mailing-list series, has no lineage and gets an empty list.
+    /// A revision whose reviews stored no finding to list is skipped and
+    /// does not use up one of the `max_revisions` slots. Only the newest
+    /// revision returned carries its patches' diffs: a fix for its findings
+    /// was made against that code, and the same list goes to every patch's
+    /// review, so older diffs would be weight that no summary shows.
+    pub async fn get_prior_revision_findings(
+        &self,
+        patchset_id: i64,
+        max_revisions: usize,
+    ) -> Result<Vec<crate::prior_revisions::PriorRevision>> {
+        let lineage = self.earlier_pr_revisions(patchset_id).await?;
+        if lineage.is_empty() {
+            return Ok(Vec::new());
+        }
+        let current_base = self
+            .pr_revision_row(patchset_id)
+            .await?
+            .and_then(|row| row.range())
+            .map(|(base, _)| base);
+        let current = self.patch_ids_by_index(patchset_id).await?;
+        let mut revisions = Vec::new();
+        for earlier in lineage {
+            if revisions.len() >= max_revisions {
+                break;
+            }
+            let with_diff = revisions.is_empty();
+            let patches = self
+                .prior_revision_patches(earlier.id, &current, with_diff)
+                .await?;
+            if !patches.is_empty() {
+                revisions.push(earlier.into_prior_revision(current_base.as_ref(), patches));
+            }
+        }
+        Ok(revisions)
+    }
+
+    /// The patchsets with `patchset_id`'s pull request URL and a lower id,
+    /// newest first. Empty when the patchset has no URL, since NULL equals
+    /// nothing in SQL.
+    async fn earlier_pr_revisions(&self, patchset_id: i64) -> Result<Vec<PrRevisionRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM patchsets
+                     WHERE mr_url = (SELECT mr_url FROM patchsets WHERE id = ?) AND id < ?
+                     ORDER BY id DESC",
+                    PrRevisionRow::COLUMNS
+                ),
+                libsql::params![patchset_id, patchset_id],
+            )
+            .await?;
+        let mut lineage = Vec::new();
+        while let Some(row) = rows.next().await? {
+            lineage.push(PrRevisionRow::from_row(&row)?);
+        }
+        Ok(lineage)
+    }
+
+    /// The row of patchset `patchset_id`, `None` when there is none.
+    async fn pr_revision_row(&self, patchset_id: i64) -> Result<Option<PrRevisionRow>> {
+        let mut rows = self
+            .conn
+            .query(
+                &format!(
+                    "SELECT {} FROM patchsets WHERE id = ?",
+                    PrRevisionRow::COLUMNS
+                ),
+                libsql::params![patchset_id],
+            )
+            .await?;
+        rows.next()
+            .await?
+            .map(|row| PrRevisionRow::from_row(&row))
+            .transpose()
+    }
+
+    /// Each patch of `patchset_id` as its part index and its git patch-id,
+    /// which is `None` for a patch stored without one.
+    async fn patch_ids_by_index(&self, patchset_id: i64) -> Result<Vec<(i64, Option<String>)>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT part_index, git_patch_id FROM patches
+                 WHERE patchset_id = ? ORDER BY part_index",
+                libsql::params![patchset_id],
+            )
+            .await?;
+        let mut patches = Vec::new();
+        while let Some(row) = rows.next().await? {
+            patches.push((
+                get_optional_integer(&row, 0)?.unwrap_or(0),
+                get_optional_text(&row, 1)?,
+            ));
+        }
+        Ok(patches)
+    }
+
+    /// The patches of an earlier revision that have findings to list, in
+    /// part order, each with its findings from every review of the patch
+    /// (reruns, and failed or cancelled runs that stored some), newest
+    /// review first. A preexisting finding is left out: verification turns
+    /// one into a concern, so no later finding could be linked to it. Of
+    /// findings whose `problem` differs only in case, whitespace and
+    /// invisible characters, the newest review's is kept. `current` is the
+    /// patch-id of each patch under review, by index.
+    async fn prior_revision_patches(
+        &self,
+        revision_id: i64,
+        current: &[(i64, Option<String>)],
+        with_diff: bool,
+    ) -> Result<Vec<crate::prior_revisions::PriorPatch>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT p.id, p.part_index, m.subject, p.message_id, p.git_patch_id,
+                        f.severity, f.problem, f.severity_explanation, f.locations
+                 FROM patches p
+                 JOIN reviews r ON r.patch_id = p.id
+                 JOIN findings f ON f.review_id = r.id
+                 LEFT JOIN messages m ON m.message_id = p.message_id
+                 WHERE p.patchset_id = ? AND COALESCE(f.preexisting, 0) != 1
+                 ORDER BY p.part_index, p.id, r.id DESC, f.id",
+                libsql::params![revision_id],
+            )
+            .await?;
+        let mut patches: Vec<(i64, crate::prior_revisions::PriorPatch)> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(row) = rows.next().await? {
+            let patch_row: i64 = row.get(0)?;
+            if patches.last().map(|(id, _)| *id) != Some(patch_row) {
+                patches.push((patch_row, prior_patch_of_row(&row, current)?));
+            }
+            let Some((key, finding)) = prior_finding_of_row(&row)? else {
+                continue;
+            };
+            if let Some((_, patch)) = patches.last_mut()
+                && seen.insert((patch_row, key))
+            {
+                patch.findings.push(finding);
+            }
+        }
+        patches.retain(|(_, patch)| !patch.findings.is_empty());
+        if with_diff {
+            for (patch_row, patch) in &mut patches {
+                patch.diff = Some(self.stored_patch_diff(*patch_row).await?);
+            }
+        }
+        Ok(patches.into_iter().map(|(_, patch)| patch).collect())
+    }
+
+    /// The diff stored for the patch row `patch_id`, decompressed.
+    async fn stored_patch_diff(&self, patch_id: i64) -> Result<String> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT diff FROM patches WHERE id = ?",
+                libsql::params![patch_id],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(crate::compression::get_compressed_string(&row, 0)?),
+            None => Ok(String::new()),
+        }
     }
 
     pub async fn get_latest_review_for_patchset(
@@ -23320,6 +23601,498 @@ mod tests {
             resolve(&db, "frob-941-bbbbbbb").await,
             RevisionLookup::NoHeadMatches
         );
+    }
+
+    /// Queues the revision of PR 27 of acme/`repo` whose head is `head`
+    /// repeated, gives it the subject ingestion would have given it, and
+    /// returns its patchset.
+    async fn pr27_revision(db: &Database, repo: &str, head: char, subject: &str) -> i64 {
+        let id = queue_revision(db, repo, 27, 'a', &head.to_string().repeat(40)).await;
+        db.conn
+            .execute(
+                "UPDATE patchsets SET subject = ? WHERE id = ?",
+                libsql::params![subject, id],
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Stores patch `index` of patchset `ps_id` under `message_id`, with
+    /// the git patch-id `patch_id`, and returns its row.
+    async fn revision_patch(
+        db: &Database,
+        ps_id: i64,
+        index: u32,
+        message_id: &str,
+        patch_id: Option<&str>,
+    ) -> i64 {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT thread_id FROM patchsets WHERE id = ?",
+                libsql::params![ps_id],
+            )
+            .await
+            .unwrap();
+        let thread_id: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        db.create_message(
+            message_id,
+            thread_id,
+            None,
+            "A <a@example.com>",
+            &format!("frob: part {index}\n of patchset {ps_id}"),
+            1000,
+            "body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.create_patch_with_git_patch_id(
+            ps_id,
+            message_id,
+            index,
+            &format!("+part {index} of patchset {ps_id}\n"),
+            patch_id,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Stores a review of `patch` that ended `status`, with one finding per
+    /// `(problem, preexisting)`.
+    async fn review_with_findings(
+        db: &Database,
+        ps_id: i64,
+        patch: i64,
+        status: &str,
+        findings: &[(&str, Option<bool>)],
+    ) {
+        let review_id = db
+            .create_review(ps_id, Some(patch), "mock", "mock", None, None, None)
+            .await
+            .unwrap();
+        db.complete_review(review_id, status, "done", None, None, None, None)
+            .await
+            .unwrap();
+        for (problem, preexisting) in findings {
+            db.create_finding(Finding {
+                review_id,
+                severity: Severity::High,
+                severity_explanation: Some(format!(
+                    "Consequence: {} corrupts the ring.\nTriggering path: a refill fails.",
+                    problem.trim()
+                )),
+                problem: problem.to_string(),
+                preexisting: *preexisting,
+                locations: Some(serde_json::json!([{
+                    "file": "drivers/frob/ring.c",
+                    "function_or_symbol": "frob_fill",
+                    "line": 42
+                }])),
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    /// A patch of `ps_id` with one review that stored these new findings.
+    async fn patch_with_findings(db: &Database, ps_id: i64, message_id: &str, problems: &[&str]) {
+        let patch = revision_patch(db, ps_id, 1, message_id, None).await;
+        let findings: Vec<_> = problems.iter().map(|p| (*p, Some(false))).collect();
+        review_with_findings(db, ps_id, patch, "Reviewed", &findings).await;
+    }
+
+    /// Each revision's label with the titles of its findings, in order.
+    fn listed(revisions: &[crate::prior_revisions::PriorRevision]) -> Vec<(String, Vec<String>)> {
+        revisions
+            .iter()
+            .map(|revision| {
+                let titles = revision
+                    .patches
+                    .iter()
+                    .flat_map(|patch| &patch.findings)
+                    .map(|finding| finding.problem.clone())
+                    .collect();
+                (revision.label.clone(), titles)
+            })
+            .collect()
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// The lineage is the pull request's URL: another pull request of the
+    /// same repository, the same number in another repository and a later
+    /// revision are not history of this one, and a mailing-list series has
+    /// none.
+    #[tokio::test]
+    async fn prior_revision_findings_follow_the_pull_request() {
+        let db = memory_db().await;
+        let v1 = pr27_revision(&db, "frob", 'b', "#27: Fix the frobnicator").await;
+        patch_with_findings(&db, v1, "v1-1@x", &["refill leaks a page"]).await;
+        let other = queue_revision(&db, "frob", 28, 'a', &"e".repeat(40)).await;
+        patch_with_findings(&db, other, "o-1@x", &["another pull request"]).await;
+        let elsewhere = pr27_revision(&db, "widget", 'f', "#27: Fix the widget").await;
+        patch_with_findings(&db, elsewhere, "w-1@x", &["another repository"]).await;
+        let v2 = pr27_revision(&db, "frob", 'c', "#27 [v2]: Fix the frobnicator").await;
+        patch_with_findings(&db, v2, "v2-1@x", &["drain races the refill"]).await;
+        let current = pr27_revision(&db, "frob", 'd', "#27 [v3]: Fix the frobnicator").await;
+        let later = pr27_revision(&db, "frob", '1', "#27 [v4]: Fix the frobnicator").await;
+        patch_with_findings(&db, later, "v4-1@x", &["from a later revision"]).await;
+
+        let revisions = db.get_prior_revision_findings(current, 5).await.unwrap();
+        assert_eq!(
+            listed(&revisions),
+            [
+                ("v2".to_string(), strings(&["drain races the refill"])),
+                ("v1".to_string(), strings(&["refill leaks a page"])),
+            ],
+            "earlier revisions of this pull request only, newest first"
+        );
+        let patch = &revisions[0].patches[0];
+        assert_eq!(patch.index, 1);
+        assert_eq!(
+            patch.subject,
+            format!("frob: part 1  of patchset {v2}"),
+            "one line"
+        );
+        assert_eq!(
+            patch.findings[0],
+            crate::prior_revisions::PriorFinding {
+                severity: Severity::High,
+                problem: "drain races the refill".to_string(),
+                consequence: Some("drain races the refill corrupts the ring.".to_string()),
+                locations: vec![crate::finding_view::FindingLocation {
+                    file: Some("drivers/frob/ring.c".to_string()),
+                    function_or_symbol: Some("frob_fill".to_string()),
+                    line: Some(42),
+                }],
+            }
+        );
+        assert_eq!(
+            patch.diff.as_deref(),
+            Some(format!("+part 1 of patchset {v2}\n").as_str()),
+            "the newest revision returned carries its diff"
+        );
+        assert_eq!(revisions[1].patches[0].diff, None, "an older one does not");
+
+        let newest = db.get_prior_revision_findings(current, 1).await.unwrap();
+        assert_eq!(listed(&newest), listed(&revisions[..1]));
+
+        let (mail, _) = patchset_with_patches(&db, "prior_mail", 1).await;
+        assert!(
+            db.get_prior_revision_findings(mail, 5)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a series without a pull request URL has no lineage"
+        );
+    }
+
+    /// A revision whose reviews stored nothing, failed without findings or
+    /// never ran does not take the slot of an older revision that has
+    /// findings, and that older revision carries the diff.
+    #[tokio::test]
+    async fn prior_revision_findings_skip_revisions_with_nothing_to_say() {
+        let db = memory_db().await;
+        let v1 = pr27_revision(&db, "frob", 'b', "#27: Fix").await;
+        patch_with_findings(&db, v1, "v1-1@x", &["constants duplicated"]).await;
+        let v2 = pr27_revision(&db, "frob", 'c', "#27 [v2]: Fix").await;
+        let failed = revision_patch(&db, v2, 1, "v2-1@x", None).await;
+        review_with_findings(&db, v2, failed, "Failed", &[]).await;
+        let v3 = pr27_revision(&db, "frob", 'd', "#27 [v3]: Fix").await;
+        patch_with_findings(&db, v3, "v3-1@x", &[]).await;
+        let v4 = pr27_revision(&db, "frob", 'e', "#27 [v4]: Fix").await;
+        revision_patch(&db, v4, 1, "v4-1@x", None).await;
+        let current = pr27_revision(&db, "frob", 'f', "#27 [v5]: Fix").await;
+
+        let revisions = db.get_prior_revision_findings(current, 1).await.unwrap();
+        assert_eq!(
+            listed(&revisions),
+            [("v1".to_string(), strings(&["constants duplicated"]))]
+        );
+        assert!(revisions[0].patches[0].diff.is_some());
+    }
+
+    /// Every review of a patch counts, reruns and failed or cancelled runs
+    /// that stored findings included, newest review first, and a finding
+    /// two runs stored is listed once, in the newest run's wording.
+    #[tokio::test]
+    async fn prior_revision_findings_union_every_pass_of_a_patch() {
+        let db = memory_db().await;
+        let v1 = pr27_revision(&db, "frob", 'b', "#27: Fix").await;
+        let patch = revision_patch(&db, v1, 1, "v1-1@x", None).await;
+        let new = |problem| (problem, Some(false));
+        review_with_findings(
+            &db,
+            v1,
+            patch,
+            "Failed",
+            &[new("salvaged race"), new("leak")],
+        )
+        .await;
+        review_with_findings(&db, v1, patch, "Reviewed", &[new("Leak ")]).await;
+        review_with_findings(&db, v1, patch, "Reviewed", &[]).await;
+        review_with_findings(&db, v1, patch, "Cancelled", &[new("stored before cancel")]).await;
+        let current = pr27_revision(&db, "frob", 'c', "#27 [v2]: Fix").await;
+
+        let revisions = db.get_prior_revision_findings(current, 5).await.unwrap();
+        assert_eq!(
+            listed(&revisions),
+            [(
+                "v1".to_string(),
+                strings(&["stored before cancel", "Leak", "salvaged race"])
+            )]
+        );
+    }
+
+    /// A preexisting finding is never listed, since verification turns one
+    /// into a concern and so could never link to it; a finding that does
+    /// not say is listed. A revision with only preexisting findings has
+    /// nothing to say.
+    #[tokio::test]
+    async fn prior_revision_findings_leave_out_preexisting_findings() {
+        let db = memory_db().await;
+        let v1 = pr27_revision(&db, "frob", 'b', "#27: Fix").await;
+        let patch = revision_patch(&db, v1, 1, "v1-1@x", None).await;
+        review_with_findings(
+            &db,
+            v1,
+            patch,
+            "Reviewed",
+            &[
+                ("introduced here", Some(false)),
+                ("there before", Some(true)),
+                ("not marked", None),
+            ],
+        )
+        .await;
+        let v2 = pr27_revision(&db, "frob", 'c', "#27 [v2]: Fix").await;
+        let patch = revision_patch(&db, v2, 1, "v2-1@x", None).await;
+        review_with_findings(&db, v2, patch, "Reviewed", &[("old code", Some(true))]).await;
+        let current = pr27_revision(&db, "frob", 'd', "#27 [v3]: Fix").await;
+
+        let revisions = db.get_prior_revision_findings(current, 5).await.unwrap();
+        assert_eq!(
+            listed(&revisions),
+            [(
+                "v1".to_string(),
+                strings(&["introduced here", "not marked"])
+            )]
+        );
+    }
+
+    /// A revision is named by the version its subject carries, on GitHub
+    /// and GitLab alike, and by its patchset id when its subject has no
+    /// pull request prefix, as a placeholder whose fetch failed has not.
+    #[tokio::test]
+    async fn prior_revision_findings_label_revisions_by_version() {
+        let db = memory_db().await;
+        let v1 = pr27_revision(&db, "frob", 'b', "#27: Fix").await;
+        patch_with_findings(&db, v1, "v1-1@x", &["one"]).await;
+        let v4 = pr27_revision(&db, "frob", 'c', "!27 [v4]: Fix").await;
+        patch_with_findings(&db, v4, "v4-1@x", &["four"]).await;
+        let unnamed = pr27_revision(&db, "frob", 'd', "Fetching PR").await;
+        patch_with_findings(&db, unnamed, "u-1@x", &["unnamed"]).await;
+        let current = pr27_revision(&db, "frob", 'e', "#27 [v5]: Fix").await;
+
+        let labels: Vec<String> =
+            listed(&db.get_prior_revision_findings(current, 5).await.unwrap())
+                .into_iter()
+                .map(|(label, _)| label)
+                .collect();
+        assert_eq!(
+            labels,
+            [format!("patchset {unnamed}"), "v4".into(), "v1".into()]
+        );
+    }
+
+    /// What the review of v2 is shown when v1's patches 1 and 2 have the
+    /// git patch-ids `earlier` and one finding each, and v2's patches 1 and
+    /// 2 have the patch-ids `current`.
+    async fn revisions_with_patch_ids(
+        db: &Database,
+        earlier: [Option<&str>; 2],
+        current: [Option<&str>; 2],
+    ) -> Vec<crate::prior_revisions::PriorRevision> {
+        let v1 = pr27_revision(db, "frob", 'b', "#27: Fix").await;
+        for (index, patch_id) in (1..).zip(earlier) {
+            let message_id = format!("v1-{index}@x");
+            let patch = revision_patch(db, v1, index, &message_id, patch_id).await;
+            review_with_findings(db, v1, patch, "Reviewed", &[("leak", Some(false))]).await;
+        }
+        let v2 = pr27_revision(db, "frob", 'c', "#27 [v2]: Fix").await;
+        for (index, patch_id) in (1..).zip(current) {
+            revision_patch(db, v2, index, &format!("v2-{index}@x"), patch_id).await;
+        }
+        db.get_prior_revision_findings(v2, 5).await.unwrap()
+    }
+
+    fn same_changes(revisions: &[crate::prior_revisions::PriorRevision]) -> Vec<Option<i64>> {
+        revisions[0]
+            .patches
+            .iter()
+            .map(|patch| patch.same_change_as)
+            .collect()
+    }
+
+    /// An earlier patch with the git patch-id of a patch under review is
+    /// marked as that patch's change, whatever its position.
+    #[tokio::test]
+    async fn prior_revision_findings_mark_the_same_change_by_patch_id() {
+        let db = memory_db().await;
+        let revisions = revisions_with_patch_ids(
+            &db,
+            [Some("pid-b"), Some("pid-z")],
+            [Some("pid-a"), Some("pid-b")],
+        )
+        .await;
+        assert_eq!(same_changes(&revisions), [Some(2), None]);
+    }
+
+    /// Two missing patch-ids, as on rows stored before patch-ids were
+    /// recorded, are not the same change, and neither is one missing id.
+    #[tokio::test]
+    async fn prior_revision_findings_never_match_two_missing_patch_ids() {
+        let db = memory_db().await;
+        let revisions = revisions_with_patch_ids(&db, [None, Some("pid-b")], [None, None]).await;
+        assert_eq!(same_changes(&revisions), [None, None]);
+    }
+
+    /// A git-fetched patch's message id is its commit, which the patch
+    /// carries; any other message id names no commit.
+    #[tokio::test]
+    async fn prior_revision_findings_carry_each_patch_commit() {
+        let db = memory_db().await;
+        let v1 = pr27_revision(&db, "frob", 'b', "#27: Fix").await;
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        for (index, message_id) in [(1, sha), (2, "patch-2@example.com")] {
+            let patch = revision_patch(&db, v1, index, message_id, None).await;
+            review_with_findings(&db, v1, patch, "Reviewed", &[("leak", Some(false))]).await;
+        }
+        let current = pr27_revision(&db, "frob", 'c', "#27 [v2]: Fix").await;
+
+        let revisions = db.get_prior_revision_findings(current, 5).await.unwrap();
+        let commits: Vec<_> = revisions[0]
+            .patches
+            .iter()
+            .map(|patch| patch.commit.as_ref().map(|commit| commit.as_str()))
+            .collect();
+        assert_eq!(commits, [Some(sha), None]);
+    }
+
+    /// Only a finding stored twice for one patch, up to case and
+    /// surrounding space, is dropped: a reworded finding stays, and so does
+    /// the same finding on another patch.
+    #[tokio::test]
+    async fn prior_revision_findings_drop_only_literal_duplicates() {
+        let db = memory_db().await;
+        let v1 = pr27_revision(&db, "frob", 'b', "#27: Fix").await;
+        let first = revision_patch(&db, v1, 1, "v1-1@x", None).await;
+        let second = revision_patch(&db, v1, 2, "v1-2@x", None).await;
+        let new = |problem| (problem, Some(false));
+        review_with_findings(&db, v1, first, "Reviewed", &[new("Leak in fill")]).await;
+        review_with_findings(
+            &db,
+            v1,
+            first,
+            "Reviewed",
+            &[new("  leak IN FILL \n"), new("leak in the fill path")],
+        )
+        .await;
+        review_with_findings(&db, v1, second, "Reviewed", &[new("Leak in fill")]).await;
+        let current = pr27_revision(&db, "frob", 'c', "#27 [v2]: Fix").await;
+
+        let revisions = db.get_prior_revision_findings(current, 5).await.unwrap();
+        let per_patch: Vec<Vec<String>> = revisions[0]
+            .patches
+            .iter()
+            .map(|patch| patch.findings.iter().map(|f| f.problem.clone()).collect())
+            .collect();
+        assert_eq!(
+            per_patch,
+            [
+                strings(&["leak IN FILL", "leak in the fill path"]),
+                strings(&["Leak in fill"]),
+            ]
+        );
+    }
+
+    /// Each earlier revision carries the head its placeholder id names; a
+    /// row whose id is not a full placeholder carries none.
+    #[tokio::test]
+    async fn prior_revision_findings_carry_each_revision_head() {
+        let db = memory_db().await;
+        let v1 = pr27_revision(&db, "frob", 'b', "#27: Fix").await;
+        patch_with_findings(&db, v1, "v1-1@x", &["one"]).await;
+        let headless = db
+            .create_fetching_patchset(
+                &format!("mr-27-{}..{}", "a".repeat(40), "c".repeat(40)),
+                "#27 [v2]: Fix",
+                None,
+                None,
+                Some("https://github.com/acme/frob/pull/27"),
+                None,
+                Some(27),
+                Some("frob-27"),
+            )
+            .await
+            .unwrap();
+        patch_with_findings(&db, headless, "v2-1@x", &["two"]).await;
+        let current = pr27_revision(&db, "frob", 'd', "#27 [v3]: Fix").await;
+
+        let revisions = db.get_prior_revision_findings(current, 5).await.unwrap();
+        let heads: Vec<_> = revisions
+            .iter()
+            .map(|revision| revision.head.as_ref().map(|head| head.as_str().to_string()))
+            .collect();
+        assert_eq!(heads, [None, Some("b".repeat(40))]);
+    }
+
+    /// Each earlier revision says whether it has the base of the revision
+    /// under review, both read from their placeholder ids; it cannot say
+    /// when either base is unknown.
+    #[tokio::test]
+    async fn prior_revision_findings_compare_each_base_with_the_current_one() {
+        let db = memory_db().await;
+        let same = queue_revision(&db, "frob", 27, 'a', &"b".repeat(40)).await;
+        patch_with_findings(&db, same, "v1-1@x", &["one"]).await;
+        let moved = queue_revision(&db, "frob", 27, 'f', &"c".repeat(40)).await;
+        patch_with_findings(&db, moved, "v2-1@x", &["two"]).await;
+        let current = queue_revision(&db, "frob", 27, 'a', &"d".repeat(40)).await;
+
+        let same_bases = |revisions: Vec<crate::prior_revisions::PriorRevision>| {
+            revisions
+                .iter()
+                .map(|revision| revision.same_base)
+                .collect::<Vec<_>>()
+        };
+        let revisions = db.get_prior_revision_findings(current, 5).await.unwrap();
+        assert_eq!(same_bases(revisions), [Some(false), Some(true)]);
+
+        let unknown_base = db
+            .create_fetching_patchset(
+                "mr-27-legacy-placeholder",
+                "#27 [v4]: Fix",
+                None,
+                None,
+                Some("https://github.com/acme/frob/pull/27"),
+                None,
+                Some(27),
+                Some("frob-27"),
+            )
+            .await
+            .unwrap();
+        let revisions = db
+            .get_prior_revision_findings(unknown_base, 5)
+            .await
+            .unwrap();
+        assert_eq!(same_bases(revisions), [None, None]);
     }
 
     #[tokio::test]

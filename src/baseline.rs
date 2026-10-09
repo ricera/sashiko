@@ -66,8 +66,10 @@ pub struct MaintainersEntry {
 ///
 /// Every producer of a baseline commit emits that form, so parsing keeps a
 /// value that came over the wire from reaching git as an option, a refspec or
-/// a log line full of control characters.
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
+/// a log line full of control characters. A value read from JSON is parsed
+/// the same way, so a payload cannot carry anything else under this type.
+#[derive(Debug, PartialEq, Eq, Clone, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct CommitId(String);
 
 impl CommitId {
@@ -85,6 +87,20 @@ impl CommitId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl TryFrom<String> for CommitId {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        Self::parse(&value).ok_or_else(|| "not a commit id of 40 lowercase hex digits".to_string())
+    }
+}
+
+impl From<CommitId> for String {
+    fn from(commit: CommitId) -> Self {
+        commit.0
     }
 }
 
@@ -782,6 +798,30 @@ mod tests {
         assert!(CommitId::parse("--upload-pack=sh").is_none());
         assert!(CommitId::parse("refs/heads/main:refs/heads/main").is_none());
         assert!(CommitId::parse("dead\u{1b}[2K\nApplied: beef").is_none());
+    }
+
+    /// A commit id travels in JSON as its string, and reading one back
+    /// applies the same rule as parse, so a payload cannot smuggle anything
+    /// else in under the type.
+    #[test]
+    fn commit_id_reads_back_from_json_only_in_its_own_form() {
+        let sha1 = "1234567890abcdef1234567890abcdef12345678";
+        let commit = CommitId::parse(sha1).unwrap();
+        let json = serde_json::to_value(&commit).unwrap();
+        assert_eq!(json, serde_json::json!(sha1));
+        assert_eq!(serde_json::from_value::<CommitId>(json).unwrap(), commit);
+
+        for rejected in [
+            serde_json::json!(sha1.to_uppercase()),
+            serde_json::json!(&sha1[..12]),
+            serde_json::json!("--upload-pack=sh"),
+            serde_json::json!(42),
+        ] {
+            assert!(
+                serde_json::from_value::<CommitId>(rejected.clone()).is_err(),
+                "{rejected}"
+            );
+        }
     }
 
     #[test]

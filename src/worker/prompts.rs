@@ -50,6 +50,7 @@ impl ClassifyAiError for ReviewError {
 
 use crate::activity::StageFailureRecord;
 use crate::cover_letter::CoverLetter;
+use crate::prior_revisions::PriorRevision;
 use crate::project::ProjectId;
 use crate::workflow::{StageFailure, StageStopCause, WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use crate::workflows::linux_patch_review::{
@@ -89,6 +90,11 @@ pub struct ReviewInput {
     /// one. A local review of git commits has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cover_letter: Option<CoverLetter>,
+    /// The findings of the earlier revisions of the series' pull request,
+    /// newest revision first, sent by the daemon only when one has some. A
+    /// local review of git commits has none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_revisions: Vec<PriorRevision>,
 }
 
 /// Reads the cover letter a review payload carries. A missing or null key

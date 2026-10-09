@@ -52,6 +52,7 @@ pub mod patch;
 pub mod patchwork;
 #[cfg(feature = "server")]
 pub mod prerequisites;
+pub mod prior_revisions;
 pub mod project;
 pub mod prompt_bundle;
 pub mod references;

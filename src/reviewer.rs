@@ -27,6 +27,7 @@ use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
 use crate::prerequisites::{
     PrerequisitePatch, parse_prerequisite_patch_ids, resolve_prerequisite_patches_from_lore,
 };
+use crate::prior_revisions::{MAX_PRIOR_REVISIONS, PriorRevision};
 use crate::settings::Settings;
 use crate::utils::redact_secret;
 use crate::worker::prompts::ReviewError;
@@ -235,9 +236,27 @@ async fn cover_letter_of(db: &Database, patchset_id: i64) -> Option<CoverLetter>
     }
 }
 
+/// The findings of the earlier revisions of the patchset's pull request,
+/// read once for the whole patchset. A patchset that is not a pull request
+/// revision has none. A failed read is logged and the review runs without
+/// them, since no stage needs them to judge the current code.
+async fn prior_revisions_of(db: &Database, patchset_id: i64) -> Vec<PriorRevision> {
+    db.get_prior_revision_findings(patchset_id, MAX_PRIOR_REVISIONS)
+        .await
+        .unwrap_or_else(|e| {
+            warn!(
+                "Reviewing patchset {} without its earlier revisions' findings: {}",
+                patchset_id, e
+            );
+            Vec::new()
+        })
+}
+
 /// The review input the worker reads from its stdin for `patchset`, whose
 /// patches are `patches`. The `cover_letter` key is present only when the
-/// series has a cover letter ([`cover_letter_of`]).
+/// series has a cover letter ([`cover_letter_of`]), and the
+/// `prior_revisions` key only when an earlier revision of its pull request
+/// has findings ([`prior_revisions_of`]).
 async fn worker_input_payload(db: &Database, patchset: &PatchsetRow, patches: Vec<Value>) -> Value {
     let message_id = patchset
         .message_id
@@ -255,6 +274,10 @@ async fn worker_input_payload(db: &Database, patchset: &PatchsetRow, patches: Ve
         payload.as_object_mut(),
     ) {
         fields.insert("cover_letter".into(), json!(cover_letter));
+    }
+    let prior_revisions = prior_revisions_of(db, patchset.id).await;
+    if let (false, Some(fields)) = (prior_revisions.is_empty(), payload.as_object_mut()) {
+        fields.insert("prior_revisions".into(), json!(prior_revisions));
     }
     payload
 }
@@ -10869,6 +10892,69 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 text: "Makes the frobnicator reentrant.".to_string(),
             })
         );
+        Ok(())
+    }
+
+    /// The findings of a pull request's earlier revisions reach the worker:
+    /// the payload the review builds for a later revision carries what the
+    /// database lists for it, and the worker's input reads the same list
+    /// back. A first revision gets a payload with no key, which reads as
+    /// an empty list.
+    #[tokio::test]
+    async fn prior_revisions_survive_the_trip_to_the_worker() -> Result<()> {
+        let db = cover_letter_db().await?;
+        let v1 = queue_frob_revision(&db, &"b".repeat(40)).await?;
+        let thread_id = count(&db, "SELECT thread_id FROM patchsets WHERE id = ?", v1).await?;
+        let commit = "0123456789abcdef0123456789abcdef01234567";
+        db.create_message(
+            commit,
+            thread_id,
+            None,
+            "Author <a@example.com>",
+            "frob: refill the ring",
+            1000,
+            "",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let patch = db.create_patch(v1, commit, 1, WorkerFixture::DIFF).await?;
+        let review = db
+            .create_review(v1, Some(patch), "mock", "mock", None, None, None)
+            .await?;
+        db.create_finding(Finding {
+            review_id: review,
+            severity: Severity::Medium,
+            severity_explanation: Some("Consequence: a page leaks per failed refill.".into()),
+            problem: "refill leaks a page".into(),
+            preexisting: Some(false),
+            locations: Some(json!([{"file": "ring.c", "line": 7}])),
+        })
+        .await?;
+        let patches = vec![json!({"index": 1, "diff": WorkerFixture::DIFF})];
+
+        let payload =
+            worker_input_payload(&db, &pending_row(&db, v1).await?, patches.clone()).await;
+        assert!(payload.get("prior_revisions").is_none(), "{payload}");
+        let input: crate::worker::ReviewInput = serde_json::from_value(payload)?;
+        assert!(input.prior_revisions.is_empty());
+
+        let v2 = queue_frob_revision(&db, &"c".repeat(40)).await?;
+        let listed = db
+            .get_prior_revision_findings(v2, MAX_PRIOR_REVISIONS)
+            .await?;
+        assert_eq!(listed.len(), 1, "v1 has a finding to list");
+        let payload = worker_input_payload(&db, &pending_row(&db, v2).await?, patches).await;
+        assert_eq!(payload["prior_revisions"][0]["label"], "v1");
+        assert_eq!(payload["prior_revisions"][0]["head"], "b".repeat(40));
+        assert_eq!(
+            payload["prior_revisions"][0]["patches"][0]["commit"],
+            commit
+        );
+        let input: crate::worker::ReviewInput = serde_json::from_value(payload)?;
+        assert_eq!(input.prior_revisions, listed);
         Ok(())
     }
 

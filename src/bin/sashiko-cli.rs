@@ -2942,8 +2942,10 @@ async fn handle_local(
                 .and_then(|p| p.subject.clone())
                 .unwrap_or_else(|| input.clone()),
             patches,
-            // Commits read from git carry no cover letter.
+            // Commits read from git carry no cover letter and no earlier
+            // revisions.
             cover_letter: None,
+            prior_revisions: Vec::new(),
         };
 
         let review_json =
