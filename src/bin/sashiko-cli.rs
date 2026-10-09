@@ -19,7 +19,8 @@ use reqwest::Client;
 use sashiko::activity::{Phase, StageTiming, format_duration};
 use sashiko::api::{
     ActivityEntry, ActivityResponse, PatchToolCalls, PatchsetActivityResponse, PatchsetsResponse,
-    ReviewAttempt, SubmitRequest, SubmitResponse, ToolCallCounts, review_runs,
+    PrReviewMode, PrReviewOutcome, PrReviewRequest, PrReviewResponse, ReviewAttempt, SubmitRequest,
+    SubmitResponse, ToolCallCounts, review_runs,
 };
 use sashiko::auth::LocalToken;
 use sashiko::finding_view::{self, FindingLine};
@@ -103,14 +104,19 @@ struct ShowOptions {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Submit a patch or range for review
+    /// Submit a patch, a range or a pull request for review
     Submit {
-        /// Revision range, commit SHA, or path to mbox file.
-        /// Defaults to "HEAD" if in a git repo, or reads from stdin if piped.
+        /// Revision range, commit SHA, path to mbox file, or a pull request
+        /// of the daemon's GitHub repository (pr-N, pr/N, prN, pr#N, '#N' or
+        /// its URL). Quote '#N': the shell drops an unquoted #N as a
+        /// comment, and submit then reviews HEAD. A bare N is a git
+        /// revision, not a pull request. Defaults to "HEAD" if in a git
+        /// repo, or reads from stdin if piped.
         #[arg(value_name = "INPUT")]
         input: Option<String>,
 
-        /// Explicitly set type (overrides auto-detection)
+        /// Explicitly set type (overrides auto-detection, including the
+        /// recognition of a pull request)
         #[arg(long, value_enum)]
         r#type: Option<SubmitType>,
 
@@ -185,10 +191,21 @@ enum Commands {
         #[arg(long, short = 'd')]
         diff: Option<String>,
     },
-    /// Request a re-review of a completed patchset
+    /// Request a re-review of a completed patchset or pull request
     Rerun {
         /// ID of the patchset to re-review
-        id: i64,
+        #[arg(required_unless_present = "pr")]
+        id: Option<i64>,
+
+        /// Review pull request N of the daemon's GitHub repository again:
+        /// its current head is queued, and rerun if it already finished
+        #[arg(
+            long,
+            value_name = "N",
+            conflicts_with = "id",
+            value_parser = clap::value_parser!(i64).range(1..)
+        )]
+        pr: Option<i64>,
     },
     /// Cancel a pending review
     Cancel {
@@ -508,7 +525,13 @@ async fn run_command(
             };
             handle_show(client, base_url, id, watch, format, opts).await
         }
-        Commands::Rerun { id } => handle_rerun(client, base_url, id, format).await,
+        Commands::Rerun { id, pr } => match RerunTarget::from_args(id, pr)? {
+            RerunTarget::Patchset(id) => handle_rerun(client, base_url, id, format).await,
+            RerunTarget::PullRequest(number) => {
+                let request = PrReference::Number(number).into_request(PrReviewMode::RerunHead);
+                handle_pr_review(client, base_url, &request, format).await
+            }
+        },
         Commands::Cancel { id, force } => handle_cancel(client, base_url, id, force, format).await,
         Commands::Local {
             input,
@@ -783,6 +806,17 @@ async fn handle_submit(
     only_subjects: Option<Vec<String>>,
     format: OutputFormat,
 ) -> Result<()> {
+    if let Some(reference) = submitted_pull_request(input.as_deref(), explicit_type) {
+        refuse_series_options(&SeriesOptions {
+            repo: repo.is_some(),
+            baseline: baseline.is_some(),
+            skip_subject: skip_subjects.is_some(),
+            only_subject: only_subjects.is_some(),
+        })?;
+        let request = reference.into_request(PrReviewMode::ReviewHead);
+        return handle_pr_review(client, base_url, &request, format).await;
+    }
+
     let url = format!("{}/api/submit", base_url);
 
     // DWIM Detection Logic
@@ -2489,6 +2523,262 @@ async fn handle_rerun(
     Ok(())
 }
 
+/// What `rerun` was asked to review again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RerunTarget {
+    /// A patchset, by its id.
+    Patchset(i64),
+    /// The current head of a pull request of the daemon's repository.
+    PullRequest(i64),
+}
+
+impl RerunTarget {
+    /// The target `rerun`'s arguments name. clap already refuses both and
+    /// neither; this refuses them again so that no combination of the two
+    /// options is silently read as one of them.
+    fn from_args(id: Option<i64>, pr: Option<i64>) -> Result<Self> {
+        match (id, pr) {
+            (Some(id), None) => Ok(Self::Patchset(id)),
+            (None, Some(number)) => Ok(Self::PullRequest(number)),
+            (Some(_), Some(_)) => anyhow::bail!("give a patchset id or --pr N, not both"),
+            (None, None) => anyhow::bail!("give a patchset id or --pr N"),
+        }
+    }
+}
+
+/// A pull request typed on the command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PrReference {
+    /// `#N`, `pr/N`, `pr#N`, `pr-N` or `prN`: pull request N of the
+    /// repository the daemon reviews.
+    Number(i64),
+    /// A pull request URL. `repo` is the "host/owner/name" it names, gh's
+    /// -R form, which the daemon compares with its own repository, so that a
+    /// URL of another repository, or of the same name on another host, is
+    /// refused rather than read as a number of this one.
+    Url { repo: String, number: i64 },
+}
+
+impl PrReference {
+    /// The request that asks the daemon to review this pull request.
+    fn into_request(self, mode: PrReviewMode) -> PrReviewRequest {
+        let (number, repo) = match self {
+            Self::Number(number) => (number, None),
+            Self::Url { repo, number } => (number, Some(repo)),
+        };
+        PrReviewRequest { number, repo, mode }
+    }
+}
+
+/// The URL path segments that come right before a pull request's number:
+/// GitHub's web and API forms. GitLab's merge_requests is not one, because
+/// the route reviews GitHub pull requests only, and reading a merge request
+/// URL as a pull request number would review a different change.
+const PR_URL_MARKERS: [&str; 2] = ["pull", "pulls"];
+
+/// The other hosts in github.com's own URLs: its API host and its www
+/// alias. A GitHub Enterprise server serves its API under its own host.
+const GITHUB_COM_ALIASES: [&str; 2] = ["api.github.com", "www.github.com"];
+
+/// The short forms of a pull request reference, matched without case. The
+/// longer prefixes come first so that "pr/20" is not read as "pr" followed
+/// by "/20".
+const PR_SHORT_PREFIXES: [&str; 5] = ["#", "pr/", "pr#", "pr-", "pr"];
+
+/// Recognises a pull request typed on the command line.
+///
+/// Accepts `#N`, `pr/N`, `pr#N`, `pr-N` and `prN` without case, and an http
+/// or https URL with a `pull` or `pulls` segment followed by the number. N is
+/// a positive decimal number of ASCII digits. A bare N is not a pull request:
+/// it is a valid git revision, and reading it as a pull request would review
+/// something other than what was asked for.
+fn parse_pr_reference(input: &str) -> Option<PrReference> {
+    let input = input.trim();
+    if has_http_scheme(input) {
+        return parse_pr_url(input);
+    }
+    let lowered = input.to_ascii_lowercase();
+    let digits = PR_SHORT_PREFIXES
+        .iter()
+        .find_map(|prefix| lowered.strip_prefix(prefix))?;
+    pr_number(digits).map(PrReference::Number)
+}
+
+/// Whether `input` starts with "http://" or "https://", in any case.
+fn has_http_scheme(input: &str) -> bool {
+    input.split_once("://").is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    })
+}
+
+/// The positive number `text` spells in ASCII digits alone. A sign, a space
+/// or any other character makes it no number, so "#+20" and "#2 0" are not
+/// pull requests.
+fn pr_number(text: &str) -> Option<i64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse::<i64>().ok().filter(|number| *number > 0)
+}
+
+/// The pull request an http(s) URL names: the first marker segment followed
+/// by a number, the URL's host, and the two segments before the marker as
+/// the repository's owner and name. Taking the last two reads the API form
+/// (".../repos/owner/name/pulls/N") and a forge served under a path prefix
+/// the same as the web form. A URL with fewer than two segments before the
+/// marker names no repository and so no pull request. The query and the
+/// fragment are ignored, and so is anything after the number, such as
+/// "/files".
+fn parse_pr_url(url: &str) -> Option<PrReference> {
+    let (_, rest) = url.split_once("://")?;
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = rest.split_once('/')?;
+    let host = pr_url_host(authority)?;
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let (marker, number) = segments.iter().enumerate().find_map(|(index, segment)| {
+        let is_marker = PR_URL_MARKERS
+            .iter()
+            .any(|marker| segment.eq_ignore_ascii_case(marker));
+        let number = segments.get(index + 1).and_then(|next| pr_number(next));
+        number.filter(|_| is_marker).map(|number| (index, number))
+    })?;
+    let [.., owner, name] = segments.get(..marker)? else {
+        return None;
+    };
+    Some(PrReference::Url {
+        repo: format!("{host}/{owner}/{name}"),
+        number,
+    })
+}
+
+/// The host a pull request URL's authority names, in lower case, with
+/// github.com's API hosts read as github.com. Credentials before an '@' are
+/// dropped so that they are never sent to the daemon. A port is kept, and
+/// the daemon refuses it, because its repository setting cannot name one.
+fn pr_url_host(authority: &str) -> Option<String> {
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    if GITHUB_COM_ALIASES.contains(&host.as_str()) {
+        return Some("github.com".to_string());
+    }
+    Some(host)
+}
+
+/// The pull request `submit` was given, if it should review one instead of
+/// detecting the submission type. An explicit --type wins, so a branch
+/// named like a pull request reference ("pr-20") can still be submitted as
+/// a revision with --type remote.
+fn submitted_pull_request(
+    input: Option<&str>,
+    explicit_type: Option<SubmitType>,
+) -> Option<PrReference> {
+    if explicit_type.is_some() {
+        return None;
+    }
+    input.and_then(parse_pr_reference)
+}
+
+/// Which of submit's series options were given.
+struct SeriesOptions {
+    repo: bool,
+    baseline: bool,
+    skip_subject: bool,
+    only_subject: bool,
+}
+
+/// Refuses submit's series options for a pull request. The daemon fetches a
+/// pull request from its own repository and reviews every commit of it, so
+/// none of them would be applied, and an option silently ignored would
+/// review something other than what was asked for.
+fn refuse_series_options(options: &SeriesOptions) -> Result<()> {
+    let given: Vec<&str> = [
+        (options.repo, "--repo"),
+        (options.baseline, "--baseline"),
+        (options.skip_subject, "--skip-subject"),
+        (options.only_subject, "--only-subject"),
+    ]
+    .into_iter()
+    .filter_map(|(present, name)| present.then_some(name))
+    .collect();
+    if given.is_empty() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{} cannot be used with a pull request: the daemon fetches it from its own \
+         repository and reviews every commit of it",
+        given.join(", ")
+    )
+}
+
+/// The longest line of the daemon's reply printed for a pull request
+/// request. Its messages are well under it; the cap only bounds a reply
+/// that is not one of them.
+const PR_REPLY_MAX_CHARS: usize = 1000;
+
+/// One line of the daemon's reply, safe to print. A reply can carry a
+/// status read from the database or a line of gh's output, so it is printed
+/// as one line with every character that could move the cursor or reorder
+/// the text replaced by a space.
+fn reply_line(text: &str) -> String {
+    finding_view::sanitize_one_line(text, PR_REPLY_MAX_CHARS)
+}
+
+/// The colour an outcome's message is printed in: green when a review was
+/// queued, yellow when nothing new was.
+fn pr_review_color(outcome: PrReviewOutcome) -> Color {
+    match outcome {
+        PrReviewOutcome::Queued | PrReviewOutcome::RerunQueued => Color::Green,
+        PrReviewOutcome::AlreadyInProgress | PrReviewOutcome::AlreadyFinished => Color::Yellow,
+    }
+}
+
+/// Asks the daemon to review a pull request by number and prints what it
+/// did. The daemon resolves the number, since it knows which repository it
+/// reviews and holds the forge credentials, and queues the head the way a
+/// webhook delivery would.
+async fn handle_pr_review(
+    client: &Client,
+    base_url: &str,
+    request: &PrReviewRequest,
+    format: OutputFormat,
+) -> Result<()> {
+    let url = format!("{}/api/pr/review", base_url);
+    let resp = client.post(&url).json(request).send().await?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = reply_line(&resp.text().await.unwrap_or_default());
+        if detail.is_empty() {
+            anyhow::bail!("Could not review PR #{} ({})", request.number, status);
+        }
+        anyhow::bail!(
+            "Could not review PR #{} ({}): {}",
+            request.number,
+            status,
+            detail
+        );
+    }
+
+    let reply: PrReviewResponse = resp.json().await?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&reply)?),
+        OutputFormat::Text => {
+            print_colored(pr_review_color(reply.outcome), &reply_line(&reply.message));
+            println!();
+        }
+    }
+    Ok(())
+}
+
 async fn handle_cancel(
     client: &Client,
     base_url: &str,
@@ -3639,6 +3929,255 @@ mod tests {
             "output": "{\"findings\": [{\"severity\": \"High\", \"preexisting\": true}, {\"severity\": \"Low\", \"preexisting\": false}]}"
         });
         assert!(review_has_new_issues(&r_mixed));
+    }
+
+    #[test]
+    fn pr_references_are_recognised_without_swallowing_git_revisions() {
+        for (input, expected) in [
+            ("#20", PrReference::Number(20)),
+            (" #20 ", PrReference::Number(20)),
+            ("pr/20", PrReference::Number(20)),
+            ("PR20", PrReference::Number(20)),
+            ("pr#20", PrReference::Number(20)),
+            ("Pr-20", PrReference::Number(20)),
+            ("pr20", PrReference::Number(20)),
+        ] {
+            assert_eq!(parse_pr_reference(input), Some(expected), "{input}");
+        }
+
+        // A URL carries the host and repository it names, the owner and name
+        // in the case they were typed, so that the daemon can refuse a
+        // repository of another name or on another host.
+        let url = |repo: &str, number| PrReference::Url {
+            repo: repo.to_string(),
+            number,
+        };
+        for (input, expected) in [
+            (
+                "https://github.com/example-org/driver-a/pull/967",
+                url("github.com/example-org/driver-a", 967),
+            ),
+            (
+                "https://github.com/Example-Org/Driver-A/pull/967/files",
+                url("github.com/Example-Org/Driver-A", 967),
+            ),
+            (
+                "HTTPS://GitHub.com/o/r/PULL/5?diff=split#discussion_r1",
+                url("github.com/o/r", 5),
+            ),
+            (
+                "http://ghe.example.com/o/r/pull/5/",
+                url("ghe.example.com/o/r", 5),
+            ),
+            (
+                "https://api.github.com/repos/o/r/pulls/5",
+                url("github.com/o/r", 5),
+            ),
+            (
+                "https://www.github.com/o/r/pull/5",
+                url("github.com/o/r", 5),
+            ),
+            (
+                "https://ghe.example.com/api/v3/repos/o/r/pulls/5",
+                url("ghe.example.com/o/r", 5),
+            ),
+            // Credentials are not sent on; a port is, for the daemon to refuse.
+            (
+                "https://user:token@github.com/o/r/pull/5",
+                url("github.com/o/r", 5),
+            ),
+            (
+                "https://ghe.example.com:8443/o/r/pull/5",
+                url("ghe.example.com:8443/o/r", 5),
+            ),
+            // A repository named like a marker is read past, as long as no
+            // number follows it.
+            (
+                "https://github.com/pull/pull/pull/3",
+                url("github.com/pull/pull", 3),
+            ),
+        ] {
+            assert_eq!(parse_pr_reference(input), Some(expected), "{input}");
+        }
+
+        // A bare number is a valid git revision. Reading it as a pull request
+        // would review something other than what was asked for, silently.
+        // Ordinary submit inputs fall through to type detection untouched.
+        for input in [
+            "20",
+            "HEAD",
+            "HEAD~3..HEAD",
+            "ffad4278c2ac",
+            "ffad4278c2ac^..11016c795eec",
+            "/tmp/series.mbox",
+            "20260101.abcdef@lore.kernel.org",
+            "-",
+            "#0",
+            "#-1",
+            "#+20",
+            "#abc",
+            "#2 0",
+            "#",
+            "pr",
+            "pr/0",
+            "prefix-20",
+            "#99999999999999999999",
+            "https://github.com/o/r",
+            "https://github.com/o/r/pull/",
+            "https://github.com/o/r/pull/0",
+            "https://github.com/o/r/issues/20",
+            "https://github.com/pull/20",
+            "https://github.com/o/pull/20",
+            "https:///o/r/pull/20",
+            "https://github.com",
+            // The route reviews GitHub pull requests only, so a GitLab merge
+            // request is not read as one: its number would name another change.
+            "https://gitlab.com/group/repo/-/merge_requests/7",
+            "https://gitlab.example.org/example-org/driver-a/merge_requests/7",
+            "ftp://github.com/o/r/pull/20",
+            "git@github.com:o/r.git",
+        ] {
+            assert_eq!(parse_pr_reference(input), None, "{input}");
+        }
+    }
+
+    /// The request a reference becomes is the one the daemon's route
+    /// accepts, which refuses unknown keys.
+    #[test]
+    fn a_pr_reference_becomes_the_route_request() {
+        let by_number = PrReference::Number(20).into_request(PrReviewMode::ReviewHead);
+        assert_eq!(
+            serde_json::to_value(&by_number).unwrap(),
+            json!({"number": 20, "repo": null, "mode": "review_head"})
+        );
+        let by_url = PrReference::Url {
+            repo: "github.com/o/r".to_string(),
+            number: 5,
+        }
+        .into_request(PrReviewMode::RerunHead);
+        let sent = serde_json::to_value(&by_url).unwrap();
+        assert_eq!(
+            sent,
+            json!({"number": 5, "repo": "github.com/o/r", "mode": "rerun_head"})
+        );
+        assert_eq!(
+            serde_json::from_value::<PrReviewRequest>(sent).unwrap(),
+            by_url
+        );
+    }
+
+    #[test]
+    fn submit_reads_a_pull_request_only_without_an_explicit_type() {
+        assert_eq!(
+            submitted_pull_request(Some("#20"), None),
+            Some(PrReference::Number(20))
+        );
+        assert_eq!(
+            submitted_pull_request(Some("pr-20"), Some(SubmitType::Remote)),
+            None
+        );
+        assert_eq!(submitted_pull_request(Some("20"), None), None);
+        assert_eq!(submitted_pull_request(None, None), None);
+    }
+
+    #[test]
+    fn series_options_are_refused_for_a_pull_request() {
+        let none = SeriesOptions {
+            repo: false,
+            baseline: false,
+            skip_subject: false,
+            only_subject: false,
+        };
+        assert!(refuse_series_options(&none).is_ok());
+        let some = SeriesOptions {
+            repo: true,
+            only_subject: true,
+            ..none
+        };
+        let err = refuse_series_options(&some).unwrap_err().to_string();
+        assert!(
+            err.starts_with("--repo, --only-subject cannot be used with a pull request"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rerun_takes_a_patchset_or_a_pull_request() {
+        let rerun = |args: &[&str]| {
+            Cli::try_parse_from(["sashiko-cli", "rerun"].iter().chain(args)).map(|cli| {
+                match cli.command {
+                    Commands::Rerun { id, pr } => RerunTarget::from_args(id, pr).unwrap(),
+                    _ => panic!("not a rerun"),
+                }
+            })
+        };
+        assert_eq!(rerun(&["41"]).unwrap(), RerunTarget::Patchset(41));
+        assert_eq!(
+            rerun(&["--pr", "967"]).unwrap(),
+            RerunTarget::PullRequest(967)
+        );
+        for refused in [
+            &[][..],
+            &["41", "--pr", "967"][..],
+            &["--pr", "0"][..],
+            &["--pr", "-1"][..],
+            &["--pr", "#967"][..],
+        ] {
+            assert!(rerun(refused).is_err(), "{refused:?}");
+        }
+        assert!(RerunTarget::from_args(None, None).is_err());
+        assert!(RerunTarget::from_args(Some(1), Some(2)).is_err());
+    }
+
+    #[test]
+    fn submit_still_takes_a_pull_request_reference_as_input() {
+        let cli = Cli::try_parse_from(["sashiko-cli", "submit", "#967"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Submit { ref input, r#type: None, .. } if input.as_deref() == Some("#967")
+        ));
+    }
+
+    /// The shell drops an unquoted #N as a comment, after which submit
+    /// reviews HEAD with no warning, so the help that offers #N says to
+    /// quote it and leads with a form the shell leaves alone.
+    #[test]
+    fn submit_help_warns_that_an_unquoted_hash_is_a_comment() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("submit")
+            .expect("submit is a subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("Quote '#N'"), "{help}");
+        let first_form = help.find("pr-N").expect("pr-N is offered");
+        let hash_form = help.find("#N").expect("#N is offered");
+        assert!(first_form < hash_form, "{help}");
+    }
+
+    /// A reply line is printed as one line with no character that could move
+    /// the cursor, whatever the daemon sent.
+    #[test]
+    fn a_pr_reply_is_printed_as_one_safe_line() {
+        assert_eq!(
+            reply_line("Queued PR #20 (head 1a2b3c4d) as patchset 41"),
+            "Queued PR #20 (head 1a2b3c4d) as patchset 41"
+        );
+        assert_eq!(
+            reply_line("was \u{1b}[2Jodd\u{202e}status\nsecond line"),
+            "was  [2Jodd status"
+        );
+        assert_eq!(pr_review_color(PrReviewOutcome::Queued), Color::Green);
+        assert_eq!(pr_review_color(PrReviewOutcome::RerunQueued), Color::Green);
+        assert_eq!(
+            pr_review_color(PrReviewOutcome::AlreadyInProgress),
+            Color::Yellow
+        );
+        assert_eq!(
+            pr_review_color(PrReviewOutcome::AlreadyFinished),
+            Color::Yellow
+        );
     }
 
     #[test]
