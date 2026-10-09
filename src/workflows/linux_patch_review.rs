@@ -2076,13 +2076,23 @@ pub(crate) fn with_prior_reviews(
     })
 }
 
-/// How verification uses the earlier findings, in both workflows: they
-/// change nothing about how a concern is judged; a finding that repeats an
-/// earlier one, or that the fix for an earlier one caused, says so in a
-/// `prior` key naming it as the block listed it, and in one sentence at the
-/// end of its Triggering path rather than in its title; and an earlier
-/// finding that no concern raises is not reported.
-pub(crate) const PRIOR_REVIEWS_VERIFICATION_RULES: &str = "PRIOR REVISION RULES: The findings \
+/// Builds the verification rules for the earlier findings, which both
+/// workflows share except for where rule 4 puts a finding's history in its
+/// severity explanation: each workflow names the sections of its own severity
+/// rubric, so `history_at` is the section the history sentence ends and
+/// `keep_first` the sentence that keeps the rubric's first section first.
+/// The rules change nothing about how a concern is judged; a finding or hard
+/// case that repeats an earlier one, or that the fix for an earlier one
+/// caused, says so in a `prior` key naming it as the block listed it, and in
+/// one sentence rather than in its title; and an earlier finding that no
+/// concern raises is not reported.
+///
+/// A macro rather than a function, so that each workflow's rules stay one
+/// `&'static str` built at compile time.
+macro_rules! prior_reviews_verification_rules {
+    (history_at: $history_at:literal, keep_first: $keep_first:literal $(,)?) => {
+        concat!(
+            "PRIOR REVISION RULES: The findings \
 above were reported on earlier revisions of this pull request. Use them as follows.\n\
 1. Judge and classify every concern on the current code, by the rules above. That a concern \
 was reported before makes it neither more nor less likely to be valid: an earlier finding is \
@@ -2100,24 +2110,35 @@ tools; that commit may no longer exist) with the current code; similar wording b
 findings is not enough.\n\
 4. Keep \"problem\" (a hard case's \"description\") the short title the rules above ask for; do \
 not say in it that the issue was reported before. Say it in one sentence: for a finding, in \
-\"severity_explanation\", at the end of its Triggering path; for a hard case, as the last \
+\"severity_explanation\", at the end of its ",
+            $history_at,
+            "; for a hard case, as the last \
 sentence of \"concern_arguments\". For a repeat, say that this path was reported on <revision> \
 and what, if anything, the current revision changed around it; for a fix regression, say which \
-change made for the earlier finding leads to this defect, and how. Keep the Consequence first, \
-as the rules above ask.\n\
+change made for the earlier finding leads to this defect, and how. ",
+            $keep_first,
+            "\n\
 5. Omit \"prior\" when no finding above is the counterpart, and never put it on \
 'dismissed_concerns'. \"prior\" may name only a finding listed above, under the label it is \
 listed under. Do not add a finding or a hard case for an earlier finding that no input concern \
 or dismissed concern raises: this stage classifies the concerns it was given, it does not \
 revive earlier ones.\n\
 \"prior\" is the only addition to the output format above. It sits beside \"source_ids\" and \
-changes nothing about it: \"source_ids\" still lists only the C* and D* IDs of this review.";
+changes nothing about it: \"source_ids\" still lists only the C* and D* IDs of this review."
+        )
+    };
+}
+pub(crate) use prior_reviews_verification_rules;
 
-/// What a post-verification stage is told when a candidate in its batch
-/// carries a link to an earlier finding. Verification made the link; this
-/// stage only keeps the history out of the title and may say the defect it
-/// reports is another one.
-pub(crate) const PRIOR_LINK_POST_VERIFICATION_RULES: &str = "PRIOR LINK RULES: A candidate with \
+/// Builds what a post-verification stage is told when a candidate in its
+/// batch carries a link to an earlier finding, with the same per-workflow
+/// rubric sections as [`prior_reviews_verification_rules`]. Verification
+/// made the link; this stage only keeps the history out of the title and may
+/// say the defect it reports is another one.
+macro_rules! prior_link_post_verification_rules {
+    (history_at: $history_at:literal, keep_first: $keep_first:literal $(,)?) => {
+        concat!(
+            "PRIOR LINK RULES: A candidate with \
 a \"prior\" key was linked by verification to a finding reported on an earlier revision of this \
 pull request (\"repeat\": the same defect; \"fix_regression\": a defect created by the change \
 made for that finding), and its concern_arguments end with one sentence saying so. Verify it like \
@@ -2125,8 +2146,30 @@ any other candidate: the link makes it neither more nor less likely to be valid.
 \"prior\" yourself: the link is carried to the finding you report for that candidate. If the \
 defect you report is not the one the link names, because you refined the candidate into another \
 defect, add \"prior\": null to that finding. When you report a linked candidate, keep \"problem\" \
-free of its history and put that sentence in \"severity_explanation\", at the end of its \
-Triggering path. Keep the Consequence first, as the rules above ask.";
+free of its history and put that sentence in \"severity_explanation\", at the end of its ",
+            $history_at,
+            ". ",
+            $keep_first
+        )
+    };
+}
+pub(crate) use prior_link_post_verification_rules;
+
+/// How Linux verification uses the earlier findings (see
+/// [`prior_reviews_verification_rules`]): the history sentence ends the
+/// Triggering path, and the Consequence stays first, as the kernel rubric
+/// and the example output order them.
+pub(crate) const PRIOR_REVIEWS_VERIFICATION_RULES: &str = prior_reviews_verification_rules!(
+    history_at: "Triggering path",
+    keep_first: "Keep the Consequence first, as the rules above ask.",
+);
+
+/// What Linux post-verification is told about a linked candidate (see
+/// [`prior_link_post_verification_rules`]), placed as in verification.
+pub(crate) const PRIOR_LINK_POST_VERIFICATION_RULES: &str = prior_link_post_verification_rules!(
+    history_at: "Triggering path",
+    keep_first: "Keep the Consequence first, as the rules above ask.",
+);
 
 /// Marks where the report's prompt carries the earlier findings that its
 /// findings' `prior` links name, then the rules for stating those links.
@@ -3124,6 +3167,8 @@ pub fn build_linux_patch_review_workflow_with_effort(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::finding_view::CalibrationLabel;
+    use regex::Regex;
 
     /// Which stages the review's deadline may stop decides what a salvage
     /// keeps. The stages that gather concerns stop; the ones that turn
@@ -5458,6 +5503,16 @@ mod tests {
         }
     }
 
+    /// The verification rules for the earlier findings that the project a
+    /// prompt is tagged with ("<project> <stage>") gives its verification.
+    fn verification_rules_of(tagged: &str) -> &'static str {
+        if tagged.starts_with("sashiko ") {
+            crate::workflows::sashiko_patch_review::PRIOR_REVIEWS_VERIFICATION_RULES
+        } else {
+            PRIOR_REVIEWS_VERIFICATION_RULES
+        }
+    }
+
     /// A review with no earlier findings gets the user prompts it had
     /// before the block existed: the block and its rules are the only
     /// difference, and without history they are empty, with no placeholder
@@ -5465,13 +5520,14 @@ mod tests {
     #[test]
     fn prior_reviews_render_nothing_without_history() {
         let context = prior_reviews();
-        let inserted = format!(
-            "\n\n{}\n\n{PRIOR_REVIEWS_VERIFICATION_RULES}",
-            context.rendered
-        );
-        let with = user_prompts(Some(context));
+        let with = user_prompts(Some(context.clone()));
         let without = user_prompts(None);
         for ((name, prompt), (_, bare)) in with.iter().zip(&without) {
+            let inserted = format!(
+                "\n\n{}\n\n{}",
+                context.rendered,
+                verification_rules_of(name)
+            );
             assert_eq!(&prompt.replacen(&inserted, "", 1), bare, "{name}");
             assert!(!bare.contains(PRIOR_REVIEWS_PLACEHOLDER), "{name}");
             assert!(!bare.contains("PRIOR REVISION RULES"), "{name}");
@@ -5496,7 +5552,10 @@ mod tests {
     /// Sashiko key list. The rules judge every concern on the current code,
     /// add "prior" as the one new key, for a repeat or a fix regression,
     /// keep the title free of the history and put it at the end of the
-    /// Triggering path, and forbid reviving an earlier finding.
+    /// rubric section that names the path (the Triggering path in Linux,
+    /// the Likelihood and preconditions reasoning in Sashiko) with the
+    /// rubric's first section kept first, and forbid reviving an earlier
+    /// finding.
     #[test]
     fn verification_reads_the_prior_rules_after_its_findings_format() {
         let context = prior_reviews();
@@ -5514,61 +5573,225 @@ mod tests {
                 .map(|(_, prompt)| prompt.as_str())
                 .unwrap_or_else(|| panic!("{name} is listed"))
         };
-        for (name, format_end) in [
-            ("linux verification", "```"),
+        for (name, format_end, history_rule) in [
+            (
+                "linux verification",
+                "```",
+                [
+                    "at the end of its Triggering path; for a hard case",
+                    "Keep the Consequence first, as the rules above ask.",
+                ],
+            ),
             (
                 "sashiko verification",
                 "and may include \"stages\" and \"prompts\".",
+                [
+                    "at the end of its Likelihood and preconditions reasoning; for a hard case",
+                    "Keep the Blast radius and irreversibility reasoning first, as severity.md \
+                     asks.",
+                ],
             ),
         ] {
             let prompt = prompt_of(name);
+            let rules = verification_rules_of(name);
             let block = prompt.find(&opening).expect("the block");
-            let rules = prompt
-                .find(PRIOR_REVIEWS_VERIFICATION_RULES)
-                .expect("the rules");
+            let rules_at = prompt.find(rules).expect("the rules");
             let format = prompt[..block]
                 .rfind(format_end)
                 .expect("the findings format before the block");
             let guides = prompt.find("severity").expect("the guides");
             assert!(
-                guides < format && format < block && block < rules,
+                guides < format && format < block && block < rules_at,
                 "{name}: the rules end the prompt, after everything they call the rules above: {prompt}"
             );
             assert!(
-                prompt[block..].contains(&format!(
-                    "{}\n\n{PRIOR_REVIEWS_VERIFICATION_RULES}",
-                    context.rendered
-                )),
+                prompt[block..].contains(&format!("{}\n\n{rules}", context.rendered)),
                 "{name}: the rules follow the block"
             );
+            let mut opened = Vec::new();
+            for rule in [
+                "1. Judge and classify every concern on the current code",
+                "2. REPEAT:",
+                "3. FIX REGRESSION:",
+                "4. Keep \"problem\"",
+                "5. Omit \"prior\"",
+                "\"prior\" is the only addition to the output format above",
+            ] {
+                let at = rules
+                    .find(&format!("\n{rule}"))
+                    .unwrap_or_else(|| panic!("{name}: {rule} opens a line: {rules}"));
+                opened.push(at);
+            }
+            assert!(opened.windows(2).all(|w| w[0] < w[1]), "{name}: {rules}");
+            for asked in [
+                r#""prior": {"relation": "repeat", "revision": "<the label it was listed under, e.g. v3>", "earlier_problem": "<the earlier finding's title, copied exactly as listed>"}"#,
+                r#""relation": "fix_regression""#,
+                "Do not add a finding or a hard case for an earlier finding that no input concern or dismissed concern raises",
+                "never put it on 'dismissed_concerns'",
+                "\"source_ids\" still lists only the C* and D* IDs",
+                "for a hard case, as the last sentence of \"concern_arguments\"",
+            ]
+            .into_iter()
+            .chain(history_rule)
+            {
+                assert!(rules.contains(asked), "{name}: {asked}: {rules}");
+            }
+            assert!(!rules.contains("revision_head"), "the daemon adds the head");
         }
-        let rules = PRIOR_REVIEWS_VERIFICATION_RULES;
-        let mut opened = Vec::new();
-        for rule in [
-            "1. Judge and classify every concern on the current code",
-            "2. REPEAT:",
-            "3. FIX REGRESSION:",
-            "4. Keep \"problem\"",
-            "5. Omit \"prior\"",
+    }
+
+    /// The rubric labels (see `CalibrationLabel::SPELLINGS`) that `rules`
+    /// names, each as a whole word, as the case-sensitive page splitter
+    /// reads them.
+    fn rubric_labels_named(rules: &str) -> Vec<&'static str> {
+        CalibrationLabel::SPELLINGS
+            .iter()
+            .map(|&(spelling, _)| spelling)
+            .filter(|spelling| names_word(rules, spelling))
+            .collect()
+    }
+
+    /// Whether `text` holds `word` with no letter, digit or '_' on either
+    /// side, so "Consequences" does not name the Consequence.
+    fn names_word(text: &str, word: &str) -> bool {
+        Regex::new(&format!(r"\b{}\b", regex::escape(word)))
+            .expect("an escaped word is a valid pattern")
+            .is_match(text)
+    }
+
+    /// Each stage's system prompt and its user prompt without earlier
+    /// findings, rendered for the model with every included file expanded
+    /// from `dir`: what the model reads before the prior revision rules.
+    async fn prompt_before_the_rules<T>(
+        stage: &Stage<LinuxPatchReviewState, T>,
+        dir: &std::path::Path,
+    ) -> String {
+        let state = LinuxPatchReviewState {
+            all_concerns: vec![json!({"id": "C1", "description": "a concern"})],
+            findings: vec![json!({"problem": "frob: refill leaks"})],
+            ..Default::default()
+        };
+        let system = match &stage.system_prompt {
+            Some(template) => template
+                .render_for_model(&state, dir)
+                .await
+                .expect("the system prompt renders"),
+            None => String::new(),
+        };
+        let user = stage
+            .user_prompt
+            .render_for_model(&state, dir)
+            .await
+            .expect("the user prompt renders");
+        assert!(!user.contains("PRIOR REVISION RULES"), "{user}");
+        assert!(!user.contains("PRIOR LINK RULES"), "{user}");
+        format!("{system}\n{user}")
+    }
+
+    /// The prior revision rules tell the model where in its severity
+    /// explanation the history goes, by the sections of the severity
+    /// rubric. Each workflow has its own rubric, so every rubric label a
+    /// workflow's rules name must be one its own prompt, rubric included,
+    /// already uses; a label from the other workflow's rubric points the
+    /// model at a section it was never asked to write. Post-verification is
+    /// checked with an unlinked batch, the prompt its link rules follow.
+    #[tokio::test]
+    async fn prior_rules_name_only_their_own_rubric_sections() {
+        use crate::workflows::sashiko_patch_review as sashiko;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let linux_dir = root.join("third_party/prompts/kernel");
+        let sashiko_dir = root.join("projects/sashiko/prompts");
+        let linux_verification = verification_stage(10, 1.0, PriorHistory::Shown);
+        let sashiko_verification = sashiko::verification_stage(10, 1.0, PriorHistory::Shown);
+        let [(_, linux_post), (_, sashiko_post)] = post_verification_stages(vec![json!({
+            "id": "H1",
+            "description": "frob: refill may leak",
+            "estimated_severity": "High",
+        })]);
+        let checked = [
+            (
+                "linux verification",
+                PRIOR_REVIEWS_VERIFICATION_RULES,
+                prompt_before_the_rules(&linux_verification, &linux_dir).await,
+            ),
+            (
+                "linux post-verification",
+                PRIOR_LINK_POST_VERIFICATION_RULES,
+                prompt_before_the_rules(&linux_post, &linux_dir).await,
+            ),
+            (
+                "linux report",
+                PRIOR_LINKS_REPORT_RULES,
+                prompt_before_the_rules(&report_stage(10, 1.0), &linux_dir).await,
+            ),
+            (
+                "sashiko verification",
+                sashiko::PRIOR_REVIEWS_VERIFICATION_RULES,
+                prompt_before_the_rules(&sashiko_verification, &sashiko_dir).await,
+            ),
+            (
+                "sashiko post-verification",
+                sashiko::PRIOR_LINK_POST_VERIFICATION_RULES,
+                prompt_before_the_rules(&sashiko_post, &sashiko_dir).await,
+            ),
+            (
+                "sashiko report",
+                sashiko::PRIOR_LINKS_REPORT_RULES,
+                prompt_before_the_rules(&sashiko::report_stage(10, 1.0), &sashiko_dir).await,
+            ),
+        ];
+        for (name, rules, prompt) in &checked {
+            for label in rubric_labels_named(rules) {
+                assert!(
+                    names_word(prompt, label),
+                    "{name}: the rules name the {label} section, which this workflow's \
+                     prompt never asks for: {prompt}"
+                );
+            }
+        }
+        // The rubric files were found, so the check above compared the rules
+        // with the rubric rather than with a prompt missing it.
+        for (name, rubric_heading) in [
+            ("linux verification", "Triggering path"),
+            ("linux post-verification", "Triggering path"),
+            (
+                "sashiko verification",
+                "**Blast radius and irreversibility**",
+            ),
+            (
+                "sashiko post-verification",
+                "**Blast radius and irreversibility**",
+            ),
         ] {
-            let at = rules
-                .find(&format!("\n{rule}"))
-                .unwrap_or_else(|| panic!("{rule} opens a line: {rules}"));
-            opened.push(at);
+            let (_, _, prompt) = checked
+                .iter()
+                .find(|(stage, _, _)| *stage == name)
+                .expect("the stage is checked");
+            assert!(prompt.contains(rubric_heading), "{name}: {prompt}");
         }
-        assert!(opened.windows(2).all(|w| w[0] < w[1]), "{rules}");
-        for asked in [
-            r#""prior": {"relation": "repeat", "revision": "<the label it was listed under, e.g. v3>", "earlier_problem": "<the earlier finding's title, copied exactly as listed>"}"#,
-            r#""relation": "fix_regression""#,
-            "at the end of its Triggering path",
-            "Keep the Consequence first",
-            "Do not add a finding or a hard case for an earlier finding that no input concern or dismissed concern raises",
-            "never put it on 'dismissed_concerns'",
-            "\"source_ids\" still lists only the C* and D* IDs",
+        for rules in [
+            PRIOR_REVIEWS_VERIFICATION_RULES,
+            PRIOR_LINK_POST_VERIFICATION_RULES,
         ] {
-            assert!(rules.contains(asked), "{asked}: {rules}");
+            assert_eq!(
+                rubric_labels_named(rules),
+                ["Consequence", "Triggering path"]
+            );
         }
-        assert!(!rules.contains("revision_head"), "the daemon adds the head");
+        for rules in [
+            sashiko::PRIOR_REVIEWS_VERIFICATION_RULES,
+            sashiko::PRIOR_LINK_POST_VERIFICATION_RULES,
+        ] {
+            assert_eq!(
+                rubric_labels_named(rules),
+                [
+                    "Blast radius",
+                    "Blast radius and irreversibility",
+                    "Likelihood",
+                    "Likelihood and preconditions"
+                ]
+            );
+        }
     }
 
     /// Substitution is single-pass, so an earlier finding whose title holds

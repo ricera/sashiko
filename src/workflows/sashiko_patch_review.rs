@@ -29,16 +29,16 @@ use crate::workflow::{
 use crate::workflows::guard::{normalize_guide_name, normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
-    PRIOR_LINK_POST_VERIFICATION_RULES, PRIOR_LINKS_PLACEHOLDER, PRIOR_REVIEWS_VERIFICATION_RULES,
-    PlanningOutput, PostVerificationOutput, PrescreenOutput, PriorHistory,
+    PRIOR_LINKS_PLACEHOLDER, PlanningOutput, PostVerificationOutput, PrescreenOutput, PriorHistory,
     SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput, VerificationOutput,
     append_stage_dismissed_concerns_with_prompts, append_stage_items_with_prompts,
     apply_planning_stage_output, apply_post_verification_stage_output,
     apply_verification_stage_output, batch_hard_cases_by_severity, build_stage_efforts_schema,
     candidates_for_prompt, collect_stage_prompts, cover_letter_placeholder,
     extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_planning_feedback,
-    format_post_verification_feedback, has_valid_proof_location, prior_link_section,
-    prior_reviews_placeholder, resolve_stage_effort, validate_planning_stage_efforts,
+    format_post_verification_feedback, has_valid_proof_location,
+    prior_link_post_verification_rules, prior_link_section, prior_reviews_placeholder,
+    prior_reviews_verification_rules, resolve_stage_effort, validate_planning_stage_efforts,
     validate_post_verification_batch_items, verification_output_checks, with_prior_links,
     with_prior_reviews,
 };
@@ -286,6 +286,27 @@ Generate the plain-text inline review report following the exact formatting rule
 - If any finding has `"preexisting": true`, state explicitly in its explanation that the issue was not introduced by this change.
 - Do NOT include `Summary:` or `Findings:` headers (the summary is generated and displayed separately in the UI).
 - Do NOT use backticks, markdown code blocks, or markdown headings. Wrap all lines at 78 characters or fewer."#;
+
+/// How Sashiko verification uses the earlier findings (see
+/// [`prior_reviews_verification_rules`]). severity.md asks for the Blast
+/// radius and irreversibility reasoning, then the Likelihood and
+/// preconditions reasoning, at the start of the severity explanation, so the
+/// history sentence ends the Likelihood and preconditions reasoning, which
+/// names the path, and the Blast radius stays first: its body is what
+/// `finding_view::consequence_of` gives as the finding's consequence when a
+/// later revision lists it, so the history must not land there.
+pub(crate) const PRIOR_REVIEWS_VERIFICATION_RULES: &str = prior_reviews_verification_rules!(
+    history_at: "Likelihood and preconditions reasoning",
+    keep_first: "Keep the Blast radius and irreversibility reasoning first, as severity.md asks.",
+);
+
+/// What Sashiko post-verification is told about a linked candidate (see
+/// [`prior_link_post_verification_rules`]), placed as in verification:
+/// post-verification reads the same severity.md.
+pub(crate) const PRIOR_LINK_POST_VERIFICATION_RULES: &str = prior_link_post_verification_rules!(
+    history_at: "Likelihood and preconditions reasoning",
+    keep_first: "Keep the Blast radius and irreversibility reasoning first, as severity.md asks.",
+);
 
 /// How the Sashiko report states a finding's link to an earlier finding: a
 /// note right after the bullet's severity marker, where
