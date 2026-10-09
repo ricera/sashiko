@@ -1,0 +1,10 @@
+-- The finding of an earlier revision of the same pull request that a finding
+-- repeats or that the fix for it caused, stored in findings.prior as JSON:
+-- {"relation": "repeat" | "fix_regression", "revision": "v3",
+--  "earlier_problem": "...", "revision_head": "1a2b3c4d5e6f"}, where
+-- revision_head, the start of that revision's head commit, is optional.
+-- NULL when the finding has no such link.
+--
+-- The column is added from Rust, only when it is missing, because ALTER TABLE
+-- has no IF NOT EXISTS and databases written by the fork already have it.
+-- Nothing else in this migration needs a statement, so this file holds none.

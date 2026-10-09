@@ -27,7 +27,7 @@ use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
 use crate::prerequisites::{
     PrerequisitePatch, parse_prerequisite_patch_ids, resolve_prerequisite_patches_from_lore,
 };
-use crate::prior_revisions::{MAX_PRIOR_REVISIONS, PriorRevision};
+use crate::prior_revisions::{MAX_PRIOR_REVISIONS, PriorLink, PriorRevision};
 use crate::settings::Settings;
 use crate::utils::redact_secret;
 use crate::worker::prompts::ReviewError;
@@ -2848,22 +2848,28 @@ impl Reviewer {
             return Ok(());
         };
         for f in findings {
-            let preexisting = f["preexisting"].as_bool();
-            if preexisting == Some(true) && !ctx.settings.linux_bug.enabled {
+            let finding = Self::finding_of_output(review_id, f);
+            if finding.preexisting == Some(true) && !ctx.settings.linux_bug.enabled {
                 continue;
             }
-            ctx.db
-                .create_finding(Finding {
-                    review_id,
-                    severity: Severity::from_str(f["severity"].as_str().unwrap_or("Low")),
-                    severity_explanation: f["severity_explanation"].as_str().map(|s| s.to_string()),
-                    problem: f["problem"].as_str().unwrap_or("").to_string(),
-                    preexisting,
-                    locations: f.get("locations").cloned(),
-                })
-                .await?;
+            ctx.db.create_finding(finding).await?;
         }
         Ok(())
+    }
+
+    /// One finding of a review's output as review `review_id` stores it. A
+    /// `prior` that does not read as a link to an earlier finding is stored
+    /// as none, so the column holds only links its readers accept.
+    fn finding_of_output(review_id: i64, f: &Value) -> Finding {
+        Finding {
+            review_id,
+            severity: Severity::from_str(f["severity"].as_str().unwrap_or("Low")),
+            severity_explanation: f["severity_explanation"].as_str().map(|s| s.to_string()),
+            problem: f["problem"].as_str().unwrap_or("").to_string(),
+            preexisting: f["preexisting"].as_bool(),
+            locations: f.get("locations").cloned(),
+            prior: f.get("prior").and_then(PriorLink::from_json),
+        }
     }
 
     /// Queues the patch's notifications for a review just stored, unless the
@@ -10895,6 +10901,36 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         Ok(())
     }
 
+    /// A finding's prior link is stored as the output gives it when it
+    /// reads as a link to an earlier finding, and as none otherwise, so the
+    /// column never holds what its readers would reject.
+    #[test]
+    fn a_findings_prior_link_is_stored_only_when_it_reads() {
+        let link = json!({
+            "relation": "repeat",
+            "revision": "v2",
+            "earlier_problem": "rx page leak",
+            "revision_head": "1a2b3c4d5e6f",
+        });
+        let stored = |prior: Option<Value>| {
+            let mut finding = json!({"severity": "High", "problem": "leak"});
+            if let Some(prior) = prior {
+                finding["prior"] = prior;
+            }
+            Reviewer::finding_of_output(7, &finding).prior
+        };
+        assert_eq!(stored(Some(link.clone())), PriorLink::from_json(&link));
+        assert!(stored(Some(link)).is_some());
+        assert_eq!(stored(None), None);
+        assert_eq!(
+            stored(Some(
+                json!({"headline": "leak", "relation": "repeat", "revision": "v2"})
+            )),
+            None
+        );
+        assert_eq!(stored(Some(json!("repeat of v2"))), None);
+    }
+
     /// The findings of a pull request's earlier revisions reach the worker:
     /// the payload the review builds for a later revision carries what the
     /// database lists for it, and the worker's input reads the same list
@@ -10931,6 +10967,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             problem: "refill leaks a page".into(),
             preexisting: Some(false),
             locations: Some(json!([{"file": "ring.c", "line": 7}])),
+            prior: None,
         })
         .await?;
         let patches = vec![json!({"index": 1, "diff": WorkerFixture::DIFF})];

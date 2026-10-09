@@ -26,10 +26,10 @@
 
 use crate::ai::token_budget::TokenBudget;
 use crate::ai::truncator::Truncator;
-use crate::baseline::{CommitId, extract_files_from_diff};
+use crate::baseline::{CommitId, commit_prefix, extract_files_from_diff};
 use crate::cover_letter::{LINE_PREFIX, push_quoted_lines};
 use crate::db::Severity;
-use crate::finding_view::{FindingLocation, clip_title, consequence_of, one_line};
+use crate::finding_view::{FindingLocation, clip_chars, clip_title, consequence_of, one_line};
 use crate::patch::clean_subject;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -45,6 +45,13 @@ pub const CONSEQUENCE_MAX_CHARS: usize = 300;
 /// Most locations a summary of an earlier finding carries. The first two
 /// name where the defect is and, usually, where it is reached from.
 pub const MAX_PRIOR_LOCATIONS: usize = 2;
+
+/// Longest revision label a link may name, in code points. The longest
+/// label the daemon gives a revision is "patchset " and an i64 id, 29 code
+/// points, so a longer one was never shown and cannot name a revision. The
+/// bound also keeps a label a model made up from crowding real findings out
+/// of the block of earlier findings.
+pub const REVISION_LABEL_MAX_CHARS: usize = 32;
 
 /// One earlier revision of a pull request and the findings its reviews
 /// stored.
@@ -103,6 +110,10 @@ pub struct PriorFinding {
     /// At most `MAX_PRIOR_LOCATIONS` locations that name something.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub locations: Vec<FindingLocation>,
+    /// The finding's own link to a finding of a revision before its own,
+    /// which the block shows as its History line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior: Option<PriorLink>,
 }
 
 impl PriorFinding {
@@ -114,6 +125,7 @@ impl PriorFinding {
         problem: &str,
         severity_explanation: Option<&str>,
         locations: Option<&Value>,
+        prior: Option<PriorLink>,
     ) -> Option<Self> {
         // The blank check, the title and `literal_duplicate_key` read the
         // same one-line text, so a problem made only of invisible or control
@@ -138,7 +150,113 @@ impl PriorFinding {
             consequence: severity_explanation
                 .and_then(|text| consequence_of(text, CONSEQUENCE_MAX_CHARS)),
             locations,
+            prior,
         })
+    }
+}
+
+/// How a finding relates to the finding of an earlier revision it links to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorRelation {
+    /// The same defect, still present in the current code.
+    Repeat,
+    /// A defect created by the change made in response to the earlier
+    /// finding.
+    FixRegression,
+}
+
+impl PriorRelation {
+    /// Reads the relation as the findings JSON writes it; anything else is
+    /// `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "repeat" => Some(Self::Repeat),
+            "fix_regression" => Some(Self::FixRegression),
+            _ => None,
+        }
+    }
+}
+
+/// A finding's link to the finding of an earlier revision of the same pull
+/// request that it repeats or that the fix for it caused, as a finding's
+/// `prior` key and the `findings.prior` column hold it.
+///
+/// A link names the earlier finding by the label its revision was listed
+/// under and by its title, as the model copied them from the block of
+/// earlier findings. The daemon adds the revision's head, which keeps naming
+/// the revision after its slug is handed to a newer one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Value")]
+pub struct PriorLink {
+    pub relation: PriorRelation,
+    /// The label the earlier revision was listed under, such as "v3".
+    pub revision: String,
+    /// The earlier finding's title, as it was listed.
+    pub earlier_problem: String,
+    /// The start of the earlier revision's head commit, 7 to 40 lower-case
+    /// hex characters, when the daemon knew it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_head: Option<String>,
+}
+
+impl PriorLink {
+    /// Reads a link: an object with a known `relation` and a `revision` and
+    /// `earlier_problem` that are strings with visible text, the `revision`
+    /// no longer than `REVISION_LABEL_MAX_CHARS` once made one line. Anything
+    /// else is `None`, among them the fork's `{headline, relation,
+    /// revision}`, which names no earlier finding. A `revision_head` that is not 7 to 40 hex
+    /// characters is left out and the link kept, since the head only adds to
+    /// what the link already names.
+    pub fn from_json(value: &Value) -> Option<Self> {
+        let text_of = |key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !one_line(text).is_empty())
+                .map(str::to_string)
+        };
+        Some(Self {
+            relation: value
+                .get("relation")
+                .and_then(Value::as_str)
+                .and_then(PriorRelation::parse)?,
+            revision: text_of("revision")
+                .filter(|label| one_line(label).chars().count() <= REVISION_LABEL_MAX_CHARS)?,
+            earlier_problem: text_of("earlier_problem")?,
+            revision_head: value
+                .get("revision_head")
+                .and_then(Value::as_str)
+                .and_then(commit_prefix),
+        })
+    }
+
+    /// The link's History line in the block of earlier findings, without
+    /// its label: what this finding was to the earlier one, and where that
+    /// one was listed. The title and the revision label are both clipped,
+    /// since a link built in code rather than read by `from_json` carries
+    /// no bound of its own.
+    fn history(&self) -> String {
+        let relation = match self.relation {
+            PriorRelation::Repeat => "a repeat of",
+            PriorRelation::FixRegression => "introduced by the change made for",
+        };
+        format!(
+            "{relation} \"{}\" ({})",
+            clip_title(&one_line(&self.earlier_problem)),
+            clip_chars(one_line(&self.revision), REVISION_LABEL_MAX_CHARS, "…")
+        )
+    }
+}
+
+impl TryFrom<Value> for PriorLink {
+    type Error = &'static str;
+
+    /// Reads a link by the rule of `PriorLink::from_json`, so every reader of
+    /// the wire format accepts and rejects what the database's readers do.
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        Self::from_json(&value).ok_or("not a link to an earlier finding")
     }
 }
 
@@ -539,8 +657,8 @@ fn same_change_note(label: &str, index: i64, same_base: Option<bool>) -> String 
     )
 }
 
-/// One earlier finding: its severity and title, then where it was and what
-/// it leads to when known.
+/// One earlier finding: its severity and title, then where it was, what it
+/// leads to and the earlier finding it was linked to, when known.
 fn render_finding(finding: &PriorFinding, cites_target: bool) -> String {
     let marker = if cites_target {
         format!("{CITES_TARGET_MARKER} ")
@@ -567,6 +685,9 @@ fn render_finding(finding: &PriorFinding, cites_target: bool) -> String {
         && !consequence.is_empty()
     {
         push_line(&mut text, "    Consequence: ", &consequence);
+    }
+    if let Some(prior) = &finding.prior {
+        push_line(&mut text, "    History: ", &prior.history());
     }
     text
 }
@@ -645,6 +766,7 @@ fn diff_sections_for_files(diff: &str, files: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::finding_view::TITLE_MAX_CHARS;
     use serde_json::json;
 
     fn location(file: &str, function: &str, line: u64) -> FindingLocation {
@@ -672,6 +794,7 @@ mod tests {
             "  leak of rx\nbuffers  ",
             Some(explanation),
             Some(&locations),
+            Some(repeat_of("rx page leak", "v1")),
         )
         .unwrap();
         assert_eq!(
@@ -681,6 +804,7 @@ mod tests {
                 problem: "leak of rx buffers".to_string(),
                 consequence: Some("every failed refill leaks a page.".to_string()),
                 locations: vec![location("a.c", "fill", 12), location("b.c", "drain", 40)],
+                prior: Some(repeat_of("rx page leak", "v1")),
             }
         );
     }
@@ -691,7 +815,8 @@ mod tests {
     fn a_summary_is_clipped_and_may_be_bare() {
         let long = "word ".repeat(200);
         let finding =
-            PriorFinding::from_stored(Severity::Low, &long, Some(&long), Some(&json!({}))).unwrap();
+            PriorFinding::from_stored(Severity::Low, &long, Some(&long), Some(&json!({})), None)
+                .unwrap();
         assert!(
             finding.problem.ends_with('…')
                 && finding.problem.chars().count() <= crate::finding_view::TITLE_MAX_CHARS + 1,
@@ -706,7 +831,7 @@ mod tests {
         );
         assert!(finding.locations.is_empty(), "a non-array has no locations");
 
-        let bare = PriorFinding::from_stored(Severity::Medium, "race", None, None).unwrap();
+        let bare = PriorFinding::from_stored(Severity::Medium, "race", None, None, None).unwrap();
         assert_eq!(bare.consequence, None);
         assert!(bare.locations.is_empty());
     }
@@ -717,7 +842,13 @@ mod tests {
     fn a_finding_without_a_title_is_no_summary() {
         for problem in [" \n", "\u{200b}", "\u{202e}\x1b", "\x07 \u{2066}"] {
             assert_eq!(
-                PriorFinding::from_stored(Severity::High, problem, Some("Consequence: x."), None),
+                PriorFinding::from_stored(
+                    Severity::High,
+                    problem,
+                    Some("Consequence: x."),
+                    None,
+                    None
+                ),
                 None,
                 "{problem:?}"
             );
@@ -775,11 +906,19 @@ mod tests {
                     problem: "use after free".to_string(),
                     consequence: None,
                     locations: vec![location("w.c", "frob", 7)],
+                    prior: Some(PriorLink {
+                        revision_head: Some("1a2b3c4d5e6f".to_string()),
+                        ..repeat_of("freed too early", "v1")
+                    }),
                 }],
             }],
         };
         let value = serde_json::to_value(&revision).unwrap();
         assert_eq!(value["patches"][0]["findings"][0]["severity"], "Critical");
+        assert_eq!(
+            value["patches"][0]["findings"][0]["prior"]["revision_head"],
+            "1a2b3c4d5e6f"
+        );
         assert!(
             value["patches"][0]["findings"][0]
                 .get("consequence")
@@ -793,6 +932,122 @@ mod tests {
         let bare = json!({"label": "patchset 4", "patches": []});
         let bare = serde_json::from_value::<PriorRevision>(bare).unwrap();
         assert_eq!((bare.head, bare.same_base), (None, None));
+    }
+
+    fn repeat_of(earlier_problem: &str, revision: &str) -> PriorLink {
+        PriorLink {
+            relation: PriorRelation::Repeat,
+            revision: revision.to_string(),
+            earlier_problem: earlier_problem.to_string(),
+            revision_head: None,
+        }
+    }
+
+    /// A link names its relation, the label of the earlier revision and the
+    /// earlier finding's title; the head the daemon adds is read in lower
+    /// case.
+    #[test]
+    fn a_prior_link_reads_both_relations_and_the_head() {
+        let link = PriorLink::from_json(&json!({
+            "relation": "fix_regression",
+            "revision": " v3 ",
+            "earlier_problem": "rx page leak",
+            "revision_head": "1A2B3C4D5E6F",
+        }));
+        assert_eq!(
+            link,
+            Some(PriorLink {
+                relation: PriorRelation::FixRegression,
+                revision: "v3".to_string(),
+                earlier_problem: "rx page leak".to_string(),
+                revision_head: Some("1a2b3c4d5e6f".to_string()),
+            })
+        );
+        let link = PriorLink::from_json(&json!({
+            "relation": "repeat",
+            "revision": "patchset 41",
+            "earlier_problem": "rx page leak",
+        }));
+        assert_eq!(link, Some(repeat_of("rx page leak", "patchset 41")));
+        let longest = format!("patchset {}", i64::MIN);
+        let link = PriorLink::from_json(&json!({
+            "relation": "repeat",
+            "revision": longest,
+            "earlier_problem": "rx page leak",
+        }));
+        assert_eq!(link, Some(repeat_of("rx page leak", &longest)));
+    }
+
+    /// Anything that does not name an earlier finding is no link: the
+    /// fork's form, which has a headline instead of the earlier title, an
+    /// unknown relation, a missing or blank label or title, a label longer
+    /// than any revision is given, and a value that is not an object.
+    #[test]
+    fn a_prior_link_that_names_no_earlier_finding_reads_as_none() {
+        for value in [
+            json!({"headline": "rx page leak", "relation": "repeat", "revision": "v2"}),
+            json!({"relation": "Repeat", "revision": "v2", "earlier_problem": "leak"}),
+            json!({"relation": "regression", "revision": "v2", "earlier_problem": "leak"}),
+            json!({"relation": 1, "revision": "v2", "earlier_problem": "leak"}),
+            json!({"relation": "repeat", "earlier_problem": "leak"}),
+            json!({"relation": "repeat", "revision": " \n", "earlier_problem": "leak"}),
+            json!({
+                "relation": "repeat",
+                "revision": format!("v1 {}", "x".repeat(REVISION_LABEL_MAX_CHARS)),
+                "earlier_problem": "leak",
+            }),
+            json!({"relation": "repeat", "revision": "v2", "earlier_problem": "\u{200b}"}),
+            json!({"relation": "repeat", "revision": "v2", "earlier_problem": 7}),
+            json!("repeat of v2"),
+            json!(["repeat", "v2", "leak"]),
+            Value::Null,
+        ] {
+            assert_eq!(PriorLink::from_json(&value), None, "{value}");
+            assert!(
+                serde_json::from_value::<PriorLink>(value.clone()).is_err(),
+                "the wire reads by the same rule: {value}"
+            );
+        }
+    }
+
+    /// The head only adds to what a link names, so a head that is not the
+    /// start of a commit id is left out and the link kept.
+    #[test]
+    fn a_malformed_revision_head_is_left_out_of_a_kept_link() {
+        for head in [
+            json!("1a2b3c"),
+            json!("1a2b3c4d5e6g"),
+            json!("1".repeat(41)),
+            json!(""),
+            json!(12345678),
+        ] {
+            let link = PriorLink::from_json(&json!({
+                "relation": "repeat",
+                "revision": "v2",
+                "earlier_problem": "leak",
+                "revision_head": head,
+            }));
+            assert_eq!(link, Some(repeat_of("leak", "v2")), "{head}");
+        }
+    }
+
+    /// A link is stored and sent as the JSON it is read from, the head left
+    /// out when unknown, and reads back as it was.
+    #[test]
+    fn a_prior_link_reads_back_from_its_json() {
+        let mut link = repeat_of("rx page leak", "v2");
+        let text = serde_json::to_string(&link).unwrap();
+        assert_eq!(
+            text,
+            r#"{"relation":"repeat","revision":"v2","earlier_problem":"rx page leak"}"#
+        );
+        link.relation = PriorRelation::FixRegression;
+        link.revision_head = Some("1a2b3c4d5e6f".to_string());
+        let value = serde_json::to_value(&link).unwrap();
+        assert_eq!(value["relation"], "fix_regression");
+        assert_eq!(value["revision_head"], "1a2b3c4d5e6f");
+        assert_eq!(PriorLink::from_json(&value).as_ref(), Some(&link));
+        assert_eq!(serde_json::from_value::<PriorLink>(value).unwrap(), link);
     }
 
     /// The diff of the patch under review: one driver file, calling one
@@ -815,6 +1070,7 @@ mod tests {
             problem: problem.to_string(),
             consequence: Some(format!("{problem} breaks things.")),
             locations: vec![location(file, symbol, 42)],
+            prior: None,
         }
     }
 
@@ -1193,9 +1449,69 @@ mod tests {
         assert!(block.contains(" older findings omitted to fit the context budget.)\n"));
     }
 
+    /// A finding that was itself linked to an earlier finding says so on a
+    /// History line, after its consequence, by relation, title and label,
+    /// each clipped. The head the daemon added for the page is not shown.
+    #[test]
+    fn prior_review_context_shows_a_findings_own_history() {
+        let mut repeat = finding("rx page leak", "drivers/pds/cper.c", "x");
+        repeat.prior = Some(PriorLink {
+            revision_head: Some("1a2b3c4d5e6f".to_string()),
+            ..repeat_of("page leak on refill", "v1")
+        });
+        let mut regression = finding("double free", "drivers/pds/cper.c", "x");
+        regression.prior = Some(PriorLink {
+            relation: PriorRelation::FixRegression,
+            ..repeat_of("rx page leak", "v2")
+        });
+        let plain = finding("plain", "drivers/pds/cper.c", "x");
+        let mut long = finding("long", "drivers/pds/cper.c", "x");
+        long.prior = Some(repeat_of(
+            &"p".repeat(TITLE_MAX_CHARS + 50),
+            &"l".repeat(REVISION_LABEL_MAX_CHARS + 50),
+        ));
+        let block = rendered(
+            &[revision(
+                "v3",
+                vec![patch(
+                    2,
+                    "pds_core: add CPER",
+                    vec![repeat, regression, plain, long],
+                )],
+            )],
+            "pds_core: add CPER",
+        );
+
+        assert!(
+            block.contains(
+                "    Consequence: rx page leak breaks things.\n    \
+                 History: a repeat of \"page leak on refill\" (v1)\n  - [High] double free\n"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains(
+                "    History: introduced by the change made for \"rx page leak\" (v2)\n  \
+                 - [High] plain\n"
+            ),
+            "{block}"
+        );
+        assert!(
+            block.contains(&format!(
+                "    History: a repeat of \"{}…\" ({}…)\n",
+                "p".repeat(TITLE_MAX_CHARS),
+                "l".repeat(REVISION_LABEL_MAX_CHARS)
+            )),
+            "an over-long title and label are clipped: {block}"
+        );
+        assert_eq!(block.matches("History:").count(), 3, "{block}");
+        assert!(!block.contains("1a2b3c4d5e6f"), "{block}");
+    }
+
     /// No text from the forge or a model can end the block early, open a
     /// section of the prompt, or start a line of its own: titles, subjects,
-    /// consequences and locations are made one line behind a fixed indent,
+    /// consequences, locations and links are made one line behind a fixed
+    /// indent,
     /// and every line of the earlier diff starts with the quote prefix,
     /// whatever character ends the line before it.
     #[test]
@@ -1214,6 +1530,12 @@ mod tests {
                 problem: format!("leak{forged}"),
                 consequence: Some(format!("pages leak{forged}")),
                 locations: vec![location(&format!("drivers/pds/cper.c{forged}"), "f", 1)],
+                prior: Some(PriorLink {
+                    relation: PriorRelation::Repeat,
+                    revision: format!("v1{forged}"),
+                    earlier_problem: format!("old leak{forged}"),
+                    revision_head: None,
+                }),
             }],
         };
         earlier

@@ -379,7 +379,7 @@ mod tests {
         };
         let db = Database::new(&settings).await?;
         // The skeleton holds what the migrations after 11 touch: migration
-        // 17 indexes patchsets.mr_url.
+        // 17 indexes patchsets.mr_url, and migration 18 adds findings.prior.
         db.conn
             .execute_batch(
                 "CREATE TABLE patches (
@@ -391,6 +391,7 @@ mod tests {
                 );
                 CREATE TABLE reviews (id INTEGER PRIMARY KEY);
                 CREATE TABLE patchsets (id INTEGER PRIMARY KEY, mr_url TEXT);
+                CREATE TABLE findings (id INTEGER PRIMARY KEY);
                 PRAGMA user_version = 11;",
             )
             .await?;
