@@ -366,6 +366,12 @@ address that finds no single revision answers 404 with one line saying
 why: no revision of that pull request is known, none has a head starting
 with the given characters, or more than one has (give more of the commit).
 
+The review comment Sashiko posts on a pull request links to the revision
+it describes with this address, using the first 12 characters of the
+head, so an older comment keeps opening its own review after the pull
+request is pushed again. A revision whose head is not known from the id
+it was queued with is linked by its stored slug instead.
+
 ## Troubleshooting
 
 ### Webhook not received

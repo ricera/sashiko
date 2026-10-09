@@ -123,6 +123,42 @@ impl PatchsetTally {
     }
 }
 
+/// How many characters of a revision's head commit a pull request comment's
+/// link carries. An address accepts as few as seven; twelve keep the prefix
+/// unique among one pull request's revisions with a wide margin, so a link
+/// handed out once does not turn ambiguous when later revisions arrive.
+const PR_COMMENT_HEAD_CHARS: usize = 12;
+
+/// The patchset address a pull request comment links to.
+///
+/// A pull request revision is linked as `<repo>-<N>-<head>`, the first
+/// [`PR_COMMENT_HEAD_CHARS`] characters of the head commit its placeholder
+/// id names. The stored slug cannot serve: the newest revision holds the
+/// bare `<repo>-<N>`, and slug rotation hands it to the next revision, so a
+/// comment linked with it would open a later revision's review once the
+/// pull request is pushed again. `<repo>` is derived from `mr_url` as
+/// ingestion derives the stored slug, so the lookup finds the revision's
+/// row under it. The address is checked to read back as one, so a link is
+/// never handed out in a form the server would not resolve. A row without
+/// a placeholder head, number or repository name falls back to its stored
+/// slug, then to its cover letter id.
+fn pr_comment_patchset_address(patchset: &PatchsetRow) -> String {
+    let revision_address = || {
+        let number = patchset.mr_number?;
+        let repo = crate::forge::extract_repo_name_from_mr_url(patchset.mr_url.as_deref()?)?;
+        let (_, head) = crate::db::pr_revision_range(patchset.message_id.as_deref()?, number)?;
+        let address = format!(
+            "{repo}-{number}-{}",
+            head.as_str().get(..PR_COMMENT_HEAD_CHARS)?
+        );
+        crate::db::PrRevisionAddress::parse(&address).map(|_| address)
+    };
+    revision_address()
+        .or_else(|| patchset.slug.clone())
+        .or_else(|| patchset.message_id.clone())
+        .unwrap_or_default()
+}
+
 #[derive(Serialize)]
 struct BaselineAttempt {
     baseline: String,
@@ -649,12 +685,11 @@ impl Reviewer {
         } else {
             ctx.settings.project.domain.as_str()
         };
-        let slug = patchset
-            .slug
-            .as_deref()
-            .or(patchset.message_id.as_deref())
-            .unwrap_or("");
-        let target_url = format!("https://{}/#/patchset/{}", domain, slug);
+        let target_url = format!(
+            "https://{}/#/patchset/{}",
+            domain,
+            pr_comment_patchset_address(patchset)
+        );
 
         let version =
             crate::forge::extract_mr_version_from_subject(patchset.subject.as_deref(), pr_number);
@@ -10429,6 +10464,191 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         assert_eq!(run.final_status, Some(ReviewStatus::Reviewed));
         assert_eq!(run.stored_status().await?.as_deref(), Some("Reviewed"));
         assert_eq!(run.forge_comments().await?, 1);
+        Ok(())
+    }
+
+    /// Queues a revision of PR 7 of acme/frob with head `head`, as the
+    /// webhook and the by-number route queue one, and returns its id.
+    async fn queue_frob_revision(db: &Database, head: &str) -> Result<i64> {
+        let base = "a".repeat(40);
+        db.create_fetching_patchset(
+            &format!("mr-7-{base}..{head}@sashiko.local"),
+            "#7: Fix the frobnicator",
+            None,
+            None,
+            Some("https://github.com/acme/frob/pull/7"),
+            Some("Fix the frobnicator"),
+            Some(7),
+            Some("frob-7"),
+        )
+        .await
+    }
+
+    /// The patchset `id` as the reviewer reads it when it picks the patchset
+    /// up, and Reviewed afterwards, as a patchset is when its comment is
+    /// queued.
+    async fn reviewed_row(db: &Database, id: i64) -> Result<PatchsetRow> {
+        db.update_patchset_status(id, ReviewStatus::Pending.as_str())
+            .await?;
+        let row = db
+            .get_pending_patchsets(100)
+            .await?
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| anyhow!("patchset {id} is not pending"))?;
+        db.update_patchset_status(id, ReviewStatus::Reviewed.as_str())
+            .await?;
+        Ok(row)
+    }
+
+    /// The patchset address the forge comment queued for `patchset_id`
+    /// links to.
+    async fn forge_comment_address(db: &Database, patchset_id: i64) -> Result<String> {
+        let target_url: String = db
+            .conn
+            .query(
+                "SELECT target_url FROM forge_outbox WHERE patchset_id = ?",
+                libsql::params![patchset_id],
+            )
+            .await?
+            .next()
+            .await?
+            .ok_or_else(|| anyhow!("no forge comment for patchset {patchset_id}"))?
+            .get(0)?;
+        target_url
+            .rsplit_once("/#/patchset/")
+            .map(|(_, address)| address.to_string())
+            .ok_or_else(|| anyhow!("{target_url} links to no patchset"))
+    }
+
+    /// The comment queued for a pull request revision links to it by the
+    /// first twelve characters of its head commit, and the link still opens
+    /// it after a newer revision takes the bare slug. The two heads share
+    /// their first seven characters, so the shortest address would no
+    /// longer name one revision, and the link's twelve still do.
+    #[tokio::test]
+    async fn the_pr_comment_links_to_its_revision() -> Result<()> {
+        use crate::db::{PrRevisionAddress, RevisionLookup};
+
+        let fixture =
+            WorkerFixture::new("#!/bin/sh\nexit 1\n", Arc::new(MockProvider), |_| {}).await?;
+        let ctx = &fixture.ctx;
+        let first =
+            queue_frob_revision(&ctx.db, &format!("0123456789ab{}", "c".repeat(28))).await?;
+        let row = reviewed_row(&ctx.db, first).await?;
+        Reviewer::queue_forge_pr_comment(ctx, &row, &[]).await?;
+        let address = forge_comment_address(&ctx.db, first).await?;
+        assert_eq!(address, "frob-7-0123456789ab");
+
+        let second = queue_frob_revision(&ctx.db, &format!("0123456ff{}", "d".repeat(31))).await?;
+        assert_eq!(
+            ctx.db.find_patchset_id_by_slug("frob-7").await?,
+            Some(second),
+            "the bare slug did not move to the newer revision"
+        );
+        let resolve = |id: &str| {
+            let address = PrRevisionAddress::parse(id);
+            async move {
+                let address = address.ok_or_else(|| anyhow!("not an address"))?;
+                ctx.db.resolve_pr_revision_address(&address).await
+            }
+        };
+        assert_eq!(resolve(&address).await?, RevisionLookup::Found(first));
+        assert_eq!(
+            resolve("frob-7-0123456").await?,
+            RevisionLookup::Ambiguous { matches: 2 }
+        );
+        Ok(())
+    }
+
+    /// A patchset row with the given cover letter id, pull request and
+    /// stored slug.
+    fn pr_row(
+        message_id: &str,
+        mr_url: Option<&str>,
+        mr_number: Option<i64>,
+        slug: Option<&str>,
+    ) -> Result<PatchsetRow> {
+        Ok(serde_json::from_value(json!({
+            "id": 1,
+            "message_id": message_id,
+            "mailing_lists": [],
+            "subsystems": [],
+            "mr_url": mr_url,
+            "mr_number": mr_number,
+            "slug": slug,
+        }))?)
+    }
+
+    /// A row that names no head of its own pull request, or whose address
+    /// would not read back as one, links with its stored slug, and a row
+    /// with no slug either links with its cover letter id.
+    #[test]
+    fn a_pr_comment_without_a_placeholder_head_links_its_slug() -> Result<()> {
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        let placeholder = |number: i64| format!("mr-{number}-{base}..{head}@sashiko.local");
+        let url = Some("https://github.com/acme/frob/pull/7");
+        let cases = [
+            (
+                "the full placeholder",
+                pr_row(&placeholder(7), url, Some(7), Some("frob-7"))?,
+                "frob-7-bbbbbbbbbbbb",
+            ),
+            (
+                "no @sashiko.local suffix",
+                pr_row(
+                    &format!("mr-7-{base}..{head}"),
+                    url,
+                    Some(7),
+                    Some("frob-7"),
+                )?,
+                "frob-7",
+            ),
+            (
+                "a short head",
+                pr_row(
+                    &format!("mr-7-{base}..bbbbbbbb@sashiko.local"),
+                    url,
+                    Some(7),
+                    Some("frob-7"),
+                )?,
+                "frob-7",
+            ),
+            (
+                "another number's placeholder",
+                pr_row(&placeholder(8), url, Some(7), Some("frob-7"))?,
+                "frob-7",
+            ),
+            (
+                "a number no address can hold",
+                pr_row(
+                    &placeholder(0),
+                    Some("https://github.com/acme/frob/pull/0"),
+                    Some(0),
+                    Some("frob-0"),
+                )?,
+                "frob-0",
+            ),
+            (
+                "no pull request URL",
+                pr_row(&placeholder(7), None, Some(7), Some("frob-7"))?,
+                "frob-7",
+            ),
+            (
+                "no pull request number",
+                pr_row(&placeholder(7), url, None, Some("frob-7"))?,
+                "frob-7",
+            ),
+            (
+                "no slug and no pull request",
+                pr_row("msg_id_1", None, None, None)?,
+                "msg_id_1",
+            ),
+        ];
+        for (case, row, expected) in cases {
+            assert_eq!(pr_comment_patchset_address(&row), expected, "{case}");
+        }
         Ok(())
     }
 
