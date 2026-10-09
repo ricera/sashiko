@@ -1836,6 +1836,42 @@ mod tests {
         );
     }
 
+    /// The diff is limited to the files cited by the findings that fit the
+    /// budget: a file cited only by a finding left out for the budget has
+    /// no section, since no finding in the block refers the reader to it.
+    #[test]
+    fn prior_review_context_shows_no_diff_for_files_of_omitted_findings() {
+        // Enough findings on a.c to spend the whole budget, so the finding
+        // on b.c, listed last and costing more than any of them, is left
+        // out.
+        let mut findings: Vec<PriorFinding> = (0..1000)
+            .map(|i| finding(&format!("leak n{i}"), "drivers/pds/a.c", "x"))
+            .collect();
+        findings.push(finding(
+            "drain leaks every page of the ring on teardown",
+            "drivers/pds/b.c",
+            "x",
+        ));
+        let mut earlier = patch(2, "pds_core: add CPER", findings);
+        earlier.diff = Some(
+            "diff --git a/drivers/pds/a.c b/drivers/pds/a.c\n+fill();\n\
+             diff --git a/drivers/pds/b.c b/drivers/pds/b.c\n+drain();\n"
+                .to_string(),
+        );
+        let block = rendered(&[revision("v1", vec![earlier])], "pds_core: add CPER");
+
+        assert!(block.contains("leak n0\n"), "{block}");
+        assert!(
+            !block.contains("drain leaks every page"),
+            "the finding on b.c does not fit"
+        );
+        assert!(block.contains("\n| +fill();\n"), "{block}");
+        assert!(
+            !block.contains("drain();"),
+            "no section for a file only an omitted finding cites"
+        );
+    }
+
     /// The cited files are gathered over the whole newest revision: a
     /// finding on another patch that cites a file of the patch under review
     /// brings that file's section from the earlier version's diff, though
