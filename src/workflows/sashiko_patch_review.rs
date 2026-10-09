@@ -21,6 +21,7 @@
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
+use crate::cover_letter::cover_letter_block;
 use crate::workflow::{
     ExecutableStage, OutputFormat, ParallelPolicy, PromptTemplate, RecitationPolicy, Stage,
     StagePolicy, ToolScope, Workflow,
@@ -29,7 +30,7 @@ use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConflictResolutionOutput, ConsolidationStage, LinuxPatchReviewState,
     PlanningOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput,
+    VerificationOutput, cover_letter_placeholder,
 };
 
 /// State container for a Sashiko patch review run.
@@ -46,6 +47,7 @@ pub fn sashiko_system_prompt(use_log: bool) -> PromptTemplate<SashikoPatchReview
     } else {
         "{{target_commit_diff_only}}"
     };
+    let cover_letter_var = cover_letter_placeholder(use_log);
 
     PromptTemplate::<SashikoPatchReviewState>::new(format!(
         r#"Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references (e.g., 'today', 'last week', 'next year') strictly on this current date.
@@ -64,7 +66,7 @@ The following documents contain the official Sashiko architecture rules, compone
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
 Baseline SHA: {{{{baseline_sha}}}}
-===========================
+==========================={cover_letter_var}
 
 Target Commit:
 {diff_var}
@@ -81,6 +83,9 @@ Target Commit:
     })
     .with_var("target_commit_diff_only", |s: &SashikoPatchReviewState| {
         s.target_commit_diff_only.clone()
+    })
+    .with_var("cover_letter_block", |s: &SashikoPatchReviewState| {
+        cover_letter_block(s.cover_letter.as_ref())
     })
     .with_var("prefetched_block", |s: &SashikoPatchReviewState| {
         if s.prefetch_failed {

@@ -14,6 +14,7 @@
 
 use crate::{
     activity::StageFailureRecord,
+    cover_letter::CoverLetter,
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
     references::ReviewReferences,
     settings::{AiSettings, Settings},
@@ -293,6 +294,9 @@ pub async fn build_review_input_from_git(
             id: 0,
             subject,
             patches,
+            // Commits read from git carry no cover letter: only a pull
+            // request reviewed by the daemon has a stored description.
+            cover_letter: None,
         },
         shas,
     ))
@@ -433,9 +437,6 @@ pub async fn run_worker(
     let progress: Option<&ProgressCallback<'_>> =
         (progress.is_some() || daemon_progress.is_some()).then_some(&forward);
 
-    let patchset_id = input.id;
-    let subject = input.subject;
-    let patches = input.patches;
     let baseline_arg = if options.current_tree {
         options.baseline.clone().unwrap_or_default()
     } else {
@@ -520,9 +521,7 @@ pub async fn run_worker(
         &ai,
         concurrency,
         timeout_seconds,
-        patchset_id,
-        subject,
-        patches,
+        input,
         &baseline_arg,
         &baseline_sha,
         &options,
@@ -1088,8 +1087,7 @@ fn unquote_c_path(text: &str) -> Option<(String, &str)> {
 async fn review_single_patch(
     worktree: &GitWorktree,
     ai: &AiSettings,
-    patchset_id: i64,
-    subject: &str,
+    series: SeriesContext<'_>,
     p: &PatchInput,
     all_patches: &[PatchInput],
     rich_patches: &[Value],
@@ -1169,8 +1167,7 @@ async fn review_single_patch(
         AttemptInputs {
             worktree,
             ai,
-            patchset_id,
-            subject,
+            series,
             p,
             all_patches,
             rich_patches,
@@ -1244,12 +1241,45 @@ where
     ))
 }
 
+/// What every patch's worker is told about the series the patch belongs
+/// to. It is taken from the review input as one unit, so that no hop
+/// between the input and a worker's payload can drop a part of it, such as
+/// the cover letter.
+#[derive(Clone, Copy)]
+struct SeriesContext<'a> {
+    patchset_id: i64,
+    subject: &'a str,
+    cover_letter: Option<&'a CoverLetter>,
+}
+
+impl<'a> SeriesContext<'a> {
+    fn of(input: &'a ReviewInput) -> Self {
+        Self {
+            patchset_id: input.id,
+            subject: &input.subject,
+            cover_letter: input.cover_letter.as_ref(),
+        }
+    }
+
+    /// The payload the worker that reviews patch `patch_index` runs on, with
+    /// every patch of the series as `rich_patches` describes it.
+    fn worker_payload(self, rich_patches: &[Value], patch_index: i64, baseline_sha: &str) -> Value {
+        json!({
+            "id": self.patchset_id,
+            "subject": self.subject,
+            "patches": rich_patches,
+            "patch_index": Some(patch_index),
+            "baseline": baseline_sha,
+            "cover_letter": self.cover_letter
+        })
+    }
+}
+
 /// What [`review_patch_attempts`] needs from [`review_single_patch`].
 struct AttemptInputs<'a, 'p> {
     worktree: &'a GitWorktree,
     ai: &'a AiSettings,
-    patchset_id: i64,
-    subject: &'a str,
+    series: SeriesContext<'a>,
     p: &'a PatchInput,
     all_patches: &'a [PatchInput],
     rich_patches: &'a [Value],
@@ -1274,8 +1304,7 @@ async fn review_patch_attempts(
     let AttemptInputs {
         worktree,
         ai,
-        patchset_id,
-        subject,
+        series,
         p,
         all_patches,
         rich_patches,
@@ -1361,13 +1390,7 @@ async fn review_patch_attempts(
         let p_index = p.index;
         let progress_cb = progress.map(|cb| move |event| cb(from_worker_progress(p_index, event)));
 
-        let patchset_val = json!({
-            "id": patchset_id,
-            "subject": subject,
-            "patches": rich_patches,
-            "patch_index": Some(p.index),
-            "baseline": baseline_sha
-        });
+        let patchset_val = series.worker_payload(rich_patches, p.index, baseline_sha);
 
         let outcome = worker
             .run(
@@ -1561,15 +1584,16 @@ async fn run_worker_in_worktree(
     ai: &AiSettings,
     concurrency: usize,
     timeout_seconds: u64,
-    patchset_id: i64,
-    subject: String,
-    patches: Vec<PatchInput>,
+    input: ReviewInput,
     baseline_arg: &str,
     baseline_sha: &str,
     options: &WorkerOptions,
     references: Vec<crate::toolbox::ReferenceRepo>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
+    let series = SeriesContext::of(&input);
+    let patchset_id = series.patchset_id;
+    let patches = &input.patches;
     info!("Worktree at {:?}", worktree.path);
     info!("Found {} patches total", patches.len());
 
@@ -1579,7 +1603,7 @@ async fn run_worker_in_worktree(
     let mut patch_messages = HashMap::new();
 
     let all_applied = if options.current_tree {
-        for p in &patches {
+        for p in patches {
             if let Some(sha) = &p.commit_id {
                 patch_shas.insert(p.index, sha.clone());
                 if let Ok(show) = worktree.get_commit_show(sha).await {
@@ -1599,7 +1623,7 @@ async fn run_worker_in_worktree(
         true
     } else if let Some(commit_hash) = &options.review_commit {
         info!("Directly reviewing commit {}", commit_hash);
-        for p in &patches {
+        for p in patches {
             if let Some(sha) = &p.commit_id {
                 patch_shas.insert(p.index, sha.clone());
             }
@@ -1628,7 +1652,7 @@ async fn run_worker_in_worktree(
         );
         let mut applied = true;
 
-        for p in &patches {
+        for p in patches {
             emit(
                 progress,
                 ProgressEvent::ApplyingPatch {
@@ -1761,16 +1785,14 @@ async fn run_worker_in_worktree(
         let patch_shas = &patch_shas;
         let options = &options;
         let references = references.as_slice();
-        let subject_clone = subject.clone();
-        let all_patches = &patches;
+        let all_patches = patches;
         let llm_semaphore = &llm_semaphore;
         let quota = &quota;
         async move {
             let result = review_single_patch(
                 worktree,
                 ai,
-                patchset_id,
-                &subject_clone,
+                series,
                 p,
                 all_patches,
                 &rich_patches,
@@ -2597,6 +2619,10 @@ mod tests {
 
         assert_eq!(shas, vec![feature_sha.clone()]);
         assert_eq!(input.id, 0);
+        assert_eq!(
+            input.cover_letter, None,
+            "git commits carry no cover letter"
+        );
         assert_eq!(input.patches.len(), 1);
         assert_eq!(input.patches[0].index, 1);
         assert_eq!(
@@ -2605,6 +2631,39 @@ mod tests {
         );
         assert_eq!(input.patches[0].subject.as_deref(), Some("Feature"));
 
+        Ok(())
+    }
+
+    /// The review input's cover letter reaches the payload every patch's
+    /// worker runs on, and the worker reads it back from there. An input
+    /// without one, such as a local review of git commits, gives a payload
+    /// the worker reads as none.
+    #[test]
+    fn the_review_input_cover_letter_reaches_every_patch_payload() -> Result<()> {
+        use crate::cover_letter::CoverLetterSource;
+        use crate::worker::prompts::payload_cover_letter;
+        let cover = CoverLetter {
+            source: CoverLetterSource::PullRequestDescription,
+            text: "Makes the frobnicator reentrant.".to_string(),
+        };
+        let mut input: ReviewInput = serde_json::from_value(json!({
+            "id": 7,
+            "subject": "#7: Frob",
+            "patches": [{"index": 1, "diff": "+a"}, {"index": 2, "diff": "+b"}],
+            "cover_letter": cover,
+        }))?;
+        let rich_patches = [json!({"index": 1}), json!({"index": 2})];
+        for index in [1, 2] {
+            let payload = SeriesContext::of(&input).worker_payload(&rich_patches, index, "base");
+            assert_eq!(payload["id"], 7);
+            assert_eq!(payload["subject"], "#7: Frob");
+            assert_eq!(payload["patch_index"], index);
+            assert_eq!(payload_cover_letter(&payload).as_ref(), Some(&cover));
+        }
+
+        input.cover_letter = None;
+        let payload = SeriesContext::of(&input).worker_payload(&rich_patches, 1, "base");
+        assert_eq!(payload_cover_letter(&payload), None);
         Ok(())
     }
 

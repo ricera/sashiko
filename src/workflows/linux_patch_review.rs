@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::cover_letter::{CoverLetter, cover_letter_block};
 use crate::settings::ReferenceKind;
 use crate::toolbox::{REPO_ARG, REPO_ARG_REVIEW, ReferenceRepo};
 use crate::workflow::graph::Workflow;
@@ -127,6 +128,9 @@ pub struct LinuxPatchReviewState {
     pub prefetch_failed: bool,
     pub series_range: Option<String>,
     pub follow_up_series_context: Option<String>,
+    /// The series cover letter, given to the stages that read the commit
+    /// message; `None` when the series has none.
+    pub cover_letter: Option<CoverLetter>,
     /// The read-only reference repositories attached to this review, in
     /// configured order. A kind "kernel" entry among them is what marks the
     /// review as out-of-tree: the repository has no mainline history and no
@@ -207,6 +211,18 @@ pub struct VerificationOutput {
 // Common System Prompt Template
 // ---------------------------------------------------------------------------
 
+/// Where the system prompt carries the series cover letter: only in the
+/// variant with the commit message, because the cover letter is the same
+/// kind of information, the author's statement of intent, and the stages
+/// that read the hunks on their own terms get neither.
+pub(crate) fn cover_letter_placeholder(use_log: bool) -> &'static str {
+    if use_log {
+        "{{cover_letter_block}}"
+    } else {
+        ""
+    }
+}
+
 pub fn linux_system_prompt(use_log: bool) -> PromptTemplate<LinuxPatchReviewState> {
     let current_date = chrono::Utc::now().format("%A, %B %d, %Y").to_string();
     let diff_var = if use_log {
@@ -214,6 +230,7 @@ pub fn linux_system_prompt(use_log: bool) -> PromptTemplate<LinuxPatchReviewStat
     } else {
         "{{target_commit_diff_only}}"
     };
+    let cover_letter_var = cover_letter_placeholder(use_log);
 
     PromptTemplate::<LinuxPatchReviewState>::new(format!(
         r#"Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references (e.g., 'today', 'last week', 'next year') strictly on this current date.
@@ -232,7 +249,7 @@ The following documents contain the official technical patterns, architectural r
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
 Baseline SHA: {{{{baseline_sha}}}}
-==========================={{{{reference_context_block}}}}
+==========================={{{{reference_context_block}}}}{cover_letter_var}
 
 Target Commit:
 {diff_var}
@@ -244,6 +261,9 @@ Target Commit:
     .with_var("target_commit_diff_only", |s: &LinuxPatchReviewState| s.target_commit_diff_only.clone())
     .with_var("reference_context_block", |s: &LinuxPatchReviewState| {
         reference_context_block(&s.references)
+    })
+    .with_var("cover_letter_block", |s: &LinuxPatchReviewState| {
+        cover_letter_block(s.cover_letter.as_ref())
     })
     .with_var("prefetched_block", |s: &LinuxPatchReviewState| {
         if s.prefetch_failed {
@@ -1721,6 +1741,156 @@ mod tests {
         let workflow = build_linux_patch_review_workflow();
         assert_eq!(workflow.name, "linux_patch_review");
         assert_eq!(workflow.steps.len(), 10);
+    }
+
+    fn pull_request_description(text: &str) -> Option<CoverLetter> {
+        Some(CoverLetter {
+            source: crate::cover_letter::CoverLetterSource::PullRequestDescription,
+            text: text.to_string(),
+        })
+    }
+
+    /// Both projects' system prompts, with and without the commit message,
+    /// rendered for one state.
+    fn system_prompts(cover_letter: Option<CoverLetter>) -> [(&'static str, String); 4] {
+        use crate::workflows::sashiko_patch_review::sashiko_system_prompt;
+        let state = LinuxPatchReviewState {
+            cover_letter,
+            ..Default::default()
+        };
+        [
+            (
+                "linux, commit message",
+                linux_system_prompt(true).render_for_log(&state),
+            ),
+            (
+                "linux, hunks only",
+                linux_system_prompt(false).render_for_log(&state),
+            ),
+            (
+                "sashiko, commit message",
+                sashiko_system_prompt(true).render_for_log(&state),
+            ),
+            (
+                "sashiko, hunks only",
+                sashiko_system_prompt(false).render_for_log(&state),
+            ),
+        ]
+    }
+
+    /// The system prompt variant that carries the commit message carries
+    /// the cover letter, after the git metadata and before the target
+    /// commit; the variant with only the hunks does not change.
+    #[test]
+    fn cover_letter_reaches_the_stage_context() {
+        let with = system_prompts(pull_request_description("Makes frob reentrant."));
+        let without = system_prompts(None);
+        for ((name, prompt), (_, bare)) in with.iter().zip(&without) {
+            if name.ends_with("hunks only") {
+                assert_eq!(prompt, bare, "{name} gets no cover letter");
+                continue;
+            }
+            let metadata = prompt
+                .find("=== Active Git Metadata ===")
+                .unwrap_or(usize::MAX);
+            let block = prompt
+                .find("=== Series Cover Letter ===")
+                .unwrap_or(usize::MAX);
+            let quoted = prompt.find("| Makes frob reentrant.").unwrap_or(usize::MAX);
+            let target = prompt.find("\n\nTarget Commit:").unwrap_or(usize::MAX);
+            assert!(
+                metadata < block && block < quoted && quoted < target && target < usize::MAX,
+                "{name}: {prompt}"
+            );
+        }
+    }
+
+    /// The stages whose system prompt carries the cover letter, sorted,
+    /// for a review whose state selects every stage.
+    fn stages_given_the_cover_letter(workflow: &Workflow<LinuxPatchReviewState>) -> Vec<&str> {
+        let state = LinuxPatchReviewState {
+            cover_letter: pull_request_description("Makes frob reentrant."),
+            ..Default::default()
+        };
+        let mut given: Vec<&str> = workflow
+            .stage_system_prompts(&state)
+            .into_iter()
+            .filter(|(_, prompt)| {
+                prompt
+                    .as_deref()
+                    .is_some_and(|p| p.contains("=== Series Cover Letter ==="))
+            })
+            .map(|(name, _)| name)
+            .collect();
+        given.sort_unstable();
+        given
+    }
+
+    /// Exactly the stages that read the commit message get the cover
+    /// letter: Linux's planning stage, which is built on the commit message
+    /// variant, among them, and every consolidation stage. The pre-screen,
+    /// Sashiko's planning stage and the analysis stages that read only the
+    /// hunks get neither.
+    #[test]
+    fn the_stages_that_read_the_commit_message_get_the_cover_letter() {
+        use crate::workflows::sashiko_patch_review::build_sashiko_patch_review_workflow;
+        assert_eq!(
+            stages_given_the_cover_letter(&build_linux_patch_review_workflow()),
+            [
+                "conflict-resolution",
+                "deduplication",
+                "goal",
+                "hardware",
+                "implementation",
+                "planning",
+                "report",
+                "verification",
+            ]
+        );
+        assert_eq!(
+            stages_given_the_cover_letter(&build_sashiko_patch_review_workflow()),
+            [
+                "conflict-resolution",
+                "deduplication",
+                "goal",
+                "implementation",
+                "interfaces-compat",
+                "report",
+                "summary",
+                "tests",
+                "verification",
+            ]
+        );
+    }
+
+    /// A review without a cover letter, or with one that is blank once
+    /// cleaned, gets the system prompt it had before the block existed.
+    #[test]
+    fn no_cover_letter_renders_nothing() {
+        let without = system_prompts(None);
+        let blank = system_prompts(pull_request_description("<!-- template -->\r\n\u{200B}"));
+        for ((name, prompt), (_, bare)) in blank.iter().zip(&without) {
+            assert_eq!(prompt, bare, "{name}");
+            assert!(
+                bare.contains("Baseline SHA: \n===========================\n\nTarget Commit:"),
+                "{name}: nothing between the metadata and the target commit: {bare}"
+            );
+        }
+    }
+
+    /// Substitution is single-pass, so a placeholder written in a cover
+    /// letter is quoted as text, never replaced.
+    #[test]
+    fn a_placeholder_in_a_cover_letter_stays_literal() {
+        let cover = "Fold {{patch_concerns}} into {{target_commit_sha}}.";
+        let state = LinuxPatchReviewState {
+            target_commit_sha: "1a2b3c4d".to_string(),
+            cover_letter: pull_request_description(cover),
+            ..Default::default()
+        };
+        let prompt = linux_system_prompt(true).render_for_log(&state);
+        assert!(prompt.contains(&format!("| {cover}")), "{prompt}");
+        assert_eq!(prompt.matches("1a2b3c4d").count(), 1, "{prompt}");
     }
 
     #[test]
