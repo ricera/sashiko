@@ -2653,8 +2653,9 @@ pub enum ExistingRevision {
     /// Send it only for a row that was created, reset, or is still
     /// Fetching, and that the auto-cancel of superseded revisions kept. A
     /// row that is pending, in review or finished already has its patches,
-    /// and a superseded one was just cancelled, so fetching either would do
-    /// nothing for an operator who asked for the revision by number.
+    /// and a superseded one was left as it was or, while in progress,
+    /// cancelled, so fetching either would do nothing for an operator who
+    /// asked for the revision by number.
     Leave,
 }
 
@@ -4506,10 +4507,48 @@ mod tests {
         assert_eq!(patchset_status(&state, id).await, "Pending");
     }
 
+    /// The status, failure reason and slug of patchset `id`, and the
+    /// statuses of its patches by id, NULL as None.
+    async fn stored_revision(
+        state: &AppState,
+        id: i64,
+    ) -> (String, Option<String>, Option<String>, Vec<Option<String>>) {
+        let mut rows = state
+            .db
+            .conn
+            .query(
+                "SELECT status, failed_reason, slug FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("the row");
+        let columns = (
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+        );
+        let mut rows = state
+            .db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE patchset_id = ? ORDER BY id",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let mut patches = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            patches.push(row.get(0).unwrap());
+        }
+        (columns.0, columns.1, columns.2, patches)
+    }
+
     /// A head the auto-cancel ranks below a newer revision, as when a pull
     /// request goes back to an earlier head, is refused with 409 naming the
     /// newer revision, in both modes. It is neither fetched nor rerun, and
-    /// the newer revision is left as it was.
+    /// neither row changes: the older one keeps its status, failure reason,
+    /// held outcomes and slug, and the newer one keeps the bare slug.
     #[tokio::test]
     async fn a_head_the_auto_cancel_supersedes_is_refused() {
         let (state, mut fetch_rx) = pr_route_state(Arc::new(FakeResolver::default()), |_| {}).await;
@@ -4517,7 +4556,29 @@ mod tests {
             .await
             .unwrap()
             .patchset_id;
-        set_patchset_status(&state, earlier, "Failed").await;
+        state
+            .db
+            .ensure_thread_for_message("held@sashiko.local", 0)
+            .await
+            .unwrap();
+        let held = state
+            .db
+            .create_patch(earlier, "held@sashiko.local", 1, "diff")
+            .await
+            .unwrap();
+        state
+            .db
+            .update_patch_status(held, crate::PatchOutcome::TimedOut)
+            .await
+            .unwrap();
+        state
+            .db
+            .update_patchset_error(
+                &format!("mr-7-{PR_BASE}..{:040x}@sashiko.local", 7u32),
+                "boom",
+            )
+            .await
+            .unwrap();
         let mut pushed = widget_pull_request(7);
         pushed.head_sha = format!("{:040x}", 0x99);
         let newer = enqueue_pull_request(&state, "GitHub", &pushed, ExistingRevision::Refetch)
@@ -4525,6 +4586,17 @@ mod tests {
             .unwrap()
             .id;
         fetches_sent(&mut fetch_rx);
+        let before = stored_revision(&state, earlier).await;
+        assert_eq!(before.0, "Failed");
+        assert_eq!(before.1.as_deref(), Some("boom"));
+        assert_eq!(
+            before.3,
+            [Some(crate::PatchOutcome::TimedOut.as_str().to_string())]
+        );
+        assert_eq!(
+            stored_revision(&state, newer).await.2.as_deref(),
+            Some("widget-7")
+        );
 
         let (status, reason) = ask_for_pr(&state, pr_request(7, PrReviewMode::ReviewHead))
             .await
@@ -4537,7 +4609,11 @@ mod tests {
             "{reason}"
         );
         assert_eq!(fetches_sent(&mut fetch_rx), 0);
-        assert_eq!(patchset_status(&state, earlier).await, "Cancelled");
+        assert_eq!(stored_revision(&state, earlier).await, before);
+        assert_eq!(
+            stored_revision(&state, newer).await.2.as_deref(),
+            Some("widget-7")
+        );
 
         set_patchset_status(&state, earlier, "Reviewed").await;
         let (status, _) = ask_for_pr(&state, pr_request(7, PrReviewMode::RerunHead))

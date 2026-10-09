@@ -142,9 +142,13 @@ pub enum PlaceholderState {
     /// No row had the id; a Fetching row was created.
     Created,
     /// The row was resubmittable (Partial, Failed, Cancelled,
-    /// FailedToApply) and is Fetching again.
+    /// FailedToApply) and is Fetching again. When a newer revision of its
+    /// pull request outranks it, the call leaves it as it was instead and
+    /// says so in [`RevisionStanding::superseded_by`].
     Reset { was: ReviewStatus },
-    /// The row was already Fetching and stays so.
+    /// The row was already Fetching and stays so. When a newer revision of
+    /// its pull request outranks it, the call leaves its columns as they
+    /// were and the auto-cancel cancels it.
     AlreadyFetching,
     /// The row was left as it was: Incomplete, Pending, In Review, Skipped
     /// or Reviewed.
@@ -158,8 +162,9 @@ pub enum PlaceholderState {
 #[cfg(feature = "server")]
 impl PlaceholderState {
     /// Whether the existing row this state describes is rewritten with the
-    /// request's columns and set to Fetching. A Created row is inserted
-    /// with them instead, so it is not reset.
+    /// request's columns and set to Fetching, unless a newer revision of
+    /// its pull request outranks it. A Created row is inserted with them
+    /// instead, so it is not reset.
     fn resets_row(&self) -> bool {
         matches!(self, Self::Reset { .. } | Self::AlreadyFetching)
     }
@@ -233,6 +238,47 @@ fn newest_revision(revisions: &[KnownRevision]) -> Option<KnownRevision> {
         .iter()
         .copied()
         .max_by_key(|revision| (revision.version, revision.id))
+}
+
+/// Where patchset `current_id` stands among `revisions`, ranked by
+/// [`newest_revision`]. Both fields are `None` when it is not among them.
+#[cfg(feature = "server")]
+fn revision_standing(revisions: &[KnownRevision], current_id: i64) -> RevisionStanding {
+    let current = revisions
+        .iter()
+        .copied()
+        .find(|revision| revision.id == current_id);
+    let newest = newest_revision(revisions);
+    RevisionStanding {
+        version: current.map(|revision| revision.version),
+        superseded_by: current.and(newest).filter(|newest| newest.id != current_id),
+    }
+}
+
+/// The version a revision of pull request `number` has: the one its
+/// subject names, else 1.
+#[cfg(feature = "server")]
+fn revision_version(subject: &str, number: i64) -> u32 {
+    crate::forge::extract_mr_version_from_subject(Some(subject), number)
+        .or_else(|| crate::patch::parse_subject_version(subject))
+        .unwrap_or(1)
+}
+
+/// Whether a row whose mr_url is the argument belongs to the same
+/// repository as a pull request with URL `mr_url`. Rows compare by owner
+/// and repository when `mr_url` names them, and by the whole URL, absent
+/// ones included, when it does not.
+#[cfg(feature = "server")]
+fn same_pull_request_repository(mr_url: Option<&str>) -> impl Fn(Option<&str>) -> bool + '_ {
+    let target_repo = mr_url.and_then(crate::forge::extract_owner_repo_from_mr_url);
+    move |row_mr_url| match (target_repo.as_deref(), row_mr_url) {
+        (Some(target), Some(r_url)) => {
+            crate::forge::extract_owner_repo_from_mr_url(r_url).as_deref() == Some(target)
+        }
+        (None, Some(r_url)) => mr_url == Some(r_url),
+        (None, None) => mr_url.is_none(),
+        (Some(_), None) => false,
+    }
 }
 
 /// [`FETCH_INTERRUPTED_REASON`], followed by the last recorded description
@@ -10649,27 +10695,13 @@ impl Database {
             return Ok(RevisionStanding::default());
         };
 
-        let target_repo = mr_url.and_then(crate::forge::extract_owner_repo_from_mr_url);
         let matching = self
-            .pull_request_revisions(num, |row_mr_url| {
-                match (target_repo.as_deref(), row_mr_url) {
-                    (Some(target), Some(r_url)) => {
-                        crate::forge::extract_owner_repo_from_mr_url(r_url).as_deref()
-                            == Some(target)
-                    }
-                    (None, Some(r_url)) => mr_url == Some(r_url),
-                    (None, None) => mr_url.is_none(),
-                    (Some(_), None) => false,
-                }
-            })
+            .pull_request_revisions(num, same_pull_request_repository(mr_url))
             .await?;
 
-        let current = matching
-            .iter()
-            .copied()
-            .find(|revision| revision.id == current_id);
+        let standing = revision_standing(&matching, current_id);
         let Some(latest) = newest_revision(&matching) else {
-            return Ok(RevisionStanding::default());
+            return Ok(standing);
         };
         let latest_id = latest.id;
 
@@ -10691,12 +10723,7 @@ impl Database {
                 .await?;
         }
 
-        Ok(RevisionStanding {
-            version: current.map(|revision| revision.version),
-            superseded_by: current
-                .filter(|revision| revision.id != latest_id)
-                .map(|_| latest),
-        })
+        Ok(standing)
     }
 
     /// The revisions of pull request `number` whose mr_url `same_repository`
@@ -10725,12 +10752,9 @@ impl Database {
             if !same_repository(row_mr_url.as_deref()) {
                 continue;
             }
-            let version = crate::forge::extract_mr_version_from_subject(Some(&row_subj), number)
-                .or_else(|| crate::patch::parse_subject_version(&row_subj))
-                .unwrap_or(1);
             matching.push(KnownRevision {
                 id: row_id,
-                version,
+                version: revision_version(&row_subj, number),
             });
         }
         Ok(matching)
@@ -11090,6 +11114,12 @@ impl Database {
     /// its patches are already ingested or reviewed. Either way the pull
     /// request's superseded revisions are reconciled again.
     ///
+    /// An existing row that a newer revision of its pull request outranks
+    /// is left as it was too, slug, failure reason and held outcomes
+    /// included, and its standing names that revision. Resetting it would
+    /// only have the auto-cancel cancel it again, and would take the bare
+    /// slug from the revision the auto-cancel keeps.
+    ///
     /// Calls are serialised from the lookup through the reconcile, so that
     /// concurrent requests for one head create a single row between them.
     /// The lock covers only database work done here.
@@ -11118,28 +11148,74 @@ impl Database {
             slug,
         };
 
-        let (id, state) = match self.find_placeholder_status(root_msg_id).await? {
+        let (id, state, outranked) = match self.find_placeholder_status(root_msg_id).await? {
             Some((id, status)) => {
                 let state = Self::placeholder_state_of(&status);
-                if state.resets_row() {
-                    self.reset_fetching_placeholder(id, &columns).await?;
-                }
-                (id, state)
+                let outranked = if state.resets_row() {
+                    self.reset_unless_outranked(id, &columns).await?
+                } else {
+                    None
+                };
+                (id, state, outranked)
             }
             None => (
                 self.insert_fetching_placeholder(root_msg_id, &columns)
                     .await?,
                 PlaceholderState::Created,
+                None,
             ),
         };
-        let standing = self
+        let reconciled = self
             .reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
             .await?;
+        // An outranked row reports the standing that kept it from being
+        // reset, so the caller refuses the head even where the stored row,
+        // which keeps its old columns, ranks otherwise.
         Ok(FetchingPlaceholder {
             id,
             state,
-            standing,
+            standing: outranked.unwrap_or(reconciled),
         })
+    }
+
+    /// Resets existing row `id` with `columns`, unless a newer revision of
+    /// its pull request would outrank it afterwards. An outranked row is
+    /// left untouched and its standing is returned; a reset one gives
+    /// `None`.
+    async fn reset_unless_outranked(
+        &self,
+        id: i64,
+        columns: &PlaceholderColumns<'_>,
+    ) -> Result<Option<RevisionStanding>> {
+        let standing = self.standing_if_reset(id, columns).await?;
+        if standing.superseded_by.is_some() {
+            return Ok(Some(standing));
+        }
+        self.reset_fetching_placeholder(id, columns).await?;
+        Ok(None)
+    }
+
+    /// Where existing row `id` would stand among the revisions of the
+    /// request's pull request once reset with `columns`: the auto-cancel's
+    /// ranking over the stored revisions, with this row read as the reset
+    /// would write it.
+    async fn standing_if_reset(
+        &self,
+        id: i64,
+        columns: &PlaceholderColumns<'_>,
+    ) -> Result<RevisionStanding> {
+        let Some(number) = columns.mr_number else {
+            return Ok(RevisionStanding::default());
+        };
+        let mut revisions = self
+            .pull_request_revisions(number, same_pull_request_repository(columns.mr_url))
+            .await?;
+        revisions.retain(|revision| revision.id != id);
+        revisions.push(KnownRevision {
+            id,
+            version: revision_version(&columns.subject, number),
+        });
+        Ok(revision_standing(&revisions, id))
     }
 
     /// The subject a Fetching placeholder is written with: the pull
@@ -19953,6 +20029,158 @@ mod tests {
                 id
             );
         }
+    }
+
+    /// Queues head `head` of pull request 7 of acme/widget, as a forge
+    /// webhook would.
+    async fn queue_widget_head(db: &Database, head: &str) -> FetchingPlaceholder {
+        db.queue_fetching_patchset(
+            &format!("mr-7-base..{head}@sashiko.local"),
+            "Fetching github PR/MR: Widget",
+            None,
+            None,
+            Some("https://github.com/acme/widget/pull/7"),
+            Some("Widget"),
+            Some(7),
+            Some("widget-7"),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The columns of patchset `id` that requeuing a revision may change:
+    /// status, failure reason, slug and subject, then the statuses of its
+    /// patches by id, NULL as None.
+    async fn stored_revision_columns(db: &Database, id: i64) -> Vec<Option<String>> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status, failed_reason, slug, subject FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let mut columns: Vec<Option<String>> = (0..4).map(|i| row.get(i).unwrap()).collect();
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT status FROM patches WHERE patchset_id = ? ORDER BY id",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            columns.push(row.get(0).unwrap());
+        }
+        columns
+    }
+
+    /// Requeuing a resubmittable revision that a newer revision of its pull
+    /// request outranks leaves it exactly as it was: status, failure
+    /// reason, slug, subject and held outcomes. The newer revision keeps
+    /// the bare slug and its status, and the call still reports the reset
+    /// state it found and the revision that outranks it.
+    #[tokio::test]
+    async fn requeuing_an_outranked_revision_leaves_it_as_it_was() {
+        let db = setup_db().await;
+        let older = queue_widget_head(&db, "head1").await.id;
+        db.ensure_thread_for_message("held@sashiko.local", 0)
+            .await
+            .unwrap();
+        let held = db
+            .create_patch(older, "held@sashiko.local", 1, "diff")
+            .await
+            .unwrap();
+        db.update_patch_status(held, PatchOutcome::TimedOut)
+            .await
+            .unwrap();
+        db.update_patchset_error("mr-7-base..head1@sashiko.local", "boom")
+            .await
+            .unwrap();
+        let newer = queue_widget_head(&db, "head2").await.id;
+        db.update_patchset_status(newer, ReviewStatus::Reviewed.as_str())
+            .await
+            .unwrap();
+        let (older_before, newer_before) = (
+            stored_revision_columns(&db, older).await,
+            stored_revision_columns(&db, newer).await,
+        );
+        assert_eq!(older_before[0].as_deref(), Some("Failed"));
+        assert_eq!(older_before[1].as_deref(), Some("boom"));
+        assert_eq!(
+            older_before[4].as_deref(),
+            Some(PatchOutcome::TimedOut.as_str())
+        );
+        assert_eq!(newer_before[2].as_deref(), Some("widget-7"));
+
+        let requeued = queue_widget_head(&db, "head1").await;
+        assert_eq!(
+            requeued,
+            FetchingPlaceholder {
+                id: older,
+                state: PlaceholderState::Reset {
+                    was: ReviewStatus::Failed
+                },
+                standing: RevisionStanding {
+                    version: Some(1),
+                    superseded_by: Some(KnownRevision {
+                        id: newer,
+                        version: 2
+                    }),
+                },
+            }
+        );
+        assert_eq!(stored_revision_columns(&db, older).await, older_before);
+        assert_eq!(stored_revision_columns(&db, newer).await, newer_before);
+    }
+
+    /// Requeuing a revision that is still Fetching while a newer revision
+    /// of its pull request outranks it leaves its columns and slug as they
+    /// were, so the newer revision keeps the bare slug and its subject. The
+    /// call reports AlreadyFetching and the revision that outranks it, and
+    /// the auto-cancel then cancels the older row.
+    #[tokio::test]
+    async fn requeuing_an_outranked_fetching_revision_keeps_the_slugs() {
+        let db = setup_db().await;
+        let older = queue_widget_head(&db, "head1").await.id;
+        let newer = queue_widget_head(&db, "head2").await.id;
+        // The auto-cancel cancelled the older row when the newer one was
+        // queued, so it is set back to Fetching directly, as a legacy row
+        // the auto-cancel never reached would be.
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Fetching' WHERE id = ?",
+                libsql::params![older],
+            )
+            .await
+            .unwrap();
+        let (older_before, newer_before) = (
+            stored_revision_columns(&db, older).await,
+            stored_revision_columns(&db, newer).await,
+        );
+        assert_eq!(older_before[2].as_deref(), Some("widget-7-v1"));
+        assert_eq!(newer_before[2].as_deref(), Some("widget-7"));
+
+        let requeued = queue_widget_head(&db, "head1").await;
+        assert_eq!(
+            requeued,
+            FetchingPlaceholder {
+                id: older,
+                state: PlaceholderState::AlreadyFetching,
+                standing: RevisionStanding {
+                    version: Some(1),
+                    superseded_by: Some(KnownRevision {
+                        id: newer,
+                        version: 2
+                    }),
+                },
+            }
+        );
+        let mut older_after = older_before;
+        older_after[0] = Some(ReviewStatus::Cancelled.as_str().to_string());
+        assert_eq!(stored_revision_columns(&db, older).await, older_after);
+        assert_eq!(stored_revision_columns(&db, newer).await, newer_before);
     }
 
     /// How many rounds the concurrent queuing test runs. The race it guards
