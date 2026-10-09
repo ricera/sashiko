@@ -129,8 +129,9 @@ impl PriorFinding {
         prior: Option<PriorLink>,
     ) -> Option<Self> {
         // The blank check, the title and `literal_duplicate_key` read the
-        // same one-line text, so a problem made only of invisible or control
-        // characters is blank rather than listed as "(no description)".
+        // same one-line text, so a problem made only of whitespace, control
+        // characters and the zero-width and directional marks `one_line`
+        // treats as spaces is blank rather than listed as "(no description)".
         let problem = one_line(problem);
         if problem.is_empty() {
             return None;
@@ -1344,8 +1345,9 @@ mod tests {
         assert!(bare.locations.is_empty());
     }
 
-    /// A problem with nothing a summary would show, whitespace or only
-    /// invisible and control characters, gives no title.
+    /// A problem made only of whitespace, control characters and the
+    /// zero-width and directional marks `one_line` treats as spaces gives
+    /// no title.
     #[test]
     fn a_finding_without_a_title_is_no_summary() {
         for problem in [" \n", "\u{200b}", "\u{202e}\x1b", "\x07 \u{2066}"] {
@@ -1363,8 +1365,9 @@ mod tests {
         }
     }
 
-    /// Two problems that show the same title are one finding, whatever
-    /// case, whitespace or invisible characters tell them apart.
+    /// Two problems that show the same title are one finding when only
+    /// case, whitespace, control characters or the zero-width and
+    /// directional marks `one_line` treats as spaces tell them apart.
     #[test]
     fn literal_duplicates_differ_only_in_what_a_title_does_not_show() {
         for problem in [
