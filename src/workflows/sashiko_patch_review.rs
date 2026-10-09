@@ -29,8 +29,9 @@ use crate::workflow::{
 use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConflictResolutionOutput, ConsolidationStage, LinuxPatchReviewState,
-    PlanningOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput, cover_letter_placeholder,
+    PRIOR_REVIEWS_VERIFICATION_RULES, PlanningOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER,
+    StageConcernsOutput, VerificationOutput, cover_letter_placeholder, prior_reviews_placeholder,
+    with_prior_reviews,
 };
 
 /// State container for a Sashiko patch review run.
@@ -319,6 +320,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: true,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "implementation",
@@ -328,6 +330,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: true,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "execution-flow",
@@ -337,6 +340,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "concurrency",
@@ -346,6 +350,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "persistence",
@@ -355,6 +360,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "llm-pipeline",
@@ -368,6 +374,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "security",
@@ -382,6 +389,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "interfaces-compat",
@@ -391,6 +399,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "tests",
@@ -400,6 +409,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
+        wants_prior_reviews: false,
     },
 ];
 
@@ -407,30 +417,35 @@ pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
     name: "deduplication",
     short: "Deduplication",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 pub static CONFLICT_RESOLUTION: ConsolidationStage = ConsolidationStage {
     name: "conflict-resolution",
     short: "Conflict Resolution",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Severity Estimation",
     wants_series_context: true,
+    wants_prior_reviews: true,
 };
 
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 pub static SUMMARY: ConsolidationStage = ConsolidationStage {
     name: "summary",
     short: "Change Summary",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] = &[
@@ -979,9 +994,14 @@ pub fn verification_stage(
     temperature: f32,
 ) -> Stage<SashikoPatchReviewState, VerificationOutput> {
     let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
-    Stage::builder(VERIFICATION.name)
-        .system_prompt(sashiko_system_prompt(true))
-        .user_prompt(with_series_context(
+    // After the key list and the two guides rather than beside the series
+    // context: the rules say what may be reported as a finding and refer to
+    // the guides as the rules above, so they are read after the findings
+    // format and the guides they apply to. The guides are placed where they
+    // were appended before, so a prompt without earlier findings is
+    // unchanged.
+    let prior_reviews = prior_reviews_placeholder(VERIFICATION.wants_prior_reviews);
+    let user_prompt = with_series_context(
             PromptTemplate::<SashikoPatchReviewState>::new(format!(
                 r#"{STAGE_VERIFICATION_INSTRUCTION}
 
@@ -990,7 +1010,7 @@ CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must fi
 Consolidated Concerns:
 {{{{patch_concerns}}}}
 
-Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "speculative" (boolean: true if the concrete path and preconditions that trigger the bug rest on an unverified assumption; severity.md caps a speculative finding at Medium, or Low if the impact is minor. If any part of that path rests on one, answer true. false if that path and its preconditions are established from the code. A low likelihood that is established from the code is reflected in the level, not in this key), "severity" (Low, Medium, High, or Critical), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters)."#
+Return ONLY a JSON object with a 'findings' array. Each object in the 'findings' array MUST use exactly the following keys: "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "speculative" (boolean: true if the concrete path and preconditions that trigger the bug rest on an unverified assumption; severity.md caps a speculative finding at Medium, or Low if the impact is minor. If any part of that path rests on one, answer true. false if that path and its preconditions are established from the code. A low likelihood that is established from the code is reflected in the level, not in this key), "severity" (Low, Medium, High, or Critical), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters).@include("false-positive-guide.md")@include("severity.md"){prior_reviews}"#
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
@@ -998,6 +1018,13 @@ Return ONLY a JSON object with a 'findings' array. Each object in the 'findings'
                 serde_json::to_string_pretty(&s.patch_concerns).unwrap_or_default()
             }),
             VERIFICATION.wants_series_context,
+        );
+    Stage::builder(VERIFICATION.name)
+        .system_prompt(sashiko_system_prompt(true))
+        .user_prompt(with_prior_reviews(
+            user_prompt,
+            VERIFICATION.wants_prior_reviews,
+            PRIOR_REVIEWS_VERIFICATION_RULES,
         ))
         .output_format(OutputFormat::json())
         .policy(StagePolicy {

@@ -74,6 +74,11 @@ pub trait ExecutableStage<S: Send + Sync>: Send + Sync {
     #[cfg(test)]
     fn system_prompt_for_log(&self, state: &S) -> Option<String>;
 
+    /// The stage's user prompt rendered for `state` as the log records it,
+    /// so a test can check what each stage of a workflow is asked.
+    #[cfg(test)]
+    fn user_prompt_for_log(&self, state: &S) -> String;
+
     /// Executes the stage in isolation against immutable state `&S`, returning
     /// execution metrics and a deferred reducer mutation to apply to `&mut S`.
     async fn execute_isolated(
@@ -416,6 +421,11 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         self.system_prompt
             .as_ref()
             .map(|template| template.render_for_log(state))
+    }
+
+    #[cfg(test)]
+    fn user_prompt_for_log(&self, state: &S) -> String {
+        self.user_prompt.render_for_log(state)
     }
 
     async fn execute_isolated(

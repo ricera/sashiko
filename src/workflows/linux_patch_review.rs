@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cover_letter::{CoverLetter, cover_letter_block};
+use crate::prior_revisions::PriorReviewContext;
 use crate::settings::ReferenceKind;
 use crate::toolbox::{REPO_ARG, REPO_ARG_REVIEW, ReferenceRepo};
 use crate::workflow::graph::Workflow;
@@ -131,6 +132,10 @@ pub struct LinuxPatchReviewState {
     /// The series cover letter, given to the stages that read the commit
     /// message; `None` when the series has none.
     pub cover_letter: Option<CoverLetter>,
+    /// What the earlier revisions of the series' pull request were told,
+    /// given to the stages that declare `wants_prior_reviews`; `None` when
+    /// no earlier revision has a finding to show.
+    pub prior_reviews: Option<PriorReviewContext>,
     /// The read-only reference repositories attached to this review, in
     /// configured order. A kind "kernel" entry among them is what marks the
     /// review as out-of-tree: the repository has no mainline history and no
@@ -740,6 +745,12 @@ pub struct AnalysisStage {
     /// Whether the prompt carries the list of patches that follow this one in
     /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
     pub wants_series_context: bool,
+    /// Whether the prompt carries what earlier revisions of the pull request
+    /// were told. No analysis stage does, so what the analysts raise is not
+    /// anchored on what was raised before, and no analysis builder places
+    /// the placeholder; a test checks every stage's rendered prompt against
+    /// this flag. See [`PRIOR_REVIEWS_PLACEHOLDER`].
+    pub wants_prior_reviews: bool,
 }
 
 pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
@@ -751,6 +762,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "implementation",
@@ -760,6 +772,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "execution-flow",
@@ -769,6 +782,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "resources",
@@ -778,6 +792,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "locking",
@@ -787,6 +802,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "security",
@@ -796,6 +812,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "hardware",
@@ -805,6 +822,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
 ];
 
@@ -818,30 +836,39 @@ pub struct ConsolidationStage {
     /// Whether the prompt carries the list of patches that follow this one in
     /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
     pub wants_series_context: bool,
+    /// Whether the prompt carries what earlier revisions of the pull request
+    /// were told. Only verification's builder places the placeholder; a test
+    /// checks every stage's rendered prompt against this flag. See
+    /// [`PRIOR_REVIEWS_PLACEHOLDER`].
+    pub wants_prior_reviews: bool,
 }
 
 pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
     name: "deduplication",
     short: "Deduplication",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 pub static CONFLICT_RESOLUTION: ConsolidationStage = ConsolidationStage {
     name: "conflict-resolution",
     short: "Conflict Resolution",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Severity Estimation",
     wants_series_context: true,
+    wants_prior_reviews: true,
 };
 
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 /// In the order the workflow runs them. Each builder refers to its own
@@ -882,6 +909,57 @@ fn with_series_context(
             .unwrap_or_default()
     })
 }
+
+/// Marks where a stage's prompt carries what the earlier revisions of the
+/// pull request were told: the block of their findings, then the rules for
+/// using it.
+///
+/// Only verification reads it. Whether a concern repeats an earlier finding
+/// is a question about concerns that are already raised, and the analysis
+/// stages go without it, so what they raise is not anchored on what was
+/// raised before. Like the series context it is declared in the stage
+/// tables: verification's builder reads its flag both to place the
+/// placeholder and to bind the variable that fills it, so the two cannot get
+/// separated. No other builder places it, and a test fails when a stage's
+/// rendered prompt and its flag disagree. Both workflows share the state
+/// type, so they share this placeholder and [`with_prior_reviews`].
+pub const PRIOR_REVIEWS_PLACEHOLDER: &str = "{{prior_review_section}}";
+
+pub(crate) fn prior_reviews_placeholder(wants: bool) -> &'static str {
+    if wants { PRIOR_REVIEWS_PLACEHOLDER } else { "" }
+}
+
+/// Fills [`PRIOR_REVIEWS_PLACEHOLDER`] with the block of earlier findings
+/// followed by `rules`, the stage's instructions for using it. Both are
+/// left out when no earlier revision has a finding to show, so the prompt
+/// of a first revision, or of anything that is not a pull request, is the
+/// prompt it was before the block existed.
+pub(crate) fn with_prior_reviews(
+    template: PromptTemplate<LinuxPatchReviewState>,
+    wants: bool,
+    rules: &'static str,
+) -> PromptTemplate<LinuxPatchReviewState> {
+    if !wants {
+        return template;
+    }
+    template.with_var("prior_review_section", move |s: &LinuxPatchReviewState| {
+        s.prior_reviews
+            .as_ref()
+            .map(|context| format!("\n\n{}\n\n{rules}", context.rendered))
+            .unwrap_or_default()
+    })
+}
+
+/// How verification uses the earlier findings, in both workflows: they
+/// change nothing about how a concern is judged, and an earlier finding that
+/// no concern raises is not reported.
+pub(crate) const PRIOR_REVIEWS_VERIFICATION_RULES: &str = "PRIOR REVISION RULES: The findings \
+     above were reported on earlier revisions of this pull request. Use them as follows.
+1. Judge every concern on the current code, by the rules above. That a concern was reported \
+     before makes it neither more nor less likely to be valid, and an earlier finding proves \
+     nothing about the code in front of you.
+2. Do not report an earlier finding that no concern in this review raises: this stage \
+     validates concerns, it does not revive them.";
 
 use crate::workflows::guard::normalize_stage_name;
 
@@ -1190,9 +1268,14 @@ pub fn verification_stage(
     temperature: f32,
 ) -> Stage<LinuxPatchReviewState, VerificationOutput> {
     let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
-    Stage::builder(VERIFICATION.name)
-        .system_prompt(linux_system_prompt(true))
-        .user_prompt(with_series_context(
+    // After the Example Output and the two guides rather than beside the
+    // series context: the rules say what may be reported as a finding and
+    // refer to the guides as the rules above, so they are read after the
+    // findings format and the guides they apply to. The guides are placed
+    // where they were appended before, so a prompt without earlier findings
+    // is unchanged.
+    let prior_reviews = prior_reviews_placeholder(VERIFICATION.wants_prior_reviews);
+    let user_prompt = with_series_context(
             PromptTemplate::<LinuxPatchReviewState>::new(format!(
                 r#"{STAGE_VERIFICATION_INSTRUCTION}
 
@@ -1225,7 +1308,7 @@ Example Output:
     }}
   ]
 }}
-```"#
+```@include("false-positive-guide.md")@include("severity.md"){prior_reviews}"#
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
@@ -1233,6 +1316,13 @@ Example Output:
                 serde_json::to_string_pretty(&s.patch_concerns).unwrap_or_default()
             }),
             VERIFICATION.wants_series_context,
+        );
+    Stage::builder(VERIFICATION.name)
+        .system_prompt(linux_system_prompt(true))
+        .user_prompt(with_prior_reviews(
+            user_prompt,
+            VERIFICATION.wants_prior_reviews,
+            PRIOR_REVIEWS_VERIFICATION_RULES,
         ))
         .output_format(OutputFormat::json())
         .policy(StagePolicy {
@@ -2265,5 +2355,253 @@ mod tests {
             positions.windows(2).all(|w| w[0] < w[1]),
             "labels out of rubric order: {example}"
         );
+    }
+
+    /// A block of earlier findings as the worker builds it: one finding on
+    /// the earlier version of the patch under review, whose title holds a
+    /// placeholder of the verification template.
+    fn prior_reviews() -> PriorReviewContext {
+        use crate::prior_revisions::{
+            PriorFinding, PriorPatch, PriorReviewTarget, PriorRevision, build_prior_review_context,
+        };
+        let revision = PriorRevision {
+            label: "v1".to_string(),
+            head: None,
+            same_base: None,
+            patches: vec![PriorPatch {
+                index: 1,
+                subject: "frob: refill the ring".to_string(),
+                commit: None,
+                same_change_as: None,
+                diff: None,
+                findings: vec![PriorFinding {
+                    severity: crate::db::Severity::High,
+                    problem: "frob: refill leaks {{patch_concerns}}".to_string(),
+                    consequence: Some("a page leaks per failed refill.".to_string()),
+                    locations: Vec::new(),
+                }],
+            }],
+        };
+        let target = PriorReviewTarget {
+            index: 1,
+            subject: "frob: refill the ring",
+            diff: "diff --git a/ring.c b/ring.c\n+refill();\n",
+        };
+        build_prior_review_context(&[revision], target).expect("a finding to show")
+    }
+
+    /// Each stage's user prompt for a review whose state selects every
+    /// stage, in both projects, with and without earlier findings.
+    fn user_prompts(prior_reviews: Option<PriorReviewContext>) -> Vec<(String, String)> {
+        use crate::workflows::sashiko_patch_review::build_sashiko_patch_review_workflow;
+        let state = LinuxPatchReviewState {
+            prior_reviews,
+            patch_concerns: vec![json!({"description": "a concern"})],
+            ..Default::default()
+        };
+        let linux = build_linux_patch_review_workflow().stage_user_prompts(&state);
+        let sashiko = build_sashiko_patch_review_workflow().stage_user_prompts(&state);
+        let tagged = |project: &str, prompts: Vec<(&str, String)>| {
+            prompts
+                .into_iter()
+                .map(|(name, prompt)| (format!("{project} {name}"), prompt))
+                .collect::<Vec<_>>()
+        };
+        let mut prompts = tagged("linux", linux);
+        prompts.extend(tagged("sashiko", sashiko));
+        prompts
+    }
+
+    /// The stages of one project that the tables say are shown what earlier
+    /// revisions were told, each tagged with its project, and every stage
+    /// the tables name.
+    fn tabled_stages(
+        project: &str,
+        analysis: &[AnalysisStage],
+        consolidation: &[&ConsolidationStage],
+    ) -> (Vec<String>, Vec<String>) {
+        let flags = analysis
+            .iter()
+            .map(|def| (def.name, def.wants_prior_reviews))
+            .chain(
+                consolidation
+                    .iter()
+                    .map(|def| (def.name, def.wants_prior_reviews)),
+            );
+        let (mut wanting, mut all) = (Vec::new(), Vec::new());
+        for (name, wants) in flags {
+            let tagged = format!("{project} {name}");
+            if wants {
+                wanting.push(tagged.clone());
+            }
+            all.push(tagged);
+        }
+        (wanting, all)
+    }
+
+    /// The rendered user prompts agree with the stage tables: exactly the
+    /// stages that declare wants_prior_reviews are shown what earlier
+    /// revisions were told, in both projects, so a flag set without the
+    /// placeholder, or a placeholder added without the flag, fails here.
+    /// Only verification declares it, so the analysts are not anchored on
+    /// what was raised before, and no system prompt carries it.
+    #[test]
+    fn prior_reviews_reach_verification_only() {
+        use crate::workflows::sashiko_patch_review as sashiko;
+        let (mut wanting, mut tabled) =
+            tabled_stages("linux", ANALYSIS_STAGES, CONSOLIDATION_STAGES);
+        let (sashiko_wanting, sashiko_tabled) = tabled_stages(
+            "sashiko",
+            sashiko::ANALYSIS_STAGES,
+            sashiko::CONSOLIDATION_STAGES,
+        );
+        wanting.extend(sashiko_wanting);
+        tabled.extend(sashiko_tabled);
+        assert_eq!(wanting, ["linux verification", "sashiko verification"]);
+        assert_eq!(prior_reviews_placeholder(true), PRIOR_REVIEWS_PLACEHOLDER);
+        assert_eq!(prior_reviews_placeholder(false), "");
+
+        let context = prior_reviews();
+        let opening = context
+            .rendered
+            .lines()
+            .next()
+            .expect("an opening line")
+            .to_string();
+        let prompts = user_prompts(Some(context.clone()));
+        for name in &tabled {
+            assert!(
+                prompts.iter().any(|(stage, _)| stage == name),
+                "{name} has a rendered prompt to check"
+            );
+        }
+        let given: Vec<String> = prompts
+            .into_iter()
+            .filter(|(_, prompt)| prompt.contains(&opening))
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(given, wanting);
+
+        use crate::workflows::sashiko_patch_review::build_sashiko_patch_review_workflow;
+        let state = LinuxPatchReviewState {
+            prior_reviews: Some(context),
+            ..Default::default()
+        };
+        let system_prompts = build_linux_patch_review_workflow()
+            .stage_system_prompts(&state)
+            .into_iter()
+            .chain(build_sashiko_patch_review_workflow().stage_system_prompts(&state));
+        for (name, prompt) in system_prompts {
+            assert!(
+                !prompt.unwrap_or_default().contains(&opening),
+                "{name}'s system prompt"
+            );
+        }
+    }
+
+    /// A review with no earlier findings gets the user prompts it had
+    /// before the block existed: the block and its rules are the only
+    /// difference, and without history they are empty, with no placeholder
+    /// left in the text.
+    #[test]
+    fn prior_reviews_render_nothing_without_history() {
+        let context = prior_reviews();
+        let inserted = format!(
+            "\n\n{}\n\n{PRIOR_REVIEWS_VERIFICATION_RULES}",
+            context.rendered
+        );
+        let with = user_prompts(Some(context));
+        let without = user_prompts(None);
+        for ((name, prompt), (_, bare)) in with.iter().zip(&without) {
+            assert_eq!(&prompt.replacen(&inserted, "", 1), bare, "{name}");
+            assert!(!bare.contains(PRIOR_REVIEWS_PLACEHOLDER), "{name}");
+            assert!(!bare.contains("PRIOR REVISION RULES"), "{name}");
+        }
+        for (name, bare) in without.iter().filter(|(n, _)| n.ends_with("verification")) {
+            assert!(
+                bare.ends_with("\n\n@false-positive-guide.md\n\n\n@severity.md\n"),
+                "{name}: the guides still end the prompt: {bare}"
+            );
+        }
+    }
+
+    /// Verification reads the block and its rules after the findings
+    /// format it asks for: after the Linux example output and after the
+    /// Sashiko key list. The rules judge every concern on the current code
+    /// and forbid reviving an earlier finding, and ask for no new key yet.
+    #[test]
+    fn verification_reads_the_prior_rules_after_its_findings_format() {
+        let context = prior_reviews();
+        let opening = context
+            .rendered
+            .lines()
+            .next()
+            .expect("an opening line")
+            .to_string();
+        let prompts = user_prompts(Some(context.clone()));
+        let prompt_of = |name: &str| {
+            prompts
+                .iter()
+                .find(|(stage, _)| stage == name)
+                .map(|(_, prompt)| prompt.as_str())
+                .unwrap_or_else(|| panic!("{name} is listed"))
+        };
+        for (name, format_end) in [
+            ("linux verification", "    }}\n  ]\n}}\n```"),
+            (
+                "sashiko verification",
+                "code_snippet, and why_this_location_matters).",
+            ),
+        ] {
+            let prompt = prompt_of(name);
+            let format_end = format_end.replace("}}", "}");
+            let block = prompt.find(&opening).expect("the block");
+            let rules = prompt
+                .find(PRIOR_REVIEWS_VERIFICATION_RULES)
+                .expect("the rules");
+            let format = prompt.find(&format_end).expect("the findings format");
+            let guides = prompt
+                .find("\n\n@false-positive-guide.md\n\n\n@severity.md\n")
+                .expect("the guides");
+            assert!(
+                format < guides && guides < block && block < rules,
+                "{name}: the rules call the guides the rules above: {prompt}"
+            );
+            assert!(
+                prompt[block..].contains(&format!(
+                    "{}\n\n{PRIOR_REVIEWS_VERIFICATION_RULES}",
+                    context.rendered
+                )),
+                "{name}: the rules follow the block"
+            );
+        }
+        for rule in [
+            "1. Judge every concern on the current code",
+            "2. Do not report an earlier finding that no concern in this review raises",
+        ] {
+            assert!(
+                PRIOR_REVIEWS_VERIFICATION_RULES.contains(&format!("\n{rule}")),
+                "{rule} opens a line"
+            );
+        }
+        assert!(
+            !PRIOR_REVIEWS_VERIFICATION_RULES.contains("\"prior\""),
+            "the findings format gains no key yet"
+        );
+    }
+
+    /// Substitution is single-pass, so an earlier finding whose title holds
+    /// another variable's placeholder keeps it as text, and the variable is
+    /// still filled where the template puts it.
+    #[test]
+    fn a_placeholder_in_an_earlier_finding_stays_literal() {
+        let prompts = user_prompts(Some(prior_reviews()));
+        for (name, prompt) in prompts.iter().filter(|(n, _)| n.ends_with("verification")) {
+            assert!(
+                prompt.contains("frob: refill leaks {{patch_concerns}}"),
+                "{name}: {prompt}"
+            );
+            assert!(prompt.contains("\"description\": \"a concern\""), "{name}");
+        }
     }
 }

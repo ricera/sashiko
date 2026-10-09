@@ -33,7 +33,7 @@ pub const COVER_LETTER_TOKENS: usize = 2000;
 /// What every line of the author's text starts with in the block, so that no
 /// line of it can start at column 0 and pass for one of the block's own
 /// lines or for a section of the prompt.
-const LINE_PREFIX: &str = "| ";
+pub(crate) const LINE_PREFIX: &str = "| ";
 
 const BLOCK_START: &str = "=== Series Cover Letter ===";
 const BLOCK_END: &str = "=== End of Series Cover Letter ===";
@@ -185,13 +185,35 @@ pub fn cover_letter_block(cover: Option<&CoverLetter>) -> String {
          ---\n",
         source = cover.source.description(),
     );
-    for line in text.lines() {
+    push_quoted_lines(&mut block, &text);
+    block.push_str(BLOCK_END);
+    block
+}
+
+/// Appends untrusted `text` to a prompt block with every line of it behind
+/// [`LINE_PREFIX`], so no line of it starts at column 0 where it could pass
+/// for a line of the block's own frame or for a section of the prompt.
+///
+/// A line ends at LF, at CR, and at every other character a reader may
+/// take as a line break (vertical tab, form feed, NEL, and the Unicode line
+/// and paragraph separators), so none of them can start an unprefixed line
+/// either. A CRLF pair ends one line, and the end of the text ends the
+/// last line without adding an empty one.
+pub(crate) fn push_quoted_lines(block: &mut String, text: &str) {
+    for line in text.lines().flat_map(|line| line.split(is_line_break)) {
         block.push_str(LINE_PREFIX);
         block.push_str(line);
         block.push('\n');
     }
-    block.push_str(BLOCK_END);
-    block
+}
+
+/// A character other than LF that a reader may take as the end of a line.
+/// `str::lines` has already split at LF and removed the CR of each CRLF.
+fn is_line_break(c: char) -> bool {
+    matches!(
+        c,
+        '\r' | '\u{0B}' | '\u{0C}' | '\u{85}' | '\u{2028}' | '\u{2029}'
+    )
 }
 
 #[cfg(test)]
@@ -376,5 +398,25 @@ mod tests {
             serde_json::json!({"source": "pull_request_description", "text": "Fixes the widget."})
         );
         assert_eq!(serde_json::from_value::<CoverLetter>(value).unwrap(), cover);
+    }
+
+    /// Every piece of quoted text a reader could take for a line of its own
+    /// starts behind the prefix, whatever character ends the line before
+    /// it, and the end of the text adds no empty line.
+    #[test]
+    fn every_quoted_line_starts_behind_the_prefix() {
+        let mut block = String::new();
+        push_quoted_lines(
+            &mut block,
+            "a\r\nb\rc\u{2028}d\u{2029}e\u{0B}f\u{0C}g\u{85}h\ni\n",
+        );
+        assert_eq!(
+            block, "| a\n| b\n| c\n| d\n| e\n| f\n| g\n| h\n| i\n",
+            "{block:?}"
+        );
+
+        let mut empty = String::new();
+        push_quoted_lines(&mut empty, "");
+        assert_eq!(empty, "");
     }
 }
