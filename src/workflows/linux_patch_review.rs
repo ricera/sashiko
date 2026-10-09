@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cover_letter::{CoverLetter, cover_letter_block};
-use crate::prior_revisions::PriorReviewContext;
+use crate::prior_revisions::{PriorReviewContext, ground_prior_link};
 use crate::settings::ReferenceKind;
 use crate::toolbox::{REPO_ARG, REPO_ARG_REVIEW, ReferenceRepo};
 use crate::workflow::graph::Workflow;
@@ -2075,17 +2075,256 @@ pub(crate) fn with_prior_reviews(
 }
 
 /// How verification uses the earlier findings, in both workflows: they
-/// change nothing about how a concern is judged, and an earlier finding that
-/// no concern raises is not reported.
+/// change nothing about how a concern is judged; a finding that repeats an
+/// earlier one, or that the fix for an earlier one caused, says so in a
+/// `prior` key naming it as the block listed it, and in one sentence at the
+/// end of its Triggering path rather than in its title; and an earlier
+/// finding that no concern raises is not reported.
 pub(crate) const PRIOR_REVIEWS_VERIFICATION_RULES: &str = "PRIOR REVISION RULES: The findings \
 above were reported on earlier revisions of this pull request. Use them as follows.\n\
 1. Judge and classify every concern on the current code, by the rules above. That a concern \
 was reported before makes it neither more nor less likely to be valid: an earlier finding is \
 not code proof that makes a concern well-justified, and it neither contests a concern nor \
 justifies a dismissal.\n\
-2. Do not add a finding or a hard case for an earlier finding that no input concern or \
-dismissed concern raises: this stage classifies the concerns it was given, it does not \
-revive earlier ones.";
+2. REPEAT: if an item you put in 'findings' or 'hard_cases' is the same defect as an earlier \
+finding and the current code still has it, add \"prior\": {\"relation\": \"repeat\", \"revision\": \
+\"<the label it was listed under, e.g. v3>\", \"earlier_problem\": \"<the earlier finding's title, \
+copied exactly as listed>\"} to that item.\n\
+3. FIX REGRESSION: if the code an item is about was added or changed in response to an earlier \
+finding -- that finding no longer applies, and the change that resolved it creates this defect \
+-- add \"prior\" with \"relation\": \"fix_regression\". Establish it by comparing the earlier \
+revision's code (its diff above, or the commit named in its patch header, read with the git \
+tools; that commit may no longer exist) with the current code; similar wording between two \
+findings is not enough.\n\
+4. Keep \"problem\" (a hard case's \"description\") the short title the rules above ask for; do \
+not say in it that the issue was reported before. Say it in one sentence: for a finding, in \
+\"severity_explanation\", at the end of its Triggering path; for a hard case, as the last \
+sentence of \"concern_arguments\". For a repeat, say that this path was reported on <revision> \
+and what, if anything, the current revision changed around it; for a fix regression, say which \
+change made for the earlier finding leads to this defect, and how. Keep the Consequence first, \
+as the rules above ask.\n\
+5. Omit \"prior\" when no finding above is the counterpart, and never put it on \
+'dismissed_concerns'. \"prior\" may name only a finding listed above, under the label it is \
+listed under. Do not add a finding or a hard case for an earlier finding that no input concern \
+or dismissed concern raises: this stage classifies the concerns it was given, it does not \
+revive earlier ones.\n\
+\"prior\" is the only addition to the output format above. It sits beside \"source_ids\" and \
+changes nothing about it: \"source_ids\" still lists only the C* and D* IDs of this review.";
+
+/// What a post-verification stage is told when a candidate in its batch
+/// carries a link to an earlier finding. Verification made the link; this
+/// stage only keeps the history out of the title and may say the defect it
+/// reports is another one.
+pub(crate) const PRIOR_LINK_POST_VERIFICATION_RULES: &str = "PRIOR LINK RULES: A candidate with \
+a \"prior\" key was linked by verification to a finding reported on an earlier revision of this \
+pull request (\"repeat\": the same defect; \"fix_regression\": a defect created by the change \
+made for that finding), and its concern_arguments end with one sentence saying so. Verify it like \
+any other candidate: the link makes it neither more nor less likely to be valid. Do not write \
+\"prior\" yourself: the link is carried to the finding you report for that candidate. If the \
+defect you report is not the one the link names, because you refined the candidate into another \
+defect, add \"prior\": null to that finding. When you report a linked candidate, keep \"problem\" \
+free of its history and put that sentence in \"severity_explanation\", at the end of its \
+Triggering path. Keep the Consequence first, as the rules above ask.";
+
+/// Whether an item was marked as present before the patchset.
+fn is_preexisting(item: &Value) -> bool {
+    item.get("preexisting")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether a review is shown the findings of earlier revisions of its pull
+/// request. The worker knows it from the review's state before it builds the
+/// workflow; verification checks the `prior` links only of a review that is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PriorHistory {
+    /// The review was shown no earlier findings, so no link can name one.
+    #[default]
+    NotShown,
+    /// The review was shown a block of earlier findings.
+    Shown,
+}
+
+impl PriorHistory {
+    /// The history of a review given the block of earlier findings its
+    /// state carries.
+    pub fn of(prior_reviews: Option<&PriorReviewContext>) -> Self {
+        match prior_reviews {
+            Some(_) => Self::Shown,
+            None => Self::NotShown,
+        }
+    }
+}
+
+/// Verification's output format and validation attempts in both workflows.
+///
+/// Upstream's lineage and structure checks always run. A review shown
+/// earlier findings also gets [`prior_link_validator`], after them, so it
+/// never spends its one rejection on an output the lineage checks reject
+/// anyway, and one validation attempt more than the default to pay for that
+/// rejection: the session counts a rejected link like a lineage fault or a
+/// JSON parse error, so without it a link the reduce would have cleaned up
+/// could take the attempt a later fault needed and fail the stage.
+pub(crate) fn verification_output_checks(
+    history: PriorHistory,
+) -> (
+    OutputFormat<LinuxPatchReviewState, VerificationOutput>,
+    usize,
+) {
+    let attempts = StagePolicy::consolidation().max_validation_attempts;
+    let format = OutputFormat::json().with_feedback_formatter(format_verification_stage_feedback);
+    match history {
+        PriorHistory::NotShown => (
+            format.with_validator(validate_verification_stage_output),
+            attempts,
+        ),
+        PriorHistory::Shown => {
+            let links = prior_link_validator();
+            (
+                format.with_validator(move |output, state| {
+                    validate_verification_stage_output(output, state)?;
+                    links(output, state)
+                }),
+                attempts + PRIOR_LINK_REJECTIONS,
+            )
+        }
+    }
+}
+
+/// How many outputs [`prior_link_validator`] rejects in one patch review.
+const PRIOR_LINK_REJECTIONS: usize = 1;
+
+/// Checks the `prior` links of the findings and hard cases verification
+/// keeps against the block of earlier findings it was shown.
+///
+/// A link that names no listed finding is rejected with feedback that names
+/// the item, what was wrong and what was listed, once per patch review: the
+/// closure remembers its own rejection, and the workflow, and so the
+/// closure, is built anew for each patch a worker reviews. A second faulty
+/// output passes, and the reduce removes whatever still does not ground
+/// ([`ground_prior_link`]).
+fn prior_link_validator()
+-> impl Fn(&VerificationOutput, &LinuxPatchReviewState) -> Result<(), String> + Send + Sync + 'static
+{
+    let rejected = std::sync::atomic::AtomicBool::new(false);
+    move |output, state| {
+        let Some(context) = &state.prior_reviews else {
+            return Ok(());
+        };
+        if rejected.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let kept = output
+            .findings
+            .iter()
+            .filter(|f| !is_preexisting(f))
+            .map(|f| ("finding", f))
+            .chain(
+                output
+                    .hard_cases
+                    .iter()
+                    .filter(|h| !is_preexisting(h))
+                    .map(|h| ("hard case", h)),
+            );
+        match context.link_feedback(kept) {
+            Some(feedback) if !rejected.swap(true, std::sync::atomic::Ordering::Relaxed) => {
+                Err(feedback)
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Grounds the `prior` link of every finding and hard case verification
+/// keeps, and removes any other: a preexisting item and a dismissed concern
+/// keep no link.
+fn ground_verification_links(out: &mut VerificationOutput, shown: Option<&PriorReviewContext>) {
+    for item in out.findings.iter_mut().chain(out.hard_cases.iter_mut()) {
+        if is_preexisting(item) {
+            remove_prior(item);
+        } else {
+            ground_prior_link(item, shown);
+        }
+    }
+    for dismissed in &mut out.dismissed_concerns {
+        remove_prior(dismissed);
+    }
+}
+
+fn remove_prior(item: &mut Value) {
+    if let Some(fields) = item.as_object_mut() {
+        fields.remove("prior");
+    }
+}
+
+/// Gives each post-verification finding the link of its candidate.
+///
+/// Post-verification is not shown the earlier findings, so it makes no
+/// links: a finding takes the already grounded link of the first hard case
+/// its source_ids name that has one, and any link the model wrote is
+/// replaced. `"prior": null` means the model refined the candidate into
+/// another defect, and keeps none. The inherited link is grounded again,
+/// which also fills in the revision's head the prompt left out. A
+/// preexisting finding and a dismissed concern keep no link.
+fn inherit_prior_links(
+    out: &mut PostVerificationOutput,
+    batch: &[Value],
+    shown: Option<&PriorReviewContext>,
+) {
+    for finding in &mut out.findings {
+        let refused = finding.get("prior").is_some_and(Value::is_null);
+        remove_prior(finding);
+        if refused || is_preexisting(finding) {
+            continue;
+        }
+        let inherited = extract_id_list(finding, "source_ids")
+            .iter()
+            .find_map(|id| {
+                batch
+                    .iter()
+                    .find(|h| h.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                    .and_then(|h| h.get("prior"))
+                    .filter(|prior| !prior.is_null())
+                    .cloned()
+            });
+        if let (Some(prior), Some(fields)) = (inherited, finding.as_object_mut()) {
+            fields.insert("prior".to_string(), prior);
+            ground_prior_link(finding, shown);
+        }
+    }
+    for dismissed in &mut out.dismissed_concerns {
+        remove_prior(dismissed);
+    }
+}
+
+/// A post-verification batch as its prompt shows it: a linked candidate's
+/// `prior` without the earlier revision's head, which is never shown to the
+/// model, since an earlier head is the commit-as-series trap.
+pub(crate) fn candidates_for_prompt(batch: &[Value]) -> Vec<Value> {
+    batch
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            if let Some(prior) = item.get_mut("prior").and_then(Value::as_object_mut) {
+                prior.remove("revision_head");
+            }
+            item
+        })
+        .collect()
+}
+
+/// The rules a post-verification batch with a linked candidate ends with,
+/// or nothing, so an unlinked batch's prompt is upstream's, byte for byte.
+pub(crate) fn prior_link_section(batch: &[Value], rules: &str) -> String {
+    if batch
+        .iter()
+        .any(|item| item.get("prior").is_some_and(|prior| !prior.is_null()))
+    {
+        format!("\n\n{rules}")
+    } else {
+        String::new()
+    }
+}
 
 use crate::workflows::guard::normalize_stage_name;
 
@@ -2379,6 +2618,7 @@ pub fn apply_verification_stage_output(
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
     enrich_verification_output(state, &mut out, outcome, stage_lookup);
+    ground_verification_links(&mut out, state.prior_reviews.as_ref());
     state.verification_findings.extend(out.findings.clone());
     state
         .verification_dismissed
@@ -2398,6 +2638,8 @@ pub fn apply_post_verification_stage_output(
     outcome: &crate::workflow::stage::StageOutcome,
     stage_lookup: fn(&str) -> Option<&'static AnalysisStage>,
 ) {
+    // Before enrichment, so source_ids are exactly as the model wrote them.
+    inherit_prior_links(&mut out, batch, state.prior_reviews.as_ref());
     enrich_post_verification_output(
         &state.selected_guides,
         batch,
@@ -2435,15 +2677,18 @@ pub fn apply_post_verification_stage_output(
 pub fn verification_stage(
     max_turns: usize,
     temperature: f32,
+    history: PriorHistory,
 ) -> Stage<LinuxPatchReviewState, VerificationOutput> {
-    verification_stage_with_effort(max_turns, temperature, None)
+    verification_stage_with_effort(max_turns, temperature, None, history)
 }
 
 pub fn verification_stage_with_effort(
     max_turns: usize,
     temperature: f32,
     effort: Option<crate::ai::EffortMode>,
+    history: PriorHistory,
 ) -> Stage<LinuxPatchReviewState, VerificationOutput> {
+    let (output_format, max_validation_attempts) = verification_output_checks(history);
     let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
     let prior_reviews = prior_reviews_placeholder(VERIFICATION.wants_prior_reviews);
     let user_template = with_series_context(
@@ -2544,16 +2789,13 @@ Example Output:
             VERIFICATION.wants_prior_reviews,
             PRIOR_REVIEWS_VERIFICATION_RULES,
         ))
-        .output_format(
-            OutputFormat::json()
-                .with_validator(validate_verification_stage_output)
-                .with_feedback_formatter(format_verification_stage_feedback),
-        )
+        .output_format(output_format)
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
             temperature,
             reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
+            max_validation_attempts,
             ..StagePolicy::consolidation()
         })
         .reduce_with_outcome(|state, out: VerificationOutput, outcome| {
@@ -2578,7 +2820,9 @@ pub fn post_verification_stage_with_effort(
     temperature: f32,
     effort: Option<crate::ai::EffortMode>,
 ) -> Stage<LinuxPatchReviewState, PostVerificationOutput> {
-    let candidate_json = serde_json::to_string_pretty(&batch).unwrap_or_default();
+    let candidate_json =
+        serde_json::to_string_pretty(&candidates_for_prompt(&batch)).unwrap_or_default();
+    let prior_link_rules = prior_link_section(&batch, PRIOR_LINK_POST_VERIFICATION_RULES);
     let batch_for_prompts = batch.clone();
     let batch_for_validate = batch.clone();
     let batch_for_reduce = batch;
@@ -2644,7 +2888,7 @@ Example Output:
     }}
   ]
 }}
-```"#
+```{prior_link_rules}"#
         ))
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
@@ -2775,17 +3019,21 @@ Return raw text output, not JSON."#
 // Complete Kernel Review Workflow Graph
 // ---------------------------------------------------------------------------
 
-/// Constructs the complete declarative workflow for Linux kernel patch review.
+/// Constructs the complete declarative workflow for Linux kernel patch review
+/// of a patch shown no earlier findings.
 pub fn build_linux_patch_review_workflow() -> Workflow<LinuxPatchReviewState> {
-    build_linux_patch_review_workflow_with_options(20, 0.0)
+    build_linux_patch_review_workflow_with_options(20, 0.0, PriorHistory::NotShown)
 }
 
-/// Constructs the declarative workflow with custom per-stage interaction limits and temperature.
+/// Constructs the declarative workflow with custom per-stage interaction
+/// limits and temperature, for a review whose earlier findings `history`
+/// says whether it is shown.
 pub fn build_linux_patch_review_workflow_with_options(
     max_turns: usize,
     temperature: f32,
+    history: PriorHistory,
 ) -> Workflow<LinuxPatchReviewState> {
-    build_linux_patch_review_workflow_with_effort(max_turns, temperature, None)
+    build_linux_patch_review_workflow_with_effort(max_turns, temperature, None, history)
 }
 
 /// Constructs the declarative workflow with optional reasoning effort mode.
@@ -2793,6 +3041,7 @@ pub fn build_linux_patch_review_workflow_with_effort(
     max_turns: usize,
     temperature: f32,
     effort: Option<crate::ai::EffortMode>,
+    history: PriorHistory,
 ) -> Workflow<LinuxPatchReviewState> {
     Workflow::builder("linux_patch_review")
         .stage(prescreen_stage_with_effort(temperature, effort))
@@ -2806,7 +3055,7 @@ pub fn build_linux_patch_review_workflow_with_effort(
             "No concerns or dismissed concerns raised in initial analysis stages",
         )
         .dynamic_parallel(
-            verification_stage_with_effort(max_turns, temperature, effort),
+            verification_stage_with_effort(max_turns, temperature, effort, history),
             move |state| {
                 resolve_post_verification_stages_with_options(state, max_turns, temperature)
             },
@@ -2970,7 +3219,7 @@ mod tests {
         // The builders name their stages with literals; this is what stops one
         // drifting from the table that has to recognise and display it.
         for name in [
-            verification_stage(1, 1.0).name(),
+            verification_stage(1, 1.0, PriorHistory::NotShown).name(),
             report_stage(1, 1.0).name(),
         ] {
             assert!(is_known_stage(name), "{name} is not in any stage table");
@@ -3208,9 +3457,14 @@ mod tests {
             1.0
         );
         assert_eq!(
-            verification_stage_with_effort(20, 0.0, Some(crate::ai::EffortMode::Mid))
-                .policy
-                .reasoning_effort,
+            verification_stage_with_effort(
+                20,
+                0.0,
+                Some(crate::ai::EffortMode::Mid),
+                PriorHistory::NotShown
+            )
+            .policy
+            .reasoning_effort,
             Some(crate::ai::ReasoningEffort::Medium)
         );
         state.effort = Some(crate::ai::EffortMode::Mid);
@@ -3779,7 +4033,7 @@ mod tests {
             wind_down: None,
         };
 
-        let wf = build_linux_patch_review_workflow_with_options(1, 1.0);
+        let wf = build_linux_patch_review_workflow_with_options(1, 1.0, PriorHistory::NotShown);
         let mut state = LinuxPatchReviewState::default();
         crate::workflow::WorkflowEngine::execute(&wf, &env, &mut state, None)
             .await
@@ -4161,7 +4415,7 @@ mod tests {
 
     #[test]
     fn test_verification_stage_preserves_preexisting_concerns() {
-        let stage = verification_stage(20, 0.0);
+        let stage = verification_stage(20, 0.0, PriorHistory::NotShown);
         let mut state = LinuxPatchReviewState {
             findings: vec![json!({
                 "problem": "existing finding",
@@ -4294,7 +4548,7 @@ mod tests {
 
     #[test]
     fn test_report_preexisting_keeps_preexisting_through_verification() {
-        let ver_stage = verification_stage(20, 0.0);
+        let ver_stage = verification_stage(20, 0.0, PriorHistory::NotShown);
 
         let mut state = LinuxPatchReviewState {
             report_preexisting: true,
@@ -4465,7 +4719,7 @@ mod tests {
         );
 
         // Verification stage user prompt log includes @subsystem/locking.md, @patterns/BPF-001.md, etc.
-        let ver_stage = verification_stage(20, 0.0);
+        let ver_stage = verification_stage(20, 0.0, PriorHistory::NotShown);
         let rendered_ver_log = ver_stage.user_prompt.render_for_log(&state);
         assert!(rendered_ver_log.contains("@subsystem/locking.md"));
         assert!(rendered_ver_log.contains("@patterns/BPF-001.md"));
@@ -4775,7 +5029,7 @@ mod tests {
     }
 
     fn verification_prompt() -> String {
-        verification_stage(10, 1.0)
+        verification_stage(10, 1.0, PriorHistory::NotShown)
             .user_prompt
             .render_for_log(&LinuxPatchReviewState::default())
     }
@@ -5182,8 +5436,10 @@ mod tests {
 
     /// Verification reads the block and its rules after the findings
     /// format it asks for: after the Linux example output and after the
-    /// Sashiko key list. The rules judge every concern on the current code
-    /// and forbid reviving an earlier finding, and ask for no new key yet.
+    /// Sashiko key list. The rules judge every concern on the current code,
+    /// add "prior" as the one new key, for a repeat or a fix regression,
+    /// keep the title free of the history and put it at the end of the
+    /// Triggering path, and forbid reviving an earlier finding.
     #[test]
     fn verification_reads_the_prior_rules_after_its_findings_format() {
         let context = prior_reviews();
@@ -5229,19 +5485,33 @@ mod tests {
                 "{name}: the rules follow the block"
             );
         }
+        let rules = PRIOR_REVIEWS_VERIFICATION_RULES;
+        let mut opened = Vec::new();
         for rule in [
             "1. Judge and classify every concern on the current code",
-            "2. Do not add a finding or a hard case for an earlier finding",
+            "2. REPEAT:",
+            "3. FIX REGRESSION:",
+            "4. Keep \"problem\"",
+            "5. Omit \"prior\"",
         ] {
-            assert!(
-                PRIOR_REVIEWS_VERIFICATION_RULES.contains(&format!("\n{rule}")),
-                "{rule} opens a line"
-            );
+            let at = rules
+                .find(&format!("\n{rule}"))
+                .unwrap_or_else(|| panic!("{rule} opens a line: {rules}"));
+            opened.push(at);
         }
-        assert!(
-            !PRIOR_REVIEWS_VERIFICATION_RULES.contains("\"prior\""),
-            "the findings format gains no key yet"
-        );
+        assert!(opened.windows(2).all(|w| w[0] < w[1]), "{rules}");
+        for asked in [
+            r#""prior": {"relation": "repeat", "revision": "<the label it was listed under, e.g. v3>", "earlier_problem": "<the earlier finding's title, copied exactly as listed>"}"#,
+            r#""relation": "fix_regression""#,
+            "at the end of its Triggering path",
+            "Keep the Consequence first",
+            "Do not add a finding or a hard case for an earlier finding that no input concern or dismissed concern raises",
+            "never put it on 'dismissed_concerns'",
+            "\"source_ids\" still lists only the C* and D* IDs",
+        ] {
+            assert!(rules.contains(asked), "{asked}: {rules}");
+        }
+        assert!(!rules.contains("revision_head"), "the daemon adds the head");
     }
 
     /// Substitution is single-pass, so an earlier finding whose title holds
@@ -5256,6 +5526,453 @@ mod tests {
                 "{name}: {prompt}"
             );
             assert!(prompt.contains("\"description\": \"a concern\""), "{name}");
+        }
+    }
+
+    /// The verification stages of both projects, by project name, for a
+    /// review whose earlier findings `history` says whether it is shown.
+    fn verification_stages(
+        history: PriorHistory,
+    ) -> [(
+        &'static str,
+        Stage<LinuxPatchReviewState, VerificationOutput>,
+    ); 2] {
+        [
+            ("linux", verification_stage(20, 0.0, history)),
+            (
+                "sashiko",
+                crate::workflows::sashiko_patch_review::verification_stage(20, 0.0, history),
+            ),
+        ]
+    }
+
+    /// The post-verification stage of each project for `batch`.
+    fn post_verification_stages(
+        batch: Vec<Value>,
+    ) -> [(
+        &'static str,
+        Stage<LinuxPatchReviewState, PostVerificationOutput>,
+    ); 2] {
+        [
+            (
+                "linux",
+                post_verification_stage(POST_VERIFICATION_STAGE_NAMES[0], batch.clone(), 20, 0.0),
+            ),
+            (
+                "sashiko",
+                crate::workflows::sashiko_patch_review::post_verification_stage(
+                    POST_VERIFICATION_STAGE_NAMES[0],
+                    batch,
+                    20,
+                    0.0,
+                ),
+            ),
+        ]
+    }
+
+    /// The title `prior_reviews` lists.
+    const LISTED: &str = "frob: refill leaks {{aggregated_concerns}}";
+
+    fn link(earlier_problem: &str) -> Value {
+        json!({"relation": "repeat", "revision": "v1", "earlier_problem": earlier_problem})
+    }
+
+    /// A Category 1a finding raised by `source`, linked to the finding
+    /// `prior_reviews` shows unless `earlier_problem` names another.
+    fn linked_finding(problem: &str, source: &str, earlier_problem: &str) -> Value {
+        json!({
+            "source_ids": [source],
+            "problem": problem,
+            "speculative": false,
+            "severity": "High",
+            "severity_explanation": "Consequence: a leak.",
+            "preexisting": false,
+            "locations": [],
+            "prior": link(earlier_problem),
+        })
+    }
+
+    /// A hard case raised by `source`, linked like [`linked_finding`].
+    fn linked_hard_case(description: &str, source: &str, earlier_problem: &str) -> Value {
+        json!({
+            "source_ids": [source],
+            "type": "Resource Management",
+            "description": description,
+            "estimated_severity": "Medium",
+            "signal_reason": "speculative_concern",
+            "concern_arguments": "a page may leak",
+            "dismissal_arguments": "",
+            "verification_question": "Is the page freed on every path?",
+            "preexisting": false,
+            "locations": [],
+            "prior": link(earlier_problem),
+        })
+    }
+
+    /// A review shown the earlier findings, whose analysts raised C1 and C2.
+    fn linked_review_state() -> LinuxPatchReviewState {
+        LinuxPatchReviewState {
+            prior_reviews: Some(prior_reviews()),
+            all_concerns: vec![
+                json!({"id": "C1", "description": "a ring leak"}),
+                json!({"id": "C2", "description": "a refill leak"}),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn verification_answer(findings: Vec<Value>, hard_cases: Vec<Value>) -> String {
+        json!({"findings": findings, "hard_cases": hard_cases, "dismissed_concerns": []})
+            .to_string()
+    }
+
+    /// The link check runs after upstream's lineage checks and rejects an
+    /// output with a link to an unlisted finding once per review, naming the
+    /// finding or hard case, the fault and the titles listed under the
+    /// revision it named; the next faulty output passes and the reduce
+    /// removes the link. A review with no earlier findings gets no link
+    /// check and the default attempts; one with them has one attempt more.
+    #[test]
+    fn the_prior_validator_names_the_bad_link_once() {
+        let state = linked_review_state();
+        let bad = verification_answer(
+            vec![
+                linked_finding("frob: ring leaks", "C1", LISTED),
+                linked_finding("frob: refill races", "C1", "frob: refill races"),
+            ],
+            vec![linked_hard_case(
+                "frob: refill may leak",
+                "C2",
+                "frob: other",
+            )],
+        );
+        let default_attempts = StagePolicy::consolidation().max_validation_attempts;
+        for (project, stage) in verification_stages(PriorHistory::NotShown) {
+            assert_eq!(
+                stage.policy.max_validation_attempts, default_attempts,
+                "{project}"
+            );
+            assert!(
+                stage.output_format.validate(&bad, &state).is_ok(),
+                "{project}: no link check without history"
+            );
+        }
+        for (project, stage) in verification_stages(PriorHistory::Shown) {
+            assert_eq!(
+                stage.policy.max_validation_attempts,
+                default_attempts + 1,
+                "{project}"
+            );
+            let format = &stage.output_format;
+            let good = verification_answer(
+                vec![linked_finding("frob: ring leaks", "C1", LISTED)],
+                vec![linked_hard_case("frob: refill may leak", "C2", LISTED)],
+            );
+            assert!(format.validate(&good, &state).is_ok(), "{project}");
+
+            let feedback = format
+                .validate(&bad, &state)
+                .expect_err("an unlisted title is rejected");
+            for expected in [
+                "- the finding \"frob: refill races\": earlier_problem \"frob: refill races\" \
+                 is not listed under \"v1\"\n",
+                "- the hard case \"frob: refill may leak\": earlier_problem \"frob: other\" \
+                 is not listed under \"v1\"\n",
+                "The titles listed under \"v1\" are:\n- \"frob: refill leaks {{aggregated_concerns}}\"\n",
+            ] {
+                assert!(feedback.contains(expected), "{project}: {feedback}");
+            }
+            assert!(
+                !feedback.contains("frob: ring leaks"),
+                "{project}: {feedback}"
+            );
+            let wrapped = format.format_feedback(&feedback);
+            assert!(
+                wrapped.contains("'findings', 'hard_cases', and 'dismissed_concerns'"),
+                "{project}: verification's own feedback wrapper: {wrapped}"
+            );
+
+            let again = format
+                .validate(&bad, &state)
+                .unwrap_or_else(|e| panic!("{project}: a second rejection: {e}"));
+            let mut reduced = state.clone();
+            apply_verification_stage_output(
+                &mut reduced,
+                again,
+                &crate::workflow::stage::StageOutcome::default(),
+                analysis_stage_by_name,
+            );
+            let links: Vec<Option<&Value>> =
+                reduced.findings.iter().map(|f| f.get("prior")).collect();
+            assert_eq!(links, [Some(&link(LISTED)), None], "{project}");
+            assert!(reduced.hard_cases[0].get("prior").is_none(), "{project}");
+        }
+    }
+
+    /// An output the lineage checks reject does not spend the one link
+    /// rejection: the next output, with lineage fixed and the bad link kept,
+    /// is still rejected for the link, and the one after passes.
+    #[test]
+    fn the_link_check_waits_for_the_lineage_checks() {
+        let state = linked_review_state();
+        let bad_link = linked_finding("frob: ring leaks", "C1", "frob: unlisted");
+        // C2 is accounted for by nothing: a lineage fault.
+        let lineage_fault = verification_answer(vec![bad_link.clone()], vec![]);
+        let link_fault = verification_answer(
+            vec![bad_link],
+            vec![linked_hard_case("frob: refill may leak", "C2", LISTED)],
+        );
+        for (project, stage) in verification_stages(PriorHistory::Shown) {
+            let format = &stage.output_format;
+            let first = format
+                .validate(&lineage_fault, &state)
+                .expect_err("a lineage fault is rejected");
+            assert!(
+                first.contains("C2"),
+                "{project}: the lineage error: {first}"
+            );
+            let second = format
+                .validate(&link_fault, &state)
+                .expect_err("the link is still rejected once");
+            assert!(second.contains("frob: unlisted"), "{project}: {second}");
+            assert!(format.validate(&link_fault, &state).is_ok(), "{project}");
+        }
+    }
+
+    /// Answers each model request with the next queued text, and nothing
+    /// once the queue is empty.
+    struct QueuedAnswers(std::sync::Mutex<std::collections::VecDeque<String>>);
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for QueuedAnswers {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            Ok(crate::ai::AiResponse {
+                content: self.0.lock().unwrap().pop_front(),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "queued".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    /// The session counts the link rejection and a JSON parse error alike,
+    /// so a review shown earlier findings gets one attempt more: a parse
+    /// error, a rejected link and a second parse error still leave the
+    /// attempt the correct answer needs, in both projects.
+    #[tokio::test]
+    async fn the_prior_rejection_leaves_the_attempts_a_parse_error_needs() {
+        let answer = |earlier_problem: &str| {
+            verification_answer(
+                vec![linked_finding("frob: ring leaks", "C1", earlier_problem)],
+                vec![linked_hard_case("frob: refill may leak", "C2", LISTED)],
+            )
+        };
+        let state = linked_review_state();
+        for (project, stage) in verification_stages(PriorHistory::Shown) {
+            let answers = [
+                "not JSON".to_string(),
+                answer("frob: refill races"),
+                "still not JSON".to_string(),
+                answer(LISTED),
+            ];
+            let tmp = tempfile::tempdir().unwrap();
+            let env = crate::workflow::WorkflowEnv {
+                provider: std::sync::Arc::new(QueuedAnswers(std::sync::Mutex::new(
+                    answers.into_iter().collect(),
+                ))),
+                tools: std::sync::Arc::new(crate::toolbox::ToolBox::new(
+                    tmp.path().to_path_buf(),
+                    None,
+                )),
+                base_dir: tmp.path(),
+                context_tag: None,
+                wind_down: None,
+            };
+            let mut reduced = state.clone();
+            stage
+                .execute(&env, &mut reduced, None)
+                .await
+                .unwrap_or_else(|e| panic!("{project}: {e:#}"));
+            assert_eq!(
+                reduced.findings[0]["prior"]["earlier_problem"], LISTED,
+                "{project}"
+            );
+        }
+    }
+
+    /// The shared reduce grounds each kept finding's and hard case's link: a
+    /// link to a listed finding is kept in canonical form, one to anything
+    /// else, or any link in a review shown no earlier findings, is removed;
+    /// a dismissed concern and a preexisting finding keep none, whether the
+    /// preexisting finding becomes a concern or, with report_preexisting,
+    /// stays a finding.
+    #[test]
+    fn verification_keeps_only_links_to_listed_findings() {
+        let mut preexisting = linked_finding("frob: old race", "C1", LISTED);
+        preexisting["preexisting"] = json!(true);
+        let output = || VerificationOutput {
+            findings: vec![
+                linked_finding("frob: ring leaks", "C1", &LISTED.to_uppercase()),
+                linked_finding("frob: refill races", "C1", "frob: refill races"),
+                preexisting.clone(),
+            ],
+            hard_cases: vec![
+                linked_hard_case("frob: refill may leak", "C2", LISTED),
+                linked_hard_case("frob: ring may leak", "C2", "frob: other"),
+            ],
+            dismissed_concerns: vec![json!({
+                "source_ids": ["D1"],
+                "description": "frob: no leak",
+                "reasoning": "freed",
+                "locations": [],
+                "prior": link(LISTED),
+            })],
+        };
+        for report_preexisting in [false, true] {
+            for (shown, kept) in [(Some(prior_reviews()), Some(link(LISTED))), (None, None)] {
+                let mut state = LinuxPatchReviewState {
+                    prior_reviews: shown,
+                    report_preexisting,
+                    ..Default::default()
+                };
+                apply_verification_stage_output(
+                    &mut state,
+                    output(),
+                    &crate::workflow::stage::StageOutcome::default(),
+                    analysis_stage_by_name,
+                );
+                let links = |items: &[Value]| -> Vec<Option<Value>> {
+                    items.iter().map(|f| f.get("prior").cloned()).collect()
+                };
+                let new: Vec<Value> = state
+                    .findings
+                    .iter()
+                    .filter(|f| !is_preexisting(f))
+                    .cloned()
+                    .collect();
+                assert_eq!(links(&new), [kept.clone(), None]);
+                assert_eq!(
+                    links(&state.verification_findings)[..2],
+                    [kept.clone(), None]
+                );
+                assert_eq!(links(&state.hard_cases), [kept.clone(), None]);
+                assert!(
+                    state.deduplicated_dismissed_concerns[0]
+                        .get("prior")
+                        .is_none()
+                );
+                assert!(state.concerns.iter().all(|c| c.get("prior").is_none()));
+                assert!(
+                    state
+                        .findings
+                        .iter()
+                        .filter(|f| is_preexisting(f))
+                        .all(|f| f.get("prior").is_none()),
+                    "report_preexisting {report_preexisting}"
+                );
+            }
+        }
+    }
+
+    /// Post-verification is not shown the earlier findings: a finding it
+    /// reports takes the grounded link of the first candidate its
+    /// source_ids name that has one, and a link the model wrote is replaced;
+    /// "prior": null keeps none, as does a preexisting finding.
+    #[test]
+    fn post_verification_inherits_the_candidates_link() {
+        let mut h1 = linked_hard_case("frob: refill may leak", "C2", LISTED);
+        h1["id"] = json!("H1");
+        let mut h2 = h1.clone();
+        h2["id"] = json!("H2");
+        h2.as_object_mut().unwrap().remove("prior");
+        let mut shown = linked_review_state();
+        let mut grounded = h1.clone();
+        ground_prior_link(&mut grounded, shown.prior_reviews.as_ref());
+        let batch = vec![grounded.clone(), h2];
+        let pv_finding = |sources: Value, prior: Option<Value>, preexisting: bool| {
+            let mut f = linked_finding("frob: refill leaks", "H1", LISTED);
+            f["source_ids"] = sources;
+            f["preexisting"] = json!(preexisting);
+            match prior {
+                Some(p) => f["prior"] = p,
+                None => {
+                    f.as_object_mut().unwrap().remove("prior");
+                }
+            }
+            f
+        };
+        let out = PostVerificationOutput {
+            findings: vec![
+                pv_finding(json!(["H1"]), Some(link("frob: bogus")), false),
+                pv_finding(json!(["H2"]), None, false),
+                pv_finding(json!(["H1"]), Some(Value::Null), false),
+                pv_finding(json!(["H2", "H1"]), None, false),
+                pv_finding(json!(["H1"]), None, true),
+            ],
+            dismissed_concerns: vec![],
+        };
+        apply_post_verification_stage_output(
+            &mut shown,
+            POST_VERIFICATION_STAGE_NAMES[0],
+            &batch,
+            out,
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        let inherited = grounded.get("prior").cloned();
+        assert!(inherited.is_some(), "the candidate's link grounds");
+        let links: Vec<Option<Value>> = shown
+            .post_verification_findings
+            .iter()
+            .map(|f| f.get("prior").cloned())
+            .collect();
+        assert_eq!(
+            links,
+            [inherited.clone(), None, None, inherited.clone(), None]
+        );
+        assert!(shown.concerns.iter().all(|c| c.get("prior").is_none()));
+    }
+
+    /// A batch with no linked candidate gets upstream's prompt; a batch with
+    /// one is told how links work, after the findings format, and is shown
+    /// the link without the earlier revision's head.
+    #[test]
+    fn post_verification_is_told_about_links_only_for_linked_candidates() {
+        let state = linked_review_state();
+        let mut linked = linked_hard_case("frob: refill may leak", "C2", LISTED);
+        linked["id"] = json!("H1");
+        ground_prior_link(&mut linked, state.prior_reviews.as_ref());
+        let mut unlinked = linked.clone();
+        unlinked.as_object_mut().unwrap().remove("prior");
+        for (project, stage) in post_verification_stages(vec![unlinked]) {
+            let prompt = stage.user_prompt.render_for_log(&state);
+            assert!(!prompt.contains("PRIOR LINK RULES"), "{project}");
+            assert!(!prompt.contains("\"prior\""), "{project}");
+        }
+        for (project, stage) in post_verification_stages(vec![linked]) {
+            let prompt = stage.user_prompt.render_for_log(&state);
+            let rules = prompt.find("PRIOR LINK RULES").expect("the rules");
+            let format = prompt
+                .find("Each object in 'findings' MUST use")
+                .expect("the format");
+            assert!(format < rules, "{project}: the rules follow the format");
+            assert!(
+                prompt.contains("\"prior\""),
+                "{project}: the candidate shows its link"
+            );
+            assert!(!prompt.contains("revision_head"), "{project}: {prompt}");
         }
     }
 }
