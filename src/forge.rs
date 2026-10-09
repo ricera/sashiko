@@ -895,8 +895,9 @@ const GH_DETAIL_MAX_CHARS: usize = 200;
 /// gh's documented exit status for "authentication required".
 const GH_EXIT_AUTH_REQUIRED: i32 = 4;
 
-/// The fields asked of gh: exactly what a review of the revision needs.
-const GH_PR_FIELDS: &str = "number,title,url,baseRefOid,headRefOid";
+/// The fields asked of gh: exactly what a review of the revision needs,
+/// including the description the model is given as the cover letter.
+const GH_PR_FIELDS: &str = "number,title,url,baseRefOid,headRefOid,body";
 
 /// What gh reported about one pull request, validated against the request:
 /// the number is the one asked for, the URL names that pull request in
@@ -913,6 +914,11 @@ pub struct ResolvedPullRequest {
     /// The title as the forge gave it. Like a webhook's, it is only stored
     /// and shown escaped.
     pub title: Option<String>,
+    /// The description as [`request_description`] reads it, with the same
+    /// trimming and cap as a webhook's, and `None` when gh gave none or a
+    /// blank one. Whoever opened the pull request wrote it, so it is
+    /// untrusted text.
+    pub body: Option<String>,
     /// The commit the pull request is based on.
     pub base: CommitId,
     /// The pull request's head commit.
@@ -925,8 +931,11 @@ impl ResolvedPullRequest {
     /// The repository URL is the https clone URL GitHub's webhook sends as
     /// clone_url, in the forge's own spelling, so the fetcher derives the
     /// same fetcher-<hash> remote, and uses the same credentials, as it does
-    /// for a webhook-driven review of the same repository. gh is not asked
-    /// for the author or the description, so neither is recorded.
+    /// for a webhook-driven review of the same repository. The description
+    /// is carried, so the revision records it as a webhook-driven one does.
+    /// gh is not asked for the author, because the Dependabot skip it feeds
+    /// does not apply to a review the operator asked for, so none is
+    /// recorded.
     pub fn to_forge_metadata(&self) -> ForgeMetadata {
         ForgeMetadata {
             repo_url: Some(format!(
@@ -939,7 +948,7 @@ impl ResolvedPullRequest {
             pr_title: self.title.clone(),
             pr_url: Some(self.url.clone()),
             author: None,
-            pr_body: None,
+            pr_body: self.body.clone(),
         }
     }
 }
@@ -1134,6 +1143,11 @@ struct GhPullRequest {
     url: String,
     base_ref_oid: String,
     head_ref_oid: String,
+    /// Read as a JSON value, not a string, so that request_description
+    /// decides what an absent, null or non-string description means, as it
+    /// does for a webhook's.
+    #[serde(default)]
+    body: serde_json::Value,
 }
 
 /// Reads and validates what gh printed for pull request `number` of `repo`.
@@ -1169,6 +1183,7 @@ fn parse_gh_pull_request(
         number,
         url,
         title: raw.title,
+        body: request_description(&raw.body),
         base,
         head,
     })
@@ -2142,12 +2157,14 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
     const GH_HEAD: &str = "89abcdef0123456789abcdef0123456789abcdef";
     const GH_URL: &str = "https://github.com/example-org/driver-a/pull/967";
 
-    /// A `gh pr view --json number,title,url,baseRefOid,headRefOid` answer
-    /// in the shape gh prints when stdout is not a terminal: one compact
-    /// object with its keys sorted, then a newline.
+    /// A `gh pr view --json number,title,url,baseRefOid,headRefOid,body`
+    /// answer in the shape gh prints when stdout is not a terminal: one
+    /// compact object with its keys sorted, then a newline. The body is
+    /// empty, as gh prints it for a pull request with no description.
     fn gh_answer(number: i64, url: &str, base: &str, head: &str) -> String {
         let answer = serde_json::json!({
             "baseRefOid": base,
+            "body": "",
             "headRefOid": head,
             "number": number,
             "title": "ionic: fix the \"rx\" ring \u{00e9}",
@@ -2180,7 +2197,9 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
     /// for `gh pr view 14462 --repo=github.com/cli/cli --json
     /// number,title,url,baseRefOid,headRefOid`. A public repository's pull
     /// request is recorded so that the source holds no private repository's
-    /// data; the title's quotes show gh's JSON escaping.
+    /// data; the title's quotes show gh's JSON escaping. It was recorded
+    /// before body was asked for, so it also stands for an answer with no
+    /// body key, which reads as no description.
     const GH_RECORDED_ANSWER: &str = r#"{"baseRefOid":"9eb4db2ba89017ea9dbcaed4f712dc4881f7f37b","headRefOid":"189706bccb1686c68fb73c5bd9013358320a9e71","number":14462,"title":"Revert \"Use internal Apple codesign action\"","url":"https://github.com/cli/cli/pull/14462"}
 "#;
 
@@ -2196,6 +2215,7 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
                 number: 14462,
                 url: "https://github.com/cli/cli/pull/14462".to_string(),
                 title: Some("Revert \"Use internal Apple codesign action\"".to_string()),
+                body: None,
                 base: CommitId::parse("9eb4db2ba89017ea9dbcaed4f712dc4881f7f37b")
                     .expect("a full commit id"),
                 head: CommitId::parse("189706bccb1686c68fb73c5bd9013358320a9e71")
@@ -2222,6 +2242,55 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
             GH_HEAD,
         );
         assert!(parse_gh_pull_request(answer.as_bytes(), &enterprise, 5).is_ok());
+    }
+
+    /// gh's body is read by the same rule as a webhook's description:
+    /// trimmed, with an empty, null, absent or non-string one as none, and
+    /// an oversized one capped. The queued metadata carries what was read,
+    /// so a revision reviewed by number records its description as a
+    /// webhook-driven one does.
+    #[test]
+    fn gh_reads_the_description_as_a_webhook_does() {
+        let with_body = |body: serde_json::Value| {
+            let mut answer: serde_json::Value =
+                serde_json::from_str(&gh_answer(967, GH_URL, GH_BASE, GH_HEAD))
+                    .expect("gh_answer prints JSON");
+            answer["body"] = body;
+            parse_gh_pull_request(answer.to_string().as_bytes(), &ionic(), 967)
+                .expect("the description never decides whether gh's answer is usable")
+        };
+        let crlf = "\r\n## Changes\r\n\r\n- Fix the \u{00e9} ring.\r\n  ";
+        let resolved = with_body(serde_json::json!(crlf));
+        assert_eq!(resolved.body, request_description(&serde_json::json!(crlf)));
+        assert_eq!(
+            resolved.body.as_deref(),
+            Some("## Changes\r\n\r\n- Fix the \u{00e9} ring.")
+        );
+        assert_eq!(resolved.to_forge_metadata().pr_body, resolved.body);
+
+        for blank in [
+            serde_json::json!(""),
+            serde_json::json!(" \r\n\t"),
+            serde_json::Value::Null,
+            serde_json::json!(42),
+            serde_json::json!({"text": "not a string"}),
+        ] {
+            let resolved = with_body(blank.clone());
+            assert_eq!(resolved.body, None, "{blank}");
+            assert_eq!(resolved.to_forge_metadata().pr_body, None, "{blank}");
+        }
+        let absent = gh_answer(967, GH_URL, GH_BASE, GH_HEAD).replace(r#""body":"","#, "");
+        assert!(!absent.contains("body"));
+        let resolved = parse_gh_pull_request(absent.as_bytes(), &ionic(), 967)
+            .expect("an answer without a body is usable");
+        assert_eq!(resolved.body, None);
+
+        let oversized = "\u{00e9}".repeat(MAX_DESCRIPTION_BYTES);
+        let capped = with_body(serde_json::json!(oversized))
+            .body
+            .expect("an oversized description is capped, not dropped");
+        assert!(capped.len() <= MAX_DESCRIPTION_BYTES);
+        assert!(capped.ends_with(DESCRIPTION_TRUNCATED));
     }
 
     /// gh prints the repository's own spelling, which may differ in case from
@@ -2253,6 +2322,7 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
         );
         assert_eq!(metadata.pr_url.as_deref(), Some(GH_URL));
         assert_eq!(metadata.author, None);
+        assert_eq!(metadata.pr_body, None);
         assert!(metadata.repo_url.as_deref().is_some_and(is_safe_repo_url));
     }
 
@@ -2399,9 +2469,19 @@ bfBnKqGjJguuHd5ta5Vh5B51\n\
             let command = command.as_std();
             assert_eq!(command.get_program(), "gh");
             let args: Vec<&std::ffi::OsStr> = command.get_args().collect();
+            // The field list is spelled out rather than read from
+            // GH_PR_FIELDS, so dropping a field (body above all, which
+            // carries the cover letter) fails this test.
             assert_eq!(
                 args,
-                ["pr", "view", "967", expected, "--json", GH_PR_FIELDS]
+                [
+                    "pr",
+                    "view",
+                    "967",
+                    expected,
+                    "--json",
+                    "number,title,url,baseRefOid,headRefOid,body"
+                ]
             );
             assert!(
                 command

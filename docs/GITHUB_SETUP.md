@@ -222,7 +222,7 @@ GitHub cannot reach.
    repository. For GitHub Enterprise, log in to that host with
    `gh auth login --hostname <host>`. The daemon runs
    `gh pr view <N> --repo=<host>/<owner>/<name> --json
-   number,title,url,baseRefOid,headRefOid` with a 60-second limit and
+   number,title,url,baseRefOid,headRefOid,body` with a 60-second limit and
    prompts disabled. Because the repository is named on the command line,
    gh never reads the daemon's git remotes.
 2. **The repository, in `Settings.toml`.** Pull request numbers belong to

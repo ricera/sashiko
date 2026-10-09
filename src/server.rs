@@ -3400,8 +3400,9 @@ mod tests {
     }
 
     /// Stands in for gh. It answers pull request N of any repository with
-    /// base PR_BASE and head N in hex, or with `failure` when one is set,
-    /// and counts the questions it is asked. No test runs gh.
+    /// base PR_BASE, head N in hex and the description fake_description(N),
+    /// or with `failure` when one is set, and counts the questions it is
+    /// asked. No test runs gh.
     #[derive(Default)]
     struct FakeResolver {
         failure: Option<crate::forge::GhError>,
@@ -3441,10 +3442,16 @@ mod tests {
                     repo.host, repo.owner, repo.name
                 ),
                 title: Some("Fix the widget".to_string()),
+                body: Some(fake_description(number)),
                 base: commit(PR_BASE),
                 head: commit(&format!("{number:040x}")),
             })
         }
+    }
+
+    /// The description FakeResolver gives pull request `number`.
+    fn fake_description(number: i64) -> String {
+        format!("Pull request {number} makes the widget reentrant.")
     }
 
     /// A state for /api/pr/review over acme/widget that admits every caller
@@ -3840,6 +3847,27 @@ mod tests {
         set_patchset_status(&state, id, "Failed").await;
         let reply = ask(ReviewHead).await;
         assert!(reply.message.contains(&requeued), "{}", reply.message);
+    }
+
+    /// A head reviewed by number records the description gh gave, on the
+    /// placeholder the route queued, so the review reads it as its cover
+    /// letter as it would after a webhook delivery.
+    #[tokio::test]
+    async fn a_pull_request_reviewed_by_number_records_its_description() {
+        let (state, mut fetch_rx) = pr_route_state(Arc::new(FakeResolver::default()), |_| {}).await;
+        let queued = ask_for_pr(&state, pr_request(7, PrReviewMode::ReviewHead))
+            .await
+            .unwrap();
+        assert_eq!(queued.outcome, PrReviewOutcome::Queued);
+        assert_eq!(
+            state
+                .db
+                .get_patchset_mr_body(queued.patchset_id)
+                .await
+                .unwrap(),
+            Some(fake_description(7))
+        );
+        assert_eq!(fetches_sent(&mut fetch_rx), 1);
     }
 
     /// Concurrent requests to the route for one pull request head share one
