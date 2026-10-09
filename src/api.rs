@@ -258,10 +258,11 @@ pub struct SubmitResponse {
 #[serde(deny_unknown_fields)]
 pub struct PrReviewRequest {
     pub number: i64,
-    /// "owner/name" when the operator gave a pull request URL. It must name
-    /// the repository forge.github_repository names, or the request is
-    /// refused, because a number means a pull request of that repository
-    /// only.
+    /// The URL's "host/owner/name" (gh's -R form; "owner/name" means
+    /// github.com) when the operator gave a pull request URL. It must name
+    /// the repository forge.github_repository names, host included, or the
+    /// request is refused, because a number means a pull request of that
+    /// repository only.
     #[serde(default)]
     pub repo: Option<String>,
     #[serde(default)]

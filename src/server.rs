@@ -2897,8 +2897,9 @@ fn pr_review_repository<'a>(
         Some(given) if !names_repository(given, repo) => Err((
             StatusCode::BAD_REQUEST,
             format!(
-                "the pull request belongs to {}, but this daemon reviews pull requests of {}/{}",
+                "the pull request belongs to {}, but this daemon reviews pull requests of {}/{}/{}",
                 crate::finding_view::sanitize_one_line(given, 200),
+                repo.host,
                 repo.owner,
                 repo.name
             ),
@@ -2907,12 +2908,19 @@ fn pr_review_repository<'a>(
     }
 }
 
-/// Whether `given`, an "owner/name" taken from a pull request URL, names
-/// `repo`. GitHub compares owners and names without case, so this does too.
+/// Whether `given`, the "host/owner/name" (or "owner/name" on github.com)
+/// taken from a pull request URL, names `repo`. The host is compared too,
+/// because a repository of the same name on another forge host is another
+/// repository, whose numbers name other changes. GitHub compares hosts,
+/// owners and names without case, so this does too.
 fn names_repository(given: &str, repo: &crate::settings::ForgeRepo) -> bool {
-    given.split_once('/').is_some_and(|(owner, name)| {
-        owner.eq_ignore_ascii_case(&repo.owner) && name.eq_ignore_ascii_case(&repo.name)
-    })
+    given
+        .parse::<crate::settings::ForgeRepo>()
+        .is_ok_and(|given| {
+            given.host.eq_ignore_ascii_case(&repo.host)
+                && given.owner.eq_ignore_ascii_case(&repo.owner)
+                && given.name.eq_ignore_ascii_case(&repo.name)
+        })
 }
 
 /// The refusal for a number gh could not resolve. It names the newest
@@ -4132,8 +4140,9 @@ mod tests {
 
     /// A request that cannot name a pull request of the configured
     /// repository is refused before gh is asked: a number below 1, a GitLab
-    /// forge, and a URL of another repository, whose refusal names both.
-    /// The URL's repository is compared without case, as GitHub does.
+    /// forge, and a URL of another repository or of the same name on another
+    /// host, whose refusal names both. The URL's host and repository are
+    /// compared without case, as GitHub does.
     #[tokio::test]
     async fn a_pr_request_is_checked_before_gh_is_asked() {
         let gh = Arc::new(FakeResolver::default());
@@ -4154,7 +4163,20 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(reason.contains("other/widget"), "{reason}");
-        assert!(reason.contains("acme/widget"), "{reason}");
+        assert!(reason.contains("github.com/acme/widget"), "{reason}");
+        for foreign in [
+            "ghe.example.com/acme/widget",
+            "github.com:8443/acme/widget",
+            "acme/widget/extra",
+        ] {
+            let (status, reason) = refusal(PrReviewRequest {
+                repo: Some(foreign.to_string()),
+                ..pr_request(7, PrReviewMode::ReviewHead)
+            })
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{foreign}");
+            assert!(reason.contains(foreign), "{reason}");
+        }
 
         let (gitlab_state, _) = pr_route_state(gh.clone(), |settings| {
             settings.forge.provider = Some("gitlab".to_string());
@@ -4167,18 +4189,20 @@ mod tests {
         assert!(reason.contains("GitHub only"), "{reason}");
         assert_eq!(gh.calls(), 0, "gh was asked");
 
-        let queued = ask_for_pr(
-            &state,
-            PrReviewRequest {
-                repo: Some("ACME/Widget".to_string()),
-                ..pr_request(7, PrReviewMode::ReviewHead)
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(queued.outcome, PrReviewOutcome::Queued);
-        assert_eq!(gh.calls(), 1);
-        assert_eq!(fetches_sent(&mut fetch_rx), 1);
+        for (number, given) in [(7, "ACME/Widget"), (8, "GitHub.com/acme/WIDGET")] {
+            let queued = ask_for_pr(
+                &state,
+                PrReviewRequest {
+                    repo: Some(given.to_string()),
+                    ..pr_request(number, PrReviewMode::ReviewHead)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(queued.outcome, PrReviewOutcome::Queued, "{given}");
+            assert_eq!(fetches_sent(&mut fetch_rx), 1, "{given}");
+        }
+        assert_eq!(gh.calls(), 2);
     }
 
     /// The route's outcome, reply and fetches for one head revision as its
