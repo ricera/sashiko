@@ -2349,8 +2349,16 @@
                         await renderListView();
                 }
             } catch (e) {
-                app.innerHTML = `<div class="error">Error: ${escapeHtml(e.message)}</div>`;
+                app.innerHTML = viewErrorHtml(e.message);
             }
+        }
+
+        // The line a view that could not be drawn is replaced with. The
+        // message can carry text from the daemon's reply, such as why an
+        // address found no patchset, so it is escaped here, where it meets
+        // the page.
+        function viewErrorHtml(message) {
+            return `<div class="error">Error: ${escapeHtml(message)}</div>`;
         }
 
         window.addEventListener('hashchange', () => {
@@ -4587,11 +4595,90 @@
             };
         }
 
+        // The longest reason a failed patchset read may put on the page. The
+        // daemon's own reasons are one short sentence; this bounds what a
+        // proxy in front of it could fill the error line with.
+        const PATCHSET_REASON_MAX_CHARS = 300;
+
+        // Why a read of /api/patchset failed, as the error line should say it.
+        //
+        // A pull request revision address (<repo>-<N>-<sha>) that finds no
+        // single revision is answered 404 with a one-line plain-text reason,
+        // which tells the reader whether the pull request is unknown, no head
+        // starts with the prefix, or the prefix is ambiguous; "404 Not Found"
+        // says none of that. Every other failure, an empty body, and a body
+        // that is not plain text (a proxy's HTML error page) read as the
+        // status line. The reason is text: whoever shows it escapes it.
+        async function patchsetLoadError(res) {
+            const statusLine = `${res.status} ${res.statusText}`;
+            const type = (res.headers && res.headers.get('content-type')) || '';
+            if (res.status !== 404 || !type.toLowerCase().startsWith('text/plain')) return statusLine;
+            let body = '';
+            try {
+                body = await res.text();
+            } catch (e) {
+                return statusLine;
+            }
+            const reason = Array.from(String(body).split('\n')[0].trim());
+            if (reason.length === 0) return statusLine;
+            return reason.length > PATCHSET_REASON_MAX_CHARS
+                ? reason.slice(0, PATCHSET_REASON_MAX_CHARS).join('') + '…'
+                : reason.join('');
+        }
+
+        // The route of a patchset page, for the address it is known by.
+        function patchsetPath(id) {
+            return `#/patchset/${encodeURIComponent(id)}`;
+        }
+
+        // The paging controls of a patchset page.
+        //
+        // They page the address the page was opened at, never the slug the
+        // reply carries: a pull request revision opened by its head commit
+        // (<repo>-<N>-<sha>) may hold the slug <repo>-<N>, which moves to the
+        // next revision when one is pushed, so paging by the slug could leave
+        // the revision the reader asked for. That address is the caller's
+        // text, so each target travels in an escaped data attribute and the
+        // handler is a constant: pasted into the handler as a string literal,
+        // an apostrophe in a Message-ID would end the literal.
+        function renderPatchsetPagination(id, page, limit, total) {
+            if (!(total > limit)) return '';
+            const totalPages = Math.ceil(total / limit);
+            const base = patchsetPath(id);
+            const button = (label, target, disabled) =>
+                `<button data-href="${escapeHtml(`${base}?page=${target}&limit=${limit}`)}"`
+                + ` onclick="navigate(this.dataset.href)" ${disabled ? 'disabled' : ''}>${label}</button>`;
+            return `
+                    <div class="pagination">
+                        ${button('First', 1, page <= 1)}
+                        ${button('Prev', page - 1, page <= 1)}
+                        <span>Page ${page} of ${totalPages} (${total} total)</span>
+                        ${button('Next', page + 1, page >= totalPages)}
+                        ${button('Last', totalPages, page >= totalPages)}
+                    </div>
+                `;
+        }
+
+        // The icon that copies a patch's permalink.
+        //
+        // The link holds the address the page was opened at, which is the
+        // caller's text, so it travels in an escaped data attribute and the
+        // handler is a constant: pasted into the handler as a string literal,
+        // an apostrophe in a Message-ID would end the literal, because the
+        // parser decodes &#039; back to a quote before the handler is compiled.
+        function renderPatchPermalink(link) {
+            const attr = escapeHtml(link);
+            return `<a href="${attr}" class="permalink-icon" data-copy="${attr}"`
+                + ` onclick="copyToClipboard(this.dataset.copy); return false;" title="Copy permalink to this patch">
+                    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg>
+                </a>`;
+        }
+
         async function renderPatchsetView(id, query = {}, view = viewGeneration) {
             const page = parseInt(query.page) || 1;
             const limit = parseInt(query.limit) || 50;
             const res = await fetch(`/api/patchset?id=${encodeURIComponent(id)}&page=${page}&limit=${limit}`);
-            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+            if (!res.ok) throw new Error(await patchsetLoadError(res));
             const data = await res.json();
             // Another view was drawn while the read was out; it owns the page.
             if (view !== viewGeneration) return;
@@ -4652,10 +4739,8 @@
                 let header = patch
                     ? `Patch ${patch.part_index}: <a href="#/message/${encodeURIComponent(patch.message_id)}">${escapeHtml(patch.subject || '(no subject)')}</a>`
                     : `Patch ID ${pid}`;
-                const patchLink = window.location.origin + window.location.pathname + `#/patchset/${encodeURIComponent(state.patchsetId)}?${patch ? 'part=' + patch.part_index : 'patch=' + pid}`;
-                header += `<a href="${patchLink}" class="permalink-icon" onclick="copyToClipboard('${patchLink}'); return false;" title="Copy permalink to this patch">
-                    <svg viewBox="0 0 16 16" width="16" height="16" fill="currentColor"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg>
-                </a>`;
+                const patchLink = window.location.origin + window.location.pathname + patchsetPath(state.patchsetId) + `?${patch ? 'part=' + patch.part_index : 'patch=' + pid}`;
+                header += renderPatchPermalink(patchLink);
 
                 const borderStyle = '';
 
@@ -4724,21 +4809,8 @@
 
             if (!reviewsHtml) reviewsHtml = '<p>No AI reviews yet.</p>';
 
-            let paginationHtml = '';
-            if (data.total_patches_in_db > data.limit) {
-                const totalPages = Math.ceil(data.total_patches_in_db / data.limit);
-                const basePath = `#/patchset/${encodeURIComponent((data.slug || data.id) || data.id || data.message_id)}`;
-
-                paginationHtml = `
-                    <div class="pagination">
-                        <button onclick="navigate('${basePath}?page=1&limit=${data.limit}')" ${data.page <= 1 ? 'disabled' : ''}>First</button>
-                        <button onclick="navigate('${basePath}?page=${data.page - 1}&limit=${data.limit}')" ${data.page <= 1 ? 'disabled' : ''}>Prev</button>
-                        <span>Page ${data.page} of ${totalPages} (${data.total_patches_in_db} total)</span>
-                        <button onclick="navigate('${basePath}?page=${data.page + 1}&limit=${data.limit}')" ${data.page >= totalPages ? 'disabled' : ''}>Next</button>
-                        <button onclick="navigate('${basePath}?page=${totalPages}&limit=${data.limit}')" ${data.page >= totalPages ? 'disabled' : ''}>Last</button>
-                    </div>
-                `;
-            }
+            const paginationHtml = renderPatchsetPagination(
+                state.patchsetId, data.page, data.limit, data.total_patches_in_db);
 
             // Only show baseline/thread section if NOT a direct git submission (heuristic: message_id is SHA or synthetic local ID or subject indicates git import)
             const isGitSubmission = (data.message_id && (/^[0-9a-f]{40}$/.test(data.message_id) || data.message_id.includes('@sashiko.local'))) || (data.subject && data.subject.startsWith('Git Import:'));
@@ -4979,7 +5051,7 @@
         // =====================================================================
         async function renderBaselineLogView(id, idx) {
             const res = await fetch(`/api/patchset?id=${encodeURIComponent(id)}`);
-            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+            if (!res.ok) throw new Error(await patchsetLoadError(res));
             const data = await res.json();
 
             let logContent = 'Log not found';
@@ -6731,12 +6803,12 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     window.scrollBy(0, -60);
                 } else if (e.key === 'l' || e.key === 'ArrowRight') {
                     if (state.view === 'patchset' && state.patchsetPage < state.patchsetTotalPages) {
-                        const basePath = `#/patchset/${encodeURIComponent(state.patchsetId)}`;
+                        const basePath = patchsetPath(state.patchsetId);
                         navigate(`${basePath}?page=${state.patchsetPage + 1}&limit=${state.patchsetLimit}`);
                     }
                 } else if (e.key === 'h' || e.key === 'ArrowLeft') {
                     if (state.view === 'patchset' && state.patchsetPage > 1) {
-                        const basePath = `#/patchset/${encodeURIComponent(state.patchsetId)}`;
+                        const basePath = patchsetPath(state.patchsetId);
                         navigate(`${basePath}?page=${state.patchsetPage - 1}&limit=${state.patchsetLimit}`);
                     } else if (e.key === 'h') {
                         e.preventDefault();
