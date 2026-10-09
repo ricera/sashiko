@@ -3374,7 +3374,7 @@ async fn process_parsed_article(
             && let (Some(title), Some(number)) = (&mr_title, &mr_number)
         {
             let mr_ver = worker_db
-                .get_mr_version_for_commit_range(*number, &root_msg_id)
+                .get_mr_version_for_commit_range(*number, mr_url.as_deref(), &root_msg_id)
                 .await
                 .unwrap_or(1);
             (
@@ -5326,6 +5326,110 @@ mod tests {
             mr_title: None,
             mr_number: None,
             receipt: None,
+        }
+    }
+
+    /// The single commit `head` of PR 7 of `repo`, fetched on top of `base`,
+    /// as the parser dispatcher hands a fetched commit to ingestion.
+    #[cfg(feature = "server")]
+    fn fetched_pr_7_commit(repo: &str, base: &str, head: &str) -> ParsedArticle {
+        let article_id = format!("mr-7-{base}..{head}");
+        let root_msg_id = format!("{article_id}@sashiko.local");
+        let body = "frob: fix the frobnicator\n".to_string();
+        let diff =
+            "diff --git a/frob.c b/frob.c\n--- a/frob.c\n+++ b/frob.c\n@@ -1 +1 @@\n-a\n+b\n";
+        ParsedArticle {
+            group: "git-fetch".to_string(),
+            article_id,
+            source: MessageSource::GitFetch,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: head.to_string(),
+                subject: "frob: fix the frobnicator".to_string(),
+                author: "A U Thor <author@example.com>".to_string(),
+                date: 1_700_000_000,
+                received_date: None,
+                in_reply_to: None,
+                references: vec![root_msg_id],
+                index: 1,
+                total: 1,
+                to: "submitted".to_string(),
+                cc: String::new(),
+                is_patch_or_cover: true,
+                version: None,
+                body: body.clone(),
+            }),
+            patch: Some(sashiko::patch::Patch {
+                message_id: head.to_string(),
+                body,
+                diff: diff.to_string(),
+                part_index: 1,
+            }),
+            baseline: Some(base.to_string()),
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: Some(format!("https://github.com/acme/{repo}/pull/7")),
+            mr_title: Some("Fix the frobnicator".to_string()),
+            mr_number: Some(7),
+            receipt: None,
+        }
+    }
+
+    /// Ingestion names each revision of a pull request with the version
+    /// its own pull request gives it: PR 7 of two repositories each stays
+    /// v1 once its commit is ingested, and the second push of one of them
+    /// is v2, not v3. Its third push was queued without a title, so its
+    /// placeholder subject names no version and ingestion counts the
+    /// revisions itself: two earlier ones of the same pull request make it
+    /// v3.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn ingestion_counts_versions_only_within_the_same_pull_request() {
+        let settings = sashiko::settings::DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        };
+        let db = Database::new(&settings).await.unwrap();
+        db.migrate().await.unwrap();
+        let policy = sashiko::email_policy::EmailPolicyConfig::default();
+        let base = "a".repeat(40);
+        let title = Some("Fix the frobnicator");
+        let revisions = [
+            ("frob", 'b', title, "#7: Fix the frobnicator"),
+            ("widget", 'c', title, "#7: Fix the frobnicator"),
+            ("frob", 'd', title, "#7 [v2]: Fix the frobnicator"),
+            ("frob", 'e', None, "#7 [v3]: Fix the frobnicator"),
+        ];
+
+        for (repo, head, placeholder_title, _) in revisions {
+            let head = head.to_string().repeat(40);
+            db.create_fetching_patchset(
+                &format!("mr-7-{base}..{head}@sashiko.local"),
+                "Fetching PR #7",
+                None,
+                None,
+                Some(&format!("https://github.com/acme/{repo}/pull/7")),
+                placeholder_title,
+                Some(7),
+                Some(&format!("{repo}-7")),
+            )
+            .await
+            .unwrap();
+        }
+
+        for (repo, head, _, expected) in revisions {
+            let head = head.to_string().repeat(40);
+            let article = fetched_pr_7_commit(repo, &base, &head);
+            assert!(matches!(
+                process_parsed_article(&db, article, None, &policy, &[]).await,
+                ProcessStatus::Ingested
+            ));
+            let details = db
+                .get_patchset_details_by_msgid(&format!("mr-7-{base}..{head}"), None, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(details["subject"], expected, "{repo} {head}");
         }
     }
 
