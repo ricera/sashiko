@@ -16,6 +16,7 @@ use crate::{
     activity::StageFailureRecord,
     cover_letter::CoverLetter,
     git_ops::{GitWorktree, extract_patch_metadata, get_commit_hash, resolve_git_range},
+    prior_revisions::PriorRevision,
     references::ReviewReferences,
     settings::{AiSettings, Settings},
     toolbox::ToolBox,
@@ -277,9 +278,11 @@ pub async fn build_review_input_from_git(
             id: 0,
             subject,
             patches,
-            // Commits read from git carry no cover letter: only a pull
-            // request reviewed by the daemon has a stored description.
+            // Commits read from git carry no cover letter and no earlier
+            // revisions: only a pull request reviewed by the daemon has a
+            // stored description and a lineage.
             cover_letter: None,
+            prior_revisions: Vec::new(),
         },
         shas,
     ))
@@ -1186,12 +1189,13 @@ where
 /// What every patch's worker is told about the series the patch belongs
 /// to. It is taken from the review input as one unit, so that no hop
 /// between the input and a worker's payload can drop a part of it, such as
-/// the cover letter.
+/// the cover letter or the earlier revisions' findings.
 #[derive(Clone, Copy)]
 struct SeriesContext<'a> {
     patchset_id: i64,
     subject: &'a str,
     cover_letter: Option<&'a CoverLetter>,
+    prior_revisions: &'a [PriorRevision],
 }
 
 impl<'a> SeriesContext<'a> {
@@ -1200,20 +1204,27 @@ impl<'a> SeriesContext<'a> {
             patchset_id: input.id,
             subject: &input.subject,
             cover_letter: input.cover_letter.as_ref(),
+            prior_revisions: &input.prior_revisions,
         }
     }
 
     /// The payload the worker that reviews patch `patch_index` runs on, with
-    /// every patch of the series as `rich_patches` describes it.
+    /// every patch of the series as `rich_patches` describes it. The
+    /// `prior_revisions` key is present only when the series has earlier
+    /// revisions with findings, so a payload without history is unchanged.
     fn worker_payload(self, rich_patches: &[Value], patch_index: i64, baseline_sha: &str) -> Value {
-        json!({
+        let mut payload = json!({
             "id": self.patchset_id,
             "subject": self.subject,
             "patches": rich_patches,
             "patch_index": Some(patch_index),
             "baseline": baseline_sha,
             "cover_letter": self.cover_letter
-        })
+        });
+        if let (false, Some(fields)) = (self.prior_revisions.is_empty(), payload.as_object_mut()) {
+            fields.insert("prior_revisions".into(), json!(self.prior_revisions));
+        }
+        payload
     }
 }
 
@@ -2764,6 +2775,52 @@ mod tests {
         input.cover_letter = None;
         let payload = SeriesContext::of(&input).worker_payload(&rich_patches, 1, "base");
         assert_eq!(payload_cover_letter(&payload), None);
+        Ok(())
+    }
+
+    /// The review input's earlier revisions reach the payload every
+    /// patch's worker runs on, and read back as they were sent. An input
+    /// without them, such as a local review of git commits, gives a
+    /// payload with no key.
+    #[test]
+    fn the_review_input_prior_revisions_reach_every_patch_payload() -> Result<()> {
+        use crate::prior_revisions::{PriorFinding, PriorPatch};
+        let revision = PriorRevision {
+            label: "v1".to_string(),
+            head: crate::baseline::CommitId::parse(&"b".repeat(40)),
+            same_base: Some(true),
+            patches: vec![PriorPatch {
+                index: 1,
+                subject: "frob: refill the ring".to_string(),
+                commit: None,
+                same_change_as: Some(2),
+                diff: Some("+refill();".to_string()),
+                findings: vec![PriorFinding {
+                    severity: crate::db::Severity::Medium,
+                    problem: "refill leaks a page".to_string(),
+                    consequence: Some("a page leaks per failed refill.".to_string()),
+                    locations: Vec::new(),
+                }],
+            }],
+        };
+        let mut input: ReviewInput = serde_json::from_value(json!({
+            "id": 7,
+            "subject": "#7 [v2]: Frob",
+            "patches": [{"index": 1, "diff": "+a"}, {"index": 2, "diff": "+b"}],
+            "prior_revisions": [revision],
+        }))?;
+        assert_eq!(input.prior_revisions, std::slice::from_ref(&revision));
+        let rich_patches = [json!({"index": 1}), json!({"index": 2})];
+        for index in [1, 2] {
+            let payload = SeriesContext::of(&input).worker_payload(&rich_patches, index, "base");
+            let sent: Vec<PriorRevision> =
+                serde_json::from_value(payload["prior_revisions"].clone())?;
+            assert_eq!(sent, std::slice::from_ref(&revision), "patch {index}");
+        }
+
+        input.prior_revisions.clear();
+        let payload = SeriesContext::of(&input).worker_payload(&rich_patches, 1, "base");
+        assert!(payload.get("prior_revisions").is_none(), "{payload}");
         Ok(())
     }
 

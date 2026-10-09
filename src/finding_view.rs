@@ -23,6 +23,7 @@
 
 use crate::db::Severity;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::io;
@@ -175,7 +176,7 @@ pub(crate) fn is_unsafe_for_terminal(c: char) -> bool {
 /// is printed to a terminal, so such a character must neither split one
 /// finding over several lines, nor reach the terminal as an escape sequence,
 /// nor reorder the text around it.
-fn sanitize_text(text: &str) -> String {
+pub(crate) fn sanitize_text(text: &str) -> String {
     text.chars()
         .map(|c| if is_unsafe_for_terminal(c) { ' ' } else { c })
         .collect::<String>()
@@ -205,7 +206,7 @@ fn line_number(value: Option<&Value>) -> Option<u64> {
 /// Sanitises `problem` (see `sanitize_text`) and clips it at
 /// `TITLE_MAX_CHARS` code points, so a multibyte character is never split.
 /// A clipped title loses its trailing whitespace and ends in "…".
-fn clip_title(problem: &str) -> String {
+pub(crate) fn clip_title(problem: &str) -> String {
     let problem = sanitize_text(problem);
     if problem.is_empty() {
         return NO_DESCRIPTION.to_string();
@@ -245,39 +246,79 @@ pub fn sanitize_one_line(text: &str, max_chars: usize) -> String {
     clip_chars(line, max_chars, "...")
 }
 
-/// Formats one location as `file:line (function)`, dropping absent parts.
-/// Returns `None` for an entry that is not an object or names neither a file
-/// nor a function, so the caller moves on to the next location. Only a
-/// non-negative integer up to 2^53 - 1 is a line number, and an integral
-/// float such as 12.0 counts as 12; a string such as "45", a negative number,
-/// a fraction and a larger number are dropped, because the verification
-/// schema asks for an integer and a guessed conversion could print a line the
-/// model never named. The web page applies the same rule when it lists a
-/// finding's locations. The file and function are sanitised like a title.
-fn format_location(location: &Value) -> Option<String> {
-    let text_of = |key: &str| {
-        location
-            .get(key)
-            .and_then(Value::as_str)
-            .map(sanitize_text)
-            .filter(|text| !text.is_empty())
-    };
-    let file = text_of("file");
-    let function = text_of("function_or_symbol");
-    let line = line_number(location.get("line"));
-    match (file, function) {
-        (Some(mut text), function) => {
-            if let Some(line) = line {
-                text.push_str(&format!(":{line}"));
-            }
-            if let Some(function) = function {
-                text.push_str(&format!(" ({function})"));
-            }
-            Some(text)
+/// One location of a finding, as the one-line views and the summaries of
+/// earlier findings read it.
+///
+/// Only a non-negative integer up to 2^53 - 1 is a line number, and an
+/// integral float such as 12.0 counts as 12; a string such as "45", a
+/// negative number, a fraction and a larger number are dropped, because the
+/// verification schema asks for an integer and a guessed conversion could
+/// print a line the model never named. The web page applies the same rule
+/// when it lists a finding's locations. A line is kept only with the file it
+/// is a line of. The file and function are sanitised like a title, since
+/// both come from the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingLocation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_or_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u64>,
+}
+
+impl FindingLocation {
+    /// Reads one entry of a finding's `locations`. Returns `None` for an
+    /// entry that is not an object or names neither a file nor a function,
+    /// so the caller moves on to the next location.
+    pub fn from_json(location: &Value) -> Option<Self> {
+        let text_of = |key: &str| {
+            location
+                .get(key)
+                .and_then(Value::as_str)
+                .map(sanitize_text)
+                .filter(|text| !text.is_empty())
+        };
+        let file = text_of("file");
+        let function_or_symbol = text_of("function_or_symbol");
+        if file.is_none() && function_or_symbol.is_none() {
+            return None;
         }
-        (None, Some(function)) => Some(function),
-        (None, None) => None,
+        let line = file
+            .as_ref()
+            .and_then(|_| line_number(location.get("line")));
+        Some(Self {
+            file,
+            function_or_symbol,
+            line,
+        })
     }
+}
+
+/// Formats a location as `file:line (function)`, dropping absent parts.
+impl std::fmt::Display for FindingLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (&self.file, &self.function_or_symbol) {
+            (Some(file), function) => {
+                write!(f, "{file}")?;
+                if let Some(line) = self.line {
+                    write!(f, ":{line}")?;
+                }
+                match function {
+                    Some(function) => write!(f, " ({function})"),
+                    None => Ok(()),
+                }
+            }
+            (None, Some(function)) => write!(f, "{function}"),
+            (None, None) => Ok(()),
+        }
+    }
+}
+
+/// Formats one location as `file:line (function)` (see [`FindingLocation`]),
+/// or `None` for an entry that names neither a file nor a function.
+fn format_location(location: &Value) -> Option<String> {
+    FindingLocation::from_json(location).map(|location| location.to_string())
 }
 
 /// A step of the severity rubric that a severity explanation may label: the
@@ -462,12 +503,18 @@ pub fn consequence_of(text: &str, chars: usize) -> Option<String> {
     let said = body_of(CalibrationLabel::Consequence)
         .or_else(|| body_of(CalibrationLabel::BlastRadius))
         .unwrap_or(&calibration.preamble);
-    let line = said
-        .split(|c: char| c.is_whitespace() || is_unsafe_for_terminal(c))
+    let line = one_line(said);
+    (!line.is_empty()).then(|| clip_on_word(line, chars))
+}
+
+/// `text` made one line: each character `is_unsafe_for_terminal` names and
+/// each run of whitespace becomes one space, with none at either end. Empty
+/// when nothing visible is left.
+pub(crate) fn one_line(text: &str) -> String {
+    text.split(|c: char| c.is_whitespace() || is_unsafe_for_terminal(c))
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>()
-        .join(" ");
-    (!line.is_empty()).then(|| clip_on_word(line, chars))
+        .join(" ")
 }
 
 /// Cuts one-line `text` after at most `max_chars` code points, at the last
@@ -983,6 +1030,30 @@ mod tests {
         assert_eq!(location_of(no_function).as_deref(), Some("f.c:12"));
         let function_only = json!([{"file": "", "line": 12, "function_or_symbol": "fn"}]);
         assert_eq!(location_of(function_only).as_deref(), Some("fn"));
+    }
+
+    /// The typed location holds what the line shows: a line number only
+    /// with the file it is a line of, and sanitised text.
+    #[test]
+    fn a_typed_location_keeps_a_line_only_with_its_file() {
+        let read = |location: Value| FindingLocation::from_json(&location);
+        assert_eq!(
+            read(json!({"file": " f.c\n", "line": 12, "function_or_symbol": "fn"})),
+            Some(FindingLocation {
+                file: Some("f.c".to_string()),
+                function_or_symbol: Some("fn".to_string()),
+                line: Some(12),
+            })
+        );
+        assert_eq!(
+            read(json!({"line": 12, "function_or_symbol": "fn"})),
+            Some(FindingLocation {
+                file: None,
+                function_or_symbol: Some("fn".to_string()),
+                line: None,
+            })
+        );
+        assert_eq!(read(json!({"line": 12})), None);
     }
 
     #[test]
