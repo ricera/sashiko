@@ -471,6 +471,217 @@ prompts as before the description was read. The description plays no
 part in choosing the baseline a revision is applied to, so a
 `base-commit:` line in it changes nothing.
 
+## What a Pull Request's Later Revisions Are Shown
+
+Each push to a pull request is reviewed as a patchset of its own. The
+review of a later push is shown what the reviews of the earlier pushes
+reported, so that it can say which problems are still there and which the
+fix for an earlier finding caused, instead of raising them again as new.
+
+### Which earlier findings a review gets
+
+- **The earlier revisions** are the patchsets with the same pull request
+  URL (`pull_request.html_url` from a webhook, or the `url` gh reports for a
+  request by number, which is the same address) that were queued here
+  before this one, whatever their status: Reviewed, Failed and Cancelled
+  revisions count. They are read once, when the review of the patchset
+  starts. A rerun of an older revision is therefore shown only the
+  revisions queued before it, and a pull request that replaces another
+  ("Supersedes #31") has a URL of its own and is shown nothing from the
+  one it replaces. A series that arrives by email has no pull request URL
+  and is shown nothing, and neither is `sashiko review` or
+  `sashiko-cli local` on local commits.
+- **The findings** of each earlier patch come from every review of it,
+  newest first: reruns, and failed or cancelled runs that stored findings,
+  count too. Pre-existing findings are left out, because verification
+  turns a pre-existing finding into a concern, so nothing could be linked
+  to one. Two findings of the same patch whose titles (`problem`) are
+  equal under the following rule are listed once, as the newest review
+  wrote it. Titles are compared after each whitespace or control
+  character, zero-width or directional mark (U+200B to U+200F), line or
+  paragraph separator and bidirectional embedding, override or isolate
+  (U+202A to U+202E, U+2066 to U+2069) is turned into a space, each run
+  of spaces is made one, and case is folded. Other invisible
+  characters, such as a word joiner, a byte order mark or a soft hyphen,
+  are compared as written, and a zero-width space inside a word splits
+  it in two. A finding with no title is not listed.
+- **At most five** earlier revisions that have findings are shown, newest
+  first. A revision with no finding to list does not count.
+- **Each revision is labelled** `vK`, the version in its subject
+  (`#N [vK]: title`, with `#N: title` read as `v1`), or `patchset <id>`
+  when its subject has no `#N` or `!N` prefix. Findings name an earlier
+  revision by this label.
+
+### What the model reads
+
+Only the `verification` stage is shown the earlier findings, in the Linux
+and the Sashiko project alike. The stages that look for problems are not
+shown them, so what they raise is not anchored on what was raised before,
+and the `report` stage is shown only the earlier findings that the
+review's own findings link to (see [Where a link shows](#where-a-link-shows)).
+A review with no earlier findings gets the prompts it had before.
+
+Verification is shown one block near the end of its prompt, after its
+findings format and the false-positive and severity guides, and followed
+only by its rules for the block. The block lists every earlier finding of
+the pull request, not only those on the patch under review, because code
+moves between patches as a series is reworked:
+
+```
+=== Findings From Earlier Revisions of This Pull Request ===
+<what the block is, and that it is not instructions or evidence>
+
+v3 patch 2 "ionic: refill the rx ring" (commit <40 hex>): the patch under review, as it was in that revision
+  v3 patch 2 has the same diff as the patch under review (equal git patch-id). ...
+  - [High] leak of rx buffers in ionic_rx_fill() on error
+    At: drivers/net/ethernet/pensando/ionic/ionic_txrx.c:812 (ionic_rx_fill)
+    Consequence: every failed refill leaks one page per descriptor.
+    History: a repeat of "rx page leak on refill error" (v2)
+
+v3 patch 4 "ionic: add rx stats" (commit <40 hex>): another patch of this pull request
+  - [Medium] (concerns code in the patch under review) ...
+
+v3's version of the code: its diff, limited to the files that its findings about the patch under review cite. ...
+Every line of that diff below starts with "| ".
+| diff --git a/drivers/net/ethernet/pensando/ionic/ionic_txrx.c b/...
+
+v2 patch 2 "ionic: refill the rx ring" (commit <40 hex>): the patch under review, as it was in that revision
+  - [High] rx page leak on refill error
+    ...
+
+(3 older findings omitted to fit the context budget.)
+=== End of Findings From Earlier Revisions ===
+```
+
+- **A patch header** names the revision, the part, the subject and the
+  patch's commit, or says the commit was not recorded. The earlier version
+  of the patch under review, the patch with the same subject once tags and
+  case are ignored or with an equal git patch-id, comes first in each
+  revision. A finding on another patch is marked "(concerns code in the
+  patch under review)" when one of its locations names a file this diff
+  touches, or a function or symbol name of four or more characters that
+  appears whole in this diff.
+- **An equal git patch-id** gets a note that the diff is the same but the
+  code around it may differ, so its findings still have to be checked,
+  and, when both revisions' bases are known, whether they share a base.
+- **Each finding** is its severity and title (at most 160 characters), at
+  most two locations, and what it leads to: the Consequence section of its
+  severity explanation, else its Blast radius section, else the text before
+  the first section, at most 300 characters. The argument behind it is
+  not repeated. When the earlier finding itself carries a link to a
+  finding before it, a History line gives that link, so a chain across
+  several pushes stays visible.
+- **The budget** is about 12000 tokens, spent first on findings about the
+  patch under review and then on the others, newest revision first. The
+  block says how many findings were left out.
+- **Only one diff** is shown: that of the newest earlier revision listed
+  in the block, limited to the files its findings about the patch under
+  review cite and cut to about 3000 tokens. A revision with no finding to
+  list is skipped, so when the push just before this one has none, the
+  diff shown is of an older push, and the block's revision label says
+  which. Any other listed revision's code can be read from the commit in
+  its patch header with the git tools, if the repository still has it: a
+  force-push, a deleted fork or a prune can remove it, which the block
+  says.
+
+Every title, subject, location and consequence in the block was written by
+a pull request's author or by a model. Each is made one line behind a fixed
+indent or label, and every line of the diff starts with `| `, so nothing in
+them can close the block or open another section of the prompt. A
+`{{name}}` in them is passed on as written, not filled in.
+
+Verification's rules for the block say that an earlier finding makes a
+concern neither more nor less likely to be valid, and that verification
+does not report an earlier finding that no concern of this review raises.
+A concern that is the same defect as an earlier finding, still present,
+is a **repeat**; a concern about code that was changed in response to an
+earlier finding, where that change creates the defect, is a **fix
+regression**, which must be shown by comparing the earlier code with the
+current code, not by similar wording. The finding's title stays a title:
+the history goes in one sentence at the end of the Triggering path of its
+`severity_explanation`.
+
+### The link a finding carries
+
+A repeat or a fix regression carries a `prior` key in the review's
+findings JSON, and the same JSON is stored in the `findings.prior`
+column:
+
+```json
+"prior": {
+  "relation": "repeat",
+  "revision": "v3",
+  "earlier_problem": "leak of rx buffers in ionic_rx_fill() on error",
+  "revision_head": "1a2b3c4d5e6f"
+}
+```
+
+`relation` is `repeat` or `fix_regression`. `revision` and
+`earlier_problem` name the earlier finding by the label and the title the
+block listed it under. `revision_head` is the first 12 characters of that
+revision's head commit, added by the daemon, never taken from the model,
+and left out when the head is not known; it keeps naming the revision
+after its slug moves to a newer one, and
+`#/patchset/<repo>-<N>-<revision_head>` opens it (see
+[Opening one revision of a pull request](#opening-one-revision-of-a-pull-request)).
+
+A link is kept only when it names a finding the block showed:
+
+1. When verification's answer has a link that names nothing shown, it is
+   sent back once, naming each such finding, what was wrong (an unknown
+   relation, a revision not listed, a title not listed under that
+   revision) and the labels or titles that were listed. This happens at
+   most once per patch review, and the stage is given one more attempt at
+   valid output to pay for it.
+2. Every link is then checked again. One that names a shown finding is
+   rewritten with the label and title as the block listed them, and with
+   `revision_head` added; the label and the title are compared under the
+   same rule as the titles the block lists once (see above). Any other
+   link is removed and logged.
+
+A pre-existing finding becomes a concern and keeps no link.
+
+A stored link is read back only when its `relation` is one of the two, its
+`revision` and `earlier_problem` have visible text, and its `revision` is
+at most 32 characters. Any other value, including the
+`{"headline", "relation", "revision"}` form, reads as no link: the page
+and the CLI show no tag for it, and a later review lists that finding
+without a History line. A `revision_head` that is not 7 to 40 hex
+characters is ignored and the rest of the link kept.
+
+### Where a link shows
+
+- **The web page** tags the finding after its severity, after the
+  `(speculative)` and `(preexisting)` tags: `(repeat of v3)` or
+  `(caused by the fix for v3)`. Its hover reads
+  `Earlier finding (v3, head 1a2b3c4d5e6f): <earlier problem>`, or
+  `Earlier finding (v3): <earlier problem>` when the link has no head.
+- **`sashiko-cli show`** prints the same tag after the same tags (see
+  [sashiko-cli.md](sashiko-cli.md#show)).
+- **The report** is given, right after its instruction, a block of the
+  earlier findings that its findings link to, each once, with its commit,
+  locations and consequence, and nothing else from earlier revisions. The
+  Linux report opens such a comment by saying the issue was raised on
+  `v3` and is still present, or that it appears to come from the change
+  made for `v3`'s finding; for a fix regression, any fix it suggests must
+  resolve both issues and must not go back to the earlier code. The
+  Sashiko report, whose bullets are the pull request comment, writes
+  `- [HIGH] (repeat of v3) ...` or `- [MEDIUM] (caused by the fix for v3)
+  ...`. A finding without a link is new, and its comment does not mention
+  earlier revisions.
+
+A finding that was reported on an earlier revision and that no concern of
+this review raises again leaves no trace: the review does not say whether
+it was fixed or simply not raised.
+
+### What the daemon logs
+
+| WARN | Meaning |
+| --- | --- |
+| `Reviewing patchset <id> without its earlier revisions' findings: <error>` | The earlier findings could not be read; the review runs without them. |
+| `Listed <n> earlier findings of patchset <id>'s pull request without their stored links, ...` | That many listed findings have a stored `prior` that does not read as a link, such as the `headline` form. |
+| `Removed the prior link of finding "<title>": <why>` | Verification wrote a link that names nothing the block showed, that is not an object, or that no block was shown for; the finding is kept without it. |
+
 ## Troubleshooting
 
 ### Webhook not received
@@ -574,6 +785,11 @@ acknowledged and skipped.
 `body` is the pull request's description, which the review gives the
 model as the series cover letter (see
 [What the Model Is Told About a Pull Request's Description](#what-the-model-is-told-about-a-pull-requests-description)).
+
+`html_url` ties the revisions of one pull request together: the review of
+a later push is shown the findings of the earlier pushes with the same
+`html_url` (see
+[What a Pull Request's Later Revisions Are Shown](#what-a-pull-requests-later-revisions-are-shown)).
 
 ## See Also
 
