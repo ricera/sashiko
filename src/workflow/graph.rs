@@ -84,6 +84,16 @@ impl<S: Send + Sync + 'static> Workflow<S> {
         })
     }
 
+    /// Every stage the workflow can run for `state`, with the user prompt it
+    /// renders for `state` (see [`ExecutableStage::user_prompt_for_log`]),
+    /// in the order the steps list them.
+    #[cfg(test)]
+    pub(crate) fn stage_user_prompts(&self, state: &S) -> Vec<(&'static str, String)> {
+        self.map_stages(state, &|stage| {
+            (stage.name(), stage.user_prompt_for_log(state))
+        })
+    }
+
     /// `f` applied to every stage the workflow can run for `state`, in the
     /// order the steps list them.
     ///

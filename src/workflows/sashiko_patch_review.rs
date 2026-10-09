@@ -29,16 +29,16 @@ use crate::workflow::{
 use crate::workflows::guard::{normalize_guide_name, normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
-    PlanningOutput, PostVerificationOutput, PrescreenOutput, SERIES_CONTEXT_PLACEHOLDER,
-    StageConcernsOutput, VerificationOutput, append_stage_dismissed_concerns_with_prompts,
-    append_stage_items_with_prompts, apply_planning_stage_output,
-    apply_post_verification_stage_output, apply_verification_stage_output,
-    batch_hard_cases_by_severity, build_stage_efforts_schema, collect_stage_prompts,
-    cover_letter_placeholder, extra_prompt_paths_for_items, extra_prompt_paths_for_state,
-    format_planning_feedback, format_post_verification_feedback,
-    format_verification_stage_feedback, has_valid_proof_location, resolve_stage_effort,
-    validate_planning_stage_efforts, validate_post_verification_batch_items,
-    validate_verification_stage_output,
+    PRIOR_REVIEWS_VERIFICATION_RULES, PlanningOutput, PostVerificationOutput, PrescreenOutput,
+    SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput, VerificationOutput,
+    append_stage_dismissed_concerns_with_prompts, append_stage_items_with_prompts,
+    apply_planning_stage_output, apply_post_verification_stage_output,
+    apply_verification_stage_output, batch_hard_cases_by_severity, build_stage_efforts_schema,
+    collect_stage_prompts, cover_letter_placeholder, extra_prompt_paths_for_items,
+    extra_prompt_paths_for_state, format_planning_feedback, format_post_verification_feedback,
+    format_verification_stage_feedback, has_valid_proof_location, prior_reviews_placeholder,
+    resolve_stage_effort, validate_planning_stage_efforts, validate_post_verification_batch_items,
+    validate_verification_stage_output, with_prior_reviews,
 };
 
 /// State container for a Sashiko patch review run.
@@ -366,6 +366,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: true,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "implementation",
@@ -375,6 +376,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: true,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "execution-flow",
@@ -384,6 +386,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "concurrency",
@@ -393,6 +396,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "persistence",
@@ -402,6 +406,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "llm-pipeline",
@@ -415,6 +420,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "security",
@@ -429,6 +435,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "interfaces-compat",
@@ -438,6 +445,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
+        wants_prior_reviews: false,
     },
     AnalysisStage {
         name: "tests",
@@ -447,6 +455,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
+        wants_prior_reviews: false,
     },
 ];
 
@@ -454,24 +463,28 @@ pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Verification",
     wants_series_context: true,
+    wants_prior_reviews: true,
 };
 
 pub static POST_VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "post-verification",
     short: "Post-Verification",
     wants_series_context: true,
+    wants_prior_reviews: false,
 };
 
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 pub static SUMMARY: ConsolidationStage = ConsolidationStage {
     name: "summary",
     short: "Change Summary",
     wants_series_context: false,
+    wants_prior_reviews: false,
 };
 
 pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
@@ -1022,6 +1035,7 @@ pub fn verification_stage_with_effort(
     effort: Option<crate::ai::EffortMode>,
 ) -> Stage<SashikoPatchReviewState, VerificationOutput> {
     let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
+    let prior_reviews = prior_reviews_placeholder(VERIFICATION.wants_prior_reviews);
     let user_template = with_series_context(
         PromptTemplate::<SashikoPatchReviewState>::new(format!(
             r#"{STAGE_VERIFICATION_INSTRUCTION}
@@ -1046,7 +1060,7 @@ Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns
 - LINEAGE REQUIREMENT ('source_ids'): Every item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every object in 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array of strings listing the exact input "C*" and/or "D*" IDs consolidated into that output item. Every input "C*" and "D*" ID MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference "C*" IDs (any contested "C*" + "D*" or promoted "D*" must be routed to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference "D*" IDs in "source_ids" (never "C*" IDs).
 - Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of "C*" IDs only), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "speculative" (boolean: true if the concrete path and preconditions that trigger the bug rest on an unverified assumption; severity.md caps a speculative finding at Medium, or Low if the impact is minor. If any part of that path rests on one, answer true. false if that path and its preconditions are established from the code. A low likelihood that is established from the code is reflected in the level, not in this key. A Category 1a finding rests on concrete code proof, so a concern you would mark true belongs in 'hard_cases' with "signal_reason": "speculative_concern" instead), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and may include "stages" (array of stage names) and "prompts" (array of prompt files).
 - Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
-- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of "D*" IDs only), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts"."#
+- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of "D*" IDs only), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts".{prior_reviews}"#
         ))
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
@@ -1067,7 +1081,11 @@ Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns
 
     Stage::builder(VERIFICATION.name)
         .system_prompt(sashiko_system_prompt(true))
-        .user_prompt(user_template)
+        .user_prompt(with_prior_reviews(
+            user_template,
+            VERIFICATION.wants_prior_reviews,
+            PRIOR_REVIEWS_VERIFICATION_RULES,
+        ))
         .output_format(
             OutputFormat::json()
                 .with_validator(validate_verification_stage_output)

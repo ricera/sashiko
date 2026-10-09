@@ -66,7 +66,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `local_review.rs`: Local review execution (`sashiko review`).
 - `finding_view.rs`: Typed one-line view of a review finding (severity, title, tags, location), shared by both CLIs.
 - `cover_letter.rs`: A series cover letter (a pull request's description), how its untrusted text is cleaned, and the prompt block that carries it.
-- `prior_revisions.rs`: The findings of a pull request's earlier revisions, cut down to the summaries the daemon sends a later revision's review.
+- `prior_revisions.rs`: The findings of a pull request's earlier revisions, cut down to the summaries the daemon sends a later revision's review, and the prompt block that shows them to verification.
 - `git_cmd.rs` & `git_ops.rs`: Safe git process spawning and repository operations.
 - `patch.rs`, `baseline.rs`, `prerequisites.rs`: Patch parsing, baseline detection, and prerequisite series resolution.
 - `forge.rs`: Webhook integration and review posting for external forges (GitHub, GitLab).

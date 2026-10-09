@@ -50,7 +50,9 @@ impl ClassifyAiError for ReviewError {
 
 use crate::activity::StageFailureRecord;
 use crate::cover_letter::CoverLetter;
-use crate::prior_revisions::PriorRevision;
+use crate::prior_revisions::{
+    PriorReviewContext, PriorReviewTarget, PriorRevision, build_prior_review_context,
+};
 use crate::project::ProjectId;
 use crate::workflow::{StageFailure, StageStopCause, WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use crate::workflows::linux_patch_review::{
@@ -106,6 +108,43 @@ pub(crate) fn payload_cover_letter(patchset: &Value) -> Option<CoverLetter> {
     serde_json::from_value(value.clone())
         .inspect_err(|e| tracing::warn!("Ignoring a malformed cover letter in the payload: {e}"))
         .ok()
+}
+
+/// Reads the earlier revisions' findings a review payload carries. A missing
+/// or null key is none. A value that does not parse is logged and dropped,
+/// so the review runs as it would have without them rather than failing
+/// over context that only verification reads.
+fn payload_prior_revisions(patchset: &Value) -> Vec<PriorRevision> {
+    let Some(value) = patchset.get("prior_revisions").filter(|v| !v.is_null()) else {
+        return Vec::new();
+    };
+    serde_json::from_value(value.clone())
+        .inspect_err(|e| {
+            tracing::warn!("Ignoring malformed earlier revisions' findings in the payload: {e}")
+        })
+        .unwrap_or_default()
+}
+
+/// The block of earlier findings for the patch a review payload names by
+/// `patch_index`, or `None` when the payload has no earlier findings or
+/// names no patch it carries: the block is about one patch, so a payload
+/// that reviews no single patch has nothing to compare them with.
+fn payload_prior_review_context(patchset: &Value) -> Option<PriorReviewContext> {
+    let revisions = payload_prior_revisions(patchset);
+    if revisions.is_empty() {
+        return None;
+    }
+    let index = patchset["patch_index"].as_i64()?;
+    let patch = patchset["patches"]
+        .as_array()?
+        .iter()
+        .find(|patch| patch["index"].as_i64() == Some(index))?;
+    let target = PriorReviewTarget {
+        index,
+        subject: patch["subject"].as_str().unwrap_or_default(),
+        diff: patch["diff"].as_str().unwrap_or_default(),
+    };
+    build_prior_review_context(&revisions, target)
 }
 
 #[derive(Clone, Debug)]
@@ -608,6 +647,7 @@ impl Worker {
             series_range: self.series_range.clone(),
             follow_up_series_context,
             cover_letter: payload_cover_letter(&patchset),
+            prior_reviews: payload_prior_review_context(&patchset),
             references: self.tools.references().to_vec(),
             selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
@@ -2076,6 +2116,97 @@ mod tests {
         assert!(post_content.contains("Series End Commit (Final State): sha2"));
         assert!(post_content.contains("- [Patch 2 of 2] (commit sha2): Patch 2 Subject"));
         assert!(post_content.contains("SERIES VERIFICATION DIRECTIVE:"));
+    }
+
+    /// The earlier revisions' findings the daemon puts in the payload reach
+    /// the verification prompt of the patch the payload names, and no other
+    /// stage's. A malformed list, or a payload that names no patch it
+    /// carries, is no block, and the review runs as it would without one.
+    #[tokio::test]
+    async fn the_worker_gives_the_payload_prior_revisions_to_verification() {
+        async fn user_prompts_for(prior_revisions: Value, patch_index: i64) -> Vec<String> {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let prompts_dir = temp_dir.path().join("prompts");
+            std::fs::create_dir_all(&prompts_dir).unwrap();
+            let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+            let mut worker = Worker::new(
+                std::sync::Arc::new(MockMultiStageSeriesProvider),
+                std::sync::Arc::new(tools),
+                PromptRegistry::new(prompts_dir),
+                WorkerConfig {
+                    project: ProjectId::Linux,
+                    max_input_tokens: 10000,
+                    max_interactions: 3,
+                    temperature: 0.0,
+                    series_range: None,
+                    baseline_sha: None,
+                    custom_prompt: None,
+                    stages: Some(vec!["goal".to_string()]),
+                    skip_report: false,
+                    report_preexisting: false,
+                    effort: None,
+                },
+            );
+            let res = worker
+                .run(
+                    serde_json::json!({
+                        "id": 201,
+                        "patch_index": patch_index,
+                        "patches": [{
+                            "index": 1,
+                            "subject": "frob: refill the ring",
+                            "diff": "diff --git a/ring.c b/ring.c\n+refill();",
+                        }],
+                        "prior_revisions": prior_revisions,
+                    }),
+                    None,
+                )
+                .await
+                .expect("review runs");
+            res.history
+                .iter()
+                .filter(|entry| entry.message.role == crate::ai::AiRole::User)
+                .filter_map(|entry| entry.message.content.clone())
+                .collect()
+        }
+
+        let revisions = serde_json::json!([{
+            "label": "v1",
+            "patches": [{
+                "index": 1,
+                "subject": "frob: refill the ring",
+                "findings": [{"severity": "High", "problem": "frob: refill leaks a page"}],
+            }],
+        }]);
+        let block_opening = "=== Findings From Earlier Revisions of This Pull Request ===";
+        let given = |prompts: &[String]| {
+            prompts
+                .iter()
+                .filter(|prompt| prompt.contains(block_opening))
+                .count()
+        };
+
+        let prompts = user_prompts_for(revisions.clone(), 1).await;
+        let verification = prompts
+            .iter()
+            .find(|prompt| prompt.contains("# Verification and severity estimation"))
+            .expect("verification runs");
+        assert!(verification.contains(block_opening), "{verification}");
+        assert!(
+            verification.contains("  - [High] frob: refill leaks a page\n"),
+            "{verification}"
+        );
+        assert_eq!(given(&prompts), 1, "only verification is shown the block");
+
+        for (absent, patch_index) in [
+            (Value::Null, 1),
+            (serde_json::json!([{"label": "v1"}]), 1),
+            (serde_json::json!("v1 had findings"), 1),
+            (revisions, 7),
+        ] {
+            let prompts = user_prompts_for(absent.clone(), patch_index).await;
+            assert_eq!(given(&prompts), 0, "{absent} for patch {patch_index}");
+        }
     }
 
     #[test]
