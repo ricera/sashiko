@@ -565,6 +565,26 @@ pub struct Database {
     bug_tool: String,
     bug_model: Option<String>,
     bug_claim: Option<BugAnalysisClaim>,
+    /// Serialises the writers that move a pull request's bare slug,
+    /// [`Self::queue_fetching_patchset`] and
+    /// [`Self::update_patchset_mr_metadata`], across every handle derived
+    /// from one [`Self::new`].
+    ///
+    /// Queuing looks up the placeholder row and inserts it when none
+    /// exists, with await points in between. All handles share one
+    /// connection and no transaction spans the two steps, and the cover
+    /// letter index on `patchsets` is not unique, so two concurrent
+    /// requests for the same head would otherwise both find no row and
+    /// both insert one. The lock is in-process rather than a unique index,
+    /// because databases already deployed can hold such duplicates and an
+    /// index over them could not be created.
+    ///
+    /// Both writers also move the bare slug off its current row and then
+    /// write it to their own row in separate statements. Ingestion that
+    /// records a revision's pull request metadata while a newer head is
+    /// being queued would otherwise take the slug back between those
+    /// statements and make the queued insert break the unique slug index.
+    pr_revision_writes: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// Ownership of one analysis attempt, separate from its audit attribution.
@@ -1784,6 +1804,7 @@ impl Database {
             bug_tool: tool.into(),
             bug_model: model,
             bug_claim: self.bug_claim.clone(),
+            pr_revision_writes: Arc::clone(&self.pr_revision_writes),
         }
     }
 
@@ -1795,6 +1816,7 @@ impl Database {
             bug_tool: self.bug_tool.clone(),
             bug_model: self.bug_model.clone(),
             bug_claim: self.bug_claim.clone(),
+            pr_revision_writes: Arc::clone(&self.pr_revision_writes),
         }
     }
 
@@ -2129,6 +2151,7 @@ impl Database {
             bug_tool: "sashiko".into(),
             bug_model: None,
             bug_claim: None,
+            pr_revision_writes: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -7939,6 +7962,9 @@ impl Database {
         mr_number: Option<i64>,
         slug: Option<&str>,
     ) -> Result<()> {
+        // Held through the reconcile so that the slug move, the slug write
+        // and the reconcile cannot interleave with a head being queued.
+        let _moving = self.pr_revision_writes.lock().await;
         if let Some(s) = slug {
             self.rotate_mr_slug(s, Some(id)).await?;
         }
@@ -10210,6 +10236,10 @@ impl Database {
     /// Pending, In Review, Skipped or Reviewed is left as it was, because
     /// its patches are already ingested or reviewed. Either way the pull
     /// request's superseded revisions are reconciled again.
+    ///
+    /// Calls are serialised from the lookup through the reconcile, so that
+    /// concurrent requests for one head create a single row between them.
+    /// The lock covers only database work done here.
     #[allow(clippy::too_many_arguments)]
     pub async fn queue_fetching_patchset(
         &self,
@@ -10222,6 +10252,7 @@ impl Database {
         mr_number: Option<i64>,
         slug: Option<&str>,
     ) -> Result<FetchingPlaceholder> {
+        let _queued = self.pr_revision_writes.lock().await;
         let columns = PlaceholderColumns {
             subject: self
                 .fetching_placeholder_subject(root_msg_id, subject, mr_url, mr_title, mr_number)
@@ -18934,6 +18965,198 @@ mod tests {
                     .unwrap(),
                 id
             );
+        }
+    }
+
+    /// How many rounds the concurrent queuing test runs. The race it guards
+    /// against needs the callers to interleave between the lookup and the
+    /// insert, which a single round does not reliably produce.
+    const CONCURRENT_QUEUE_ROUNDS: usize = 50;
+
+    /// How many callers queue the same head at once in each round.
+    const CONCURRENT_QUEUE_CALLERS: usize = 8;
+
+    /// Queues the pull request placeholder `cover` names from
+    /// CONCURRENT_QUEUE_CALLERS tasks released together, and returns what
+    /// each call reported.
+    async fn queue_concurrently(
+        db: &Arc<Database>,
+        cover: &str,
+    ) -> Vec<Result<FetchingPlaceholder>> {
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENT_QUEUE_CALLERS));
+        let mut callers = tokio::task::JoinSet::new();
+        for _ in 0..CONCURRENT_QUEUE_CALLERS {
+            let db = Arc::clone(db);
+            let barrier = Arc::clone(&barrier);
+            let cover = cover.to_string();
+            callers.spawn(async move {
+                barrier.wait().await;
+                db.queue_fetching_patchset(
+                    &cover,
+                    "Fetching github PR/MR: Widget",
+                    None,
+                    None,
+                    Some("https://github.com/acme/widget/pull/7"),
+                    Some("Widget"),
+                    Some(7),
+                    Some("widget-7"),
+                )
+                .await
+            });
+        }
+        callers.join_all().await
+    }
+
+    /// Concurrent requests for one pull request head create exactly one
+    /// placeholder row between them: one call reports Created, every other
+    /// reports AlreadyFetching, and none fails on the slug's unique index.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_queuing_of_one_head_creates_one_row() {
+        let db = setup_db().await;
+        for round in 0..CONCURRENT_QUEUE_ROUNDS {
+            let cover = format!("mr-7-base{round}..head{round}@sashiko.local");
+            let results = queue_concurrently(&db, &cover).await;
+
+            let placeholders: Vec<FetchingPlaceholder> = results
+                .into_iter()
+                .map(|result| result.unwrap_or_else(|e| panic!("round {round}: {e:#}")))
+                .collect();
+            let created = placeholders
+                .iter()
+                .filter(|p| p.state == PlaceholderState::Created)
+                .count();
+            let already = placeholders
+                .iter()
+                .filter(|p| p.state == PlaceholderState::AlreadyFetching)
+                .count();
+            assert_eq!(created, 1, "round {round}: {placeholders:?}");
+            assert_eq!(
+                already,
+                CONCURRENT_QUEUE_CALLERS - 1,
+                "round {round}: {placeholders:?}"
+            );
+            assert!(
+                placeholders.iter().all(|p| p.id == placeholders[0].id),
+                "round {round}: {placeholders:?}"
+            );
+
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM patchsets WHERE cover_letter_message_id = ?",
+                    libsql::params![cover.as_str()],
+                )
+                .await
+                .unwrap();
+            let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(count, 1, "round {round}");
+        }
+    }
+
+    /// How many tasks record an ingested revision's pull request metadata
+    /// while a newer head of the same pull request is being queued.
+    const CONCURRENT_METADATA_WRITERS: usize = 4;
+
+    /// How many rounds the metadata interleaving test runs. Its window is a
+    /// single await between the queued head's slug move and its insert, so
+    /// it needs more rounds than the duplicate-row test to be hit at all.
+    const CONCURRENT_METADATA_ROUNDS: usize = 200;
+
+    /// Queues the head `cover` names for pull request `number` from one task
+    /// while CONCURRENT_METADATA_WRITERS tasks record the metadata of the
+    /// earlier revision `ingested`, all released together.
+    async fn queue_while_recording_metadata(
+        db: &Arc<Database>,
+        number: i64,
+        cover: &str,
+        ingested: i64,
+    ) -> (Result<FetchingPlaceholder>, Vec<Result<()>>) {
+        let url = format!("https://github.com/acme/widget/pull/{number}");
+        let slug = format!("widget-{number}");
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENT_METADATA_WRITERS + 1));
+        let mut writers = tokio::task::JoinSet::new();
+        for _ in 0..CONCURRENT_METADATA_WRITERS {
+            let (db, barrier) = (Arc::clone(db), Arc::clone(&barrier));
+            let (url, slug) = (url.clone(), slug.clone());
+            writers.spawn(async move {
+                barrier.wait().await;
+                db.update_patchset_mr_metadata(
+                    ingested,
+                    Some(&url),
+                    Some("Widget"),
+                    Some(number),
+                    Some(&slug),
+                )
+                .await
+            });
+        }
+        let queuer = {
+            let (db, barrier, cover) = (Arc::clone(db), Arc::clone(&barrier), cover.to_string());
+            tokio::spawn(async move {
+                barrier.wait().await;
+                db.queue_fetching_patchset(
+                    &cover,
+                    "Fetching github PR/MR: Widget",
+                    None,
+                    None,
+                    Some(&url),
+                    Some("Widget"),
+                    Some(number),
+                    Some(&slug),
+                )
+                .await
+            })
+        };
+        let queued = queuer
+            .await
+            .unwrap_or_else(|e| panic!("queuer panicked: {e}"));
+        (queued, writers.join_all().await)
+    }
+
+    /// Recording an ingested revision's pull request metadata while a newer
+    /// head is queued cannot take the bare slug back between the queued
+    /// head's slug move and its insert, so neither write fails on the
+    /// unique slug index and exactly one row ends up holding the bare slug.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queuing_a_head_while_ingestion_records_metadata_keeps_one_bare_slug() {
+        let db = setup_db().await;
+        for round in 0..CONCURRENT_METADATA_ROUNDS {
+            let number = 100 + round as i64;
+            let url = format!("https://github.com/acme/widget/pull/{number}");
+            let slug = format!("widget-{number}");
+            let earlier = db
+                .queue_fetching_patchset(
+                    &format!("mr-{number}-base..head1@sashiko.local"),
+                    "Fetching github PR/MR: Widget",
+                    None,
+                    None,
+                    Some(&url),
+                    Some("Widget"),
+                    Some(number),
+                    Some(&slug),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("round {round}: {e:#}"));
+
+            let cover = format!("mr-{number}-base..head2@sashiko.local");
+            let (queued, recorded) =
+                queue_while_recording_metadata(&db, number, &cover, earlier.id).await;
+            let queued = queued.unwrap_or_else(|e| panic!("round {round}: queue: {e:#}"));
+            assert_eq!(queued.state, PlaceholderState::Created, "round {round}");
+            for result in recorded {
+                result.unwrap_or_else(|e| panic!("round {round}: metadata: {e:#}"));
+            }
+
+            let mut rows = db
+                .conn
+                .query(
+                    "SELECT COUNT(*) FROM patchsets WHERE slug = ?",
+                    libsql::params![slug.as_str()],
+                )
+                .await
+                .unwrap();
+            let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(count, 1, "round {round}");
         }
     }
 
