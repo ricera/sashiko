@@ -4915,4 +4915,118 @@ mod tests {
             assert_eq!(details["status"], expected.as_str(), "{}", article_id);
         }
     }
+
+    /// Queues head `head` of PR 7 of acme/widget on top of `base` with the
+    /// arguments the forge enqueue path passes for a GitHub delivery, and
+    /// returns the placeholder's patchset id.
+    #[cfg(feature = "server")]
+    async fn queue_pr_7_head(db: &Database, base: &str, head: &str) -> i64 {
+        db.queue_fetching_patchset(
+            &format!("mr-7-{base}..{head}@sashiko.local"),
+            "Fetching GitHub PR/MR: Fix the frobnicator",
+            None,
+            None,
+            Some("https://github.com/acme/widget/pull/7"),
+            Some("Fix the frobnicator"),
+            Some(7),
+            Some("widget-7"),
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// The status and slug of every revision of PR 7, by patchset id.
+    #[cfg(feature = "server")]
+    async fn pr_7_revisions(db: &Database) -> Vec<(i64, String, Option<String>)> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT id, status, slug FROM patchsets WHERE mr_number = 7 ORDER BY id",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut revisions = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            revisions.push((
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+            ));
+        }
+        revisions
+    }
+
+    /// Ingests the fetched commit `head` of PR 7 of acme/widget on top of
+    /// `base`, as the dispatcher hands it over once its fetch completes.
+    #[cfg(feature = "server")]
+    async fn ingest_pr_7_head(db: &Database, base: &str, head: &str) {
+        let policy = sashiko::email_policy::EmailPolicyConfig::default();
+        let article = fetched_pr_7_commit("widget", base, head);
+        assert!(matches!(
+            process_parsed_article(db, article, None, &policy, &[]).await,
+            ProcessStatus::Ingested
+        ));
+    }
+
+    /// Ingesting the fetch of an older head of a pull request after a newer
+    /// head was queued leaves the bare slug on the newer revision and the
+    /// versioned one on the older, and neither status changes. A webhook
+    /// that redelivers the older head once the newer one is reviewed sends
+    /// that fetch, and so do two pushes that share one fetch batch when the
+    /// older is ingested last.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn ingesting_an_outranked_head_leaves_the_bare_slug_on_the_newest() {
+        let base = "a".repeat(40);
+        let (head_a, head_b) = ("b".repeat(40), "d".repeat(40));
+
+        for redelivered in [true, false] {
+            let settings = sashiko::settings::DatabaseSettings {
+                url: ":memory:".to_string(),
+                token: String::new(),
+            };
+            let db = Database::new(&settings).await.unwrap();
+            db.migrate().await.unwrap();
+            let older = queue_pr_7_head(&db, &base, &head_a).await;
+            let (newer, statuses) = if redelivered {
+                ingest_pr_7_head(&db, &base, &head_a).await;
+                db.update_patchset_status(older, sashiko::ReviewStatus::Failed.as_str())
+                    .await
+                    .unwrap();
+                let newer = queue_pr_7_head(&db, &base, &head_b).await;
+                ingest_pr_7_head(&db, &base, &head_b).await;
+                db.update_patchset_status(newer, sashiko::ReviewStatus::Reviewed.as_str())
+                    .await
+                    .unwrap();
+                assert_eq!(queue_pr_7_head(&db, &base, &head_a).await, older);
+                (newer, ["Failed", "Reviewed"])
+            } else {
+                let newer = queue_pr_7_head(&db, &base, &head_b).await;
+                ingest_pr_7_head(&db, &base, &head_b).await;
+                (newer, ["Cancelled", "Pending"])
+            };
+            let expected = vec![
+                (
+                    older,
+                    statuses[0].to_string(),
+                    Some("widget-7-v1".to_string()),
+                ),
+                (newer, statuses[1].to_string(), Some("widget-7".to_string())),
+            ];
+            assert_eq!(
+                pr_7_revisions(&db).await,
+                expected,
+                "redelivered {redelivered}"
+            );
+
+            ingest_pr_7_head(&db, &base, &head_a).await;
+            assert_eq!(
+                pr_7_revisions(&db).await,
+                expected,
+                "redelivered {redelivered}"
+            );
+        }
+    }
 }
