@@ -603,8 +603,12 @@ is a **repeat**; a concern about code that was changed in response to an
 earlier finding, where that change creates the defect, is a **fix
 regression**, which must be shown by comparing the earlier code with the
 current code, not by similar wording. The finding's title stays a title:
-the history goes in one sentence at the end of the Triggering path of its
-`severity_explanation`.
+the history goes in one sentence in its `severity_explanation`, at the end
+of the section of the project's severity rubric that names the path, so
+the rubric's first section stays first. A Linux review ends its Triggering
+path with it and keeps the Consequence first; a Sashiko review ends its
+Likelihood and preconditions reasoning with it and keeps the Blast radius
+and irreversibility reasoning first.
 
 ### The link a finding carries
 

@@ -357,18 +357,26 @@ pub enum CalibrationLabel {
 }
 
 impl CalibrationLabel {
+    /// Every spelling of a label, without its qualifier, with the step it
+    /// names. The Sashiko headings have a short and a long spelling, and
+    /// both name one step. The prompt tests read it to find the labels a
+    /// rule names.
+    pub(crate) const SPELLINGS: [(&'static str, Self); 7] = [
+        ("Consequence", Self::Consequence),
+        ("Triggering path", Self::TriggeringPath),
+        ("Reachability", Self::Reachability),
+        ("Blast radius", Self::BlastRadius),
+        ("Blast radius and irreversibility", Self::BlastRadius),
+        ("Likelihood", Self::Likelihood),
+        ("Likelihood and preconditions", Self::Likelihood),
+    ];
+
     /// Names the step a label's spelling stands for, without its qualifier.
-    /// The Sashiko headings have a short and a long spelling, and both name
-    /// one step.
     fn from_spelling(spelling: &str) -> Option<Self> {
-        match spelling {
-            "Consequence" => Some(Self::Consequence),
-            "Triggering path" => Some(Self::TriggeringPath),
-            "Reachability" => Some(Self::Reachability),
-            "Blast radius" | "Blast radius and irreversibility" => Some(Self::BlastRadius),
-            "Likelihood" | "Likelihood and preconditions" => Some(Self::Likelihood),
-            _ => None,
-        }
+        Self::SPELLINGS
+            .iter()
+            .find(|(written, _)| *written == spelling)
+            .map(|&(_, label)| label)
     }
 }
 
@@ -848,6 +856,22 @@ mod tests {
             Some(CalibrationLabel::Likelihood)
         );
         assert_eq!(CalibrationLabel::from_spelling("consequence"), None);
+    }
+
+    /// The splitter's pattern and the spelling table list the same labels,
+    /// so every spelling the table holds opens a section of its own step.
+    #[test]
+    fn the_pattern_opens_a_section_at_every_tabled_spelling() {
+        for (spelling, label) in CalibrationLabel::SPELLINGS {
+            let calibration = split_severity_explanation(&format!("{spelling}: body."))
+                .expect("the text is not empty");
+            let opened = calibration
+                .sections
+                .iter()
+                .map(|section| (section.written.as_str(), section.label))
+                .collect::<Vec<_>>();
+            assert_eq!(opened, [(spelling, label)], "{spelling}");
+        }
     }
 
     #[test]

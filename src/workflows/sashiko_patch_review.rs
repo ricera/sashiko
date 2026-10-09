@@ -29,9 +29,9 @@ use crate::workflow::{
 use crate::workflows::guard::{normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConflictResolutionOutput, ConsolidationStage, LinuxPatchReviewState,
-    PRIOR_LINKS_PLACEHOLDER, PRIOR_REVIEWS_VERIFICATION_RULES, PlanningOutput, PrescreenOutput,
-    PriorHistory, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput, VerificationOutput,
-    cover_letter_placeholder, prior_reviews_placeholder, reduce_verification,
+    PRIOR_LINKS_PLACEHOLDER, PlanningOutput, PrescreenOutput, PriorHistory,
+    SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput, VerificationOutput, cover_letter_placeholder,
+    prior_reviews_placeholder, prior_reviews_verification_rules, reduce_verification,
     verification_output_checks, with_prior_links, with_prior_reviews,
 };
 
@@ -246,6 +246,19 @@ Generate the plain-text inline review report following the exact formatting rule
 - Output ONLY a plain bulleted list of ALL findings ordered from highest severity to lowest (`- [CRITICAL] ...`, `- [HIGH] ...`, `- [MEDIUM] ...`, `- [LOW] ...`), or `No issues found.` if there are no findings.
 - Do NOT include `Summary:` or `Findings:` headers (the summary is generated and displayed separately in the UI).
 - Do NOT use backticks, markdown code blocks, or markdown headings. Wrap all lines at 78 characters or fewer."#;
+
+/// How Sashiko verification uses the earlier findings (see
+/// [`prior_reviews_verification_rules`]). severity.md asks for the Blast
+/// radius and irreversibility reasoning, then the Likelihood and
+/// preconditions reasoning, at the start of the severity explanation, so the
+/// history sentence ends the Likelihood and preconditions reasoning, which
+/// names the path, and the Blast radius stays first: its body is what
+/// `finding_view::consequence_of` gives as the finding's consequence when a
+/// later revision lists it, so the history must not land there.
+pub(crate) const PRIOR_REVIEWS_VERIFICATION_RULES: &str = prior_reviews_verification_rules!(
+    history_at: "Likelihood and preconditions reasoning",
+    keep_first: "Keep the Blast radius and irreversibility reasoning first, as severity.md asks.",
+);
 
 /// How the Sashiko report states a finding's link to an earlier finding: a
 /// note right after the bullet's severity marker, where
