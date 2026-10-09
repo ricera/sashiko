@@ -213,8 +213,11 @@ Trigger a review for a specific PR/MR:
 
 **GitHub:**
 ```bash
-./scripts/trigger_github_pr_review.sh owner/repo 123
+sashiko-cli submit '#123'
 ```
+
+This needs `forge.github_repository` and gh on the daemon host; see
+[Review a Pull Request by Number](GITHUB_SETUP.md#review-a-pull-request-by-number).
 
 **GitLab:**
 ```bash
