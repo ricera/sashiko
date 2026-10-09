@@ -376,7 +376,10 @@ impl PrRevisionAddress {
     /// taken. A looser test such as "starts with `<repo>-<N>-v`" would also
     /// accept `frob-7-viewer-7`, the slug of PR 7 of a repository named
     /// `frob-7-viewer`. The fallback is tied to the row's own id because
-    /// `frob-7-v2-7` is also PR 7 of a repository named `frob-7-v2`. The
+    /// `frob-7-v2-7` is also PR 7 of a repository named `frob-7-v2`. That
+    /// tie still matches the bare slug of the `frob-7-v2` row stored at id
+    /// 7, so the slug alone cannot settle which repository a row is in;
+    /// [`Self::owns_row`] settles it from the row's pull request URL. The
     /// test is made here rather than with LIKE, because a repository name
     /// may hold `_`.
     fn owns_slug(&self, slug: &str, row_id: i64) -> bool {
@@ -396,6 +399,34 @@ impl PrRevisionAddress {
         };
         let is_version = !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit());
         is_version && fallback_id.is_none_or(|id| id == row_id.to_string())
+    }
+
+    /// Whether row `row_id`, with its stored `slug` and `mr_url`, is a
+    /// revision of this pull request.
+    ///
+    /// The slug must be one of the pull request's (see
+    /// [`Self::owns_slug`]). When the row has a pull request URL, the
+    /// repository name [`crate::forge::extract_repo_name_from_mr_url`]
+    /// reads from it must also equal the address's, compared exactly as the
+    /// slug is. That is the function `reviewer::pr_comment_patchset_address`
+    /// builds the address with, so every address it hands out passes this
+    /// check, and the one ingestion uses when it rewrites the slug after a
+    /// fetch. The placeholder slug is written first, from the repository
+    /// URL through [`crate::forge::extract_repo_name_from_url`]
+    /// (`server::enqueue_pull_request`), and a row whose fetch never
+    /// finished keeps it. Every forge source Sashiko reads gives the two
+    /// URLs for the same repository, so both functions give the same name.
+    /// The URL test keeps the row of PR 7 of a repository named
+    /// `frob-7-v2` stored at id 7, whose bare slug `frob-7-v2-7` has the
+    /// shape of frob's rotation fallback, out of frob PR 7. A URL that
+    /// names no repository matches no address, because the row's
+    /// repository is then unknown. Only a row with no URL is judged by its
+    /// slug alone, as nothing else records its repository.
+    fn owns_row(&self, slug: &str, mr_url: Option<&str>, row_id: i64) -> bool {
+        let in_repo = mr_url.is_none_or(|url| {
+            crate::forge::extract_repo_name_from_mr_url(url).as_deref() == Some(self.repo.as_str())
+        });
+        in_repo && self.owns_slug(slug, row_id)
     }
 }
 
@@ -9931,8 +9962,9 @@ impl Database {
     /// Finds the one revision of a pull request whose head commit starts
     /// with the address's prefix.
     ///
-    /// The candidates are the rows with the address's number whose slug is
-    /// one of that pull request's (see [`PrRevisionAddress::owns_slug`]),
+    /// The candidates are the rows with the address's number that are
+    /// revisions of that pull request by their slug and, when they have
+    /// one, their pull request URL (see [`PrRevisionAddress::owns_row`]),
     /// and each one's head comes from its placeholder id through
     /// [`pr_revision_range`]. The number is bound as an integer and the name
     /// and prefix are compared here, so no part of the address reaches SQL
@@ -9944,7 +9976,8 @@ impl Database {
         let mut rows = self
             .conn
             .query(
-                "SELECT id, slug, cover_letter_message_id FROM patchsets WHERE mr_number = ?",
+                "SELECT id, slug, cover_letter_message_id, mr_url
+                 FROM patchsets WHERE mr_number = ?",
                 libsql::params![address.number],
             )
             .await?;
@@ -9952,8 +9985,9 @@ impl Database {
         let mut matches = Vec::new();
         while let Some(row) = rows.next().await? {
             let id: i64 = row.get(0)?;
-            let owned =
-                get_optional_text(&row, 1)?.is_some_and(|slug| address.owns_slug(&slug, id));
+            let mr_url = get_optional_text(&row, 3)?;
+            let owned = get_optional_text(&row, 1)?
+                .is_some_and(|slug| address.owns_row(&slug, mr_url.as_deref(), id));
             if !owned {
                 continue;
             }
@@ -24140,6 +24174,32 @@ mod tests {
             resolve(&db, "frob-9-ddddddd").await,
             RevisionLookup::UnknownPullRequest
         );
+
+        // PR 7 of a repository named frob-7-v2, stored at id 7, has the
+        // bare slug frob-7-v2-7, which has the shape of frob PR 7's
+        // rotation fallback for that row. Its URL keeps it out of frob PR
+        // 7, alone and when a frob revision shares its head prefix.
+        let shared = |tail: char| format!("abcdef9{}", tail.to_string().repeat(33));
+        let frob = queue_revision(&db, "frob", 7, 'a', &shared('f')).await;
+        queue_revision(&db, "widget", 1, 'a', &"1".repeat(40)).await;
+        let other_repo = queue_revision(&db, "frob-7-v2", 7, 'a', &shared('e')).await;
+        assert_eq!(other_repo, 7, "the other repository's row is at id 7");
+        assert_eq!(
+            db.find_patchset_id_by_slug("frob-7-v2-7").await.unwrap(),
+            Some(other_repo)
+        );
+        assert_eq!(
+            resolve(&db, "frob-7-abcdef9e").await,
+            RevisionLookup::NoHeadMatches
+        );
+        assert_eq!(
+            resolve(&db, "frob-7-abcdef9").await,
+            RevisionLookup::Found(frob)
+        );
+        assert_eq!(
+            resolve(&db, "frob-7-v2-7-abcdef9").await,
+            RevisionLookup::Found(other_repo)
+        );
     }
 
     /// A pull request owns its bare slug and the slugs rotation writes, the
@@ -24164,6 +24224,21 @@ mod tests {
         ] {
             assert!(!address.owns_slug(other, 41), "{other}");
         }
+    }
+
+    /// A row with a pull request URL is the address's only when that URL
+    /// names the address's repository; a row with none is judged by its
+    /// slug alone.
+    #[test]
+    fn a_pull_request_url_keeps_a_row_in_its_repository() {
+        let address = PrRevisionAddress::parse("frob-7-abcdef0").unwrap();
+        let url = |repo: &str| format!("https://github.com/acme/{repo}/pull/7");
+        assert!(address.owns_row("frob-7-v2-7", Some(&url("frob")), 7));
+        assert!(address.owns_row("frob-7-v2-7", None, 7));
+        assert!(!address.owns_row("frob-7-v2-7", Some(&url("frob-7-v2")), 7));
+        assert!(!address.owns_row("frob-7-v2-7", Some(&url("Frob")), 7));
+        assert!(!address.owns_row("frob-7", Some("https://example.com/7"), 7));
+        assert!(!address.owns_row("frob-8", Some(&url("frob")), 7));
     }
 
     /// A prefix two heads share is ambiguous, more of the commit picks one,
