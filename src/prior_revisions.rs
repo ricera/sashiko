@@ -392,8 +392,10 @@ pub enum LinkFault {
     NothingShown,
     /// `prior` is not a JSON object.
     NotAnObject,
-    /// `relation` is missing, or neither of the two relations.
-    UnknownRelation(String),
+    /// `relation` is neither of the two relations: `written` is the
+    /// relation made one line and clipped, and `cut` says whether clipping
+    /// dropped any of it.
+    UnknownRelation { written: String, cut: bool },
     /// The key is missing, not a string, or has no visible text.
     NoText(&'static str),
     /// `revision` is not a label the block listed.
@@ -414,10 +416,11 @@ impl std::fmt::Display for LinkFault {
         match self {
             Self::NothingShown => write!(f, "no findings of earlier revisions were shown"),
             Self::NotAnObject => write!(f, "\"prior\" is not a JSON object"),
-            Self::UnknownRelation(written) => write!(
+            Self::UnknownRelation { written, cut } => write!(
                 f,
-                "relation {} is neither \"repeat\" nor \"fix_regression\"",
-                quoted(written)
+                "relation {}{} is neither \"repeat\" nor \"fix_regression\"",
+                quoted_ascii(written),
+                if *cut { "…" } else { "" }
             ),
             Self::NoText(key) => write!(f, "\"{key}\" is missing or not a non-empty string"),
             Self::RevisionNotListed(written) => {
@@ -443,6 +446,31 @@ impl std::fmt::Display for LinkFault {
 /// orchestrator's own words.
 fn quoted(text: &str) -> String {
     Value::from(text).to_string()
+}
+
+/// `text` as `quoted` writes it, with every character outside ASCII written
+/// as a JSON `\uXXXX` escape (a surrogate pair above U+FFFF), so the result
+/// is still a JSON string literal of the same text. A relation is quoted
+/// this way because both relations are ASCII: a character `one_line` keeps
+/// but a reader cannot see, such as a soft hyphen (U+00AD) or a word joiner
+/// (U+2060), would otherwise make the quoted relation look identical to a
+/// valid one, and the model would write it again unchanged. A relation cut
+/// short is marked by a "…" after the closing quote rather than inside it,
+/// so the marker cannot be read as an ellipsis the model wrote, which this
+/// writes as `\u2026`.
+fn quoted_ascii(text: &str) -> String {
+    let mut escaped = String::new();
+    for c in quoted(text).chars() {
+        if c.is_ascii() {
+            escaped.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                escaped.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    escaped
 }
 
 /// The key two spellings of one revision label or one title are compared
@@ -489,13 +517,19 @@ impl PriorReviewContext {
                 .filter(|text| !one_line(text).is_empty())
                 .ok_or(LinkFault::NoText(key))
         };
+        // The relation is made one line before it is parsed, as a label and
+        // a title are before they are matched, so a relation that differs
+        // from a valid one only by whitespace, or by a mark
+        // is_unsafe_for_terminal names, at either end still names it. Any
+        // other invisible character is shown escaped in the feedback
+        // (quoted_ascii). Unlike a label and a title it stays
+        // case-sensitive: both relations are lower-case keywords, not text
+        // copied from the block.
         let relation = text("relation").and_then(|written| {
-            PriorRelation::parse(written.trim()).ok_or_else(|| {
-                LinkFault::UnknownRelation(clip_chars(
-                    one_line(written),
-                    QUOTED_RELATION_MAX_CHARS,
-                    "…",
-                ))
+            let written = one_line(written);
+            PriorRelation::parse(&written).ok_or_else(|| LinkFault::UnknownRelation {
+                cut: written.chars().nth(QUOTED_RELATION_MAX_CHARS).is_some(),
+                written: clip_chars(written, QUOTED_RELATION_MAX_CHARS, ""),
             })
         });
         let shown = text("revision").and_then(|revision| {
@@ -711,12 +745,13 @@ type LocatedLink<'a> = (
 /// Parses `finding["prior"]` into a [`PriorLink`] that names a finding the
 /// block showed and writes it back in canonical form
 /// ([`PriorReviewContext::ground`]), or removes the key and logs why: no
-/// block was shown, not an object, an unknown relation, a revision not
-/// shown, or an earlier_problem not shown under that revision, compared
-/// made one line and case-folded. A `"prior": null` is removed without a
-/// log, since it says there is no link. Both verification reduces call it
-/// on each finding they keep, so the findings JSON, the stored column and
-/// the page only ever hold a link to a finding the review was shown.
+/// block was shown, not an object, a relation that is not one once made
+/// one line (case-sensitive), a revision not shown, or an earlier_problem
+/// not shown under that revision, compared made one line and case-folded.
+/// A `"prior": null` is removed without a log, since it says there is no
+/// link. Both verification reduces call it on each finding they keep, so
+/// the findings JSON, the stored column and the page only ever hold a link
+/// to a finding the review was shown.
 pub fn ground_prior_link(finding: &mut Value, shown: Option<&PriorReviewContext>) {
     let Some(fields) = finding.as_object_mut() else {
         return;
@@ -2312,6 +2347,108 @@ mod tests {
         assert_eq!(
             LinkFault::NothingShown.to_string(),
             "no findings of earlier revisions were shown"
+        );
+    }
+
+    /// A relation is read made one line, as a label and a title are
+    /// matched, so a relation with an invisible mark or a line break around
+    /// it grounds, and the validator and the reduce agree on it: the
+    /// validator gives no feedback and the reduce keeps the link with the
+    /// relation written canonically. It stays case-sensitive.
+    #[test]
+    fn a_relation_is_read_made_one_line_by_validator_and_reduce() {
+        let context = shown_context();
+        for (written, relation) in [
+            ("repeat\u{200B}", "repeat"),
+            ("\u{2066}fix_regression\u{2069}\n", "fix_regression"),
+        ] {
+            let prior = json!({"relation": written, "revision": "v1",
+                               "earlier_problem": "rx page leak"});
+            assert_eq!(
+                context.link_feedback([&with_prior(prior.clone())]),
+                None,
+                "{written:?}"
+            );
+            assert_eq!(
+                grounded(prior, Some(&context)),
+                Some(json!({"relation": relation, "revision": "v1",
+                            "earlier_problem": "rx page leak"})),
+                "{written:?}"
+            );
+        }
+        let upper = json!({"relation": "Repeat\u{200B}", "revision": "v1",
+                           "earlier_problem": "rx page leak"});
+        assert!(
+            context
+                .link_feedback([&with_prior(upper.clone())])
+                .is_some()
+        );
+        assert_eq!(grounded(upper, Some(&context)), None);
+    }
+
+    /// The feedback for a relation that is not one names it, and writes
+    /// each character outside ASCII as a JSON escape, so a soft hyphen or a
+    /// word joiner that `one_line` keeps shows where it differs from a
+    /// valid relation. The validator and the reduce both reject it.
+    #[test]
+    fn a_relation_fault_names_the_relation_with_hidden_characters_escaped() {
+        let context = shown_context();
+        let fault_of = |relation: &str| {
+            let prior = json!({"relation": relation, "revision": "v1",
+                               "earlier_problem": "rx page leak"});
+            assert_eq!(
+                grounded(prior.clone(), Some(&context)),
+                None,
+                "{relation:?}"
+            );
+            let feedback = context
+                .link_feedback([&with_prior(prior.clone())])
+                .expect("feedback");
+            let fault = context.ground(&prior).unwrap_err().to_string();
+            assert!(feedback.contains(&fault), "{feedback}");
+            fault
+        };
+        assert_eq!(
+            fault_of("caused_by"),
+            "relation \"caused_by\" is neither \"repeat\" nor \"fix_regression\""
+        );
+        assert_eq!(
+            fault_of("repeat\u{AD}"),
+            "relation \"repeat\\u00ad\" is neither \"repeat\" nor \"fix_regression\""
+        );
+        assert_eq!(
+            fault_of("re\u{2060}peat \u{1F501}"),
+            "relation \"re\\u2060peat \\ud83d\\udd01\" is neither \"repeat\" nor \
+             \"fix_regression\""
+        );
+        let escaped: Value = serde_json::from_str(
+            fault_of("repeat\u{AD}")
+                .trim_start_matches("relation ")
+                .split(" is neither")
+                .next()
+                .expect("a quoted relation"),
+        )
+        .expect("the quoted relation is a JSON string");
+        assert_eq!(escaped, "repeat\u{AD}");
+        // A relation cut short is marked after the closing quote, while an
+        // ellipsis the model wrote is escaped inside it, so the two differ.
+        assert_eq!(
+            fault_of(&"a".repeat(QUOTED_RELATION_MAX_CHARS + 5)),
+            format!(
+                "relation \"{}\"… is neither \"repeat\" nor \"fix_regression\"",
+                "a".repeat(QUOTED_RELATION_MAX_CHARS)
+            )
+        );
+        assert_eq!(
+            fault_of("repeat…"),
+            "relation \"repeat\\u2026\" is neither \"repeat\" nor \"fix_regression\""
+        );
+        assert_eq!(
+            fault_of(&"a".repeat(QUOTED_RELATION_MAX_CHARS)),
+            format!(
+                "relation \"{}\" is neither \"repeat\" nor \"fix_regression\"",
+                "a".repeat(QUOTED_RELATION_MAX_CHARS)
+            )
         );
     }
 
