@@ -345,6 +345,27 @@ the configured repository) and the operator token as a bearer token. It answers
 `{"outcome", "patchset_id", "number", "head", "previous_status",
 "message"}`, which `sashiko-cli --format json` prints as it is.
 
+### Opening one revision of a pull request
+
+Each revision of a pull request is its own patchset, and three addresses
+open one: on the page (`#/patchset/<address>`), with
+`sashiko-cli show <address>`, and on `GET /api/patch` and
+`GET /api/patchset`.
+
+| Address | Opens |
+| --- | --- |
+| `<repo>-<N>`, e.g. `driver-a-967` | The newest revision. When a newer one arrives, this address moves to it. |
+| `<repo>-<N>-vK`, e.g. `driver-a-967-v2` | Revision K, once a newer revision has taken `<repo>-<N>`. |
+| `<repo>-<N>-<sha>`, e.g. `driver-a-967-1a2b3c4` | The revision whose head commit starts with `<sha>`: 7 to 40 hex characters, in any case. It never moves, so it is the one to share. |
+
+`<repo>` is the repository name without its owner. The head is the one
+the revision was queued with, so a revision whose fetch failed or was
+cancelled still opens. A stored slug always wins: if a repository is
+itself named like `<repo>-<N>`, its own slugs keep their meaning. An
+address that finds no single revision answers 404 with one line saying
+why: no revision of that pull request is known, none has a head starting
+with the given characters, or more than one has (give more of the commit).
+
 ## Troubleshooting
 
 ### Webhook not received

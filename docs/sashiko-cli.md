@@ -146,7 +146,13 @@ sashiko-cli show [OPTIONS] [ID]
 
 **Arguments:**
 
-- `ID` -- Patchset ID or `latest` (default: `latest`).
+- `ID` -- Patchset ID or `latest` (default: `latest`). A pull request
+  revision can also be named by its slug (`driver-a-967` for the
+  newest revision, `driver-a-967-v2` for an older one) or by its head
+  commit, `<repo>-<N>-<sha>` with 7 to 40 hex characters of the head
+  (`driver-a-967-1a2b3c4`), which keeps naming that revision after
+  newer ones arrive. See
+  [GITHUB_SETUP.md](GITHUB_SETUP.md#opening-one-revision-of-a-pull-request).
 
 **Options:**
 

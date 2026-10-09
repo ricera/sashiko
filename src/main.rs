@@ -5424,8 +5424,13 @@ mod tests {
                 process_parsed_article(&db, article, None, &policy, &[]).await,
                 ProcessStatus::Ingested
             ));
+            let patchset = db
+                .find_patchset_id_by_msgid(&format!("mr-7-{base}..{head}"))
+                .await
+                .unwrap()
+                .unwrap();
             let details = db
-                .get_patchset_details_by_msgid(&format!("mr-7-{base}..{head}"), None, None)
+                .get_patchset_details(patchset, None, None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -5477,7 +5482,7 @@ mod tests {
             ));
 
             let details = db
-                .get_patchset_details_by_msgid(&article_id, None, None)
+                .get_patchset_details(ps, None, None)
                 .await
                 .unwrap()
                 .unwrap();

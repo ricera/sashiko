@@ -1056,31 +1056,99 @@ async fn attach_patchset_flags(
     Ok(())
 }
 
+/// An error reply with an empty body, for a miss or a failure that has no
+/// reason to give the caller.
+fn bare(status: StatusCode) -> (StatusCode, String) {
+    (status, String::new())
+}
+
+/// The 500 a database failure behind a patchset lookup gets. The error is
+/// logged, not sent: it can name tables and values the caller has no
+/// business seeing.
+fn lookup_failed(e: anyhow::Error) -> (StatusCode, String) {
+    info!("Database error: {}", e);
+    bare(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// The patchset the id of a /api/patch or /api/patchset request names.
+///
+/// A number is a patchset id. An id with a `-` and no `@` is a stored slug
+/// first, and only when no slug matches a pull request revision address
+/// (`<repo>-<N>-<sha>`), so a stored slug of that shape keeps its meaning.
+/// Anything else is a message id. `Ok(None)` is a miss with nothing more to
+/// say; an address that finds no single revision is a 404 saying why.
+async fn locate_patchset(state: &AppState, id: &str) -> Result<Option<i64>, (StatusCode, String)> {
+    if let Ok(id) = id.parse::<i64>() {
+        return Ok(Some(id));
+    }
+    if !id.contains('-') || id.contains('@') {
+        info!("Looking up patchset by msgid: {:?}", id);
+        return state
+            .db
+            .find_patchset_id_by_msgid(id)
+            .await
+            .map_err(lookup_failed);
+    }
+    info!("Looking up patchset by slug: {:?}", id);
+    if let Some(found) = state
+        .db
+        .find_patchset_id_by_slug(id)
+        .await
+        .map_err(lookup_failed)?
+    {
+        return Ok(Some(found));
+    }
+    let Some(address) = crate::db::PrRevisionAddress::parse(id) else {
+        return Ok(None);
+    };
+    let lookup = state
+        .db
+        .resolve_pr_revision_address(&address)
+        .await
+        .map_err(lookup_failed)?;
+    revision_lookup_reply(&address, lookup)
+}
+
+/// The patchset a pull request revision address found, or the 404 that
+/// says why it found none. The reason repeats only the validated hex
+/// prefix, never the rest of the caller's text.
+fn revision_lookup_reply(
+    address: &crate::db::PrRevisionAddress,
+    lookup: crate::db::RevisionLookup,
+) -> Result<Option<i64>, (StatusCode, String)> {
+    use crate::db::RevisionLookup;
+    let prefix = &address.head_prefix;
+    let reason = match lookup {
+        RevisionLookup::Found(id) => return Ok(Some(id)),
+        RevisionLookup::UnknownPullRequest => {
+            "no pull request revision has this address".to_string()
+        }
+        RevisionLookup::NoHeadMatches => {
+            format!("no revision of this pull request has a head commit starting {prefix}")
+        }
+        RevisionLookup::Ambiguous { matches } => format!(
+            "{prefix} matches {matches} revisions of this pull request; give more of the commit"
+        ),
+    };
+    Err((StatusCode::NOT_FOUND, reason))
+}
+
 async fn get_patchset(
     auth: crate::auth::OptionalAuthUser,
     OptionalPrincipal(principal): OptionalPrincipal,
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let result = if let Ok(id_val) = query.id.parse::<i64>() {
-        info!("Fetching details for patchset id: {}", id_val);
-        state
-            .db
-            .get_patchset_details(id_val, query.page, query.per_page)
-            .await
-    } else if query.id.contains('-') && !query.id.contains('@') {
-        info!("Fetching details for patchset slug: {}", query.id);
-        state
-            .db
-            .get_patchset_details_by_slug(&query.id, query.page, query.per_page)
-            .await
-    } else {
-        info!("Fetching details for patchset msgid: {}", query.id);
-        state
-            .db
-            .get_patchset_details_by_msgid(&query.id, query.page, query.per_page)
-            .await
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let result = match locate_patchset(&state, &query.id).await? {
+        Some(id) => {
+            info!("Fetching details for patchset id: {}", id);
+            state
+                .db
+                .get_patchset_details(id, query.page, query.per_page)
+                .await
+        }
+        None => Ok(None),
     };
 
     match result {
@@ -1095,19 +1163,19 @@ async fn get_patchset(
                 query.per_page,
                 true,
             )
-            .await?;
-            redact_embedded_bugs(&state, &principal, &mut details).await?;
+            .await
+            .map_err(bare)?;
+            redact_embedded_bugs(&state, &principal, &mut details)
+                .await
+                .map_err(bare)?;
             annotate_review_stages(&state, &mut details);
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Patchset not found: {}", query.id);
-            Err(StatusCode::NOT_FOUND)
+            info!("Patchset not found: {:?}", query.id);
+            Err(bare(StatusCode::NOT_FOUND))
         }
-        Err(e) => {
-            info!("Database error: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+        Err(e) => Err(lookup_failed(e)),
     }
 }
 
@@ -1179,25 +1247,16 @@ async fn get_patchset_summary(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(query): Query<PatchQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let result = if let Ok(id_val) = query.id.parse::<i64>() {
-        info!("Fetching summary for patchset id: {}", id_val);
-        state
-            .db
-            .get_patchset_summary(id_val, query.page, query.per_page)
-            .await
-    } else if query.id.contains('-') && !query.id.contains('@') {
-        info!("Fetching summary for patchset slug: {}", query.id);
-        state
-            .db
-            .get_patchset_summary_by_slug(&query.id, query.page, query.per_page)
-            .await
-    } else {
-        info!("Fetching summary for patchset msgid: {}", query.id);
-        state
-            .db
-            .get_patchset_summary_by_msgid(&query.id, query.page, query.per_page)
-            .await
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let result = match locate_patchset(&state, &query.id).await? {
+        Some(id) => {
+            info!("Fetching summary for patchset id: {}", id);
+            state
+                .db
+                .get_patchset_summary(id, query.page, query.per_page)
+                .await
+        }
+        None => Ok(None),
     };
 
     match result {
@@ -1212,18 +1271,16 @@ async fn get_patchset_summary(
                 query.per_page,
                 false,
             )
-            .await?;
+            .await
+            .map_err(bare)?;
             annotate_review_stages(&state, &mut details);
             Ok(Json(details))
         }
         Ok(None) => {
-            info!("Patchset not found: {}", query.id);
-            Err(StatusCode::NOT_FOUND)
+            info!("Patchset not found: {:?}", query.id);
+            Err(bare(StatusCode::NOT_FOUND))
         }
-        Err(e) => {
-            info!("Database error: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+        Err(e) => Err(lookup_failed(e)),
     }
 }
 
@@ -4561,6 +4618,122 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Both routes that open a patchset by id, as the page and the CLI use
+    /// them.
+    const PATCHSET_ROUTES: [&str; 2] = ["/api/patch", "/api/patchset"];
+
+    /// Queues the revision of PR `number` whose head is `head`, under
+    /// `slug`, and returns its patchset.
+    async fn queue_revision_at(db: &Database, number: i64, head: &str, slug: &str) -> i64 {
+        db.create_fetching_patchset(
+            &format!("mr-{number}-{}..{head}@sashiko.local", "a".repeat(40)),
+            "Fetching PR",
+            None,
+            None,
+            Some(&format!("https://github.com/acme/frob/pull/{number}")),
+            Some("Fix the frobnicator"),
+            Some(number),
+            Some(slug),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// GETs `route` for `id` and returns the status and the body text.
+    async fn open_patchset(addr: SocketAddr, route: &str, id: &str) -> (StatusCode, String) {
+        let resp = reqwest::get(format!("http://{addr}{route}?id={id}"))
+            .await
+            .unwrap();
+        (resp.status(), resp.text().await.unwrap())
+    }
+
+    /// A stored slug that has the shape of an address keeps naming the row
+    /// that holds it: repository repo-12's PR 1234567 is not PR 12 of repo.
+    #[tokio::test]
+    async fn an_exact_slug_wins_over_the_address() {
+        let (addr, db) = serve_activity(crate::activity::ActivityRegistry::new()).await;
+        let head = format!("1234567{}", "b".repeat(33));
+        queue_revision_at(&db, 12, &head, "repo-12").await;
+        let bare = queue_revision_at(&db, 1234567, &"c".repeat(40), "repo-12-1234567").await;
+
+        for route in PATCHSET_ROUTES {
+            let (status, body) = open_patchset(addr, route, "repo-12-1234567").await;
+            assert_eq!(status, StatusCode::OK, "{route}: {body}");
+            let details: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(details["id"], bare, "{route}");
+            // The lookup only finds the id; the reply still went through
+            // the embargo and maintainer access step.
+            assert_eq!(details["can_view_embargoed"], false, "{route}");
+        }
+    }
+
+    /// A revision under embargo opened by its address is gated exactly as
+    /// when it is opened by number: a public caller sees no reviews.
+    #[tokio::test]
+    async fn an_embargoed_revision_opened_by_its_address_shows_no_reviews() {
+        let (addr, db) = serve_activity(crate::activity::ActivityRegistry::new()).await;
+        let id = queue_revision_at(&db, 5, &format!("feed123{}", "4".repeat(33)), "frob-5").await;
+        let until = chrono::Utc::now().timestamp() + 3600;
+        db.execute(
+            "UPDATE patchsets SET embargo_until = ? WHERE id = ?",
+            libsql::params![until, id],
+        )
+        .await
+        .unwrap();
+
+        for route in PATCHSET_ROUTES {
+            let (status, body) = open_patchset(addr, route, "frob-5-feed123").await;
+            assert_eq!(status, StatusCode::OK, "{route}: {body}");
+            let details: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(details["id"], id, "{route}");
+            assert_eq!(details["can_view_embargoed"], false, "{route}");
+            assert_eq!(
+                details["reviews"].as_array().map(Vec::len),
+                Some(0),
+                "{route}: {body}"
+            );
+        }
+    }
+
+    /// An address opens its revision on both routes after a newer one took
+    /// the bare slug; each way it can miss is a 404 whose body says why and
+    /// repeats nothing but the hex prefix; an id that is no address at all
+    /// is a 404 with no body, as before.
+    #[tokio::test]
+    async fn an_ambiguous_or_unknown_prefix_is_a_404_that_says_why() {
+        let (addr, db) = serve_activity(crate::activity::ActivityRegistry::new()).await;
+        let v1 = queue_revision_at(&db, 7, &format!("abcdef1{}", "1".repeat(33)), "frob-7").await;
+        queue_revision_at(&db, 7, &format!("abcdef1{}", "2".repeat(33)), "frob-7").await;
+
+        let misses = [
+            (
+                "frob-9-ABCDEF1",
+                "no pull request revision has this address",
+            ),
+            (
+                "frob-7-0000000",
+                "no revision of this pull request has a head commit starting 0000000",
+            ),
+            (
+                "frob-7-ABCDEF1",
+                "abcdef1 matches 2 revisions of this pull request; give more of the commit",
+            ),
+            ("frob-seven", ""),
+        ];
+        for route in PATCHSET_ROUTES {
+            let (status, body) = open_patchset(addr, route, "frob-7-abcdef11").await;
+            assert_eq!(status, StatusCode::OK, "{route}: {body}");
+            let details: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(details["id"], v1, "{route}");
+
+            for (id, reason) in misses {
+                let (status, body) = open_patchset(addr, route, id).await;
+                assert_eq!(status, StatusCode::NOT_FOUND, "{route} {id}");
+                assert_eq!(body, reason, "{route} {id}");
+            }
+        }
     }
 
     /// A fetch is keyed by what it fetches, so the patchset has to be bridged to

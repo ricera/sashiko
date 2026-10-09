@@ -1089,3 +1089,67 @@ async fn test_pr_review_by_number_follows_the_head_revision() {
         assert_eq!(server.fetches_sent(), fetches, "{status} under {mode}");
     }
 }
+
+// ── Open a Pull Request Revision by Its Head Commit ─────────────────────
+
+/// After later pushes take the bare slug, the first revision is still
+/// opened by its head prefix on both routes, the bare slug opens the
+/// newest and the rotated -v1 slug the first. Each miss is a 404 whose
+/// body is its reason: an unknown pull request, a prefix no head starts
+/// with, and a prefix two heads share.
+#[tokio::test]
+#[ignore]
+async fn test_a_pull_request_revision_opens_by_its_head_after_rotation() {
+    let server = spawn_test_server(false).await;
+    let mut revisions = Vec::new();
+    let shares_b_prefix = format!("bbbbbbb{}", "e".repeat(33));
+    for head in ["b".repeat(40), shares_b_prefix, "c".repeat(40)] {
+        let id = server
+            .db
+            .create_fetching_patchset(
+                &format!("mr-7-{PR_BASE}..{head}@sashiko.local"),
+                "Fetching PR #7",
+                None,
+                None,
+                Some("https://github.com/acme/widget/pull/7"),
+                Some("Fix the widget"),
+                Some(7),
+                Some("widget-7"),
+            )
+            .await
+            .unwrap();
+        revisions.push(id);
+    }
+
+    for route in ["/api/patch", "/api/patchset"] {
+        for (id, expected) in [
+            ("widget-7-bbbbbbbbbbbb", revisions[0]),
+            ("widget-7", revisions[2]),
+            ("widget-7-v1", revisions[0]),
+        ] {
+            let found = get_json(&server, &format!("{route}?id={id}")).await;
+            assert_eq!(found["id"], expected, "{route} {id}");
+        }
+
+        for (id, reason) in [
+            (
+                "widget-9-bbbbbbb",
+                "no pull request revision has this address",
+            ),
+            (
+                "widget-7-ddddddd",
+                "no revision of this pull request has a head commit starting ddddddd",
+            ),
+            (
+                "widget-7-bbbbbbb",
+                "bbbbbbb matches 2 revisions of this pull request; give more of the commit",
+            ),
+        ] {
+            let resp = reqwest::get(format!("{}{route}?id={id}", server.base_url))
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 404, "{route} {id}");
+            assert_eq!(resp.text().await.unwrap(), reason, "{route} {id}");
+        }
+    }
+}

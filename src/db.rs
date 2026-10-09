@@ -247,6 +247,165 @@ fn interrupted_fetch_reason(description: &str) -> String {
     }
 }
 
+/// What the placeholder id of a pull request revision holds between its
+/// `mr-{N}-` prefix and its `@sashiko.local` suffix: the range its fetch
+/// asked for, `{base}..{head}` as the forge sent it. `None` when the id is
+/// not a placeholder of pull request `mr_number`.
+#[cfg(feature = "server")]
+fn pr_placeholder_range(cover_id: &str, mr_number: i64) -> Option<&str> {
+    cover_id
+        .strip_suffix("@sashiko.local")?
+        .strip_prefix(&format!("mr-{mr_number}-"))
+}
+
+/// The base and head of a pull request revision, from its placeholder id.
+///
+/// The placeholder `mr-{N}-{base}..{head}@sashiko.local` stays the
+/// patchset's cover letter id after ingestion, and it exists from the
+/// moment the row is created, so a revision whose fetch failed or was
+/// cancelled still has its head. Only that form, with two full commit ids
+/// and N equal to `mr_number`, gives `Some`; anything else, such as a row
+/// stored before placeholders carried the suffix, names no head.
+#[cfg(feature = "server")]
+pub fn pr_revision_range(
+    cover_id: &str,
+    mr_number: i64,
+) -> Option<(crate::baseline::CommitId, crate::baseline::CommitId)> {
+    let (base, head) = pr_placeholder_range(cover_id, mr_number)?.split_once("..")?;
+    Some((
+        crate::baseline::CommitId::parse(base)?,
+        crate::baseline::CommitId::parse(head)?,
+    ))
+}
+
+/// The fewest hex characters of a head commit an address may give. Fewer
+/// would match too many commits to name one revision.
+#[cfg(feature = "server")]
+const MIN_HEAD_PREFIX_LEN: usize = 7;
+
+/// An address of one pull request revision, `<repo>-<N>-<sha>`, where
+/// `<sha>` is 7 to 40 hex characters at the start of the revision's head
+/// commit.
+///
+/// The address is lookup-only: no stored slug has this form, so it keeps
+/// naming its revision after slug rotation hands `<repo>-<N>` to a newer
+/// one. The address is the caller's text, so only this exact shape is
+/// accepted, and the head prefix is the only part of it a reply repeats.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrRevisionAddress {
+    /// The repository name, as slugs carry it, without its owner.
+    pub repo: String,
+    /// The pull request number, above zero.
+    pub number: i64,
+    /// The start of the head commit, in lower case.
+    pub head_prefix: String,
+}
+
+#[cfg(feature = "server")]
+impl PrRevisionAddress {
+    /// Reads an address from the right: the last `-` segment is the head
+    /// prefix, the one before it the number, and what remains the
+    /// repository name. Anything else is `None`.
+    pub fn parse(id: &str) -> Option<Self> {
+        let (rest, head_prefix) = id.rsplit_once('-')?;
+        let (repo, number) = rest.rsplit_once('-')?;
+        let is_head_prefix = (MIN_HEAD_PREFIX_LEN..=40).contains(&head_prefix.len())
+            && head_prefix.bytes().all(|b| b.is_ascii_hexdigit());
+        if repo.is_empty() || !is_head_prefix {
+            return None;
+        }
+        Some(Self {
+            repo: repo.to_string(),
+            number: parse_pr_number(number)?,
+            head_prefix: head_prefix.to_ascii_lowercase(),
+        })
+    }
+
+    /// Whether the slug stored on row `row_id` is one of this pull
+    /// request's. Only the shapes the enqueue paths and slug rotation write
+    /// are accepted: `<repo>-<N>`, which the newest revision holds,
+    /// `<repo>-<N>-v<ver>`, which rotation gives an older one, and
+    /// `<repo>-<N>-v<ver>-<row_id>`, rotation's fallback when that slug is
+    /// taken. A looser test such as "starts with `<repo>-<N>-v`" would also
+    /// accept `frob-7-viewer-7`, the slug of PR 7 of a repository named
+    /// `frob-7-viewer`. The fallback is tied to the row's own id because
+    /// `frob-7-v2-7` is also PR 7 of a repository named `frob-7-v2`. The
+    /// test is made here rather than with LIKE, because a repository name
+    /// may hold `_`.
+    fn owns_slug(&self, slug: &str, row_id: i64) -> bool {
+        let bare = format!("{}-{}", self.repo, self.number);
+        let Some(rest) = slug.strip_prefix(&bare) else {
+            return false;
+        };
+        if rest.is_empty() {
+            return true;
+        }
+        let Some(rotated) = rest.strip_prefix("-v") else {
+            return false;
+        };
+        let (version, fallback_id) = match rotated.split_once('-') {
+            Some((version, id)) => (version, Some(id)),
+            None => (rotated, None),
+        };
+        let is_version = !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit());
+        is_version && fallback_id.is_none_or(|id| id == row_id.to_string())
+    }
+}
+
+/// A pull request number written the way a slug writes one: ASCII digits
+/// with no leading zero, above zero, so each number has one address.
+#[cfg(feature = "server")]
+fn parse_pr_number(text: &str) -> Option<i64> {
+    let canonical =
+        !text.is_empty() && !text.starts_with('0') && text.bytes().all(|b| b.is_ascii_digit());
+    if !canonical {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// What a [`PrRevisionAddress`] found.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevisionLookup {
+    /// The patchset of the one revision whose head starts with the prefix.
+    Found(i64),
+    /// No revision of `<repo>-<N>` is known.
+    UnknownPullRequest,
+    /// The pull request is known; no revision's head starts with the
+    /// prefix.
+    NoHeadMatches,
+    /// More than one head commit starts with the prefix.
+    Ambiguous { matches: usize },
+}
+
+#[cfg(feature = "server")]
+impl RevisionLookup {
+    /// Decides the lookup from what was read: whether any revision of the
+    /// pull request is known, and the head and patchset of each revision
+    /// whose head starts with the prefix.
+    ///
+    /// Two revisions can share a head: one asked for again after the base
+    /// branch moved gets a new placeholder for the same head. Giving more of
+    /// the commit could never tell them apart, so heads are counted, not
+    /// rows, and of one head's rows the newest is the one found.
+    fn from_matches(known: bool, matches: &[(crate::baseline::CommitId, i64)]) -> Self {
+        let heads = matches
+            .iter()
+            .map(|(head, _)| head.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        let newest = matches.iter().map(|&(_, id)| id).max();
+        match (newest, heads) {
+            (Some(id), 1) => Self::Found(id),
+            (Some(_), _) => Self::Ambiguous { matches: heads },
+            (None, _) if known => Self::NoHeadMatches,
+            (None, _) => Self::UnknownPullRequest,
+        }
+    }
+}
+
 /// The status a list or detail view shows for a patchset or a patch.
 ///
 /// While an embargo holds, a finished review is shown as Embargoed, so the
@@ -2116,18 +2275,6 @@ impl Database {
         }
 
         Ok(None)
-    }
-
-    pub async fn get_patchset_details_by_msgid(
-        &self,
-        msg_id: &str,
-        page: Option<u32>,
-        limit: Option<u32>,
-    ) -> Result<Option<serde_json::Value>> {
-        match self.find_patchset_id_by_msgid(msg_id).await? {
-            Some(id) => self.get_patchset_details(id, page, limit).await,
-            None => Ok(None),
-        }
     }
 
     pub async fn get_message_body(&self, msg_id: &str) -> Result<Option<String>> {
@@ -9328,62 +9475,21 @@ impl Database {
         }
     }
 
-    pub async fn get_patchset_summary_by_msgid(
-        &self,
-        msg_id: &str,
-        page: Option<u32>,
-        limit: Option<u32>,
-    ) -> Result<Option<serde_json::Value>> {
-        match self.find_patchset_id_by_msgid(msg_id).await? {
-            Some(id) => self.get_patchset_summary(id, page, limit).await,
+    /// The patchset whose stored slug is exactly `slug`.
+    pub async fn find_patchset_id_by_slug(&self, slug: &str) -> Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id FROM patchsets WHERE slug = ?",
+                libsql::params![slug],
+            )
+            .await?;
+        match rows.next().await? {
+            Some(row) => Ok(Some(row.get(0)?)),
             None => Ok(None),
         }
     }
 
-    pub async fn get_patchset_details_by_slug(
-        &self,
-        slug: &str,
-        page: Option<u32>,
-        limit: Option<u32>,
-    ) -> Result<Option<serde_json::Value>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patchsets WHERE slug = ?",
-                libsql::params![slug],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_details(id, page, limit).await;
-        }
-
-        Ok(None)
-    }
-
-    pub async fn get_patchset_summary_by_slug(
-        &self,
-        slug: &str,
-        page: Option<u32>,
-        limit: Option<u32>,
-    ) -> Result<Option<serde_json::Value>> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id FROM patchsets WHERE slug = ?",
-                libsql::params![slug],
-            )
-            .await?;
-        if let Ok(Some(row)) = rows.next().await {
-            let id: i64 = row.get(0)?;
-            return self.get_patchset_summary(id, page, limit).await;
-        }
-
-        Ok(None)
-    }
-
-    /// Fetches full details for a single review record by review ID, including
-    /// its parent `patchset_id` and `embargo_until` timestamp for embargo checks.
     pub async fn get_review_details(&self, id: i64) -> Result<Option<serde_json::Value>> {
         let mut rows = self
             .conn
@@ -9722,16 +9828,56 @@ impl Database {
             return Ok(None);
         };
         let mr_number = row.get::<Option<i64>>(1).ok().flatten();
-        let Some(placeholder) = msgid.strip_suffix("@sashiko.local") else {
-            return Ok(None);
-        };
-        let commit = match mr_number {
-            Some(n) => placeholder
-                .strip_prefix(&format!("mr-{n}-"))
-                .unwrap_or(placeholder),
-            None => placeholder,
-        };
-        Ok((!commit.is_empty()).then(|| commit.to_string()))
+        // A pull request's fetch is keyed by the range inside its prefix;
+        // any other placeholder, or a pull request placeholder of another
+        // number, by everything before the suffix.
+        let commit = mr_number
+            .and_then(|n| pr_placeholder_range(&msgid, n))
+            .or_else(|| msgid.strip_suffix("@sashiko.local"));
+        Ok(commit
+            .filter(|commit| !commit.is_empty())
+            .map(str::to_string))
+    }
+
+    /// Finds the one revision of a pull request whose head commit starts
+    /// with the address's prefix.
+    ///
+    /// The candidates are the rows with the address's number whose slug is
+    /// one of that pull request's (see [`PrRevisionAddress::owns_slug`]),
+    /// and each one's head comes from its placeholder id through
+    /// [`pr_revision_range`]. The number is bound as an integer and the name
+    /// and prefix are compared here, so no part of the address reaches SQL
+    /// as text.
+    pub async fn resolve_pr_revision_address(
+        &self,
+        address: &PrRevisionAddress,
+    ) -> Result<RevisionLookup> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, slug, cover_letter_message_id FROM patchsets WHERE mr_number = ?",
+                libsql::params![address.number],
+            )
+            .await?;
+        let mut known = false;
+        let mut matches = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id: i64 = row.get(0)?;
+            let owned =
+                get_optional_text(&row, 1)?.is_some_and(|slug| address.owns_slug(&slug, id));
+            if !owned {
+                continue;
+            }
+            known = true;
+            let head = get_optional_text(&row, 2)?
+                .and_then(|cover| pr_revision_range(&cover, address.number))
+                .map(|(_, head)| head)
+                .filter(|head| head.as_str().starts_with(&address.head_prefix));
+            if let Some(head) = head {
+                matches.push((head, id));
+            }
+        }
+        Ok(RevisionLookup::from_matches(known, &matches))
     }
 
     pub async fn get_latest_review_for_patchset(
@@ -18037,10 +18183,10 @@ mod tests {
         assert!(reviews[1].findings.is_empty());
     }
 
-    /// Verify that get_patchset_details_by_msgid and get_patchset_summary_by_msgid
-    /// resolve synthetic IDs when queried by bare SHA.
+    /// Verify that find_patchset_id_by_msgid resolves a synthetic id when it
+    /// is queried by bare SHA, bracketed SHA or the full id.
     #[tokio::test]
-    async fn test_get_patchset_details_by_synthetic_msgid() {
+    async fn test_find_patchset_id_by_synthetic_msgid() {
         let db = setup_db().await;
         let sha = "a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4";
         let synthetic_id = format!("{}@sashiko.local", sha);
@@ -18060,48 +18206,22 @@ mod tests {
             .await
             .unwrap();
 
-        // 1. Querying with the bare SHA must find the patchset details
-        let details = db
-            .get_patchset_details_by_msgid(sha, None, None)
-            .await
-            .unwrap();
-        assert!(
-            details.is_some(),
-            "get_patchset_details_by_msgid with bare SHA should resolve patchset with @sashiko.local cover letter"
-        );
-        assert_eq!(details.unwrap()["id"], ps_id);
+        // 1. The bare SHA, the bracketed SHA and the full synthetic id all
+        // resolve to the patchset with the @sashiko.local cover letter.
+        for id in [sha.to_string(), format!("<{}>", sha), synthetic_id.clone()] {
+            assert_eq!(
+                db.find_patchset_id_by_msgid(&id).await.unwrap(),
+                Some(ps_id),
+                "{id}"
+            );
+        }
 
-        // 2. Querying with bracketed SHA must also find the patchset details
-        let details_bracketed = db
-            .get_patchset_details_by_msgid(&format!("<{}>", sha), None, None)
-            .await
-            .unwrap();
-        assert_eq!(details_bracketed.unwrap()["id"], ps_id);
-
-        // 3. Querying with full synthetic ID must also find the patchset details
-        let details_full = db
-            .get_patchset_details_by_msgid(&synthetic_id, None, None)
-            .await
-            .unwrap();
-        assert_eq!(details_full.unwrap()["id"], ps_id);
-
-        // 4. Querying with the bare SHA must also find the patchset summary
-        let summary = db
-            .get_patchset_summary_by_msgid(sha, None, None)
-            .await
-            .unwrap();
-        assert!(
-            summary.is_some(),
-            "get_patchset_summary_by_msgid with bare SHA should resolve patchset with @sashiko.local cover letter"
-        );
-        assert_eq!(summary.unwrap()["id"], ps_id);
-
-        // 5. update_patchset_error with bare SHA updates the synthetic patchset
+        // 2. update_patchset_error with bare SHA updates the synthetic patchset
         db.update_patchset_error(sha, "Fetch failed: timeout")
             .await
             .unwrap();
         let updated = db
-            .get_patchset_details_by_msgid(sha, None, None)
+            .get_patchset_details(ps_id, None, None)
             .await
             .unwrap()
             .unwrap();
@@ -18170,18 +18290,11 @@ mod tests {
         );
 
         let details = db
-            .get_patchset_details_by_msgid(cover, None, None)
+            .get_patchset_details(1, None, None)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(details["subject"], "[PATCH v4 00/16] Remove PG_private");
-
-        let summary = db
-            .get_patchset_summary_by_msgid(cover, None, None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(summary["id"], 1);
 
         // A patch can sit in two patchsets while the database is in this
         // state, so the patch lookup answers the same way as the cover letter
@@ -18923,8 +19036,9 @@ mod tests {
 
     /// The status and failure reason of the patchset `id` names.
     async fn status_and_reason(db: &Database, id: &str) -> (serde_json::Value, serde_json::Value) {
+        let patchset = db.find_patchset_id_by_msgid(id).await.unwrap().unwrap();
         let details = db
-            .get_patchset_details_by_msgid(id, None, None)
+            .get_patchset_details(patchset, None, None)
             .await
             .unwrap()
             .unwrap();
@@ -23118,12 +23232,15 @@ mod tests {
         assert_eq!(ps_id_2, placeholder_ps_id);
         db.create_patch(ps_id_2, sha2, 2, "diff2").await.unwrap();
 
+        assert_eq!(
+            db.find_patchset_id_by_slug(slug).await.unwrap(),
+            Some(placeholder_ps_id)
+        );
         let details = db
-            .get_patchset_details_by_slug(slug, None, None)
+            .get_patchset_details(placeholder_ps_id, None, None)
             .await
             .unwrap()
-            .expect("should find PR patchset by slug");
-        assert_eq!(details["id"].as_i64(), Some(placeholder_ps_id));
+            .unwrap();
         assert_eq!(details["total_parts"].as_i64(), Some(2));
         assert_eq!(details["received_parts"].as_i64(), Some(2));
         assert_eq!(
@@ -23161,12 +23278,15 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            db.find_patchset_id_by_slug(slug).await.unwrap(),
+            Some(ps_v1)
+        );
         let details_v1 = db
-            .get_patchset_details_by_slug(slug, None, None)
+            .get_patchset_details(ps_v1, None, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(details_v1["id"].as_i64(), Some(ps_v1));
         assert_eq!(
             details_v1["subject"].as_str(),
             Some("#513: baseline: route iwl-net and iwl-next series to dev-queue")
@@ -23217,12 +23337,15 @@ mod tests {
         assert_ne!(ps_v2, ps_v1);
 
         // Latest slug ("sashiko-513") now points to v2
+        assert_eq!(
+            db.find_patchset_id_by_slug(slug).await.unwrap(),
+            Some(ps_v2)
+        );
         let details_v2 = db
-            .get_patchset_details_by_slug(slug, None, None)
+            .get_patchset_details(ps_v2, None, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(details_v2["id"].as_i64(), Some(ps_v2));
         assert_eq!(
             details_v2["subject"].as_str(),
             Some("#513 [v2]: baseline: route iwl-net and iwl-next series to dev-queue")
@@ -23233,12 +23356,15 @@ mod tests {
         );
 
         // Older v1 patchset rotated to "sashiko-513-v1"
+        assert_eq!(
+            db.find_patchset_id_by_slug("sashiko-513-v1").await.unwrap(),
+            Some(ps_v1)
+        );
         let rotated_v1 = db
-            .get_patchset_details_by_slug("sashiko-513-v1", None, None)
+            .get_patchset_details(ps_v1, None, None)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rotated_v1["id"].as_i64(), Some(ps_v1));
         assert_eq!(
             rotated_v1["subject"].as_str(),
             Some("#513: baseline: route iwl-net and iwl-next series to dev-queue")
@@ -23314,6 +23440,292 @@ mod tests {
                 .await
                 .unwrap(),
             1
+        );
+    }
+
+    /// Only the port's placeholder form, with two full commit ids and the
+    /// row's own number, names a base and a head. The fetch key read from
+    /// the same ids is what it was before the parse was shared.
+    #[tokio::test]
+    async fn pr_revision_range_reads_only_a_full_placeholder() {
+        let base = "a".repeat(40);
+        let head = "b".repeat(40);
+        let full = format!("mr-7-{base}..{head}@sashiko.local");
+        let (got_base, got_head) = pr_revision_range(&full, 7).unwrap();
+        assert_eq!((got_base.as_str(), got_head.as_str()), (&*base, &*head));
+
+        let short = &head[..8];
+        for (cover, number) in [
+            (format!("mr-7-{base}..{short}@sashiko.local"), 7),
+            (format!("mr-7-{base}..{}@sashiko.local", "B".repeat(40)), 7),
+            // A row stored before placeholders carried the suffix.
+            (format!("mr-7-{base}..{head}"), 7),
+            (full.clone(), 8),
+            (format!("{head}@sashiko.local"), 7),
+            (format!("mr-7-{head}@sashiko.local"), 7),
+            (format!("mr-7-{base}..{head}..{head}@sashiko.local"), 7),
+        ] {
+            assert_eq!(
+                pr_revision_range(&cover, number),
+                None,
+                "{cover} as #{number}"
+            );
+        }
+
+        let db = memory_db().await;
+        let pr = db
+            .create_fetching_patchset(
+                &full,
+                "Fetching PR #7",
+                None,
+                None,
+                None,
+                None,
+                Some(7),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_fetch_commit(pr).await.unwrap(),
+            Some(format!("{base}..{head}"))
+        );
+        let elsewhere = db
+            .create_fetching_patchset(
+                &format!("mr-7-{base}..{}@sashiko.local", "c".repeat(40)),
+                "Fetching PR #7",
+                None,
+                None,
+                None,
+                None,
+                Some(8),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_fetch_commit(elsewhere).await.unwrap(),
+            Some(format!("mr-7-{base}..{}", "c".repeat(40))),
+            "a placeholder of another number is keyed by all of it, as before"
+        );
+    }
+
+    #[test]
+    fn pr_revision_address_parses() {
+        let address = |repo: &str, number: i64, head_prefix: &str| PrRevisionAddress {
+            repo: repo.to_string(),
+            number,
+            head_prefix: head_prefix.to_string(),
+        };
+        let forty = "0123456789abcdef0123456789abcdef01234567";
+        for (id, parsed) in [
+            ("driver-b-27-3422a31b", address("driver-b", 27, "3422a31b")),
+            (&*format!("widget-7-{forty}"), address("widget", 7, forty)),
+            ("widget-7-ABCDEF0", address("widget", 7, "abcdef0")),
+            ("repo-12-1234567", address("repo", 12, "1234567")),
+        ] {
+            assert_eq!(PrRevisionAddress::parse(id), Some(parsed), "{id}");
+        }
+        for id in [
+            "widget-7-abcdef",
+            &*format!("widget-7-{forty}8"),
+            "widget-7-abcdefg",
+            "widget-0-abcdef0",
+            "widget-07-abcdef0",
+            "-7-abcdef0",
+            "7-abcdef0",
+            "driver-b-27-v2",
+            "widget-7",
+            "widget-99999999999999999999-abcdef0",
+        ] {
+            assert_eq!(PrRevisionAddress::parse(id), None, "{id}");
+        }
+    }
+
+    /// Queues the revision of PR `number` of acme/`repo` whose base and head
+    /// are `base` and `head` repeated, under the slug both enqueue paths
+    /// give it, and returns its patchset.
+    async fn queue_revision(db: &Database, repo: &str, number: i64, base: char, head: &str) -> i64 {
+        let base = base.to_string().repeat(40);
+        db.create_fetching_patchset(
+            &format!("mr-{number}-{base}..{head}@sashiko.local"),
+            "Fetching PR",
+            None,
+            None,
+            Some(&format!("https://github.com/acme/{repo}/pull/{number}")),
+            Some("Fix the frobnicator"),
+            Some(number),
+            Some(&format!("{repo}-{number}")),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn resolve(db: &Database, id: &str) -> RevisionLookup {
+        let address = PrRevisionAddress::parse(id).unwrap();
+        db.resolve_pr_revision_address(&address).await.unwrap()
+    }
+
+    /// Once a newer revision takes the bare slug, the older one is still
+    /// opened by its head prefix, and the stored slugs keep their meaning.
+    #[tokio::test]
+    async fn a_head_prefix_finds_its_revision_after_rotation() {
+        let db = memory_db().await;
+        let v1 = queue_revision(&db, "frob", 7, 'a', &"b".repeat(40)).await;
+        let v2 = queue_revision(&db, "frob", 7, 'a', &"c".repeat(40)).await;
+
+        assert_eq!(
+            resolve(&db, "frob-7-bbbbbbb").await,
+            RevisionLookup::Found(v1)
+        );
+        assert_eq!(
+            resolve(&db, "frob-7-cccccccc").await,
+            RevisionLookup::Found(v2)
+        );
+        assert_eq!(
+            db.find_patchset_id_by_slug("frob-7").await.unwrap(),
+            Some(v2)
+        );
+        assert_eq!(
+            db.find_patchset_id_by_slug("frob-7-v1").await.unwrap(),
+            Some(v1)
+        );
+    }
+
+    /// The head comes from the placeholder, so a revision whose fetch
+    /// failed before any patch arrived is still found.
+    #[tokio::test]
+    async fn a_failed_revision_is_still_addressable() {
+        let db = memory_db().await;
+        let id = queue_revision(&db, "frob", 7, 'a', &"b".repeat(40)).await;
+        db.conn
+            .execute(
+                "UPDATE patchsets SET status = 'Failed' WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve(&db, "frob-7-bbbbbbb").await,
+            RevisionLookup::Found(id)
+        );
+    }
+
+    /// A head prefix finds nothing under another number or another
+    /// repository name, even one whose name ends like it.
+    #[tokio::test]
+    async fn the_address_stays_inside_its_pull_request() {
+        let db = memory_db().await;
+        queue_revision(&db, "frob", 7, 'a', &"b".repeat(40)).await;
+        queue_revision(&db, "frob", 8, 'a', &"c".repeat(40)).await;
+
+        assert_eq!(
+            resolve(&db, "frob-8-bbbbbbb").await,
+            RevisionLookup::NoHeadMatches
+        );
+        assert_eq!(
+            resolve(&db, "frob-9-bbbbbbb").await,
+            RevisionLookup::UnknownPullRequest
+        );
+        for other in ["widget-7-bbbbbbb", "rob-7-bbbbbbb", "x-frob-7-bbbbbbb"] {
+            assert_eq!(
+                resolve(&db, other).await,
+                RevisionLookup::UnknownPullRequest,
+                "{other}"
+            );
+        }
+
+        // PR 7 of a repository whose name starts with `frob-7-v` stores the
+        // slug frob-7-viewer-7, which is not one of frob PR 7's.
+        let viewer = "d".repeat(40);
+        queue_revision(&db, "frob-7-viewer", 7, 'a', &viewer).await;
+        assert_eq!(
+            resolve(&db, "frob-7-ddddddd").await,
+            RevisionLookup::NoHeadMatches
+        );
+        assert_eq!(
+            resolve(&db, "frob-9-ddddddd").await,
+            RevisionLookup::UnknownPullRequest
+        );
+        queue_revision(&db, "frob-9-viewer", 9, 'a', &viewer).await;
+        assert_eq!(
+            resolve(&db, "frob-9-ddddddd").await,
+            RevisionLookup::UnknownPullRequest
+        );
+    }
+
+    /// A pull request owns its bare slug and the slugs rotation writes, the
+    /// fallback only with the row's own id, and nothing else that merely
+    /// starts with its bare slug.
+    #[test]
+    fn a_pull_request_owns_only_the_slugs_rotation_writes() {
+        let address = PrRevisionAddress::parse("frob-7-abcdef0").unwrap();
+        for owned in ["frob-7", "frob-7-v1", "frob-7-v12", "frob-7-v2-41"] {
+            assert!(address.owns_slug(owned, 41), "{owned}");
+        }
+        for other in [
+            "frob-7-viewer-7",
+            "frob-7-v",
+            "frob-7-v2-7",
+            "frob-7-v2-",
+            "frob-7-v2-41-v1",
+            "frob-7-vx",
+            "frob-70",
+            "frob-7v1",
+            "frob-8",
+        ] {
+            assert!(!address.owns_slug(other, 41), "{other}");
+        }
+    }
+
+    /// A prefix two heads share is ambiguous, more of the commit picks one,
+    /// and a head queued twice (its base moved) is one revision, found at
+    /// its newest row.
+    #[tokio::test]
+    async fn an_ambiguous_prefix_counts_heads_not_rows() {
+        let db = memory_db().await;
+        let first = format!("abcdef1{}", "1".repeat(33));
+        let second = format!("abcdef1{}", "2".repeat(33));
+        let v1 = queue_revision(&db, "frob", 7, 'a', &first).await;
+        queue_revision(&db, "frob", 7, 'a', &second).await;
+        assert_eq!(
+            resolve(&db, "frob-7-abcdef1").await,
+            RevisionLookup::Ambiguous { matches: 2 }
+        );
+        assert_eq!(
+            resolve(&db, "frob-7-abcdef11").await,
+            RevisionLookup::Found(v1)
+        );
+
+        let rebased_base = queue_revision(&db, "frob", 7, 'e', &first).await;
+        assert!(rebased_base > v1);
+        assert_eq!(
+            resolve(&db, &format!("frob-7-{first}")).await,
+            RevisionLookup::Found(rebased_base)
+        );
+    }
+
+    /// A row without a full placeholder, as one stored before placeholders
+    /// carried their suffix, makes its pull request known but has no head
+    /// to match.
+    #[tokio::test]
+    async fn a_revision_without_a_placeholder_head_matches_nothing() {
+        let db = memory_db().await;
+        db.create_fetching_patchset(
+            &format!("mr-941-{}..{}", "a".repeat(40), "b".repeat(40)),
+            "Fetching PR",
+            None,
+            None,
+            Some("https://github.com/acme/frob/pull/941"),
+            None,
+            Some(941),
+            Some("frob-941"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolve(&db, "frob-941-bbbbbbb").await,
+            RevisionLookup::NoHeadMatches
         );
     }
 
