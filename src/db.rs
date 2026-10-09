@@ -2826,16 +2826,7 @@ impl Database {
         // while SQLite walks the potentially large patches table.
         if current_version < 12 {
             info!("Applying database migration version 12 (Git patch IDs)...");
-            let has_git_patch_id = {
-                let mut columns = self.conn.query("PRAGMA table_info(patches)", ()).await?;
-                let mut found = false;
-                while let Some(row) = columns.next().await? {
-                    let name: String = row.get(1)?;
-                    found |= name == "git_patch_id";
-                }
-                found
-            };
-            if has_git_patch_id {
+            if table_has_column(&self.conn, "patches", "git_patch_id").await? {
                 self.execute(
                     "CREATE INDEX IF NOT EXISTS idx_patches_git_patch_id
                      ON patches(git_patch_id)",
@@ -2864,16 +2855,7 @@ impl Database {
         if current_version < 14 {
             info!("Applying database migration version 14 (review reference repositories)...");
             let tx = self.begin_transaction().await?;
-            let has_column = {
-                let mut columns = tx.query("PRAGMA table_info(reviews)", ()).await?;
-                let mut found = false;
-                while let Some(row) = columns.next().await? {
-                    let name: String = row.get(1)?;
-                    found |= name == "reference_repos";
-                }
-                found
-            };
-            if !has_column {
+            if !table_has_column(&tx, "reviews", "reference_repos").await? {
                 tx.execute_batch(include_str!("migrations/014_review_reference_repos.sql"))
                     .await?;
             }
@@ -2905,16 +2887,7 @@ impl Database {
                 ("patchsets", "review_duration_seconds", "INTEGER"),
             ];
             for (table, column, kind) in COLUMNS {
-                let present = {
-                    let mut columns = tx.query(&format!("PRAGMA table_info({table})"), ()).await?;
-                    let mut found = false;
-                    while let Some(row) = columns.next().await? {
-                        let name: String = row.get(1)?;
-                        found |= name == *column;
-                    }
-                    found
-                };
-                if !present {
+                if !table_has_column(&tx, table, column).await? {
                     tx.execute(
                         &format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"),
                         (),
