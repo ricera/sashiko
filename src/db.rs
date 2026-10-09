@@ -9680,11 +9680,13 @@ impl Database {
     /// (reruns, and failed or cancelled runs that stored some), newest
     /// review first. A preexisting finding is left out: verification turns
     /// one into a concern, so no later finding could be linked to it. Of
-    /// findings whose `problem` differs only in case, whitespace and
-    /// invisible characters, the newest review's is kept. `current` is the
-    /// patch-id of each patch under review, by index. Each listed finding
-    /// whose stored link does not read adds one to `unreadable_links`; a row
-    /// left out, as a duplicate or for having no title, adds nothing.
+    /// findings whose `problem` differs only in case, whitespace, control
+    /// characters and the zero-width and directional marks
+    /// `finding_view::one_line` treats as spaces, the newest review's is
+    /// kept. `current` is the patch-id of each patch under review, by
+    /// index. Each listed finding whose stored link does not read adds one
+    /// to `unreadable_links`; a row left out, as a duplicate or for having
+    /// no title, adds nothing.
     async fn prior_revision_patches(
         &self,
         revision_id: i64,
