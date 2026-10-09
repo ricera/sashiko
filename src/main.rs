@@ -1006,6 +1006,7 @@ async fn run_daemon(
         dry_run: settings.smtp.as_ref().map(|s| s.dry_run).unwrap_or(false),
         local_token,
         activity: activity.clone(),
+        pull_request_resolver: Arc::new(sashiko::forge::GhCli),
     };
     let api_handle = tokio::spawn(async move {
         if let Err(e) =

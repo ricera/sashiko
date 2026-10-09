@@ -1034,3 +1034,195 @@ async fn test_recorded_stage_rows_carry_order_and_label() {
         assert!(find("mystery")["stage_label"].is_null(), "{label}");
     }
 }
+
+// ── Review a Pull Request by Number ─────────────────────────────────────
+
+/// The base every pull request [`FakeGh`] answers for is based on.
+const PR_BASE: &str = "1111111111111111111111111111111111111111";
+
+/// Stands in for gh, so that no test runs it or reaches the network: pull
+/// request N of any repository has base [`PR_BASE`] and head N in hex.
+struct FakeGh;
+
+#[async_trait::async_trait]
+impl sashiko::forge::PullRequestResolver for FakeGh {
+    async fn resolve(
+        &self,
+        repo: &sashiko::settings::ForgeRepo,
+        number: i64,
+    ) -> Result<sashiko::forge::ResolvedPullRequest, sashiko::forge::GhError> {
+        let commit = |hex: &str| sashiko::baseline::CommitId::parse(hex).expect("a commit id");
+        Ok(sashiko::forge::ResolvedPullRequest {
+            repo: repo.clone(),
+            number,
+            url: format!(
+                "https://{}/{}/{}/pull/{number}",
+                repo.host, repo.owner, repo.name
+            ),
+            title: Some("Fix the widget".to_string()),
+            base: commit(PR_BASE),
+            head: commit(&format!("{number:040x}")),
+        })
+    }
+}
+
+/// A running server that admits only the local operator token, resolves
+/// pull request numbers with [`FakeGh`], and keeps its fetch requests for
+/// the test to count.
+struct PrServer {
+    base_url: String,
+    db: Arc<Database>,
+    fetch_rx: mpsc::Receiver<FetchRequest>,
+    token: String,
+}
+
+impl PrServer {
+    /// Posts `request` to /api/pr/review, with the local token when
+    /// `with_token` is set, and returns the status and the body text.
+    async fn ask(&self, request: serde_json::Value, with_token: bool) -> (u16, String) {
+        let mut post = reqwest::Client::new()
+            .post(format!("{}/api/pr/review", self.base_url))
+            .json(&request);
+        if with_token {
+            post = post.bearer_auth(&self.token);
+        }
+        let resp = post.send().await.unwrap();
+        (resp.status().as_u16(), resp.text().await.unwrap())
+    }
+
+    /// Asks with the token for pull request 7 in `mode`, expecting success.
+    async fn review_seven(&self, mode: &str) -> serde_json::Value {
+        let (status, body) = self
+            .ask(serde_json::json!({ "number": 7, "mode": mode }), true)
+            .await;
+        assert_eq!(status, 200, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    /// How many fetch requests are waiting, taking them off the channel.
+    fn fetches_sent(&mut self) -> usize {
+        std::iter::from_fn(|| self.fetch_rx.try_recv().ok()).count()
+    }
+
+    async fn set_status(&self, id: i64, status: &str) {
+        self.db
+            .conn
+            .execute(
+                "UPDATE patchsets SET status = ? WHERE id = ?",
+                libsql::params![status, id],
+            )
+            .await
+            .unwrap();
+    }
+}
+
+async fn spawn_pr_server(read_only: bool, github_repository: Option<&str>) -> PrServer {
+    let db = Arc::new(
+        Database::new(&DatabaseSettings {
+            url: ":memory:".to_string(),
+            token: String::new(),
+        })
+        .await
+        .unwrap(),
+    );
+    db.migrate().await.unwrap();
+    let (event_tx, _event_rx) = mpsc::channel::<Event>(100);
+    let (fetch_tx, fetch_rx) = mpsc::channel::<FetchRequest>(100);
+
+    let mut settings = test_settings(read_only);
+    settings.forge.github_repository = github_repository.map(|repo| repo.parse().unwrap());
+    let local_token = sashiko::auth::LocalToken::generate().unwrap();
+    let token = local_token.secret().to_string();
+    let app = build_router(
+        Arc::new(settings),
+        Arc::clone(&db),
+        event_tx,
+        fetch_tx,
+        ServerOptions {
+            local_token: Some(local_token),
+            pull_request_resolver: Arc::new(FakeGh),
+            ..Default::default()
+        },
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    PrServer {
+        base_url,
+        db,
+        fetch_rx,
+        token,
+    }
+}
+
+/// The route is a mutation: it refuses a caller without the token, and a
+/// read-only server refuses even the token.
+#[tokio::test]
+#[ignore]
+async fn test_pr_review_refuses_without_the_token_or_on_a_read_only_server() {
+    let request = serde_json::json!({ "number": 7 });
+    let mut server = spawn_pr_server(false, Some("acme/widget")).await;
+    assert_eq!(server.ask(request.clone(), false).await.0, 403);
+    assert_eq!(server.fetches_sent(), 0);
+
+    let mut read_only = spawn_pr_server(true, Some("acme/widget")).await;
+    assert_eq!(read_only.ask(request, true).await.0, 403);
+    assert_eq!(read_only.fetches_sent(), 0);
+}
+
+/// Without forge.github_repository the route cannot say which repository a
+/// number belongs to, and refuses with 422 and a reason naming the setting.
+#[tokio::test]
+#[ignore]
+async fn test_pr_review_needs_the_github_repository_setting() {
+    let mut server = spawn_pr_server(false, None).await;
+    let (status, body) = server.ask(serde_json::json!({ "number": 7 }), true).await;
+    assert_eq!(status, 422);
+    assert!(body.contains("forge.github_repository"), "{body}");
+    assert_eq!(server.fetches_sent(), 0);
+}
+
+/// One head revision asked for again and again as its row moves through
+/// the statuses: queued with its id when new, in progress while still
+/// Fetching (the fetch is sent again, to recover a lost request) and while
+/// Pending (none is), finished once Reviewed, rerun under rerun_head, and
+/// queued again after a failure.
+#[tokio::test]
+#[ignore]
+async fn test_pr_review_by_number_follows_the_head_revision() {
+    let mut server = spawn_pr_server(false, Some("acme/widget")).await;
+
+    let queued = server.review_seven("review_head").await;
+    assert_eq!(queued["outcome"], "queued");
+    assert_eq!(queued["number"], 7);
+    assert_eq!(queued["head"], format!("{:040x}", 7));
+    assert!(queued["previous_status"].is_null(), "{queued}");
+    let id = queued["patchset_id"].as_i64().unwrap();
+    assert_eq!(server.fetches_sent(), 1);
+
+    let fetching = server.review_seven("review_head").await;
+    assert_eq!(fetching["outcome"], "already_in_progress");
+    assert_eq!(fetching["previous_status"], "Fetching");
+    assert_eq!(server.fetches_sent(), 1);
+
+    for (status, mode, outcome, fetches) in [
+        ("Pending", "review_head", "already_in_progress", 0),
+        ("Reviewed", "review_head", "already_finished", 0),
+        ("Reviewed", "rerun_head", "rerun_queued", 0),
+        ("Failed", "review_head", "queued", 1),
+    ] {
+        server.set_status(id, status).await;
+        let reply = server.review_seven(mode).await;
+        assert_eq!(reply["patchset_id"], id, "one head has one row");
+        assert_eq!(reply["outcome"], outcome, "{status} under {mode}: {reply}");
+        assert_eq!(server.fetches_sent(), fetches, "{status} under {mode}");
+    }
+}

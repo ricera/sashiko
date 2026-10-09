@@ -156,14 +156,42 @@ impl PlaceholderState {
     fn resets_row(&self) -> bool {
         matches!(self, Self::Reset { .. } | Self::AlreadyFetching)
     }
+
+    /// The status the row had before the call, as it is stored, or `None`
+    /// when the call created the row.
+    pub fn previous_status(&self) -> Option<&str> {
+        match self {
+            Self::Created => None,
+            Self::Reset { was } | Self::Kept(was) => Some(was.as_str()),
+            Self::AlreadyFetching => Some(FETCHING),
+            Self::KeptUnknown { status } => Some(status),
+        }
+    }
 }
 
-/// The patchset a fetch request belongs to, and what queuing it found.
+/// The patchset a fetch request belongs to, what queuing it found, and
+/// where it stands among its pull request's revisions afterwards.
 #[cfg(feature = "server")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchingPlaceholder {
     pub id: i64,
     pub state: PlaceholderState,
+    pub standing: RevisionStanding,
+}
+
+/// Where one patchset stands among the stored revisions of its pull
+/// request once the auto-cancel of superseded revisions has run. Both
+/// fields are `None` for a patchset that names no pull request, or that is
+/// not among the revisions the auto-cancel read.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RevisionStanding {
+    /// The version the patchset's subject names (1 when it names none).
+    pub version: Option<u32>,
+    /// The newer revision the auto-cancel keeps instead of this one. The
+    /// auto-cancel cancels this patchset when it is in progress, and would
+    /// cancel it again were it rerun.
+    pub superseded_by: Option<KnownRevision>,
 }
 
 /// The columns a Fetching placeholder row is written with, whether it is
@@ -177,6 +205,27 @@ struct PlaceholderColumns<'a> {
     mr_title: Option<&'a str>,
     mr_number: Option<i64>,
     slug: Option<&'a str>,
+}
+
+/// One stored revision of a pull request: its patchset and the version its
+/// subject names.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownRevision {
+    pub id: i64,
+    pub version: u32,
+}
+
+/// The newest of a pull request's revisions: the highest version, and of
+/// equal versions the latest row. This is the revision the auto-cancel of
+/// superseded revisions keeps, so a caller that names it names the one left
+/// standing.
+#[cfg(feature = "server")]
+fn newest_revision(revisions: &[KnownRevision]) -> Option<KnownRevision> {
+    revisions
+        .iter()
+        .copied()
+        .max_by_key(|revision| (revision.version, revision.id))
 }
 
 /// [`FETCH_INTERRUPTED_REASON`], followed by the last recorded description
@@ -9541,67 +9590,51 @@ impl Database {
         Ok(true)
     }
 
+    /// Cancels every in-progress revision of pull request `mr_number` but
+    /// the newest, and says where patchset `current_id` stands among them.
     pub async fn reconcile_superseded_pr_patchsets(
         &self,
-        _current_id: i64,
+        current_id: i64,
         mr_url: Option<&str>,
         mr_number: Option<i64>,
-    ) -> Result<usize> {
+    ) -> Result<RevisionStanding> {
         let Some(num) = mr_number else {
-            return Ok(0);
+            return Ok(RevisionStanding::default());
         };
 
         let target_repo = mr_url.and_then(crate::forge::extract_owner_repo_from_mr_url);
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT id, subject, mr_url FROM patchsets WHERE mr_number = ? ORDER BY id ASC LIMIT 200",
-                libsql::params![num],
-            )
+        let matching = self
+            .pull_request_revisions(num, |row_mr_url| {
+                match (target_repo.as_deref(), row_mr_url) {
+                    (Some(target), Some(r_url)) => {
+                        crate::forge::extract_owner_repo_from_mr_url(r_url).as_deref()
+                            == Some(target)
+                    }
+                    (None, Some(r_url)) => mr_url == Some(r_url),
+                    (None, None) => mr_url.is_none(),
+                    (Some(_), None) => false,
+                }
+            })
             .await?;
 
-        let mut matching: Vec<(i64, u32)> = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let row_id: i64 = row.get(0)?;
-            let row_subj: String = row.get(1).unwrap_or_default();
-            let row_mr_url: Option<String> = row.get(2).ok();
-
-            let same_repo = match (target_repo.as_deref(), row_mr_url.as_deref()) {
-                (Some(target), Some(r_url)) => {
-                    crate::forge::extract_owner_repo_from_mr_url(r_url).as_deref() == Some(target)
-                }
-                (None, Some(r_url)) => mr_url == Some(r_url),
-                (None, None) => mr_url.is_none(),
-                (Some(_), None) => false,
-            };
-            if !same_repo {
-                continue;
-            }
-
-            let ver = crate::forge::extract_mr_version_from_subject(Some(&row_subj), num)
-                .or_else(|| crate::patch::parse_subject_version(&row_subj))
-                .unwrap_or(1);
-            matching.push((row_id, ver));
-        }
-        drop(rows);
-
-        if matching.len() <= 1 {
-            return Ok(0);
-        }
-
-        let latest_id = matching
+        let current = matching
             .iter()
-            .max_by_key(|(id, ver)| (*ver, *id))
-            .map(|(id, _)| *id)
-            .unwrap();
+            .copied()
+            .find(|revision| revision.id == current_id);
+        let Some(latest) = newest_revision(&matching) else {
+            return Ok(RevisionStanding::default());
+        };
+        let latest_id = latest.id;
 
-        let mut cancelled_count = 0;
-        for (old_id, old_ver) in matching {
+        for KnownRevision {
+            id: old_id,
+            version: old_ver,
+        } in matching
+        {
             if old_id == latest_id {
                 continue;
             }
             if self.cancel_patchset(old_id, true).await? {
-                cancelled_count += 1;
                 info!(
                     "Cancelled superseded PR #{} v{} patchset {} (superseded by patchset {})",
                     num, old_ver, old_id, latest_id
@@ -9611,7 +9644,72 @@ impl Database {
                 .await?;
         }
 
-        Ok(cancelled_count)
+        Ok(RevisionStanding {
+            version: current.map(|revision| revision.version),
+            superseded_by: current
+                .filter(|revision| revision.id != latest_id)
+                .map(|_| latest),
+        })
+    }
+
+    /// The revisions of pull request `number` whose mr_url `same_repository`
+    /// accepts, oldest row first, each with the version its subject names
+    /// (1 when it names none). It reads at most the first 200 rows with that
+    /// number, the bound the auto-cancel of superseded revisions has always
+    /// read under.
+    async fn pull_request_revisions(
+        &self,
+        number: i64,
+        same_repository: impl Fn(Option<&str>) -> bool,
+    ) -> Result<Vec<KnownRevision>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, subject, mr_url FROM patchsets WHERE mr_number = ? ORDER BY id ASC LIMIT 200",
+                libsql::params![number],
+            )
+            .await?;
+
+        let mut matching = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let row_id: i64 = row.get(0)?;
+            let row_subj: String = row.get(1).unwrap_or_default();
+            let row_mr_url: Option<String> = row.get(2).ok();
+            if !same_repository(row_mr_url.as_deref()) {
+                continue;
+            }
+            let version = crate::forge::extract_mr_version_from_subject(Some(&row_subj), number)
+                .or_else(|| crate::patch::parse_subject_version(&row_subj))
+                .unwrap_or(1);
+            matching.push(KnownRevision {
+                id: row_id,
+                version,
+            });
+        }
+        Ok(matching)
+    }
+
+    /// The newest stored revision of pull request `number` of the GitHub
+    /// repository `owner`/`name`, whatever its status: the one the
+    /// auto-cancel would keep. Owner and name compare without ASCII case,
+    /// because GitHub treats them so and the caller may only have the
+    /// configured spelling, not the forge's. A row without a pull request
+    /// URL belongs to no repository and is never returned.
+    pub async fn newest_pull_request_revision(
+        &self,
+        owner: &str,
+        name: &str,
+        number: i64,
+    ) -> Result<Option<KnownRevision>> {
+        let wanted = format!("{owner}/{name}");
+        let revisions = self
+            .pull_request_revisions(number, |row_mr_url| {
+                row_mr_url
+                    .and_then(crate::forge::extract_owner_repo_from_mr_url)
+                    .is_some_and(|repo| repo.eq_ignore_ascii_case(&wanted))
+            })
+            .await?;
+        Ok(newest_revision(&revisions))
     }
 
     pub async fn reconcile_superseded_series_patchsets(
@@ -9748,52 +9846,52 @@ impl Database {
     }
 
     pub async fn rerun_patchset(&self, id: i64) -> Result<()> {
-        // 1. Get current status of the patchset
-        let mut rows = self
+        self.rerun_patchset_if(id, None).await.map(|_| ())
+    }
+
+    /// Reruns patchset `id` as [`Self::rerun_patchset`] does, but only
+    /// while its status is still `observed`, and says whether it did. A
+    /// caller that chose to rerun from a status it read earlier passes that
+    /// status, so that a row another request has since set Pending, or a
+    /// reviewer has since picked up, is not reset under the review.
+    pub async fn rerun_patchset_from(&self, id: i64, observed: ReviewStatus) -> Result<bool> {
+        self.rerun_patchset_if(id, Some(observed)).await
+    }
+
+    /// Reruns patchset `id`, when its status is `observed` if one is given,
+    /// and says whether a row was reset.
+    async fn rerun_patchset_if(&self, id: i64, observed: Option<ReviewStatus>) -> Result<bool> {
+        // One statement tests the status and resets the row, so no other
+        // writer can change the status between the two. SET expressions read
+        // the row as it was before the update, so the count is raised only
+        // for a row that was Reviewed. The review clock starts over too: it
+        // carries time across a restart of the same review, and a rerun is a
+        // new review whose cost should not include the last one's.
+        let reset = self
             .conn
-            .query(
-                "SELECT status FROM patchsets WHERE id = ?",
-                libsql::params![id],
-            )
-            .await?;
-
-        let mut current_status = None;
-        if let Ok(Some(row)) = rows.next().await {
-            let status: String = row.get(0)?;
-            current_status = Some(status);
-        }
-
-        let should_increment = current_status.as_deref() == Some("Reviewed");
-
-        // 2. Reset patchset status to Pending. The review clock starts over
-        // too: it carries time across a restart of the same review, and a
-        // rerun is a new review whose cost should not include the last one's.
-        self.conn
             .execute(
-                "UPDATE patchsets SET status = 'Pending', review_duration_seconds = NULL WHERE id = ?",
-                libsql::params![id],
+                "UPDATE patchsets SET status = 'Pending', review_duration_seconds = NULL,
+                    target_review_count = CASE WHEN status = 'Reviewed'
+                        THEN COALESCE(target_review_count, 1) + 1
+                        ELSE target_review_count END
+                 WHERE id = ?1 AND (?2 IS NULL OR status = ?2)",
+                libsql::params![id, observed.map(|status| status.as_str())],
             )
             .await?;
-
-        // 3. Increment target_review_count only if it was previously Reviewed
-        if should_increment {
-            self.conn
-                .execute(
-                    "UPDATE patchsets SET target_review_count = COALESCE(target_review_count, 1) + 1 WHERE id = ?",
-                    libsql::params![id],
-                )
-                .await?;
+        if reset == 0 {
+            return Ok(false);
         }
 
-        // 4. Patches whose review ran out of time or failed for good are
+        // Patches whose review ran out of time or failed for good are
         // reviewed again. The count is not raised for a Partial patchset, so
         // the patches that already have a full review are not reviewed again
         // with them.
         self.clear_held_outcomes(id).await?;
 
-        // 5. Failed reviews that never reached the model (infra failures)
+        // Failed reviews that never reached the model (infra failures)
         // block retrying, so they go.
-        self.delete_unreached_failed_reviews(id).await
+        self.delete_unreached_failed_reviews(id).await?;
+        Ok(true)
     }
 
     /// Deletes a patchset's failed reviews that never reached the model,
@@ -9971,24 +10069,28 @@ impl Database {
             slug,
         };
 
-        let placeholder = match self.find_placeholder_status(root_msg_id).await? {
+        let (id, state) = match self.find_placeholder_status(root_msg_id).await? {
             Some((id, status)) => {
                 let state = Self::placeholder_state_of(&status);
                 if state.resets_row() {
                     self.reset_fetching_placeholder(id, &columns).await?;
                 }
-                FetchingPlaceholder { id, state }
+                (id, state)
             }
-            None => FetchingPlaceholder {
-                id: self
-                    .insert_fetching_placeholder(root_msg_id, &columns)
+            None => (
+                self.insert_fetching_placeholder(root_msg_id, &columns)
                     .await?,
-                state: PlaceholderState::Created,
-            },
+                PlaceholderState::Created,
+            ),
         };
-        self.reconcile_superseded_pr_patchsets(placeholder.id, mr_url, mr_number)
+        let standing = self
+            .reconcile_superseded_pr_patchsets(id, mr_url, mr_number)
             .await?;
-        Ok(placeholder)
+        Ok(FetchingPlaceholder {
+            id,
+            state,
+            standing,
+        })
     }
 
     /// The subject a Fetching placeholder is written with: the pull
@@ -18486,6 +18588,81 @@ mod tests {
         assert!(!PlaceholderState::Created.resets_row());
     }
 
+    /// The status a placeholder state reports having found is the stored
+    /// one: none for a created row, "Fetching" for one still fetching, the
+    /// stored spelling of a review status, and an unknown status as it is.
+    #[test]
+    fn placeholder_state_reports_the_status_it_found() {
+        assert_eq!(PlaceholderState::Created.previous_status(), None);
+        assert_eq!(
+            PlaceholderState::AlreadyFetching.previous_status(),
+            Some(FETCHING)
+        );
+        for status in ReviewStatus::ALL {
+            assert_eq!(
+                PlaceholderState::Kept(status).previous_status(),
+                Some(status.as_str())
+            );
+            assert_eq!(
+                PlaceholderState::Reset { was: status }.previous_status(),
+                Some(status.as_str())
+            );
+        }
+        let unknown = PlaceholderState::KeptUnknown {
+            status: String::new(),
+        };
+        assert_eq!(unknown.previous_status(), Some(""));
+    }
+
+    /// The newest known revision of a pull request is looked up within its
+    /// repository, owner and name compared without case: the highest
+    /// version wins over a later row, and rows of another repository with
+    /// the same number, or with no pull request URL, are never returned.
+    #[tokio::test]
+    async fn newest_pull_request_revision_stays_in_its_repository() {
+        let db = memory_db().await;
+        let queue = |cover: &'static str, subject: &'static str, url: Option<&'static str>| {
+            let db = &db;
+            async move {
+                db.create_fetching_patchset(cover, subject, None, None, url, None, Some(7), None)
+                    .await
+                    .unwrap()
+            }
+        };
+        let widget = Some("https://github.com/Acme/Widget/pull/7");
+        let newest = queue("a@sashiko.local", "#7 [v2]: Fix", widget).await;
+        queue("b@sashiko.local", "#7: Fix", widget).await;
+        queue(
+            "c@sashiko.local",
+            "#7 [v9]: Other",
+            Some("https://github.com/other/widget/pull/7"),
+        )
+        .await;
+        queue("d@sashiko.local", "#7 [v9]: Bare", None).await;
+
+        assert_eq!(
+            db.newest_pull_request_revision("acme", "widget", 7)
+                .await
+                .unwrap(),
+            Some(KnownRevision {
+                id: newest,
+                version: 2
+            })
+        );
+        assert_eq!(
+            db.newest_pull_request_revision("acme", "widget", 8)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.newest_pull_request_revision("acme", "gadget", 7)
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
     /// Queues the placeholder `cover` names with no pull request facts.
     async fn queue_placeholder(db: &Database, cover: &str) -> FetchingPlaceholder {
         db.queue_fetching_patchset(cover, "Fetching", None, None, None, None, None, None)
@@ -18584,7 +18761,8 @@ mod tests {
             second,
             FetchingPlaceholder {
                 id: first.id,
-                state: PlaceholderState::AlreadyFetching
+                state: PlaceholderState::AlreadyFetching,
+                standing: RevisionStanding::default(),
             }
         );
         assert_requeue_effect(&db, first.id, &second.state, Some(FETCHING)).await;
@@ -18611,7 +18789,8 @@ mod tests {
                 found,
                 FetchingPlaceholder {
                     id,
-                    state: expected
+                    state: expected,
+                    standing: RevisionStanding::default(),
                 },
                 "{status:?}"
             );

@@ -221,7 +221,7 @@ impl SignInLinkRateLimiter {
 /// why they arrive separately from Settings. They are grouped because passing
 /// them positionally made three consecutive bools that no call site could be
 /// read against.
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct ServerOptions {
     /// Accepts mutations from any address without authentication. Unsafe, and
     /// only set by an explicit command line flag.
@@ -238,6 +238,24 @@ pub struct ServerOptions {
     /// with nothing reporting, which is what a router built without a daemon
     /// behind it should serve.
     pub activity: Arc<crate::activity::ActivityRegistry>,
+    /// What turns a pull request number into its commits for
+    /// /api/pr/review. The daemon passes gh. The default resolves nothing,
+    /// so that a router built without a daemon behind it, as every test's
+    /// is, can never run gh or reach the network.
+    pub pull_request_resolver: Arc<dyn crate::forge::PullRequestResolver>,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            allow_all_submit: false,
+            smtp_enabled: false,
+            dry_run: false,
+            local_token: None,
+            activity: Arc::default(),
+            pull_request_resolver: Arc::new(crate::forge::NoResolver),
+        }
+    }
 }
 
 pub struct AppState {
@@ -252,6 +270,7 @@ pub struct AppState {
     pub dry_run: bool,
     pub local_token: Option<crate::auth::LocalToken>,
     pub activity: Arc<crate::activity::ActivityRegistry>,
+    pub pull_request_resolver: Arc<dyn crate::forge::PullRequestResolver>,
     pub sign_in_link_rate_limiter: SignInLinkRateLimiter,
     stats_timeline_cache: AsyncMapCache<Option<i64>, serde_json::Value>,
     stats_reviews_cache: AsyncCache<serde_json::Value>,
@@ -305,6 +324,7 @@ pub fn build_router(
         dry_run: options.dry_run,
         local_token: options.local_token,
         activity: options.activity,
+        pull_request_resolver: options.pull_request_resolver,
         sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
         stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
         stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -355,6 +375,7 @@ pub fn build_router(
         .route("/api/patchset/rerun", post(rerun_patchset))
         .route("/api/patchset/cancel", post(cancel_patchset))
         .route("/api/patch/rerun", post(rerun_patch))
+        .route("/api/pr/review", post(review_pull_request))
         .route("/api/bug", get(get_bug))
         .route("/api/bugs", get(list_bugs))
         .route("/api/bugs/subsystems", get(list_bug_subsystems))
@@ -2109,27 +2130,31 @@ pub enum ExistingRevision {
     /// change that.
     Refetch,
     /// Send it only for a row that was created, reset, or is still
-    /// Fetching. A row that is pending, in review or finished already has
-    /// its patches, so fetching them again would do nothing for an operator
-    /// who asked for the revision by number.
+    /// Fetching, and that the auto-cancel of superseded revisions kept. A
+    /// row that is pending, in review or finished already has its patches,
+    /// and a superseded one was just cancelled, so fetching either would do
+    /// nothing for an operator who asked for the revision by number.
     Leave,
 }
 
 impl ExistingRevision {
-    /// Whether a fetch request is sent for a placeholder that queuing
-    /// found in `found`. A row that was already Fetching is fetched again
-    /// in both modes, because a fetch request lost to a daemon restart is
-    /// recovered only by a new one.
-    fn sends_fetch(self, found: &crate::db::PlaceholderState) -> bool {
+    /// Whether a fetch request is sent for `placeholder` after queuing. A
+    /// row that was already Fetching is fetched again in both modes,
+    /// because a fetch request lost to a daemon restart is recovered only
+    /// by a new one.
+    fn sends_fetch(self, placeholder: &crate::db::FetchingPlaceholder) -> bool {
         use crate::db::PlaceholderState;
         match self {
             Self::Refetch => true,
-            Self::Leave => matches!(
-                found,
-                PlaceholderState::Created
-                    | PlaceholderState::Reset { .. }
-                    | PlaceholderState::AlreadyFetching
-            ),
+            Self::Leave => {
+                placeholder.standing.superseded_by.is_none()
+                    && matches!(
+                        placeholder.state,
+                        PlaceholderState::Created
+                            | PlaceholderState::Reset { .. }
+                            | PlaceholderState::AlreadyFetching
+                    )
+            }
         }
     }
 }
@@ -2175,7 +2200,7 @@ async fn enqueue_pull_request(
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
 
-    if !existing.sends_fetch(&placeholder.state) {
+    if !existing.sends_fetch(&placeholder) {
         return Ok(placeholder);
     }
 
@@ -2193,6 +2218,354 @@ async fn enqueue_pull_request(
     })?;
 
     Ok(placeholder)
+}
+
+/// The reply to a request the route refuses: a status and one line saying
+/// why, which the CLI prints as it is.
+type PrReviewRefusal = (StatusCode, String);
+
+/// Reviews a pull request of the configured GitHub repository by its number
+/// (`POST /api/pr/review`).
+///
+/// gh resolves the number to the pull request's current base and head, and
+/// the head revision is queued through the same path a webhook delivery
+/// takes, so it gets the same placeholder, subject, slug and auto-cancel of
+/// older revisions. Unlike a delivery, a revision that is already pending,
+/// under review or finished is not fetched again; RerunHead reruns a
+/// finished one instead. A head that auto-cancel ranks below another
+/// revision is refused, because it would be cancelled rather than reviewed.
+async fn review_pull_request(
+    auth: crate::auth::OptionalAuthUser,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<PrReviewRequest>,
+) -> Result<Json<PrReviewResponse>, PrReviewRefusal> {
+    authorize_pr_review(&state, &headers, auth.0.as_ref(), request.mode)?;
+    let repo = pr_review_repository(&state.settings.forge, &request)?;
+    let resolved = match state
+        .pull_request_resolver
+        .resolve(repo, request.number)
+        .await
+    {
+        Ok(resolved) => resolved,
+        Err(err) => return Err(unresolved_pull_request(&state, repo, request.number, &err).await),
+    };
+
+    let forge_name = crate::forge::ForgeProvider::name(&crate::forge::GitHubForge);
+    let metadata = resolved.to_forge_metadata();
+    let placeholder = enqueue_pull_request(&state, forge_name, &metadata, ExistingRevision::Leave)
+        .await
+        .map_err(|status| (status, "Failed to queue the pull request".to_string()))?;
+
+    if let Some(newer) = placeholder.standing.superseded_by {
+        return Err(superseded_head(&placeholder, newer, &resolved));
+    }
+    let outcome = match pr_review_step(&placeholder.state, request.mode) {
+        PrReviewStep::Report(outcome) => outcome,
+        PrReviewStep::Rerun(observed) => {
+            rerun_head(&state, &placeholder, observed, &resolved).await?
+        }
+    };
+
+    let response = pr_review_response(outcome, &placeholder, &resolved);
+    info!("{}", response.message);
+    Ok(Json(response))
+}
+
+/// The first 8 characters of a pull request's head commit, for messages.
+fn short_head(resolved: &crate::forge::ResolvedPullRequest) -> &str {
+    let head = resolved.head.as_str();
+    head.get(..8).unwrap_or(head)
+}
+
+/// The refusal for a head the auto-cancel of superseded revisions ranks
+/// below another revision of the pull request. Versions count rows, not the
+/// order of heads, so a pull request whose head went back to an earlier
+/// revision lands here. The auto-cancel cancels such a head when it is in
+/// progress and would cancel it again after a rerun, so the route reports
+/// that rather than a review that will not happen.
+fn superseded_head(
+    placeholder: &crate::db::FetchingPlaceholder,
+    newer: crate::db::KnownRevision,
+    resolved: &crate::forge::ResolvedPullRequest,
+) -> PrReviewRefusal {
+    let number = resolved.number;
+    let id = placeholder.id;
+    let was = placeholder
+        .state
+        .previous_status()
+        .map(|status| format!(", was {status}"))
+        .unwrap_or_default();
+    let message = format!(
+        "PR #{number} head {} is patchset {id}{}{was}, but patchset {}, v{} of PR #{number} \
+         is newer here, and the auto-cancel of superseded revisions keeps only the newest, \
+         so this head was not queued",
+        short_head(resolved),
+        version_label(&placeholder.standing),
+        newer.id,
+        newer.version,
+    );
+    warn!("{}", message);
+    (StatusCode::CONFLICT, message)
+}
+
+/// ", vK" for a revision whose version is known, else nothing.
+fn version_label(standing: &crate::db::RevisionStanding) -> String {
+    standing
+        .version
+        .map(|version| format!(", v{version}"))
+        .unwrap_or_default()
+}
+
+/// Reruns the head revision, which queuing found finished in `observed`,
+/// as /api/patchset/rerun does. The rerun happens only while the row is
+/// still `observed`: another request may have rerun it since, and a
+/// reviewer may already hold it, and resetting it then would pull the row
+/// out from under that review. Such a row is refused with 409.
+async fn rerun_head(
+    state: &AppState,
+    placeholder: &crate::db::FetchingPlaceholder,
+    observed: crate::ReviewStatus,
+    resolved: &crate::forge::ResolvedPullRequest,
+) -> Result<PrReviewOutcome, PrReviewRefusal> {
+    let rerun = state
+        .db
+        .rerun_patchset_from(placeholder.id, observed)
+        .await
+        .map_err(|e| {
+            error!("Failed to rerun patchset {}: {}", placeholder.id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to rerun patchset".to_string(),
+            )
+        })?;
+    if rerun {
+        return Ok(PrReviewOutcome::RerunQueued);
+    }
+    Err((
+        StatusCode::CONFLICT,
+        format!(
+            "PR #{} head {} as patchset {} is no longer {}, so it was not rerun; \
+             ask again to see where it stands",
+            resolved.number,
+            short_head(resolved),
+            placeholder.id,
+            observed.as_str()
+        ),
+    ))
+}
+
+/// The permissions a request to review a pull request by number needs.
+/// Reviewing the head ingests its patches, so it needs Ingest. A rerun is
+/// the act /api/patchset/rerun performs, which needs Review, so RerunHead
+/// needs both; otherwise an Ingest-only caller could rerun any review by
+/// naming its pull request.
+fn pr_review_permissions(mode: PrReviewMode) -> &'static [crate::settings::Permission] {
+    use crate::settings::Permission;
+    match mode {
+        PrReviewMode::ReviewHead => &[Permission::Ingest],
+        PrReviewMode::RerunHead => &[Permission::Ingest, Permission::Review],
+    }
+}
+
+/// Refuses a request to review a pull request by number on a read-only
+/// server, or from a caller missing a permission `mode` needs. Where the
+/// request comes from is not consulted, as for every other mutation.
+fn authorize_pr_review(
+    state: &Arc<AppState>,
+    headers: &axum::http::HeaderMap,
+    auth: Option<&crate::auth::AuthUser>,
+    mode: PrReviewMode,
+) -> Result<(), PrReviewRefusal> {
+    if state.read_only {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Server is running in read-only mode.".into(),
+        ));
+    }
+    match pr_review_permissions(mode)
+        .iter()
+        .find(|perm| !is_authorized(state, headers, auth, **perm))
+    {
+        Some(perm) => Err((
+            StatusCode::FORBIDDEN,
+            format!("You don't have the {perm:?} permission this request needs."),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The repository a request's number belongs to: the one
+/// forge.github_repository names, never one read from a git remote, since
+/// the daemon's repository also holds fetcher remotes whose URLs come from
+/// requests. A request naming another repository is refused rather than
+/// reviewed against this daemon's tree.
+fn pr_review_repository<'a>(
+    forge: &'a crate::settings::ForgeSettings,
+    request: &PrReviewRequest,
+) -> Result<&'a crate::settings::ForgeRepo, PrReviewRefusal> {
+    if request.number <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "{} is not a pull request number; they start at 1",
+                request.number
+            ),
+        ));
+    }
+    if forge
+        .provider
+        .as_deref()
+        .is_some_and(|provider| provider.trim().eq_ignore_ascii_case("gitlab"))
+    {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "reviewing a merge request by number needs gh, which is GitHub only".into(),
+        ));
+    }
+    let Some(repo) = forge.github_repository.as_ref() else {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "set forge.github_repository to review a pull request by number".into(),
+        ));
+    };
+    match request.repo.as_deref() {
+        Some(given) if !names_repository(given, repo) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "the pull request belongs to {}, but this daemon reviews pull requests of {}/{}",
+                crate::finding_view::sanitize_one_line(given, 200),
+                repo.owner,
+                repo.name
+            ),
+        )),
+        _ => Ok(repo),
+    }
+}
+
+/// Whether `given`, an "owner/name" taken from a pull request URL, names
+/// `repo`. GitHub compares owners and names without case, so this does too.
+fn names_repository(given: &str, repo: &crate::settings::ForgeRepo) -> bool {
+    given.split_once('/').is_some_and(|(owner, name)| {
+        owner.eq_ignore_ascii_case(&repo.owner) && name.eq_ignore_ascii_case(&repo.name)
+    })
+}
+
+/// The refusal for a number gh could not resolve. It names the newest
+/// revision of that pull request already known here, if any, and how to
+/// rerun it, rather than rerunning it: reviewing an older head when the
+/// operator asked for the pull request would be a surprise, and a rerun by
+/// patchset id does it explicitly. Every part of the message is safe to log:
+/// GhError's text is already one sanitized line.
+async fn unresolved_pull_request(
+    state: &AppState,
+    repo: &crate::settings::ForgeRepo,
+    number: i64,
+    err: &crate::forge::GhError,
+) -> PrReviewRefusal {
+    let mut message = format!(
+        "could not resolve pull request #{number} of {}/{}: {err}",
+        repo.owner, repo.name
+    );
+    match state
+        .db
+        .newest_pull_request_revision(&repo.owner, &repo.name, number)
+        .await
+    {
+        Ok(Some(known)) => message.push_str(&format!(
+            "; the newest known revision is patchset {}, v{}; use sashiko-cli rerun {} to review it again",
+            known.id, known.version, known.id
+        )),
+        Ok(None) => {}
+        Err(e) => error!(
+            "Failed to look up the known revisions of pull request #{}: {}",
+            number, e
+        ),
+    }
+    warn!("{}", message);
+    (StatusCode::BAD_GATEWAY, message)
+}
+
+/// What the route does once the head revision is queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrReviewStep {
+    /// Nothing more; the outcome is reported as it is.
+    Report(PrReviewOutcome),
+    /// Rerun the revision, which queuing found finished in this status, and
+    /// report RerunQueued.
+    Rerun(crate::ReviewStatus),
+}
+
+/// Maps what queuing the head revision found to what the route does. A row
+/// still Fetching, waiting or under review is in progress, and so is one
+/// with a status no writer stores, which is not known to have finished. A
+/// Reviewed or Skipped row has finished, and RerunHead reruns it. Queuing
+/// resets a Cancelled, Partial, Failed or FailedToApply row, so Kept never
+/// holds one; were it to, the row ended without being queued again, which is
+/// reported as finished too, so that RerunHead can rerun it.
+fn pr_review_step(found: &crate::db::PlaceholderState, mode: PrReviewMode) -> PrReviewStep {
+    use crate::ReviewStatus::*;
+    use crate::db::PlaceholderState::*;
+    match (found, mode) {
+        (Created | Reset { .. }, _) => PrReviewStep::Report(PrReviewOutcome::Queued),
+        (AlreadyFetching | KeptUnknown { .. } | Kept(Incomplete | Pending | InReview), _) => {
+            PrReviewStep::Report(PrReviewOutcome::AlreadyInProgress)
+        }
+        (
+            Kept(Reviewed | Skipped | Cancelled | Partial | Failed | FailedToApply),
+            PrReviewMode::ReviewHead,
+        ) => PrReviewStep::Report(PrReviewOutcome::AlreadyFinished),
+        (
+            Kept(status @ (Reviewed | Skipped | Cancelled | Partial | Failed | FailedToApply)),
+            PrReviewMode::RerunHead,
+        ) => PrReviewStep::Rerun(*status),
+    }
+}
+
+/// The reply for a queued head revision, with one line for the operator.
+/// The message names the pull request by number and commit only: the title
+/// is the forge's text and is shown escaped where it is stored instead.
+fn pr_review_response(
+    outcome: PrReviewOutcome,
+    placeholder: &crate::db::FetchingPlaceholder,
+    resolved: &crate::forge::ResolvedPullRequest,
+) -> PrReviewResponse {
+    let number = resolved.number;
+    let id = placeholder.id;
+    let head = resolved.head.as_str();
+    let short = short_head(resolved);
+    let previous_status = placeholder.state.previous_status().map(str::to_string);
+    let was = match previous_status.as_deref() {
+        Some("") | None => "no status".to_string(),
+        Some(status) => status.to_string(),
+    };
+    let message = match (outcome, &placeholder.state) {
+        (PrReviewOutcome::Queued, crate::db::PlaceholderState::Created) => {
+            format!("Queued PR #{number} (head {short}) as patchset {id}")
+        }
+        (PrReviewOutcome::Queued, _) => format!(
+            "PR #{number} head {short} had {was} as patchset {id}{}; queued again",
+            version_label(&placeholder.standing)
+        ),
+        (PrReviewOutcome::AlreadyInProgress, _) => {
+            format!("PR #{number} head {short} is already being reviewed as patchset {id} ({was})")
+        }
+        (PrReviewOutcome::AlreadyFinished, _) => format!(
+            "PR #{number} head {short} already finished as patchset {id} ({was}); \
+             use rerun --pr {number} to review it again"
+        ),
+        (PrReviewOutcome::RerunQueued, _) => {
+            format!("Rerun of PR #{number} queued as patchset {id}")
+        }
+    };
+    PrReviewResponse {
+        outcome,
+        patchset_id: id,
+        number,
+        head: head.to_string(),
+        previous_status,
+        message,
+    }
 }
 
 async fn list_bugs(
@@ -2632,6 +3005,7 @@ mod tests {
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
             local_token: None,
             activity: Default::default(),
+            pull_request_resolver: Arc::new(FakeResolver::default()),
         };
         (state, fetch_rx)
     }
@@ -2848,6 +3222,630 @@ mod tests {
             .get(0)
             .unwrap();
         assert_eq!(status, "Reviewed");
+    }
+
+    /// Stands in for gh. It answers pull request N of any repository with
+    /// base PR_BASE and head N in hex, or with `failure` when one is set,
+    /// and counts the questions it is asked. No test runs gh.
+    #[derive(Default)]
+    struct FakeResolver {
+        failure: Option<crate::forge::GhError>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeResolver {
+        fn failing(failure: crate::forge::GhError) -> Self {
+            Self {
+                failure: Some(failure),
+                ..Default::default()
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::forge::PullRequestResolver for FakeResolver {
+        async fn resolve(
+            &self,
+            repo: &crate::settings::ForgeRepo,
+            number: i64,
+        ) -> Result<crate::forge::ResolvedPullRequest, crate::forge::GhError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(failure) = &self.failure {
+                return Err(failure.clone());
+            }
+            let commit = |hex: &str| CommitId::parse(hex).expect("a full commit id");
+            Ok(crate::forge::ResolvedPullRequest {
+                repo: repo.clone(),
+                number,
+                url: format!(
+                    "https://{}/{}/{}/pull/{number}",
+                    repo.host, repo.owner, repo.name
+                ),
+                title: Some("Fix the widget".to_string()),
+                base: commit(PR_BASE),
+                head: commit(&format!("{number:040x}")),
+            })
+        }
+    }
+
+    /// A state for /api/pr/review over acme/widget that admits every caller
+    /// and asks `resolver` instead of gh, with `configure` applied to its
+    /// settings last.
+    async fn pr_route_state(
+        resolver: Arc<FakeResolver>,
+        configure: impl FnOnce(&mut crate::settings::Settings),
+    ) -> (Arc<AppState>, mpsc::Receiver<FetchRequest>) {
+        let (mut state, fetch_rx) = pull_request_state().await;
+        let mut settings = (*state.settings).clone();
+        settings.forge.github_repository = Some("acme/widget".parse().unwrap());
+        configure(&mut settings);
+        state.settings = Arc::new(settings);
+        state.allow_all_submit = true;
+        state.pull_request_resolver = resolver;
+        (Arc::new(state), fetch_rx)
+    }
+
+    fn pr_request(number: i64, mode: PrReviewMode) -> PrReviewRequest {
+        PrReviewRequest {
+            number,
+            repo: None,
+            mode,
+        }
+    }
+
+    /// Sends `request` to the route as an anonymous caller.
+    async fn ask_for_pr(
+        state: &Arc<AppState>,
+        request: PrReviewRequest,
+    ) -> Result<PrReviewResponse, PrReviewRefusal> {
+        review_pull_request(
+            crate::auth::OptionalAuthUser(None),
+            axum::http::HeaderMap::new(),
+            State(state.clone()),
+            Json(request),
+        )
+        .await
+        .map(|Json(response)| response)
+    }
+
+    async fn set_patchset_status(state: &AppState, id: i64, status: &str) {
+        state
+            .db
+            .conn
+            .execute(
+                "UPDATE patchsets SET status = ? WHERE id = ?",
+                libsql::params![status, id],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Every state queuing can find maps to the outcome section 4.2.3's
+    /// table gives it, in both modes. Kept is walked over every status, so a
+    /// status added later must be placed.
+    #[test]
+    fn pr_review_follows_the_state_table() {
+        use crate::db::PlaceholderState;
+        use PrReviewOutcome::*;
+        let report = PrReviewStep::Report;
+        let fixed = [
+            (PlaceholderState::Created, report(Queued), report(Queued)),
+            (
+                PlaceholderState::Reset {
+                    was: crate::ReviewStatus::Failed,
+                },
+                report(Queued),
+                report(Queued),
+            ),
+            (
+                PlaceholderState::AlreadyFetching,
+                report(AlreadyInProgress),
+                report(AlreadyInProgress),
+            ),
+            (
+                PlaceholderState::KeptUnknown {
+                    status: String::new(),
+                },
+                report(AlreadyInProgress),
+                report(AlreadyInProgress),
+            ),
+        ];
+        let kept = crate::ReviewStatus::ALL.map(|status| {
+            use crate::ReviewStatus::*;
+            let (review, rerun) = match status {
+                Incomplete | Pending | InReview => {
+                    (report(AlreadyInProgress), report(AlreadyInProgress))
+                }
+                Reviewed | Skipped | Cancelled | Partial | Failed | FailedToApply => {
+                    (report(AlreadyFinished), PrReviewStep::Rerun(status))
+                }
+            };
+            (PlaceholderState::Kept(status), review, rerun)
+        });
+        for (found, review, rerun) in fixed.into_iter().chain(kept) {
+            assert_eq!(
+                pr_review_step(&found, PrReviewMode::ReviewHead),
+                review,
+                "{found:?}"
+            );
+            assert_eq!(
+                pr_review_step(&found, PrReviewMode::RerunHead),
+                rerun,
+                "{found:?}"
+            );
+        }
+    }
+
+    /// A state whose ACL lets one user ingest, one review and one do both,
+    /// and which publishes `token`.
+    async fn pr_auth_state(read_only: bool, token: &crate::auth::LocalToken) -> Arc<AppState> {
+        let (mut state, _) = pull_request_state().await;
+        let mut settings = (*state.settings).clone();
+        settings.server.testing_mode = false;
+        settings.server.acl.ingest = vec![
+            "ingester@example.org".to_string(),
+            "both@example.org".to_string(),
+        ];
+        settings.server.acl.review = vec![
+            "reviewer@example.org".to_string(),
+            "both@example.org".to_string(),
+        ];
+        state.settings = Arc::new(settings);
+        state.read_only = read_only;
+        state.local_token = Some(token.clone());
+        Arc::new(state)
+    }
+
+    /// Who may make a request in `mode`: the local token, each ACL user,
+    /// and nobody at all, on a writable server and on a read-only one.
+    async fn pr_review_admits(mode: PrReviewMode) -> Vec<(&'static str, bool, bool)> {
+        let token = crate::auth::LocalToken::generate().unwrap();
+        let mut with_token = axum::http::HeaderMap::new();
+        with_token.insert(
+            "authorization",
+            format!("Bearer {}", token.secret()).parse().unwrap(),
+        );
+        let bare = axum::http::HeaderMap::new();
+        let writable = pr_auth_state(false, &token).await;
+        let read_only = pr_auth_state(true, &token).await;
+        let callers = [
+            ("token", &with_token, None),
+            ("ingester", &bare, Some("ingester@example.org")),
+            ("reviewer", &bare, Some("reviewer@example.org")),
+            ("both", &bare, Some("both@example.org")),
+            ("nobody", &bare, None),
+        ];
+        callers
+            .into_iter()
+            .map(|(who, headers, email)| {
+                let user = email.map(crate::auth::AuthUser::new);
+                let admits = |state: &Arc<AppState>| {
+                    authorize_pr_review(state, headers, user.as_ref(), mode).is_ok()
+                };
+                (who, admits(&writable), admits(&read_only))
+            })
+            .collect()
+    }
+
+    /// Reviewing a head needs Ingest alone; read-only refuses everyone.
+    #[tokio::test]
+    async fn review_pr_needs_ingest() {
+        assert_eq!(
+            pr_review_admits(PrReviewMode::ReviewHead).await,
+            vec![
+                ("token", true, false),
+                ("ingester", true, false),
+                ("reviewer", false, false),
+                ("both", true, false),
+                ("nobody", false, false),
+            ]
+        );
+    }
+
+    /// Rerunning a head needs Review as well as Ingest, so neither an
+    /// ingest-only nor a review-only user may; read-only refuses everyone.
+    #[tokio::test]
+    async fn rerun_pr_needs_review_permission() {
+        assert_eq!(
+            pr_review_admits(PrReviewMode::RerunHead).await,
+            vec![
+                ("token", true, false),
+                ("ingester", false, false),
+                ("reviewer", false, false),
+                ("both", true, false),
+                ("nobody", false, false),
+            ]
+        );
+    }
+
+    /// Runs git in `dir`, failing the test if git does.
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let status = crate::git_cmd::in_dir(dir)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The daemon's repository can say which GitHub repository it came
+    /// from, and holds a fetcher remote on GitHub, but without
+    /// forge.github_repository the route refuses with 422 and asks gh
+    /// nothing: no remote decides what a number means.
+    #[tokio::test]
+    async fn a_number_is_never_resolved_against_a_remote() {
+        let repo = tempfile::tempdir().unwrap();
+        git_in(repo.path(), &["init", "--quiet"]);
+        git_in(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://gitlab.example.org/acme/widget.git",
+            ],
+        );
+        git_in(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "fetcher-0123456789abcdef",
+                "https://github.com/acme/widget.git",
+            ],
+        );
+        let gh = Arc::new(FakeResolver::default());
+        let (state, mut fetch_rx) = pr_route_state(gh.clone(), |settings| {
+            settings.git.repository_path = repo.path().display().to_string();
+            settings.forge.github_repository = None;
+        })
+        .await;
+
+        let (status, reason) = ask_for_pr(&state, pr_request(7, PrReviewMode::ReviewHead))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(reason.contains("forge.github_repository"), "{reason}");
+        assert_eq!(gh.calls(), 0, "gh was asked");
+        assert_eq!(fetches_sent(&mut fetch_rx), 0);
+    }
+
+    /// A request that cannot name a pull request of the configured
+    /// repository is refused before gh is asked: a number below 1, a GitLab
+    /// forge, and a URL of another repository, whose refusal names both.
+    /// The URL's repository is compared without case, as GitHub does.
+    #[tokio::test]
+    async fn a_pr_request_is_checked_before_gh_is_asked() {
+        let gh = Arc::new(FakeResolver::default());
+        let (state, mut fetch_rx) = pr_route_state(gh.clone(), |_| {}).await;
+        let refusal = |request| {
+            let state = state.clone();
+            async move { ask_for_pr(&state, request).await.unwrap_err() }
+        };
+
+        for number in [0, -1] {
+            let (status, _) = refusal(pr_request(number, PrReviewMode::ReviewHead)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "#{number}");
+        }
+        let (status, reason) = refusal(PrReviewRequest {
+            repo: Some("other/widget".to_string()),
+            ..pr_request(7, PrReviewMode::ReviewHead)
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(reason.contains("other/widget"), "{reason}");
+        assert!(reason.contains("acme/widget"), "{reason}");
+
+        let (gitlab_state, _) = pr_route_state(gh.clone(), |settings| {
+            settings.forge.provider = Some("gitlab".to_string());
+        })
+        .await;
+        let (status, reason) = ask_for_pr(&gitlab_state, pr_request(7, PrReviewMode::ReviewHead))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(reason.contains("GitHub only"), "{reason}");
+        assert_eq!(gh.calls(), 0, "gh was asked");
+
+        let queued = ask_for_pr(
+            &state,
+            PrReviewRequest {
+                repo: Some("ACME/Widget".to_string()),
+                ..pr_request(7, PrReviewMode::ReviewHead)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued.outcome, PrReviewOutcome::Queued);
+        assert_eq!(gh.calls(), 1);
+        assert_eq!(fetches_sent(&mut fetch_rx), 1);
+    }
+
+    /// The route's outcome, reply and fetches for one head revision as its
+    /// row moves through the statuses: queued when new, in progress while
+    /// Fetching (with the fetch sent again, to recover a lost request) and
+    /// while Pending (with none), finished once Reviewed, rerun under
+    /// RerunHead, and queued again after a failure.
+    #[tokio::test]
+    async fn the_pr_route_reports_what_it_did_with_the_head() {
+        let gh = Arc::new(FakeResolver::default());
+        let (state, mut fetch_rx) = pr_route_state(gh.clone(), |_| {}).await;
+        let ask = |mode| {
+            let state = state.clone();
+            async move { ask_for_pr(&state, pr_request(7, mode)).await.unwrap() }
+        };
+        use PrReviewMode::*;
+        use PrReviewOutcome::*;
+
+        let first = ask(ReviewHead).await;
+        let id = first.patchset_id;
+        assert_eq!(
+            first,
+            PrReviewResponse {
+                outcome: Queued,
+                patchset_id: id,
+                number: 7,
+                head: format!("{:040x}", 7),
+                previous_status: None,
+                message: format!("Queued PR #7 (head 00000000) as patchset {id}"),
+            }
+        );
+        assert_eq!(fetches_sent(&mut fetch_rx), 1);
+
+        let fetching = ask(ReviewHead).await;
+        assert_eq!(
+            (fetching.outcome, fetching.previous_status.as_deref()),
+            (AlreadyInProgress, Some("Fetching"))
+        );
+        assert_eq!(fetches_sent(&mut fetch_rx), 1, "a lost fetch is recovered");
+
+        // The rows below are each set by hand, then asked about once; the
+        // expected fetch count says whether the route fetched again.
+        let steps: [(&str, PrReviewMode, PrReviewOutcome, usize, &str); 5] = [
+            (
+                "Pending",
+                ReviewHead,
+                AlreadyInProgress,
+                0,
+                "is already being reviewed",
+            ),
+            ("Pending", RerunHead, AlreadyInProgress, 0, "(Pending)"),
+            (
+                "Reviewed",
+                ReviewHead,
+                AlreadyFinished,
+                0,
+                "use rerun --pr 7",
+            ),
+            (
+                "Reviewed",
+                RerunHead,
+                RerunQueued,
+                0,
+                "Rerun of PR #7 queued",
+            ),
+            ("Failed", ReviewHead, Queued, 1, "had Failed as patchset"),
+        ];
+        for (status, mode, outcome, fetches, says) in steps {
+            set_patchset_status(&state, id, status).await;
+            let reply = ask(mode).await;
+            assert_eq!(reply.patchset_id, id, "one head has one row");
+            assert_eq!(reply.outcome, outcome, "{status} under {mode:?}");
+            assert_eq!(reply.previous_status.as_deref(), Some(status));
+            assert!(reply.message.contains(says), "{}", reply.message);
+            assert_eq!(
+                fetches_sent(&mut fetch_rx),
+                fetches,
+                "{status} under {mode:?}"
+            );
+        }
+        assert_eq!(gh.calls(), 7);
+        let requeued = format!("had Failed as patchset {id}, v1; queued again");
+        set_patchset_status(&state, id, "Failed").await;
+        let reply = ask(ReviewHead).await;
+        assert!(reply.message.contains(&requeued), "{}", reply.message);
+    }
+
+    /// The rerun under RerunHead leaves the finished row Pending for the
+    /// reviewer, as /api/patchset/rerun does.
+    #[tokio::test]
+    async fn a_rerun_by_pr_number_queues_the_finished_row() {
+        let (state, _fetch_rx) = pr_route_state(Arc::new(FakeResolver::default()), |_| {}).await;
+        let id = ask_for_pr(&state, pr_request(7, PrReviewMode::ReviewHead))
+            .await
+            .unwrap()
+            .patchset_id;
+        set_patchset_status(&state, id, "Reviewed").await;
+        let reply = ask_for_pr(&state, pr_request(7, PrReviewMode::RerunHead))
+            .await
+            .unwrap();
+        assert_eq!(reply.outcome, PrReviewOutcome::RerunQueued);
+        let status: String = state
+            .db
+            .conn
+            .query(
+                "SELECT status FROM patchsets WHERE id = ?",
+                libsql::params![id],
+            )
+            .await
+            .unwrap()
+            .next()
+            .await
+            .unwrap()
+            .expect("the row")
+            .get(0)
+            .unwrap();
+        assert_eq!(status, "Pending");
+    }
+
+    /// The status patchset `id` holds now.
+    async fn patchset_status(state: &AppState, id: i64) -> String {
+        state
+            .db
+            .get_patchset_status(id)
+            .await
+            .unwrap()
+            .expect("the row")
+    }
+
+    /// RerunHead reruns the head only while its row still holds the status
+    /// queuing found. A row that has moved on since, here one a reviewer
+    /// picked up after another request reran it, is refused with 409 and
+    /// left under its review; a row still finished is rerun.
+    #[tokio::test]
+    async fn a_rerun_leaves_a_head_that_moved_on() {
+        use crate::forge::PullRequestResolver;
+        let (state, _fetch_rx) = pr_route_state(Arc::new(FakeResolver::default()), |_| {}).await;
+        let repo = "acme/widget".parse().unwrap();
+        let resolved = FakeResolver::default().resolve(&repo, 7).await.unwrap();
+        let placeholder = enqueue_pull_request(
+            &state,
+            "GitHub",
+            &resolved.to_forge_metadata(),
+            ExistingRevision::Leave,
+        )
+        .await
+        .unwrap();
+        let id = placeholder.id;
+
+        set_patchset_status(&state, id, "In Review").await;
+        let (status, reason) = rerun_head(
+            &state,
+            &placeholder,
+            crate::ReviewStatus::Reviewed,
+            &resolved,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(reason.contains("is no longer Reviewed"), "{reason}");
+        assert_eq!(patchset_status(&state, id).await, "In Review");
+
+        set_patchset_status(&state, id, "Reviewed").await;
+        let rerun = rerun_head(
+            &state,
+            &placeholder,
+            crate::ReviewStatus::Reviewed,
+            &resolved,
+        )
+        .await;
+        assert_eq!(rerun, Ok(PrReviewOutcome::RerunQueued));
+        assert_eq!(patchset_status(&state, id).await, "Pending");
+    }
+
+    /// A head the auto-cancel ranks below a newer revision, as when a pull
+    /// request goes back to an earlier head, is refused with 409 naming the
+    /// newer revision, in both modes. It is neither fetched nor rerun, and
+    /// the newer revision is left as it was.
+    #[tokio::test]
+    async fn a_head_the_auto_cancel_supersedes_is_refused() {
+        let (state, mut fetch_rx) = pr_route_state(Arc::new(FakeResolver::default()), |_| {}).await;
+        let earlier = ask_for_pr(&state, pr_request(7, PrReviewMode::ReviewHead))
+            .await
+            .unwrap()
+            .patchset_id;
+        set_patchset_status(&state, earlier, "Failed").await;
+        let mut pushed = widget_pull_request(7);
+        pushed.head_sha = format!("{:040x}", 0x99);
+        let newer = enqueue_pull_request(&state, "GitHub", &pushed, ExistingRevision::Refetch)
+            .await
+            .unwrap()
+            .id;
+        fetches_sent(&mut fetch_rx);
+
+        let (status, reason) = ask_for_pr(&state, pr_request(7, PrReviewMode::ReviewHead))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            reason.contains(&format!(
+                "is patchset {earlier}, v1, was Failed, but patchset {newer}, v2 of PR #7"
+            )),
+            "{reason}"
+        );
+        assert_eq!(fetches_sent(&mut fetch_rx), 0);
+        assert_eq!(patchset_status(&state, earlier).await, "Cancelled");
+
+        set_patchset_status(&state, earlier, "Reviewed").await;
+        let (status, _) = ask_for_pr(&state, pr_request(7, PrReviewMode::RerunHead))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(patchset_status(&state, earlier).await, "Reviewed");
+        assert_eq!(patchset_status(&state, newer).await, "Fetching");
+        assert_eq!(fetches_sent(&mut fetch_rx), 0);
+    }
+
+    /// A router built with the default options resolves no pull request:
+    /// its resolver refuses every number without running anything, so no
+    /// test that builds one can run gh.
+    #[tokio::test]
+    async fn the_default_options_resolve_no_pull_request() {
+        let repo = "acme/widget".parse().unwrap();
+        let resolved = ServerOptions::default()
+            .pull_request_resolver
+            .resolve(&repo, 7)
+            .await;
+        assert!(
+            matches!(resolved, Err(crate::forge::GhError::NotConfigured)),
+            "{resolved:?}"
+        );
+    }
+
+    /// When gh cannot resolve a number, the refusal is a 502 carrying gh's
+    /// line and naming the newest revision of that pull request in this
+    /// repository, by patchset and version, with the command that reruns it.
+    /// A pull request with the same number in another repository is not
+    /// named, though its row is newer and its version higher, and nothing is
+    /// queued.
+    #[tokio::test]
+    async fn an_unresolved_number_names_the_newest_known_revision() {
+        let detail = "GraphQL: Could not resolve to a PullRequest with the number of 7.";
+        let gh = Arc::new(FakeResolver::failing(crate::forge::GhError::Failed {
+            detail: detail.to_string(),
+        }));
+        let (state, mut fetch_rx) = pr_route_state(gh, |_| {}).await;
+        let mut revision = widget_pull_request(7);
+        let mut queue = |head: u32, repo: &str| {
+            revision.head_sha = format!("{head:040x}");
+            revision.repo_url = Some(format!("https://github.com/{repo}.git"));
+            revision.pr_url = Some(format!("https://github.com/{repo}/pull/7"));
+            let (state, metadata) = (state.clone(), revision.clone());
+            async move {
+                enqueue_pull_request(&state, "GitHub", &metadata, ExistingRevision::Leave)
+                    .await
+                    .unwrap()
+                    .id
+            }
+        };
+        queue(0x71, "acme/widget").await;
+        let newest = queue(0x72, "acme/widget").await;
+        queue(0x73, "other/widget").await;
+        fetches_sent(&mut fetch_rx);
+
+        let (status, reason) = ask_for_pr(&state, pr_request(7, PrReviewMode::ReviewHead))
+            .await
+            .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(reason.contains(detail), "{reason}");
+        assert!(
+            reason.contains(&format!(
+                "the newest known revision is patchset {newest}, v2; \
+                 use sashiko-cli rerun {newest}"
+            )),
+            "{reason}"
+        );
+        assert_eq!(fetches_sent(&mut fetch_rx), 0);
+
+        let (_, unknown) = ask_for_pr(&state, pr_request(8, PrReviewMode::ReviewHead))
+            .await
+            .unwrap_err();
+        assert!(!unknown.contains("newest known revision"), "{unknown}");
     }
 
     /// Serves a router with `activity` behind it, read-only so that nothing
@@ -4564,6 +5562,7 @@ mod tests {
             dry_run: true,
             local_token: None,
             activity: Default::default(),
+            pull_request_resolver: Arc::new(FakeResolver::default()),
             sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
             stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
             stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -4958,6 +5957,7 @@ mod tests {
                 dry_run: true,
                 local_token: None,
                 activity: Default::default(),
+                pull_request_resolver: Arc::new(FakeResolver::default()),
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
                 stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -5025,6 +6025,7 @@ mod tests {
                 dry_run: true,
                 local_token,
                 activity: Default::default(),
+                pull_request_resolver: Arc::new(FakeResolver::default()),
                 sign_in_link_rate_limiter: SignInLinkRateLimiter::new(),
                 stats_timeline_cache: AsyncMapCache::new(Duration::from_secs(60)),
                 stats_reviews_cache: AsyncCache::new(Duration::from_secs(60)),
@@ -5168,6 +6169,7 @@ mod tests {
             bug_subsystems_cache: AsyncMapCache::new(Duration::from_secs(5)),
             local_token: None,
             activity: Default::default(),
+            pull_request_resolver: Arc::new(FakeResolver::default()),
         });
         let index = crate::maintainers::MaintainersIndex::from_reader(
             b"Maintainers List\n================\n\nSECTION A\nM:\tAlice <a@example.org>\nF:\ta/\n\nSECTION B\nM:\tBob <b@example.org>\nF:\tb/\n".as_slice()
