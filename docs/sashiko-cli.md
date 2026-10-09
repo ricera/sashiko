@@ -166,6 +166,26 @@ sashiko-cli show [OPTIONS] [ID]
 | `--inline` | Include inline review content in text output. |
 | `-d, --diff <ID>` | Compare with another patchset ID. |
 
+Each finding is printed as one line, `[Severity] title`, followed by its
+tags, then its first location on an indented line:
+
+```
+  [High] leak of rx buffers in ionic_rx_fill() on error (repeat of v2)
+    drivers/net/ethernet/pensando/ionic/ionic_txrx.c:812 (ionic_rx_fill)
+```
+
+The tags are `(speculative)`, `(preexisting)`, and, on a later revision
+of a pull request, `(repeat of v2)` for a finding that repeats a finding
+of the earlier revision labelled `v2`, or `(caused by the fix for v2)` for
+one that the change made for such a finding caused, in that order,
+worded as on the web page. The label is `vK` from the earlier revision's
+subject, or `patchset <id>` when the subject has no pull request prefix.
+The line shows only the tag: the earlier finding's title and the earlier
+revision's head are in the page's hover and in the finding's stored
+`prior` link. See
+[GITHUB_SETUP.md](GITHUB_SETUP.md#what-a-pull-requests-later-revisions-are-shown)
+for what a later revision's review is shown and how a link is checked.
+
 ### rerun
 
 Request a re-review of a completed patchset.
@@ -185,6 +205,12 @@ command does what `submit '#N'` does. It needs both the Ingest and Review
 rights, which the local operator token holds. If gh cannot resolve the
 number, the error names the newest revision of the pull request already
 known here, which `sashiko-cli rerun <ID>` reruns by its patchset id.
+
+A review of a pull request's later revision, by number or by webhook, is
+shown the findings of the revisions queued before it, and links a finding
+that repeats one of them, or that the fix for one caused, to that finding
+(see [show](#show) and
+[GITHUB_SETUP.md](GITHUB_SETUP.md#what-a-pull-requests-later-revisions-are-shown)).
 
 ### cancel
 
