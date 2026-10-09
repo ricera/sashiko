@@ -90,6 +90,18 @@ impl CommitId {
     }
 }
 
+/// The fewest hex characters of a commit id that name one commit among a
+/// pull request's revisions. Fewer would match too many commits.
+pub const MIN_COMMIT_PREFIX_LEN: usize = 7;
+
+/// `text` in lower case when it is the start of a commit id: 7 to 40 hex
+/// characters. `None` otherwise.
+pub fn commit_prefix(text: &str) -> Option<String> {
+    let is_prefix = (MIN_COMMIT_PREFIX_LEN..=40).contains(&text.len())
+        && text.bytes().all(|b| b.is_ascii_hexdigit());
+    is_prefix.then(|| text.to_ascii_lowercase())
+}
+
 impl TryFrom<String> for CommitId {
     type Error = String;
 

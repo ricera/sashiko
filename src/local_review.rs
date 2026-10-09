@@ -2800,6 +2800,7 @@ mod tests {
                     problem: "refill leaks a page".to_string(),
                     consequence: Some("a page leaks per failed refill.".to_string()),
                     locations: Vec::new(),
+                    prior: None,
                 }],
             }],
         };

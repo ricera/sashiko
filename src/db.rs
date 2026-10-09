@@ -403,13 +403,53 @@ fn prior_patch_of_row(
     })
 }
 
+/// What the `prior` column of a row of the prior-findings query, column 9,
+/// holds.
+#[cfg(feature = "server")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredPriorLink {
+    /// NULL: the finding was not linked to an earlier one.
+    Absent,
+    Link(crate::prior_revisions::PriorLink),
+    /// Text `PriorLink::from_json` does not read, such as the fork's
+    /// `{headline, relation, revision}` or anything malformed.
+    Unreadable,
+}
+
+#[cfg(feature = "server")]
+impl StoredPriorLink {
+    /// Reads column 9. A value that is not text, such as a BLOB, which a
+    /// TEXT column keeps as stored, is `Unreadable` like malformed text, so
+    /// one odd row never costs the review its other earlier findings.
+    fn of_row(row: &libsql::Row) -> Result<Self> {
+        let text = match row.get::<libsql::Value>(9)? {
+            libsql::Value::Null => return Ok(Self::Absent),
+            libsql::Value::Text(text) => text,
+            _ => return Ok(Self::Unreadable),
+        };
+        Ok(serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| crate::prior_revisions::PriorLink::from_json(&value))
+            .map_or(Self::Unreadable, Self::Link))
+    }
+
+    fn into_link(self) -> Option<crate::prior_revisions::PriorLink> {
+        match self {
+            Self::Link(link) => Some(link),
+            Self::Absent | Self::Unreadable => None,
+        }
+    }
+}
+
 /// The finding of a row of the prior-findings query, from columns 5 to 8:
-/// severity, problem, severity explanation and locations, with the key its
-/// stored `problem` gives it among literal duplicates. Locations that are
-/// not JSON read as none. `None` for a finding with no title.
+/// severity, problem, severity explanation and locations, with `prior`, the
+/// link read from column 9, and the key its stored `problem` gives it among
+/// literal duplicates. Locations that are not JSON read as none. `None` for
+/// a finding with no title.
 #[cfg(feature = "server")]
 fn prior_finding_of_row(
     row: &libsql::Row,
+    prior: Option<crate::prior_revisions::PriorLink>,
 ) -> Result<Option<(String, crate::prior_revisions::PriorFinding)>> {
     let severity = get_optional_integer(row, 5)?
         .and_then(|level| i32::try_from(level).ok())
@@ -422,6 +462,7 @@ fn prior_finding_of_row(
         &problem,
         get_optional_text(row, 7)?.as_deref(),
         locations.as_ref(),
+        prior,
     );
     Ok(finding.map(|finding| {
         (
@@ -430,11 +471,6 @@ fn prior_finding_of_row(
         )
     }))
 }
-
-/// The fewest hex characters of a head commit an address may give. Fewer
-/// would match too many commits to name one revision.
-#[cfg(feature = "server")]
-const MIN_HEAD_PREFIX_LEN: usize = 7;
 
 /// An address of one pull request revision, `<repo>-<N>-<sha>`, where
 /// `<sha>` is 7 to 40 hex characters at the start of the revision's head
@@ -463,15 +499,13 @@ impl PrRevisionAddress {
     pub fn parse(id: &str) -> Option<Self> {
         let (rest, head_prefix) = id.rsplit_once('-')?;
         let (repo, number) = rest.rsplit_once('-')?;
-        let is_head_prefix = (MIN_HEAD_PREFIX_LEN..=40).contains(&head_prefix.len())
-            && head_prefix.bytes().all(|b| b.is_ascii_hexdigit());
-        if repo.is_empty() || !is_head_prefix {
+        if repo.is_empty() {
             return None;
         }
         Some(Self {
             repo: repo.to_string(),
             number: parse_pr_number(number)?,
-            head_prefix: head_prefix.to_ascii_lowercase(),
+            head_prefix: crate::baseline::commit_prefix(head_prefix)?,
         })
     }
 
@@ -611,7 +645,7 @@ fn shown_under_embargo(status: Option<String>, is_embargoed: bool) -> Option<Str
 
 /// The schema version [`Database::migrate`] leaves a database at.
 #[cfg(feature = "server")]
-pub(crate) const SCHEMA_VERSION: u32 = 17;
+pub(crate) const SCHEMA_VERSION: u32 = 18;
 
 /// Whether `table` has a column named `column`, for migrations that add a
 /// column a database may already have: ALTER TABLE has no IF NOT EXISTS.
@@ -1245,6 +1279,9 @@ pub struct Finding {
     pub problem: String,
     pub preexisting: Option<bool>,
     pub locations: Option<serde_json::Value>,
+    /// The finding of an earlier revision of the same pull request that this
+    /// one repeats or was caused by the fix for.
+    pub prior: Option<crate::prior_revisions::PriorLink>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2928,6 +2965,10 @@ impl Database {
             self.migrate_patchsets_mr_body().await?;
         }
 
+        if current_version < 18 {
+            self.migrate_findings_prior().await?;
+        }
+
         info!("Database schema is up to date at version {SCHEMA_VERSION}.");
 
         Ok(())
@@ -2954,6 +2995,31 @@ impl Database {
         tx.execute_batch(include_str!("migrations/017_patchsets_mr_body.sql"))
             .await?;
         tx.execute("PRAGMA user_version = 17", ()).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Migration 18: a finding's link to the finding of an earlier revision
+    /// it repeats or was caused by the fix for.
+    ///
+    /// The column is added only when it is missing, as 015 and 017 add
+    /// theirs, because the fork's databases already have it and ALTER TABLE
+    /// has no IF NOT EXISTS. The file documents the column's JSON and holds
+    /// no statement, so running it on every database is harmless.
+    async fn migrate_findings_prior(&self) -> Result<()> {
+        info!("Applying database migration version 18 (links to earlier findings)...");
+        let tx = self.begin_transaction().await?;
+        if !table_has_column(&tx, "findings", "prior").await? {
+            // JSON naming the finding of an earlier revision of the same pull
+            // request that this finding repeats or that the fix for it
+            // caused, in the form 018_findings_prior.sql describes; NULL when
+            // the finding has no such link.
+            tx.execute("ALTER TABLE findings ADD COLUMN prior TEXT", ())
+                .await?;
+        }
+        tx.execute_batch(include_str!("migrations/018_findings_prior.sql"))
+            .await?;
+        tx.execute("PRAGMA user_version = 18", ()).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -3694,19 +3760,25 @@ impl Database {
             .locations
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
+        let prior = finding
+            .prior
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         self.execute(
-            "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations)
-             VALUES (?, ?, ?, ?, ?, ?)",
-            libsql::params![
-                finding.review_id,
-                finding.severity as i32,
-                finding.severity_explanation,
-                finding.problem,
-                val,
-                locations_val,
-            ],
-        )
-        .await?;
+                "INSERT INTO findings (review_id, severity, severity_explanation, problem, preexisting, locations, prior)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+                libsql::params![
+                    finding.review_id,
+                    finding.severity as i32,
+                    finding.severity_explanation,
+                    finding.problem,
+                    val,
+                    locations_val,
+                    prior,
+                ],
+            )
+            .await?;
         Ok(())
     }
 
@@ -10266,14 +10338,39 @@ impl Database {
     /// revision returned carries its patches' diffs: a fix for its findings
     /// was made against that code, and the same list goes to every patch's
     /// review, so older diffs would be weight that no summary shows.
+    ///
+    /// A finding whose stored link to an earlier finding does not read, such
+    /// as one a fork database holds in the fork's form, is listed without
+    /// it, and one warning says how many listed findings lost their link.
     pub async fn get_prior_revision_findings(
         &self,
         patchset_id: i64,
         max_revisions: usize,
     ) -> Result<Vec<crate::prior_revisions::PriorRevision>> {
+        let (revisions, unreadable_links) = self
+            .read_prior_revision_findings(patchset_id, max_revisions)
+            .await?;
+        if unreadable_links > 0 {
+            warn!(
+                "Listed {unreadable_links} earlier findings of patchset {patchset_id}'s pull \
+                 request without their stored links, which do not read as links to an \
+                 earlier finding."
+            );
+        }
+        Ok(revisions)
+    }
+
+    /// The work of `get_prior_revision_findings`, with the number of listed
+    /// findings whose stored link does not read.
+    async fn read_prior_revision_findings(
+        &self,
+        patchset_id: i64,
+        max_revisions: usize,
+    ) -> Result<(Vec<crate::prior_revisions::PriorRevision>, usize)> {
+        let mut unreadable_links = 0;
         let lineage = self.earlier_pr_revisions(patchset_id).await?;
         if lineage.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), unreadable_links));
         }
         let current_base = self
             .pr_revision_row(patchset_id)
@@ -10288,13 +10385,13 @@ impl Database {
             }
             let with_diff = revisions.is_empty();
             let patches = self
-                .prior_revision_patches(earlier.id, &current, with_diff)
+                .prior_revision_patches(earlier.id, &current, with_diff, &mut unreadable_links)
                 .await?;
             if !patches.is_empty() {
                 revisions.push(earlier.into_prior_revision(current_base.as_ref(), patches));
             }
         }
-        Ok(revisions)
+        Ok((revisions, unreadable_links))
     }
 
     /// The patchsets with `patchset_id`'s pull request URL and a lower id,
@@ -10366,18 +10463,22 @@ impl Database {
     /// one into a concern, so no later finding could be linked to it. Of
     /// findings whose `problem` differs only in case, whitespace and
     /// invisible characters, the newest review's is kept. `current` is the
-    /// patch-id of each patch under review, by index.
+    /// patch-id of each patch under review, by index. Each listed finding
+    /// whose stored link does not read adds one to `unreadable_links`; a row
+    /// left out, as a duplicate or for having no title, adds nothing.
     async fn prior_revision_patches(
         &self,
         revision_id: i64,
         current: &[(i64, Option<String>)],
         with_diff: bool,
+        unreadable_links: &mut usize,
     ) -> Result<Vec<crate::prior_revisions::PriorPatch>> {
         let mut rows = self
             .conn
             .query(
                 "SELECT p.id, p.part_index, m.subject, p.message_id, p.git_patch_id,
-                        f.severity, f.problem, f.severity_explanation, f.locations
+                        f.severity, f.problem, f.severity_explanation, f.locations,
+                        f.prior
                  FROM patches p
                  JOIN reviews r ON r.patch_id = p.id
                  JOIN findings f ON f.review_id = r.id
@@ -10394,13 +10495,16 @@ impl Database {
             if patches.last().map(|(id, _)| *id) != Some(patch_row) {
                 patches.push((patch_row, prior_patch_of_row(&row, current)?));
             }
-            let Some((key, finding)) = prior_finding_of_row(&row)? else {
+            let prior = StoredPriorLink::of_row(&row)?;
+            let unreadable = prior == StoredPriorLink::Unreadable;
+            let Some((key, finding)) = prior_finding_of_row(&row, prior.into_link())? else {
                 continue;
             };
             if let Some((_, patch)) = patches.last_mut()
                 && seen.insert((patch_row, key))
             {
                 patch.findings.push(finding);
+                *unreadable_links += usize::from(unreadable);
             }
         }
         patches.retain(|(_, patch)| !patch.findings.is_empty());
@@ -14733,6 +14837,7 @@ mod tests {
             problem: "Pre-existing issue".to_string(),
             preexisting: Some(true),
             locations: None,
+            prior: None,
         })
         .await
         .unwrap();
@@ -14814,6 +14919,7 @@ mod tests {
             problem: format!("A problem found by a {status} review"),
             preexisting: Some(false),
             locations: None,
+            prior: None,
         })
         .await
         .unwrap();
@@ -16695,6 +16801,7 @@ mod tests {
             problem: "salvaged finding".to_string(),
             preexisting: Some(false),
             locations: None,
+            prior: None,
         })
         .await
         .unwrap();
@@ -24902,6 +25009,7 @@ mod tests {
                     "function_or_symbol": "frob_fill",
                     "line": 42
                 }])),
+                prior: None,
             })
             .await
             .unwrap();
@@ -24981,6 +25089,7 @@ mod tests {
                     function_or_symbol: Some("frob_fill".to_string()),
                     line: Some(42),
                 }],
+                prior: None,
             }
         );
         assert_eq!(
@@ -25302,6 +25411,161 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(same_bases(revisions), [None, None]);
+    }
+
+    /// Sets the stored `prior` of every finding whose problem is `problem`.
+    async fn set_stored_prior(db: &Database, problem: &str, prior: &str) {
+        db.conn
+            .execute(
+                "UPDATE findings SET prior = ? WHERE problem = ?",
+                libsql::params![prior, problem],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The `prior` link of each listed finding, by title, in order.
+    fn listed_links(
+        revisions: &[crate::prior_revisions::PriorRevision],
+    ) -> Vec<(String, Option<crate::prior_revisions::PriorLink>)> {
+        revisions
+            .iter()
+            .flat_map(|revision| &revision.patches)
+            .flat_map(|patch| &patch.findings)
+            .map(|finding| (finding.problem.clone(), finding.prior.clone()))
+            .collect()
+    }
+
+    /// A finding's link to an earlier finding is stored as its JSON, the
+    /// head included when known, and a later revision's review reads it
+    /// back on the finding for its History line; a finding without one has
+    /// none.
+    #[tokio::test]
+    async fn prior_link_is_stored_and_read_back() {
+        use crate::prior_revisions::{PriorLink, PriorRelation};
+        let db = memory_db().await;
+        let v1 = pr27_revision(&db, "frob", 'b', "#27: Fix").await;
+        patch_with_findings(&db, v1, "v1-1@x", &["rx page leak"]).await;
+        let v2 = pr27_revision(&db, "frob", 'c', "#27 [v2]: Fix").await;
+        let patch = revision_patch(&db, v2, 1, "v2-1@x", None).await;
+        let review_id = db
+            .create_review(v2, Some(patch), "mock", "mock", None, None, None)
+            .await
+            .unwrap();
+        let link = PriorLink {
+            relation: PriorRelation::FixRegression,
+            revision: "v1".to_string(),
+            earlier_problem: "rx page leak".to_string(),
+            revision_head: Some("bbbbbbbbbbbb".to_string()),
+        };
+        db.create_finding(Finding {
+            review_id,
+            severity: Severity::High,
+            severity_explanation: None,
+            problem: "double free".to_string(),
+            preexisting: Some(false),
+            locations: None,
+            prior: Some(link.clone()),
+        })
+        .await
+        .unwrap();
+
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT prior FROM findings WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        let stored: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored).unwrap(),
+            serde_json::json!({
+                "relation": "fix_regression",
+                "revision": "v1",
+                "earlier_problem": "rx page leak",
+                "revision_head": "bbbbbbbbbbbb",
+            })
+        );
+
+        let current = pr27_revision(&db, "frob", 'd', "#27 [v3]: Fix").await;
+        let revisions = db.get_prior_revision_findings(current, 5).await.unwrap();
+        assert_eq!(
+            listed_links(&revisions),
+            [
+                ("double free".to_string(), Some(link)),
+                ("rx page leak".to_string(), None),
+            ]
+        );
+    }
+
+    /// A stored link that does not read, the fork's
+    /// `{headline, relation, revision}`, malformed text or a value that is
+    /// not text at all, is no link: its finding is still listed, without
+    /// one, and each such finding listed is counted for the one warning. A
+    /// literal duplicate and a finding with no title are not listed, so
+    /// their links are not counted. A well-formed link beside them is kept.
+    #[tokio::test]
+    async fn prior_revision_findings_list_a_finding_whose_stored_prior_is_legacy() {
+        let db = memory_db().await;
+        let v1 = pr27_revision(&db, "frob", 'b', "#27: Fix").await;
+        patch_with_findings(
+            &db,
+            v1,
+            "v1-1@x",
+            &[
+                "legacy",
+                "malformed",
+                "blob",
+                "linked",
+                "plain",
+                "Legacy",
+                " ",
+            ],
+        )
+        .await;
+        let legacy = r#"{"headline": "an earlier leak", "relation": "repeat", "revision": "v0"}"#;
+        for problem in ["legacy", "Legacy", " "] {
+            set_stored_prior(&db, problem, legacy).await;
+        }
+        set_stored_prior(&db, "malformed", "not json").await;
+        db.conn
+            .execute(
+                "UPDATE findings SET prior = X'7B7D' WHERE problem = 'blob'",
+                (),
+            )
+            .await
+            .unwrap();
+        set_stored_prior(
+            &db,
+            "linked",
+            r#"{"relation": "repeat", "revision": "v0", "earlier_problem": "an earlier leak"}"#,
+        )
+        .await;
+        let current = pr27_revision(&db, "frob", 'c', "#27 [v2]: Fix").await;
+
+        let (revisions, unreadable) = db.read_prior_revision_findings(current, 5).await.unwrap();
+        assert_eq!(unreadable, 3);
+        let linked = crate::prior_revisions::PriorLink::from_json(&serde_json::json!({
+            "relation": "repeat",
+            "revision": "v0",
+            "earlier_problem": "an earlier leak",
+        }));
+        assert_eq!(
+            listed_links(&revisions),
+            [
+                ("legacy".to_string(), None),
+                ("malformed".to_string(), None),
+                ("blob".to_string(), None),
+                ("linked".to_string(), linked),
+                ("plain".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            db.get_prior_revision_findings(current, 5).await.unwrap(),
+            revisions
+        );
     }
 
     #[tokio::test]
@@ -29461,6 +29725,64 @@ mod tests {
             db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
             Some("Kept across the replay.")
         );
+    }
+
+    async fn stored_prior_of(db: &Database, review_id: i64) -> Option<String> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT prior FROM findings WHERE review_id = ?",
+                libsql::params![review_id],
+            )
+            .await
+            .unwrap();
+        get_optional_text(&rows.next().await.unwrap().unwrap(), 0).unwrap()
+    }
+
+    /// Migration 18 adds findings.prior on a fresh database and on one at
+    /// 17 without it. Set back to 17 with the column present, as a fork
+    /// database has it, it does not fail and keeps what is stored.
+    #[tokio::test]
+    async fn test_migration_18_adds_the_finding_link_column() {
+        let db = memory_db().await;
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+        assert!(
+            column_names(&db, "findings")
+                .await
+                .contains(&"prior".to_string())
+        );
+
+        db.conn
+            .execute_batch(
+                "ALTER TABLE findings DROP COLUMN prior;
+                 PRAGMA user_version = 17;",
+            )
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+        assert!(
+            column_names(&db, "findings")
+                .await
+                .contains(&"prior".to_string())
+        );
+
+        let (_, _, review_id) = reviewed_patchset(&db, "prior_migration").await;
+        let link = r#"{"relation":"repeat","revision":"v1","earlier_problem":"leak"}"#;
+        db.conn
+            .execute(
+                "INSERT INTO findings (review_id, severity, problem, prior) VALUES (?, 3, 'x', ?)",
+                libsql::params![review_id, link],
+            )
+            .await
+            .unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 17", ())
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+        assert_eq!(stored_prior_of(&db, review_id).await.as_deref(), Some(link));
     }
 
     /// A description is stored as given, a large one compressed, and a

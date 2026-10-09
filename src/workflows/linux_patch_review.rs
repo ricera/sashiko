@@ -5017,6 +5017,7 @@ mod tests {
                     problem: "frob: refill leaks {{aggregated_concerns}}".to_string(),
                     consequence: Some("a page leaks per failed refill.".to_string()),
                     locations: Vec::new(),
+                    prior: None,
                 }],
             }],
         };

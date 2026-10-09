@@ -218,7 +218,7 @@ pub(crate) fn clip_title(problem: &str) -> String {
 /// never split, and ends a cut text with `marker` after dropping the
 /// whitespace the cut left at its end. Text within the limit is returned as
 /// it is.
-fn clip_chars(text: String, max_chars: usize, marker: &str) -> String {
+pub(crate) fn clip_chars(text: String, max_chars: usize, marker: &str) -> String {
     match text.char_indices().nth(max_chars) {
         Some((cut, _)) => format!("{}{marker}", text[..cut].trim_end()),
         None => text,
