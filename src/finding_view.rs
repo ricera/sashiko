@@ -22,6 +22,7 @@
 //! shows, so a summary of an earlier finding can say what it leads to.
 
 use crate::db::Severity;
+use crate::prior_revisions::{PriorLink, PriorRelation};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -56,6 +57,10 @@ pub struct FindingLine {
     pub preexisting: bool,
     /// The first location that names something, as `file:line (function)`.
     pub location: Option<String>,
+    /// The finding of an earlier revision of the pull request that this one
+    /// repeats or that the fix for it caused, read by the rule of
+    /// `PriorLink::from_json`, which the web page's tag also follows.
+    pub prior: Option<PriorLink>,
 }
 
 impl FindingLine {
@@ -76,6 +81,7 @@ impl FindingLine {
                 .get("locations")
                 .and_then(Value::as_array)
                 .and_then(|locations| locations.iter().find_map(format_location)),
+            prior: finding.get("prior").and_then(PriorLink::from_json),
         }
     }
 }
@@ -89,9 +95,10 @@ pub fn none_marked_speculative(findings: &[Value]) -> bool {
         .any(|finding| finding.get("speculative").is_some_and(Value::is_boolean))
 }
 
-/// Writes one finding as `  [Severity] title (speculative) (preexisting)`,
-/// with its location on an indented second line when it has one. The tags
-/// use the web page's order and wording.
+/// Writes one finding as
+/// `  [Severity] title (speculative) (preexisting) (repeat of v3)`, with its
+/// location on an indented second line when it has one. The tags use the web
+/// page's order and wording.
 pub fn write_finding_line(out: &mut impl WriteColor, line: &FindingLine) -> io::Result<()> {
     write!(out, "  ")?;
     out.set_color(ColorSpec::new().set_fg(Some(severity_color(line.severity))))?;
@@ -104,11 +111,27 @@ pub fn write_finding_line(out: &mut impl WriteColor, line: &FindingLine) -> io::
     if line.preexisting {
         write!(out, " (preexisting)")?;
     }
+    if let Some(prior) = &line.prior {
+        write!(out, " {}", prior_tag(prior))?;
+    }
     writeln!(out)?;
     if let Some(location) = &line.location {
         writeln!(out, "    {location}")?;
     }
     Ok(())
+}
+
+/// The tag of a finding linked to an earlier revision's finding, worded as
+/// the web page words it: "(repeat of v3)" or "(caused by the fix for v3)".
+/// The label is made one line, because the link only trims it and a model
+/// wrote it, so a newline or an escape sequence in it would otherwise reach
+/// the terminal.
+fn prior_tag(prior: &PriorLink) -> String {
+    let relation = match prior.relation {
+        PriorRelation::Repeat => "repeat of",
+        PriorRelation::FixRegression => "caused by the fix for",
+    };
+    format!("({relation} {})", one_line(&prior.revision))
 }
 
 /// Writes `NOT_MARKED_NOTE` as one dim line when `findings` is a non-empty
@@ -1001,6 +1024,7 @@ mod tests {
             speculative: None,
             preexisting: false,
             location: None,
+            prior: None,
         };
         for finding in [Value::Null, json!("junk"), json!(4), json!([1])] {
             assert_eq!(FindingLine::from_json(&finding), empty, "{finding}");
@@ -1214,6 +1238,108 @@ mod tests {
         assert_eq!(
             written(&line),
             "  [High] title (speculative) (preexisting)\n"
+        );
+    }
+
+    /// A link to the earlier finding "rx page leak" listed under v3, with
+    /// `relation` and the head of that revision.
+    fn prior_link(relation: &str) -> Value {
+        json!({
+            "relation": relation,
+            "revision": "v3",
+            "earlier_problem": "rx page leak",
+            "revision_head": "1a2b3c4d5e6f",
+        })
+    }
+
+    #[test]
+    fn a_line_reads_its_link_to_an_earlier_finding() {
+        let line = FindingLine::from_json(&json!({"prior": prior_link("fix_regression")}));
+        assert_eq!(
+            line.prior,
+            Some(PriorLink {
+                relation: PriorRelation::FixRegression,
+                revision: "v3".to_string(),
+                earlier_problem: "rx page leak".to_string(),
+                revision_head: Some("1a2b3c4d5e6f".to_string()),
+            })
+        );
+        let headless = FindingLine::from_json(&json!({
+            "prior": {"relation": "repeat", "revision": "v3", "earlier_problem": "leak",
+                      "revision_head": "1a2b3c"},
+        }));
+        assert_eq!(
+            headless
+                .prior
+                .map(|link| (link.relation, link.revision_head)),
+            Some((PriorRelation::Repeat, None))
+        );
+    }
+
+    #[test]
+    fn a_malformed_link_reads_as_none() {
+        for prior in [
+            json!({"relation": "duplicate", "revision": "v3", "earlier_problem": "leak"}),
+            json!({"relation": "Repeat", "revision": "v3", "earlier_problem": "leak"}),
+            json!({"relation": "repeat", "revision": " \n ", "earlier_problem": "leak"}),
+            json!({"relation": "repeat", "revision": "v".repeat(33), "earlier_problem": "leak"}),
+            json!({"relation": "repeat", "revision": "v3", "earlier_problem": 7}),
+            json!({"relation": "repeat", "revision": "v3", "headline": "leak"}),
+            json!("repeat of v3"),
+            json!(["repeat", "v3", "leak"]),
+            Value::Null,
+        ] {
+            let line = FindingLine::from_json(
+                &json!({"severity": "High", "problem": "t", "prior": prior}),
+            );
+            assert_eq!(line.prior, None, "{prior}");
+            assert_eq!(written(&line), "  [High] t\n", "{prior}");
+        }
+    }
+
+    #[test]
+    fn a_linked_line_prints_its_tag_in_the_page_wording() {
+        let tagged = |relation: &str| {
+            written(&FindingLine::from_json(&json!({
+                "severity": "Medium",
+                "problem": "title",
+                "prior": prior_link(relation),
+            })))
+        };
+        assert_eq!(tagged("repeat"), "  [Medium] title (repeat of v3)\n");
+        assert_eq!(
+            tagged("fix_regression"),
+            "  [Medium] title (caused by the fix for v3)\n"
+        );
+    }
+
+    #[test]
+    fn the_earlier_finding_tag_comes_after_the_others() {
+        let line = FindingLine::from_json(&json!({
+            "severity": "High",
+            "problem": "title",
+            "speculative": true,
+            "preexisting": true,
+            "prior": prior_link("repeat"),
+            "locations": [{"file": "f.c", "line": 3}],
+        }));
+        assert_eq!(
+            written(&line),
+            "  [High] title (speculative) (preexisting) (repeat of v3)\n    f.c:3\n"
+        );
+    }
+
+    #[test]
+    fn an_earlier_revision_label_prints_as_one_safe_line() {
+        let line = FindingLine::from_json(&json!({
+            "severity": "Low",
+            "problem": "title",
+            "prior": {"relation": "repeat", "revision": "  v3\n (fixup)\u{1b}[31m\u{202E} ",
+                      "earlier_problem": "leak"},
+        }));
+        assert_eq!(
+            written(&line),
+            "  [Low] title (repeat of v3 (fixup) [31m)\n"
         );
     }
 
