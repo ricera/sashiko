@@ -303,21 +303,22 @@ impl ForgeHeadFetch {
         }
     }
 
-    /// Logs what an operator can act on: a WARN with the credentials fix
+    /// What an operator can act on: a warning with the credentials fix
     /// when the forge refused every ref, since then the daemon's user may
-    /// lack read access, and an info line when a served ref still left a
-    /// commit missing, since credentials cannot help there.
-    fn report(self, remote: &str, number: i64) {
+    /// lack read access, an info line when a served ref still left a commit
+    /// missing, since credentials cannot help there, and nothing when every
+    /// commit arrived.
+    fn report(self, remote: &str, number: i64) -> Option<ForgeHeadReport> {
         match self {
-            Self::Complete => {}
-            Self::Served(kind) => info!(
+            Self::Complete => None,
+            Self::Served(kind) => Some(ForgeHeadReport::Info(format!(
                 "{} from {} did not bring every commit of pull request {}: the head of an \
                  older request was force-pushed away, or the base is left to the heads fetch.",
                 kind.name(number),
                 remote,
                 number
-            ),
-            Self::Refused => warn!(
+            ))),
+            Self::Refused => Some(ForgeHeadReport::Warn(format!(
                 "Could not fetch the head of pull request {} from {}: the forge refused the \
                  fetch by SHA and both {} and {}. The daemon's user needs read credentials \
                  for {}: run gh auth setup-git as that user, or add a \
@@ -328,7 +329,28 @@ impl ForgeHeadFetch {
                 ForgeHeadRef::MergeRequest.name(number),
                 remote,
                 remote
-            ),
+            ))),
+        }
+    }
+}
+
+/// One line about a pull request's forge ref fetch, at the level an
+/// operator should see it. The level is part of the value so that a test
+/// can pin which outcomes warn without capturing the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ForgeHeadReport {
+    /// Something credentials cannot fix, logged at info.
+    Info(String),
+    /// Something the operator has to act on, logged at WARN.
+    Warn(String),
+}
+
+impl ForgeHeadReport {
+    /// Writes the line to the log at its level.
+    fn log(&self) {
+        match self {
+            Self::Info(message) => info!("{}", message),
+            Self::Warn(message) => warn!("{}", message),
         }
     }
 }
@@ -638,9 +660,10 @@ impl FetchAgent {
         marks: &BatchMarks<'_>,
     ) -> Result<()> {
         for head in forge_heads {
-            self.fetch_forge_head(source, head, marks)
-                .await?
-                .report(source.remote, head.number);
+            let outcome = self.fetch_forge_head(source, head, marks).await?;
+            if let Some(report) = outcome.report(source.remote, head.number) {
+                report.log();
+            }
         }
         Ok(())
     }
@@ -2198,18 +2221,29 @@ mod tests {
         let older = format!("{}..{}", base, MISSING_HEAD);
 
         let url = forge.to_string_lossy().to_string();
-        assert_eq!(
-            forge_head_outcome(&agent, &url, &[&older]).await?,
-            ForgeHeadFetch::Served(ForgeHeadRef::Pull)
-        );
-        assert_eq!(
-            forge_head_outcome(&agent, REFUSING_REMOTE, &[&older]).await?,
-            ForgeHeadFetch::Refused
-        );
-        assert_eq!(
-            forge_head_outcome(&agent, &url, &[&format!("{}..{}", base, base)]).await?,
-            ForgeHeadFetch::Complete
-        );
+        let served = forge_head_outcome(&agent, &url, &[&older]).await?;
+        assert_eq!(served, ForgeHeadFetch::Served(ForgeHeadRef::Pull));
+        let refused = forge_head_outcome(&agent, REFUSING_REMOTE, &[&older]).await?;
+        assert_eq!(refused, ForgeHeadFetch::Refused);
+        let complete = forge_head_outcome(&agent, &url, &[&format!("{}..{}", base, base)]).await?;
+        assert_eq!(complete, ForgeHeadFetch::Complete);
+
+        // Only the refusal warns, and only the refusal tells the operator
+        // to set up credentials, since a forge that served a ref already
+        // granted read access.
+        assert_eq!(complete.report(&url, 7), None);
+        match served.report(&url, 7) {
+            Some(ForgeHeadReport::Info(message)) => {
+                assert!(!message.contains("gh auth setup-git"), "{}", message)
+            }
+            other => panic!("a served ref must report at info: {:?}", other),
+        }
+        match refused.report(REFUSING_REMOTE, 7) {
+            Some(ForgeHeadReport::Warn(message)) => {
+                assert!(message.contains("gh auth setup-git"), "{}", message)
+            }
+            other => panic!("a refusal must report at WARN: {:?}", other),
+        }
         assert_eq!(
             recorded_fetches(&agent),
             [
