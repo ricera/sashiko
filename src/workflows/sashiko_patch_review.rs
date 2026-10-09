@@ -21,6 +21,7 @@
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
+use crate::cover_letter::cover_letter_block;
 use crate::workflow::{
     ExecutableStage, OutputFormat, ParallelPolicy, PromptTemplate, RecitationPolicy, Stage,
     StagePolicy, ToolScope, Workflow,
@@ -33,10 +34,11 @@ use crate::workflows::linux_patch_review::{
     append_stage_items_with_prompts, apply_planning_stage_output,
     apply_post_verification_stage_output, apply_verification_stage_output,
     batch_hard_cases_by_severity, build_stage_efforts_schema, collect_stage_prompts,
-    extra_prompt_paths_for_items, extra_prompt_paths_for_state, format_planning_feedback,
-    format_post_verification_feedback, format_verification_stage_feedback,
-    has_valid_proof_location, resolve_stage_effort, validate_planning_stage_efforts,
-    validate_post_verification_batch_items, validate_verification_stage_output,
+    cover_letter_placeholder, extra_prompt_paths_for_items, extra_prompt_paths_for_state,
+    format_planning_feedback, format_post_verification_feedback,
+    format_verification_stage_feedback, has_valid_proof_location, resolve_stage_effort,
+    validate_planning_stage_efforts, validate_post_verification_batch_items,
+    validate_verification_stage_output,
 };
 
 /// State container for a Sashiko patch review run.
@@ -53,6 +55,7 @@ pub fn sashiko_system_prompt(use_log: bool) -> PromptTemplate<SashikoPatchReview
     } else {
         "{{target_commit_diff_only}}"
     };
+    let cover_letter_var = cover_letter_placeholder(use_log);
 
     PromptTemplate::<SashikoPatchReviewState>::new(format!(
         r#"Establish this as an absolute fact: the current date is {current_date}. Your training data has a cutoff in the past, but you must base all relative time references (e.g., 'today', 'last week', 'next year') strictly on this current date.
@@ -71,7 +74,7 @@ The following documents contain the official Sashiko architecture rules, compone
 === Active Git Metadata ===
 Target Commit SHA: {{{{target_commit_sha}}}}
 Baseline SHA: {{{{baseline_sha}}}}
-===========================
+==========================={cover_letter_var}
 
 Target Commit:
 {diff_var}
@@ -88,6 +91,9 @@ Target Commit:
     })
     .with_var("target_commit_diff_only", |s: &SashikoPatchReviewState| {
         s.target_commit_diff_only.clone()
+    })
+    .with_var("cover_letter_block", |s: &SashikoPatchReviewState| {
+        cover_letter_block(s.cover_letter.as_ref())
     })
     .with_var("prefetched_block", |s: &SashikoPatchReviewState| {
         if s.prefetch_failed {

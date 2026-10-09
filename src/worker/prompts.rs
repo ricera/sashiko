@@ -49,6 +49,7 @@ impl ClassifyAiError for ReviewError {
 }
 
 use crate::activity::StageFailureRecord;
+use crate::cover_letter::CoverLetter;
 use crate::project::ProjectId;
 use crate::workflow::{StageFailure, StageStopCause, WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use crate::workflows::linux_patch_review::{
@@ -84,6 +85,21 @@ pub struct ReviewInput {
     pub id: i64,
     pub subject: String,
     pub patches: Vec<PatchInput>,
+    /// The series cover letter, sent by the daemon only when the series has
+    /// one. A local review of git commits has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_letter: Option<CoverLetter>,
+}
+
+/// Reads the cover letter a review payload carries. A missing or null key
+/// is no cover letter. A value that does not parse is logged and dropped,
+/// so the review runs as it would have without one rather than failing
+/// over context the stages can do without.
+pub(crate) fn payload_cover_letter(patchset: &Value) -> Option<CoverLetter> {
+    let value = patchset.get("cover_letter").filter(|v| !v.is_null())?;
+    serde_json::from_value(value.clone())
+        .inspect_err(|e| tracing::warn!("Ignoring a malformed cover letter in the payload: {e}"))
+        .ok()
 }
 
 #[derive(Clone, Debug)]
@@ -585,6 +601,7 @@ impl Worker {
             prefetch_failed,
             series_range: self.series_range.clone(),
             follow_up_series_context,
+            cover_letter: payload_cover_letter(&patchset),
             references: self.tools.references().to_vec(),
             selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
@@ -1745,6 +1762,72 @@ mod tests {
             !sashiko.contains("Read-only Reference Repositories"),
             "only the Linux prompt lists reference repositories"
         );
+    }
+
+    /// The cover letter the daemon puts in the payload reaches the system
+    /// prompt the review opens with; a malformed one is dropped and the
+    /// review runs as it would without one.
+    #[tokio::test]
+    async fn the_worker_gives_the_payload_cover_letter_to_the_stages() {
+        async fn system_prompt_for(cover_letter: Value) -> String {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let prompts_dir = temp_dir.path().join("prompts");
+            std::fs::create_dir_all(&prompts_dir).unwrap();
+            let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
+            let mut worker = Worker::new(
+                std::sync::Arc::new(MockBlockedProvider {
+                    attempts: AtomicUsize::new(0),
+                }),
+                std::sync::Arc::new(tools),
+                PromptRegistry::new(prompts_dir),
+                WorkerConfig {
+                    project: ProjectId::Linux,
+                    max_input_tokens: 10000,
+                    max_interactions: 3,
+                    temperature: 0.0,
+                    series_range: None,
+                    baseline_sha: None,
+                    custom_prompt: None,
+                    stages: Some(vec!["goal".to_string()]),
+                    skip_report: false,
+                    report_preexisting: false,
+                    effort: None,
+                },
+            );
+            let res = worker
+                .run(
+                    serde_json::json!({
+                        "id": 1,
+                        "patch_index": 1,
+                        "patches": [{"diff": "diff --git a/x.c b/x.c\n+int x;"}],
+                        "cover_letter": cover_letter,
+                    }),
+                    None,
+                )
+                .await
+                .expect("review runs");
+            res.history[0].message.content.clone().unwrap_or_default()
+        }
+
+        let with = system_prompt_for(serde_json::json!({
+            "source": "pull_request_description",
+            "text": "Makes x reentrant.",
+        }))
+        .await;
+        assert!(with.contains("=== Series Cover Letter ==="), "{with}");
+        assert!(with.contains("\n| Makes x reentrant.\n"), "{with}");
+
+        for absent in [
+            Value::Null,
+            serde_json::json!({"source": "mailing_list", "text": "Hi"}),
+            serde_json::json!("Makes x reentrant."),
+        ] {
+            let prompt = system_prompt_for(absent.clone()).await;
+            assert!(
+                !prompt.contains("Series Cover Letter"),
+                "{absent} is no cover letter: {prompt}"
+            );
+        }
     }
 
     #[tokio::test]

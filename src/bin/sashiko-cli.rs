@@ -3074,6 +3074,8 @@ async fn handle_local(
                 .and_then(|p| p.subject.clone())
                 .unwrap_or_else(|| input.clone()),
             patches,
+            // Commits read from git carry no cover letter.
+            cover_letter: None,
         };
 
         let review_json =

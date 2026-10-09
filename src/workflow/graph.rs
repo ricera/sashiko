@@ -68,34 +68,51 @@ impl<S: Send + Sync + 'static> Workflow<S> {
 
     /// Every stage the workflow can run for `state`, with whether the
     /// review's deadline may stop it, in the order the steps list them.
+    #[cfg(test)]
+    pub(crate) fn interruptible_stages(&self, state: &S) -> Vec<(&'static str, bool)> {
+        self.map_stages(state, &|stage| (stage.name(), stage.interruptible()))
+    }
+
+    /// Every stage the workflow can run for `state`, with the system prompt
+    /// it renders for `state` (see
+    /// [`ExecutableStage::system_prompt_for_log`]), in the order the steps
+    /// list them.
+    #[cfg(test)]
+    pub(crate) fn stage_system_prompts(&self, state: &S) -> Vec<(&'static str, Option<String>)> {
+        self.map_stages(state, &|stage| {
+            (stage.name(), stage.system_prompt_for_log(state))
+        })
+    }
+
+    /// `f` applied to every stage the workflow can run for `state`, in the
+    /// order the steps list them.
     ///
     /// The dynamic fan-outs are resolved against `state`, so a state that
     /// selects every stage lists every stage. Both arms of a branch are
     /// listed, because either may run.
     #[cfg(test)]
-    pub(crate) fn interruptible_stages(&self, state: &S) -> Vec<(&'static str, bool)> {
-        let entry = |stage: &dyn ExecutableStage<S>| (stage.name(), stage.interruptible());
+    fn map_stages<R>(&self, state: &S, f: &dyn Fn(&dyn ExecutableStage<S>) -> R) -> Vec<R> {
         let mut stages = Vec::new();
         for step in &self.steps {
             match step {
-                WorkflowStep::Stage(stage) => stages.push(entry(stage.as_ref())),
+                WorkflowStep::Stage(stage) => stages.push(f(stage.as_ref())),
                 WorkflowStep::Parallel { stages: group, .. } => {
-                    stages.extend(group.iter().map(|stage| entry(stage.as_ref())));
+                    stages.extend(group.iter().map(|stage| f(stage.as_ref())));
                 }
                 WorkflowStep::DynamicParallel {
                     planner, resolver, ..
                 } => {
-                    stages.push(entry(planner.as_ref()));
-                    stages.extend(resolver(state).iter().map(|stage| entry(stage.as_ref())));
+                    stages.push(f(planner.as_ref()));
+                    stages.extend(resolver(state).iter().map(|stage| f(stage.as_ref())));
                 }
                 WorkflowStep::Branch {
                     then_flow,
                     else_flow,
                     ..
                 } => {
-                    stages.extend(then_flow.interruptible_stages(state));
+                    stages.extend(then_flow.map_stages(state, f));
                     if let Some(flow) = else_flow {
-                        stages.extend(flow.interruptible_stages(state));
+                        stages.extend(flow.map_stages(state, f));
                     }
                 }
                 WorkflowStep::EarlyExitIf { .. } => {}

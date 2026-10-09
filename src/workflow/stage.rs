@@ -147,6 +147,12 @@ pub trait ExecutableStage<S: Send + Sync>: Send + Sync {
     /// ([`StagePolicy::interruptible`]).
     fn interruptible(&self) -> bool;
 
+    /// The stage's system prompt rendered for `state` as the log records
+    /// it, or `None` when the stage has none, so a test can check what
+    /// each stage of a workflow is told.
+    #[cfg(test)]
+    fn system_prompt_for_log(&self, state: &S) -> Option<String>;
+
     /// Executes the stage in isolation against immutable state `&S`, returning
     /// execution metrics and a deferred reducer mutation to apply to `&mut S`.
     async fn execute_isolated(
@@ -515,6 +521,13 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
 
     fn interruptible(&self) -> bool {
         self.policy.interruptible
+    }
+
+    #[cfg(test)]
+    fn system_prompt_for_log(&self, state: &S) -> Option<String> {
+        self.system_prompt
+            .as_ref()
+            .map(|template| template.render_for_log(state))
     }
 
     async fn execute_isolated(

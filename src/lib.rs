@@ -24,6 +24,7 @@ pub mod backfill;
 pub mod baseline;
 #[cfg(feature = "server")]
 pub mod compression;
+pub mod cover_letter;
 pub mod db;
 #[cfg(feature = "server")]
 pub mod email_policy;
