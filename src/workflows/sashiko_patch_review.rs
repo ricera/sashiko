@@ -251,13 +251,16 @@ Generate the plain-text inline review report following the exact formatting rule
 /// [`prior_reviews_verification_rules`]). severity.md asks for the Blast
 /// radius and irreversibility reasoning, then the Likelihood and
 /// preconditions reasoning, at the start of the severity explanation, so the
-/// history sentence ends the Likelihood and preconditions reasoning, which
-/// names the path, and the Blast radius stays first: its body is what
-/// `finding_view::consequence_of` gives as the finding's consequence when a
-/// later revision lists it, so the history must not land there.
+/// history sentence is the last sentence of the Likelihood and preconditions
+/// section, which names the path and is the last of this rubric's sections
+/// that `finding_view::CalibrationLabel` names, and the Blast radius stays
+/// first: its body is what `finding_view::consequence_of` gives as the
+/// finding's consequence when a later revision lists it, so the history
+/// must not land there.
 pub(crate) const PRIOR_REVIEWS_VERIFICATION_RULES: &str = prior_reviews_verification_rules!(
-    history_at: "Likelihood and preconditions reasoning",
-    keep_first: "Keep the Blast radius and irreversibility reasoning first, as severity.md asks.",
+    history_at: "Likelihood and preconditions",
+    keep_first: "Keep the \"Blast radius and irreversibility\" section first, as severity.md \
+     asks.",
 );
 
 /// How the Sashiko report states a finding's link to an earlier finding: a
