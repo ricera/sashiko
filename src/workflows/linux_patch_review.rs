@@ -2081,23 +2081,50 @@ pub(crate) fn with_prior_reviews(
 /// severity explanation: each workflow names the sections of its own severity
 /// rubric, so `history_at` is the section the history sentence ends and
 /// `keep_first` the sentence that keeps the rubric's first section first.
-/// The rules change nothing about how a concern is judged; a finding or hard
-/// case that repeats an earlier one, or that the fix for an earlier one
-/// caused, says so in a `prior` key naming it as the block listed it, and in
-/// one sentence rather than in its title; and an earlier finding that no
-/// concern raises is not reported.
+/// The rules change nothing about how a concern is judged; the commits the
+/// block names show what earlier revisions contained, and since a commit
+/// carried over unchanged can also be in the series under review, the series
+/// and its final state come only from the series block the workflow's worker
+/// writes (`series_block`) and its series end commit, never from the block;
+/// code an earlier revision's other patch adds never stands in for a later
+/// patch of the series under review; verification may route a concern as a
+/// series interaction only for a patch the series block lists and never names a
+/// block commit in a hard case; the block's commits are read only to compare
+/// the earlier code with the current code for a repeat or a fix regression; a
+/// finding or hard case that repeats an earlier one, or that the fix for an
+/// earlier one caused, says so in a `prior` key naming it as the block listed
+/// it, and in one sentence rather than in its title; and an earlier finding
+/// that no concern raises is not reported.
 ///
 /// A macro rather than a function, so that each workflow's rules stay one
 /// `&'static str` built at compile time.
 macro_rules! prior_reviews_verification_rules {
-    (history_at: $history_at:literal, keep_first: $keep_first:literal $(,)?) => {
+    (
+        series_block: $series_block:literal,
+        history_at: $history_at:literal,
+        keep_first: $keep_first:literal $(,)?
+    ) => {
         concat!(
             "PRIOR REVISION RULES: The findings \
 above were reported on earlier revisions of this pull request. Use them as follows.\n\
 1. Judge and classify every concern on the current code, by the rules above. That a concern \
 was reported before makes it neither more nor less likely to be valid: an earlier finding is \
 not code proof that makes a concern well-justified, and it neither contests a concern nor \
-justifies a dismissal.\n\
+justifies a dismissal. The commits named in \"Findings From Earlier Revisions of This Pull \
+Request\" above show what earlier revisions contained. A commit carried over unchanged can also \
+be part of the series under review, so that the block names a commit says nothing either way: \
+take the series under review and its final state only from \"",
+            $series_block,
+            "\" and \"Series End Commit (Final State)\" when they are provided in the context, never \
+from the block. Code at a commit the block names, including another patch of that revision, \
+does not show how the series under review handles a concern, even when it uses what the patch \
+under review defines, and without those sections no later patch of the series under review is \
+available. So classify a concern as a hard case with \"signal_reason\": \"series_interaction\", \
+or keep it out of \"findings\" as possibly resolved later in the series, only for a later patch \
+listed there, and never present a commit the block names as part of this series in a hard \
+case's \"concern_arguments\", \"dismissal_arguments\" or \"verification_question\". Beyond \
+that, use a commit the block names only to compare the earlier revision's code with the current \
+code, under REPEAT or FIX REGRESSION below.\n\
 2. REPEAT: if an item you put in 'findings' or 'hard_cases' is the same defect as an earlier \
 finding and the current code still has it, add \"prior\": {\"relation\": \"repeat\", \"revision\": \
 \"<the label it was listed under, e.g. v3>\", \"earlier_problem\": \"<the earlier finding's title, \
@@ -2155,14 +2182,66 @@ free of its history and put that sentence in \"severity_explanation\", at the en
 }
 pub(crate) use prior_link_post_verification_rules;
 
+/// Builds what a post-verification stage is told when the pull request had
+/// earlier revisions. Post-verification is not shown their findings, but
+/// verification was, and a hard case's arguments or verification question
+/// may name one of their commits; a commit the series block does not list
+/// is not a later patch of the series under review, so the SERIES
+/// VALIDATION RULE dismisses nothing on its strength. `series_block` is the
+/// heading of the series block the workflow's worker writes.
+macro_rules! prior_series_post_verification_rule {
+    (series_block: $series_block:literal $(,)?) => {
+        concat!(
+            "PRIOR REVISION SERIES RULE: This pull request had earlier revisions, and a \
+candidate's arguments or \"verification_question\" may name a commit of one of them. Take the \
+series under review and its final state only from \"",
+            $series_block,
+            "\" and \"Series End Commit (Final State)\" when they are provided in the context. A \
+commit not listed there does not show how the series under review handles the candidate, even \
+when it uses what the patch under review defines, so when you apply the SERIES VALIDATION \
+RULE, dismiss no candidate as resolved by it, and without those sections dismiss no candidate \
+as handled by a later patch."
+        )
+    };
+}
+pub(crate) use prior_series_post_verification_rule;
+
+/// Marks where a post-verification prompt carries the rule that keeps an
+/// earlier revision's commits out of its series validation. It is filled
+/// from the review's state, since the batch says nothing about whether the
+/// pull request had earlier revisions; without them it is empty, so the
+/// prompt is the one it had before.
+pub const PRIOR_SERIES_RULE_PLACEHOLDER: &str = "{{prior_series_rule}}";
+
+/// Fills [`PRIOR_SERIES_RULE_PLACEHOLDER`] with `rule` when the review was
+/// shown the findings of earlier revisions, and with nothing otherwise.
+pub(crate) fn with_prior_series_rule(
+    template: PromptTemplate<LinuxPatchReviewState>,
+    rule: &'static str,
+) -> PromptTemplate<LinuxPatchReviewState> {
+    template.with_var("prior_series_rule", move |s: &LinuxPatchReviewState| {
+        if s.prior_reviews.is_some() {
+            format!("\n\n{rule}")
+        } else {
+            String::new()
+        }
+    })
+}
+
 /// How Linux verification uses the earlier findings (see
 /// [`prior_reviews_verification_rules`]): the history sentence ends the
 /// Triggering path, and the Consequence stays first, as the kernel rubric
 /// and the example output order them.
 pub(crate) const PRIOR_REVIEWS_VERIFICATION_RULES: &str = prior_reviews_verification_rules!(
+    series_block: "Follow-Up Patches in Series",
     history_at: "Triggering path",
     keep_first: "Keep the Consequence first, as the rules above ask.",
 );
+
+/// What Linux post-verification is told when the pull request had earlier
+/// revisions (see [`prior_series_post_verification_rule`]).
+pub(crate) const PRIOR_SERIES_POST_VERIFICATION_RULE: &str =
+    prior_series_post_verification_rule!(series_block: "Follow-Up Patches in Series");
 
 /// What Linux post-verification is told about a linked candidate (see
 /// [`prior_link_post_verification_rules`]), placed as in verification.
@@ -2980,7 +3059,7 @@ Example Output:
     }}
   ]
 }}
-```{prior_link_rules}"#
+```{prior_link_rules}{PRIOR_SERIES_RULE_PLACEHOLDER}"#
         ))
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
@@ -2992,6 +3071,7 @@ Example Output:
     .with_var("candidate_hard_cases", move |_: &LinuxPatchReviewState| {
         candidate_json.clone()
     });
+    let user_template = with_prior_series_rule(user_template, PRIOR_SERIES_POST_VERIFICATION_RULE);
 
     Stage::builder(stage_name)
         .system_prompt(linux_system_prompt(true))
@@ -5514,21 +5594,28 @@ mod tests {
     }
 
     /// A review with no earlier findings gets the user prompts it had
-    /// before the block existed: the block and its rules are the only
-    /// difference, and without history they are empty, with no placeholder
-    /// left in the text.
+    /// before the block existed: the block and its rules, and
+    /// post-verification's series rule, are the only difference, and
+    /// without history they are empty, with no placeholder left in the
+    /// text.
     #[test]
     fn prior_reviews_render_nothing_without_history() {
         let context = prior_reviews();
         let with = user_prompts(Some(context.clone()));
         let without = user_prompts(None);
         for ((name, prompt), (_, bare)) in with.iter().zip(&without) {
-            let inserted = format!(
-                "\n\n{}\n\n{}",
-                context.rendered,
-                verification_rules_of(name)
-            );
+            let inserted = if name.contains(" post-verification") {
+                format!("\n\n{}", series_of(name).1)
+            } else {
+                format!(
+                    "\n\n{}\n\n{}",
+                    context.rendered,
+                    verification_rules_of(name)
+                )
+            };
             assert_eq!(&prompt.replacen(&inserted, "", 1), bare, "{name}");
+            assert!(!bare.contains(PRIOR_SERIES_RULE_PLACEHOLDER), "{name}");
+            assert!(!bare.contains("PRIOR REVISION SERIES RULE"), "{name}");
             assert!(!bare.contains(PRIOR_REVIEWS_PLACEHOLDER), "{name}");
             assert!(!bare.contains("PRIOR REVISION RULES"), "{name}");
         }
@@ -5637,6 +5724,163 @@ mod tests {
                 assert!(rules.contains(asked), "{name}: {asked}: {rules}");
             }
             assert!(!rules.contains("revision_head"), "the daemon adds the head");
+        }
+    }
+
+    /// The heading of the series block each workflow's worker writes, and
+    /// the rule a post-verification stage of that workflow is told when the
+    /// pull request had earlier revisions, by the project a prompt is tagged
+    /// with ("<project> <stage>").
+    fn series_of(tagged: &str) -> (&'static str, &'static str) {
+        if tagged.starts_with("sashiko ") {
+            (
+                "Patch Series Context",
+                crate::workflows::sashiko_patch_review::PRIOR_SERIES_POST_VERIFICATION_RULE,
+            )
+        } else {
+            (
+                "Follow-Up Patches in Series",
+                PRIOR_SERIES_POST_VERIFICATION_RULE,
+            )
+        }
+    }
+
+    /// A commit the block names may also be in the series under review, when
+    /// it was carried over unchanged, so verification takes the series and
+    /// its final state only from the series block and series end commit the
+    /// context provides, never from the block, routes a concern as a series
+    /// interaction only for a patch listed there, keeps block commits out of
+    /// its hard cases, and reads the block's commits only to compare the
+    /// earlier code with the current code. Post-verification, which is not
+    /// shown the block, is told to dismiss nothing under its series rule on
+    /// the strength of a commit the series block does not list. Each
+    /// workflow names the heading its own worker writes, and the stage rule
+    /// each sentence refers to is above it.
+    #[test]
+    fn prior_reviews_keep_earlier_commits_out_of_the_series() {
+        let patchset = serde_json::json!({
+            "patch_index": 1,
+            "patches": [
+                { "index": 1, "subject": "net: add foo", "commit_id": "sha1" },
+                { "index": 2, "subject": "net: use foo", "commit_id": "sha2" }
+            ]
+        });
+        for (series, heading) in [
+            (
+                crate::worker::prompts::build_follow_up_series_context(
+                    Some("base..sha2"),
+                    &patchset,
+                    "sha1",
+                ),
+                "=== Follow-Up Patches in Series ===",
+            ),
+            (
+                crate::worker::prompts::build_sashiko_series_context(
+                    Some("base..sha2"),
+                    &patchset,
+                    "sha1",
+                ),
+                "=== Patch Series Context ===",
+            ),
+        ] {
+            let series = series.expect("a series block");
+            assert!(series.contains(heading), "{series}");
+            assert!(
+                series.contains("Series End Commit (Final State): sha2"),
+                "{series}"
+            );
+        }
+
+        let sentence = |series_block: &str| {
+            format!(
+                "The commits named in \"Findings From Earlier Revisions of This Pull Request\" \
+                 above show what earlier revisions contained. A commit carried over unchanged \
+                 can also be part of the series under review, so that the block names a commit \
+                 says nothing either way: take the series under review and its final state only \
+                 from \"{series_block}\" and \"Series End Commit (Final State)\" when they are \
+                 provided in the context, never from the block. Code at a commit the block \
+                 names, including another patch of that revision, does not show how the series \
+                 under review handles a concern, even when it uses what the patch under review \
+                 defines, and without those sections no later patch of the series under review \
+                 is available. So classify a concern as a hard case with \"signal_reason\": \
+                 \"series_interaction\", or keep it out of \"findings\" as possibly resolved \
+                 later in the series, only for a later patch listed there, and never present a \
+                 commit the block names as part of this series in a hard case's \
+                 \"concern_arguments\", \"dismissal_arguments\" or \"verification_question\". \
+                 Beyond that, use a commit the block names only to compare the earlier \
+                 revision's code with the current code, under REPEAT or FIX REGRESSION below."
+            )
+        };
+        let post_rule = |series_block: &str| {
+            format!(
+                "PRIOR REVISION SERIES RULE: This pull request had earlier revisions, and a \
+                 candidate's arguments or \"verification_question\" may name a commit of one of \
+                 them. Take the series under review and its final state only from \
+                 \"{series_block}\" and \"Series End Commit (Final State)\" when they are \
+                 provided in the context. A commit not listed there does not show how the \
+                 series under review handles the candidate, even when it uses what the patch \
+                 under review defines, so when you apply the SERIES VALIDATION RULE, dismiss no \
+                 candidate as resolved by it, and without those sections dismiss no candidate \
+                 as handled by a later patch."
+            )
+        };
+        let prompts = user_prompts(Some(prior_reviews()));
+        let prompt_of = |name: &str| {
+            prompts
+                .iter()
+                .find(|(stage, _)| stage == name)
+                .map(|(_, prompt)| prompt.as_str())
+                .unwrap_or_else(|| panic!("{name} is listed"))
+        };
+        let post_name = |project: &str| format!("{project} {}", POST_VERIFICATION_STAGE_NAMES[0]);
+        for (project, other_heading, post_anchor) in [
+            (
+                "linux",
+                "Patch Series Context",
+                "6. **SERIES VALIDATION RULE:**",
+            ),
+            (
+                "sashiko",
+                "Follow-Up Patches in Series",
+                "7. **SERIES VALIDATION RULE:**",
+            ),
+        ] {
+            let name = format!("{project} verification");
+            let (series_block, post_rules) = series_of(&name);
+            let rules = verification_rules_of(&name);
+            let first_rule = rules
+                .find("\n1. Judge and classify every concern on the current code")
+                .expect("rule 1");
+            let second_rule = rules.find("\n2. REPEAT:").expect("rule 2");
+            let at = rules
+                .find(&sentence(series_block))
+                .unwrap_or_else(|| panic!("{name}: {rules}"));
+            assert!(first_rule < at && at < second_rule, "{name}: {rules}");
+            assert!(rules.contains("3. FIX REGRESSION:"), "{name}: {rules}");
+            assert!(!rules.contains(other_heading), "{name}: {rules}");
+            let prompt = prompt_of(&name);
+            let block = prompt
+                .find("=== Findings From Earlier Revisions of This Pull Request ===")
+                .expect("the block");
+            let signal = prompt
+                .find("\"series_interaction\"")
+                .unwrap_or_else(|| panic!("{name}: {prompt}"));
+            assert!(signal < block, "{name}: the series signal is above");
+
+            assert_eq!(post_rules, post_rule(series_block), "{project}");
+            let name = post_name(project);
+            let prompt = prompt_of(&name);
+            let rule_at = prompt
+                .find(post_rules)
+                .unwrap_or_else(|| panic!("{name}: {prompt}"));
+            let anchor = prompt
+                .find(post_anchor)
+                .unwrap_or_else(|| panic!("{name}: {prompt}"));
+            assert!(anchor < rule_at, "{name}: the series rule is above");
+            assert!(
+                !prompt.contains("Findings From Earlier Revisions"),
+                "{name}: post-verification is not shown the block"
+            );
         }
     }
 

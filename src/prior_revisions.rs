@@ -1103,7 +1103,7 @@ fn render_patch_header(
     let role = if earlier_version {
         "the patch under review, as it was in that revision"
     } else {
-        "another patch of this pull request"
+        "another patch of that revision"
     };
     let mut header = String::new();
     push_line(
@@ -1682,7 +1682,7 @@ mod tests {
         assert!(
             at(lines[3])
                 < at(
-                    "\nv2 patch 3 (commit not recorded, another patch of this pull request): subject \"tools: add harness\"\n"
+                    "\nv2 patch 3 (commit not recorded, another patch of that revision): subject \"tools: add harness\"\n"
                 )
         );
     }
@@ -1735,7 +1735,7 @@ mod tests {
         );
         assert!(block.contains(&unmarked("harness sizes")), "{block}");
         assert!(block.contains(
-            "\nv2 patch 2 (commit not recorded, another patch of this pull request): subject \"pds_core: add CPER\"\n"
+            "\nv2 patch 2 (commit not recorded, another patch of that revision): subject \"pds_core: add CPER\"\n"
         ));
     }
 
@@ -1781,10 +1781,10 @@ mod tests {
         other.same_change_as = Some(3);
         let block = rendered(&[revision("v2", vec![other])], "pds_core: add CPER");
         assert!(!block.contains("has the same diff"), "{block}");
-        assert!(
-            block.contains("another patch of this pull request"),
-            "{block}"
-        );
+        assert!(block.contains("another patch of that revision"), "{block}");
+        // The earlier revision's other patches are that revision's, not
+        // patches of the series under review.
+        assert!(!block.contains("of this pull request)"), "{block}");
     }
 
     /// The newest revision's diff is shown for the files its findings about
@@ -1944,8 +1944,8 @@ mod tests {
         assert!(!block.contains(&long_subject), "the subject is clipped");
         assert!(
             block.contains(&format!(
-                "\nv{MAX_PRIOR_REVISIONS} patch 3 (commit not recorded, another patch of this \
-                 pull request): subject {}\n",
+                "\nv{MAX_PRIOR_REVISIONS} patch 3 (commit not recorded, another patch of that \
+                 revision): subject {}\n",
                 quoted(&clip_title(&format!("{long_subject} 1")))
             )),
             "{block}"
@@ -2124,7 +2124,7 @@ mod tests {
             .find(|line| line.starts_with("v1 patch 2 "))
             .unwrap_or_else(|| panic!("no header: {block}"));
         let facts = format!(
-            "v1 patch 2 (commit {}, another patch of this pull request): subject ",
+            "v1 patch 2 (commit {}, another patch of that revision): subject ",
             "d".repeat(40)
         );
         assert!(line.starts_with(&facts), "the daemon's facts lead: {line}");
