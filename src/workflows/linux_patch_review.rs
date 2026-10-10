@@ -958,7 +958,15 @@ pub(crate) fn with_prior_reviews(
 /// explanation: each workflow names the sections of its own severity rubric,
 /// so `history_at` is the section the history sentence ends and `keep_first`
 /// the sentence that keeps the rubric's first section first. The rules
-/// change nothing about how a concern is judged; a finding that repeats an
+/// change nothing about how a concern is judged; the commits the block
+/// names show what earlier revisions contained, and since a commit carried
+/// over unchanged can also be in the series under review, the series and
+/// its final state come only from the follow-up patches and series end
+/// commit the context provides, never from the block; code an earlier
+/// revision's other patch adds never stands in for a later patch of the
+/// series under review; and the block's commits are read only to compare
+/// the earlier code with the current code for a repeat or a fix
+/// regression; a finding that repeats an
 /// earlier one, or that the fix for an earlier one caused, says so in a
 /// `prior` key naming it as the block listed it, and in one sentence in its
 /// severity explanation rather than in its title; and an earlier finding
@@ -973,7 +981,18 @@ macro_rules! prior_reviews_verification_rules {
      above were reported on earlier revisions of this pull request. Use them as follows.
 1. Judge every concern on the current code, by the rules above. That a concern was reported \
      before makes it neither more nor less likely to be valid, and an earlier finding proves \
-     nothing about the code in front of you.
+     nothing about the code in front of you. The commits named in \"Findings From Earlier \
+     Revisions of This Pull Request\" above show what earlier revisions contained. A commit \
+     carried over unchanged can also be part of the series under review, so that the block names \
+     a commit says nothing either way: when you apply the SERIES VALIDATION RULE, or otherwise \
+     decide whether this series fixes or changes a concern, take the series under review and its \
+     final state only from \"Follow-Up Patches in Series\" and \"Series End Commit (Final \
+     State)\" when they are provided in the context, never from the block. Code at a commit the \
+     block names, including another patch of that revision, does not show how the series under \
+     review handles a concern, even when it uses what the patch under review defines; without \
+     those two sections no later patch of the series under review is available, so dismiss no \
+     concern as handled by one. Beyond that, use a commit the block names only to compare the \
+     earlier revision's code with the current code, under REPEAT or FIX REGRESSION below.
 2. REPEAT: if a concern is the same defect as an earlier finding and the current code still has \
      it, add \"prior\": {\"relation\": \"repeat\", \"revision\": \"<the label it was listed under, e.g. \
      v3>\", \"earlier_problem\": \"<the earlier finding's title, copied exactly as listed>\"}.
@@ -2834,6 +2853,75 @@ mod tests {
                 assert!(rules.contains(asked), "{name}: {asked}: {rules}");
             }
             assert!(!rules.contains("revision_head"), "the daemon adds the head");
+        }
+    }
+
+    /// A commit the block names may also be in the series under review, when
+    /// it was carried over unchanged, so the rules take the series and its
+    /// final state only from the follow-up patches and series end commit the
+    /// context provides, never from the block, and read the block's commits
+    /// only to compare the earlier code with the current code. The block, the
+    /// series rule, the repeat and fix regression rules, and the two headings
+    /// the worker writes for the series are all named as they appear.
+    #[test]
+    fn verification_keeps_earlier_commits_out_of_the_series() {
+        let prompts = user_prompts(Some(prior_reviews()));
+        let sentence = "The commits named in \"Findings From Earlier Revisions of This Pull \
+             Request\" above show what earlier revisions contained. A commit carried over \
+             unchanged can also be part of the series under review, so that the block names a \
+             commit says nothing either way: when you apply the SERIES VALIDATION RULE, or \
+             otherwise decide whether this series fixes or changes a concern, take the series \
+             under review and its final state only from \"Follow-Up Patches in Series\" and \
+             \"Series End Commit (Final State)\" when they are provided in the context, never \
+             from the block. Code at a commit the block names, including another patch of that \
+             revision, does not show how the series under review handles a concern, even when \
+             it uses what the patch under review defines; without those two sections no later \
+             patch of the series under review is available, so dismiss no concern as handled \
+             by one. Beyond that, use a commit the block names only to compare the earlier \
+             revision's code with the current code, under REPEAT or FIX REGRESSION below.";
+        let series = crate::worker::prompts::build_follow_up_series_context(
+            Some("base..sha2"),
+            &serde_json::json!({
+                "patch_index": 1,
+                "patches": [
+                    { "index": 1, "subject": "net: add foo", "commit_id": "sha1" },
+                    { "index": 2, "subject": "net: use foo", "commit_id": "sha2" }
+                ]
+            }),
+            "sha1",
+        )
+        .expect("a follow-up block");
+        assert!(
+            series.contains("=== Follow-Up Patches in Series ==="),
+            "{series}"
+        );
+        assert!(
+            series.contains("Series End Commit (Final State): sha2"),
+            "{series}"
+        );
+        for name in ["linux verification", "sashiko verification"] {
+            let prompt = prompts
+                .iter()
+                .find(|(stage, _)| stage == name)
+                .map(|(_, prompt)| prompt.as_str())
+                .unwrap_or_else(|| panic!("{name} is listed"));
+            let rules = verification_rules_of(name);
+            let first_rule = rules
+                .find("\n1. Judge every concern on the current code")
+                .expect("rule 1");
+            let second_rule = rules.find("\n2. REPEAT:").expect("rule 2");
+            let at = rules
+                .find(sentence)
+                .unwrap_or_else(|| panic!("{name}: {rules}"));
+            assert!(first_rule < at && at < second_rule, "{name}: {rules}");
+            let block = prompt
+                .find("=== Findings From Earlier Revisions of This Pull Request ===")
+                .expect("the block");
+            let series_rule = prompt
+                .find("3. SERIES VALIDATION RULE:")
+                .unwrap_or_else(|| panic!("{name}: {prompt}"));
+            assert!(series_rule < block, "{name}: the series rule is above");
+            assert!(rules.contains("3. FIX REGRESSION:"), "{name}: {rules}");
         }
     }
 

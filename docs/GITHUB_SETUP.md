@@ -538,7 +538,7 @@ v3 patch 2 (commit <40 hex>, the patch under review, as it was in that revision)
     Consequence: every failed refill leaks one page per descriptor.
     History: a repeat of "rx page leak on refill error" (v2)
 
-v3 patch 4 (commit <40 hex>, another patch of this pull request): subject "ionic: add rx stats"
+v3 patch 4 (commit <40 hex>, another patch of that revision): subject "ionic: add rx stats"
   - [Medium] (concerns code in the patch under review) ...
 
 v3's version of the code: its diff, limited to the files that its findings about the patch under review cite. ...
