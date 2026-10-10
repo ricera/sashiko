@@ -2079,8 +2079,12 @@ pub(crate) fn with_prior_reviews(
 /// Builds the verification rules for the earlier findings, which both
 /// workflows share except for where rule 4 puts a finding's history in its
 /// severity explanation: each workflow names the sections of its own severity
-/// rubric, so `history_at` is the section the history sentence ends and
-/// `keep_first` the sentence that keeps the rubric's first section first.
+/// rubric, by the labels `finding_view::CalibrationLabel` splits it at, so
+/// `history_at` is the section whose last sentence is the history sentence,
+/// `history_before` the section that follows it, when the rubric has one,
+/// `keep_first` the sentence that keeps the rubric's first section first,
+/// and `section_names`, for a rubric whose example output writes each
+/// section's name with a colon, the sentence that keeps those names.
 /// The rules change nothing about how a concern is judged; the commits the
 /// block names show what earlier revisions contained, and since a commit
 /// carried over unchanged can also be in the series under review, the series
@@ -2102,7 +2106,9 @@ macro_rules! prior_reviews_verification_rules {
     (
         series_block: $series_block:literal,
         history_at: $history_at:literal,
-        keep_first: $keep_first:literal $(,)?
+        $(history_before: $history_before:literal,)?
+        keep_first: $keep_first:literal,
+        $(section_names: $section_names:literal,)?
     ) => {
         concat!(
             "PRIOR REVISION RULES: The findings \
@@ -2137,13 +2143,16 @@ tools; that commit may no longer exist) with the current code; similar wording b
 findings is not enough.\n\
 4. Keep \"problem\" (a hard case's \"description\") the short title the rules above ask for; do \
 not say in it that the issue was reported before. Say it in one sentence: for a finding, in \
-\"severity_explanation\", at the end of its ",
+\"severity_explanation\", as the last sentence of its \"",
             $history_at,
+            "\" section",
+            $(", before its \"", $history_before, "\" section",)?
             "; for a hard case, as the last \
 sentence of \"concern_arguments\". For a repeat, say that this path was reported on <revision> \
 and what, if anything, the current revision changed around it; for a fix regression, say which \
 change made for the earlier finding leads to this defect, and how. ",
             $keep_first,
+            $(" ", $section_names,)?
             "\n\
 5. Omit \"prior\" when no finding above is the counterpart, and never put it on \
 'dismissed_concerns'. \"prior\" may name only a finding listed above, under the label it is \
@@ -2163,7 +2172,12 @@ pub(crate) use prior_reviews_verification_rules;
 /// made the link; this stage only keeps the history out of the title and may
 /// say the defect it reports is another one.
 macro_rules! prior_link_post_verification_rules {
-    (history_at: $history_at:literal, keep_first: $keep_first:literal $(,)?) => {
+    (
+        history_at: $history_at:literal,
+        $(history_before: $history_before:literal,)?
+        keep_first: $keep_first:literal,
+        $(section_names: $section_names:literal,)?
+    ) => {
         concat!(
             "PRIOR LINK RULES: A candidate with \
 a \"prior\" key was linked by verification to a finding reported on an earlier revision of this \
@@ -2173,10 +2187,14 @@ any other candidate: the link makes it neither more nor less likely to be valid.
 \"prior\" yourself: the link is carried to the finding you report for that candidate. If the \
 defect you report is not the one the link names, because you refined the candidate into another \
 defect, add \"prior\": null to that finding. When you report a linked candidate, keep \"problem\" \
-free of its history and put that sentence in \"severity_explanation\", at the end of its ",
+free of its history and put that sentence in \"severity_explanation\", as the last sentence \
+of its \"",
             $history_at,
+            "\" section",
+            $(", before its \"", $history_before, "\" section",)?
             ". ",
-            $keep_first
+            $keep_first,
+            $(" ", $section_names,)?
         )
     };
 }
@@ -2229,13 +2247,18 @@ pub(crate) fn with_prior_series_rule(
 }
 
 /// How Linux verification uses the earlier findings (see
-/// [`prior_reviews_verification_rules`]): the history sentence ends the
-/// Triggering path, and the Consequence stays first, as the kernel rubric
-/// and the example output order them.
+/// [`prior_reviews_verification_rules`]): the history sentence is the last
+/// sentence of the Triggering path, before the Reachability, and the
+/// Consequence stays first, as the kernel rubric and the example output
+/// order them, with each section starting with its name and a colon, as the
+/// example output writes it, so that the page can split it.
 pub(crate) const PRIOR_REVIEWS_VERIFICATION_RULES: &str = prior_reviews_verification_rules!(
     series_block: "Follow-Up Patches in Series",
     history_at: "Triggering path",
+    history_before: "Reachability",
     keep_first: "Keep the Consequence first, as the rules above ask.",
+    section_names: "Start each section with its name and a colon, as the example output does: \
+     \"Consequence:\", \"Triggering path:\", \"Reachability:\".",
 );
 
 /// What Linux post-verification is told when the pull request had earlier
@@ -2247,7 +2270,10 @@ pub(crate) const PRIOR_SERIES_POST_VERIFICATION_RULE: &str =
 /// [`prior_link_post_verification_rules`]), placed as in verification.
 pub(crate) const PRIOR_LINK_POST_VERIFICATION_RULES: &str = prior_link_post_verification_rules!(
     history_at: "Triggering path",
+    history_before: "Reachability",
     keep_first: "Keep the Consequence first, as the rules above ask.",
+    section_names: "Start each section with its name and a colon, as the example output does: \
+     \"Consequence:\", \"Triggering path:\", \"Reachability:\".",
 );
 
 /// Marks where the report's prompt carries the earlier findings that its
@@ -5638,11 +5664,12 @@ mod tests {
     /// format it asks for: after the Linux example output and after the
     /// Sashiko key list. The rules judge every concern on the current code,
     /// add "prior" as the one new key, for a repeat or a fix regression,
-    /// keep the title free of the history and put it at the end of the
-    /// rubric section that names the path (the Triggering path in Linux,
-    /// the Likelihood and preconditions reasoning in Sashiko) with the
-    /// rubric's first section kept first, and forbid reviving an earlier
-    /// finding.
+    /// keep the title free of the history and make it the last sentence of
+    /// the rubric section that names the path (the Triggering path, before
+    /// the Reachability, in Linux; the Likelihood and preconditions section
+    /// in Sashiko) with the rubric's first section kept first and, in
+    /// Linux, each section's name and colon kept, and forbid reviving an
+    /// earlier finding.
     #[test]
     fn verification_reads_the_prior_rules_after_its_findings_format() {
         let context = prior_reviews();
@@ -5665,17 +5692,21 @@ mod tests {
                 "linux verification",
                 "```",
                 [
-                    "at the end of its Triggering path; for a hard case",
-                    "Keep the Consequence first, as the rules above ask.",
+                    "as the last sentence of its \"Triggering path\" section, before its \
+                     \"Reachability\" section; for a hard case",
+                    "Keep the Consequence first, as the rules above ask. Start each section \
+                     with its name and a colon, as the example output does: \"Consequence:\", \
+                     \"Triggering path:\", \"Reachability:\".\n5. ",
                 ],
             ),
             (
                 "sashiko verification",
                 "and may include \"stages\" and \"prompts\".",
                 [
-                    "at the end of its Likelihood and preconditions reasoning; for a hard case",
-                    "Keep the Blast radius and irreversibility reasoning first, as severity.md \
-                     asks.",
+                    "as the last sentence of its \"Likelihood and preconditions\" section; for \
+                     a hard case",
+                    "Keep the \"Blast radius and irreversibility\" section first, as \
+                     severity.md asks.\n5. ",
                 ],
             ),
         ] {
@@ -6019,7 +6050,7 @@ mod tests {
         ] {
             assert_eq!(
                 rubric_labels_named(rules),
-                ["Consequence", "Triggering path"]
+                ["Consequence", "Triggering path", "Reachability"]
             );
         }
         for rules in [
@@ -6036,6 +6067,82 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// Rule 4 names the exact section the history sentence ends and, in
+    /// Linux, the section after it, by the labels the splitter reads, and in
+    /// Linux asks that each section start with its name and a colon, as the
+    /// example output writes it: "at the end of its Triggering path" let the
+    /// sentence land after the Reachability or drop a section's name. The
+    /// Sashiko prompt asks for no such names, so its rule 4 does not either.
+    /// Post-verification's rule for a linked candidate places the sentence
+    /// the same way. An explanation written as the rule asks splits with the
+    /// history as the Triggering path's last sentence and a labelled
+    /// Reachability after it.
+    #[test]
+    fn verification_says_which_section_the_history_sentence_ends() {
+        use crate::workflows::sashiko_patch_review as sashiko;
+        let linux = "for a finding, in \"severity_explanation\", as the last sentence of its \
+             \"Triggering path\" section, before its \"Reachability\" section; for a hard case, \
+             as the last sentence of \"concern_arguments\".";
+        let linux_names = "Keep the Consequence first, as the rules above ask. Start each \
+             section with its name and a colon, as the example output does: \"Consequence:\", \
+             \"Triggering path:\", \"Reachability:\".";
+        let linux_post = "put that sentence in \"severity_explanation\", as the last sentence \
+             of its \"Triggering path\" section, before its \"Reachability\" section. ";
+        let sashiko_at = "as the last sentence of its \"Likelihood and preconditions\" section";
+        let sashiko_keep =
+            "Keep the \"Blast radius and irreversibility\" section first, as severity.md asks.";
+        for (rules, placement) in [
+            (PRIOR_REVIEWS_VERIFICATION_RULES, linux),
+            (PRIOR_LINK_POST_VERIFICATION_RULES, linux_post),
+        ] {
+            assert!(rules.contains(placement), "{rules}");
+            assert!(rules.contains(linux_names), "{rules}");
+        }
+        for rules in [
+            sashiko::PRIOR_REVIEWS_VERIFICATION_RULES,
+            sashiko::PRIOR_LINK_POST_VERIFICATION_RULES,
+        ] {
+            assert!(rules.contains(sashiko_at), "{rules}");
+            assert!(rules.contains(sashiko_keep), "{rules}");
+            assert!(!rules.contains("Start each section"), "{rules}");
+            assert!(!rules.contains("before its"), "{rules}");
+        }
+        for (spelling, label) in [
+            ("Triggering path", CalibrationLabel::TriggeringPath),
+            ("Reachability", CalibrationLabel::Reachability),
+            ("Likelihood and preconditions", CalibrationLabel::Likelihood),
+            (
+                "Blast radius and irreversibility",
+                CalibrationLabel::BlastRadius,
+            ),
+        ] {
+            assert!(CalibrationLabel::SPELLINGS.contains(&(spelling, label)));
+        }
+        let history = "This path was reported on v2 and is unchanged.";
+        let explanation = format!(
+            "Consequence: the page leaks. Triggering path: a refill fails. {history} \
+             Reachability: any receive."
+        );
+        let split = crate::finding_view::split_severity_explanation(&explanation)
+            .expect("the explanation has labels");
+        let sections: Vec<_> = split
+            .sections
+            .iter()
+            .map(|section| (section.label, section.body.as_str()))
+            .collect();
+        assert_eq!(
+            sections,
+            [
+                (CalibrationLabel::Consequence, "the page leaks"),
+                (
+                    CalibrationLabel::TriggeringPath,
+                    "a refill fails. This path was reported on v2 and is unchanged"
+                ),
+                (CalibrationLabel::Reachability, "any receive."),
+            ]
+        );
     }
 
     /// Substitution is single-pass, so an earlier finding whose title holds
