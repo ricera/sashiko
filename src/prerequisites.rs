@@ -1292,7 +1292,8 @@ mod tests {
         };
         let db = Database::new(&settings).await?;
         // The skeleton holds what the migrations after 11 touch: migration
-        // 17 indexes patchsets.mr_url, and migration 18 adds findings.prior.
+        // 17 indexes patchsets.mr_url, migration 18 adds findings.prior, and
+        // migration 19 adds patchsets.b4_cover_letter.
         db.conn
             .execute_batch(
                 "CREATE TABLE patches (
