@@ -16,11 +16,12 @@
 //! author's text is cleaned, and the system prompt block that carries it to
 //! the stages that read the commit message.
 //!
-//! The text is written by whoever opened the pull request, so it is untrusted
-//! input. It is cleaned of characters that make it read differently on the
-//! forge than it does to the model, cut to a token budget, and every line of
-//! it is fenced behind a prefix, so nothing in it can close the block or open
-//! a section of its own.
+//! The text is written by whoever opened the pull request or pushed the b4
+//! tracker commit its range starts with, so it is untrusted input. It is
+//! cleaned of characters that make it read differently on the forge than it
+//! does to the model, cut to a token budget, and every line of it is fenced
+//! behind a prefix, so nothing in it can close the block or open a section
+//! of its own.
 
 use serde::{Deserialize, Serialize};
 
@@ -60,15 +61,30 @@ pub enum CoverLetterSource {
     /// The pull request description stored for the revision under review
     /// (`patchsets.mr_body`).
     PullRequestDescription,
+    /// The prose of the b4 tracker commit that starts the range under
+    /// review (`patchsets.b4_cover_letter`), written only when the fetcher
+    /// read an edited cover letter from it.
+    B4Tracker,
 }
 
 impl CoverLetterSource {
+    /// Every source, in the order a review takes them: the first one that
+    /// holds a cover letter is the only one the model is given. A tracker
+    /// holds a cover letter only when its author wrote one for `b4 send`,
+    /// which is the series' own statement of intent, so it goes ahead of the
+    /// pull request description.
+    pub const BY_PRECEDENCE: [CoverLetterSource; 2] = [
+        CoverLetterSource::B4Tracker,
+        CoverLetterSource::PullRequestDescription,
+    ];
+
     /// The phrase the block's source line uses for this source.
     fn description(self) -> &'static str {
         match self {
             CoverLetterSource::PullRequestDescription => {
                 "the pull request description, written by the author"
             }
+            CoverLetterSource::B4Tracker => "the cover letter of a b4-prepared series",
         }
     }
 }
@@ -80,6 +96,25 @@ impl CoverLetterSource {
 pub struct CoverLetter {
     pub source: CoverLetterSource,
     pub text: String,
+}
+
+impl CoverLetter {
+    /// The cover letter `text` gives as `source`, or `None` when the model
+    /// would read nothing of the author's in it. A description qualifies
+    /// when it is not blank once [`sanitize_author_text`] cleans it, since a
+    /// blank one renders no block. A tracker qualifies only when it holds
+    /// prose by [`crate::patch::has_b4_prose`], the rule ingestion stores
+    /// it by, so a row stored under an older rule cannot put a lone signoff
+    /// in front of the model as the series' statement of intent. Either way
+    /// a text that does not qualify leaves the model the cover letter a
+    /// later source holds.
+    pub fn from_stored(source: CoverLetterSource, text: String) -> Option<CoverLetter> {
+        let holds_text = match source {
+            CoverLetterSource::B4Tracker => crate::patch::has_b4_prose(&text),
+            CoverLetterSource::PullRequestDescription => !sanitize_author_text(&text).is_empty(),
+        };
+        holds_text.then_some(CoverLetter { source, text })
+    }
 }
 
 /// Cleans text a pull request's author wrote before a model reads it.
@@ -440,13 +475,88 @@ mod tests {
 
     #[test]
     fn a_cover_letter_crosses_the_wire_with_its_source() {
-        let cover = description("Fixes the widget.");
-        let value = serde_json::to_value(&cover).unwrap();
-        assert_eq!(
-            value,
-            serde_json::json!({"source": "pull_request_description", "text": "Fixes the widget."})
+        for (source, name) in [
+            (
+                CoverLetterSource::PullRequestDescription,
+                "pull_request_description",
+            ),
+            (CoverLetterSource::B4Tracker, "b4_tracker"),
+        ] {
+            let cover = CoverLetter {
+                source,
+                text: "Fixes the widget.".to_string(),
+            };
+            let value = serde_json::to_value(&cover).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({"source": name, "text": "Fixes the widget."})
+            );
+            assert_eq!(serde_json::from_value::<CoverLetter>(value).unwrap(), cover);
+        }
+    }
+
+    /// A b4 tracker's prose is framed as the series' own cover letter, and
+    /// the rest of the block is the one a description gets: only the source
+    /// line differs.
+    #[test]
+    fn a_b4_tracker_cover_letter_names_its_source() {
+        let text = "Fixes two port_info lifetime bugs.";
+        let tracker = cover_letter_block(Some(&CoverLetter {
+            source: CoverLetterSource::B4Tracker,
+            text: text.to_string(),
+        }));
+        assert!(
+            tracker.contains("\nSource: the cover letter of a b4-prepared series.\n"),
+            "{tracker}"
         );
-        assert_eq!(serde_json::from_value::<CoverLetter>(value).unwrap(), cover);
+        assert_eq!(
+            tracker.replace(
+                "the cover letter of a b4-prepared series",
+                "the pull request description, written by the author"
+            ),
+            cover_letter_block(Some(&description(text)))
+        );
+    }
+
+    /// A stored text is a cover letter only when something of it is left
+    /// once cleaned, whatever its source.
+    #[test]
+    fn a_text_blank_once_cleaned_is_no_cover_letter() {
+        for source in CoverLetterSource::BY_PRECEDENCE {
+            assert_eq!(
+                CoverLetter::from_stored(source, "<!-- notes -->\n\u{200B}".to_string()),
+                None,
+                "{source:?}"
+            );
+            assert_eq!(
+                CoverLetter::from_stored(source, " Fixes the widget.\n".to_string()),
+                Some(CoverLetter {
+                    source,
+                    text: " Fixes the widget.\n".to_string(),
+                }),
+                "{source:?}"
+            );
+        }
+    }
+
+    /// A stored tracker whose only text left once cleaned is trailers is no
+    /// cover letter, whatever hidden text sat beside them, while a
+    /// description holding a lone signoff is still the author's text.
+    #[test]
+    fn a_tracker_of_trailers_once_cleaned_is_no_cover_letter() {
+        for beside in ["\u{200B}", "\u{FEFF}", "\u{00AD}", "<!-- note -->"] {
+            let text = format!("Signed-off-by: A <a@x>\n{beside}\n");
+            assert_eq!(
+                CoverLetter::from_stored(CoverLetterSource::B4Tracker, text.clone()),
+                None,
+                "{text:?}"
+            );
+            assert!(
+                CoverLetter::from_stored(CoverLetterSource::PullRequestDescription, text.clone())
+                    .is_some(),
+                "{text:?}"
+            );
+        }
     }
 
     /// Every piece of quoted text a reader could take for a line of its own

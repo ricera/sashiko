@@ -206,31 +206,58 @@ fn first_patch_message_id(patches: &[Value]) -> Option<&str> {
 }
 
 /// The cover letter the model is given for a patchset, chosen from typed
-/// columns that exactly one code path writes each: a pull request
-/// description (`patchsets.mr_body`, written only when a pull request
-/// revision is queued) is the cover letter, and otherwise there is none.
+/// columns that exactly one code path writes each, in the order of
+/// [`CoverLetterSource::BY_PRECEDENCE`]: a b4 tracker's prose
+/// (`patchsets.b4_cover_letter`, written only when the fetcher reads an
+/// edited tracker at the start of a pull request or flagged range), else a
+/// pull request description (`patchsets.mr_body`, written only when a pull
+/// request revision is queued), else none. Only the first one that holds
+/// text the model would read reaches it, so a description never sits beside
+/// a tracker's cover letter, and a tracker that holds no prose once cleaned
+/// does not hide the description.
 ///
 /// No message body is read here. A message id cannot say who wrote the
 /// message: an emailed series or an injected mbox keeps its own ids, one
 /// ending in `@sashiko.local` included, so such a cover message proves
 /// nothing about where its body came from. And a mailing-list singleton's
 /// cover id is its own patch, whose email is not a statement of the
-/// series' intent. A failed read is logged and the review runs without a
-/// cover letter, since every stage can do without it.
+/// series' intent.
 async fn cover_letter_of(db: &Database, patchset_id: i64) -> Option<CoverLetter> {
-    match db.get_patchset_mr_body(patchset_id).await {
-        Ok(description) => description.map(|text| CoverLetter {
-            source: CoverLetterSource::PullRequestDescription,
-            text,
-        }),
-        Err(e) => {
-            warn!(
-                "Reviewing patchset {} without its pull request description: {}",
-                patchset_id, e
-            );
-            None
+    for source in CoverLetterSource::BY_PRECEDENCE {
+        let stored = stored_cover_letter(db, patchset_id, source).await;
+        if let Some(cover) = stored.and_then(|text| CoverLetter::from_stored(source, text)) {
+            return Some(cover);
         }
     }
+    None
+}
+
+/// The text stored for patchset `patchset_id` in the column `source` names.
+/// A failed read is logged and taken as none, so the review falls back to
+/// the next source, or runs without a cover letter, since every stage can
+/// do without it.
+async fn stored_cover_letter(
+    db: &Database,
+    patchset_id: i64,
+    source: CoverLetterSource,
+) -> Option<String> {
+    let (read, what) = match source {
+        CoverLetterSource::B4Tracker => (
+            db.get_patchset_b4_cover_letter(patchset_id).await,
+            "b4 cover letter",
+        ),
+        CoverLetterSource::PullRequestDescription => (
+            db.get_patchset_mr_body(patchset_id).await,
+            "pull request description",
+        ),
+    };
+    read.unwrap_or_else(|e| {
+        warn!(
+            "Reviewing patchset {} without its {}: {}",
+            patchset_id, what, e
+        );
+        None
+    })
 }
 
 /// The findings of the earlier revisions of the patchset's pull request,
@@ -11506,6 +11533,105 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 source: CoverLetterSource::PullRequestDescription,
                 text: "Makes the frobnicator reentrant.".to_string(),
             })
+        );
+        Ok(())
+    }
+
+    /// The system prompts of the stages that read the commit message, in
+    /// both projects, for the cover letter of the review input the daemon
+    /// builds for patchset `id`.
+    async fn cover_letter_prompts(db: &Database, id: i64) -> Result<[String; 2]> {
+        use crate::workflows::linux_patch_review::{LinuxPatchReviewState, linux_system_prompt};
+        use crate::workflows::sashiko_patch_review::sashiko_system_prompt;
+        let patches = vec![json!({"index": 1, "diff": WorkerFixture::DIFF})];
+        let payload = worker_input_payload(db, &pending_row(db, id).await?, patches).await;
+        let input: crate::worker::ReviewInput = serde_json::from_value(payload)?;
+        let state = LinuxPatchReviewState {
+            cover_letter: input.cover_letter,
+            ..Default::default()
+        };
+        Ok([
+            linux_system_prompt(true).render_for_log(&state),
+            sashiko_system_prompt(true).render_for_log(&state),
+        ])
+    }
+
+    /// A b4 tracker's cover letter, when one is stored, is the only cover
+    /// letter the model reads: the pull request description stored beside
+    /// it reaches no prompt. Without one the description is the cover
+    /// letter, and with neither there is none. A tracker that holds no
+    /// prose once cleaned, not even beside a signoff, does not hide the
+    /// description, and an unedited template,
+    /// kernel-fork#35's, stores nothing, so it leaves the description as
+    /// the cover letter.
+    #[tokio::test]
+    async fn the_tracker_cover_letter_takes_precedence() -> Result<()> {
+        let db = cover_letter_db().await?;
+        let id = queue_frob_revision(&db, &"b".repeat(40)).await?;
+        let description = "The description: makes the frobnicator reentrant.";
+        let tracker = "The tracker: fixes two frobnicator races.";
+        let reads = |prompts: &[String; 2], quoted: &str, source: &str| {
+            prompts.iter().all(|prompt| {
+                prompt.contains(&format!("\n| {quoted}\n"))
+                    && prompt.contains(&format!("\nSource: {source}.\n"))
+            })
+        };
+
+        let none = cover_letter_prompts(&db, id).await?;
+        assert!(
+            none.iter().all(|p| !p.contains("Series Cover Letter")),
+            "{none:?}"
+        );
+
+        db.set_patchset_mr_body(id, description).await?;
+        assert_eq!(
+            cover_letter_of(&db, id).await.map(|cover| cover.source),
+            Some(CoverLetterSource::PullRequestDescription)
+        );
+        let prompts = cover_letter_prompts(&db, id).await?;
+        assert!(
+            reads(
+                &prompts,
+                description,
+                "the pull request description, written by the author"
+            ),
+            "{prompts:?}"
+        );
+
+        assert_eq!(
+            crate::patch::extract_b4_cover_letter(crate::patch::KERNEL_FORK_35_TRACKER),
+            None,
+            "an unedited template gives ingestion nothing to store"
+        );
+        for hidden in [
+            "<!-- notes -->\n\u{200B}",
+            "Signed-off-by: A <a@x>\n\u{200B}",
+        ] {
+            db.set_patchset_b4_cover_letter(id, hidden).await?;
+            assert_eq!(cover_letter_prompts(&db, id).await?, prompts, "{hidden:?}");
+        }
+
+        db.set_patchset_b4_cover_letter(id, tracker).await?;
+        assert_eq!(
+            cover_letter_of(&db, id).await,
+            Some(CoverLetter {
+                source: CoverLetterSource::B4Tracker,
+                text: tracker.to_string(),
+            })
+        );
+        let prompts = cover_letter_prompts(&db, id).await?;
+        assert!(
+            reads(
+                &prompts,
+                tracker,
+                "the cover letter of a b4-prepared series"
+            ),
+            "{prompts:?}"
+        );
+        assert!(
+            prompts.iter().all(|p| !p.contains("The description")
+                && p.matches("=== Series Cover Letter ===").count() == 1),
+            "{prompts:?}"
         );
         Ok(())
     }
