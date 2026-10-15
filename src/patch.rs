@@ -565,10 +565,16 @@ pub fn extract_b4_cover_letter(message: &str) -> Option<String> {
 /// an HTML comment or an invisible character is not blank to `str::trim`
 /// yet reaches the model as nothing, so on the raw text a lone signoff
 /// beside such a line would pass for a cover letter.
-pub(crate) fn has_b4_prose(cover: &str) -> bool {
+fn has_b4_prose(cover: &str) -> bool {
     crate::cover_letter::sanitize_author_text(cover)
         .lines()
-        .any(|line| !line.trim().is_empty() && !is_trailer_line(line))
+        .any(is_b4_prose_line)
+}
+
+/// Whether a line of a cleaned b4 cover letter is prose: neither blank nor
+/// a known trailer.
+pub(crate) fn is_b4_prose_line(line: &str) -> bool {
+    !line.trim().is_empty() && !is_trailer_line(line)
 }
 
 /// Applies b4's comment rules to a cover letter: `#` lines are emptied,

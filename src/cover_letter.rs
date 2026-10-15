@@ -25,11 +25,16 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ai::truncator::Truncator;
+use crate::ai::truncator::{SequentialTruncationResult, Truncator};
 
 /// The most of a cover letter, in approximate tokens, that one prompt
 /// carries. Anything longer is cut at a line boundary with a notice.
 pub const COVER_LETTER_TOKENS: usize = 2000;
+
+/// The line that ends an author's text cut to the forge's description cap
+/// (`forge::MAX_DESCRIPTION_BYTES`) when it is stored. Sashiko writes it,
+/// not the author, so it is no prose of the author's.
+pub(crate) const DESCRIPTION_TRUNCATED: &str = "\n[truncated]";
 
 /// What every line of the author's text starts with in the block, so that no
 /// line of it can start at column 0 and pass for one of the block's own
@@ -102,19 +107,52 @@ impl CoverLetter {
     /// The cover letter `text` gives as `source`, or `None` when the model
     /// would read nothing of the author's in it. A description qualifies
     /// when it is not blank once [`sanitize_author_text`] cleans it, since a
-    /// blank one renders no block. A tracker qualifies only when it holds
-    /// prose by [`crate::patch::has_b4_prose`], the rule ingestion stores
-    /// it by, so a row stored under an older rule cannot put a lone signoff
-    /// in front of the model as the series' statement of intent. Either way
-    /// a text that does not qualify leaves the model the cover letter a
-    /// later source holds.
+    /// blank one renders no block. A tracker qualifies only when its block
+    /// quotes prose by [`shows_b4_prose`], the rule ingestion stores it by,
+    /// so a row stored under an older rule cannot put a lone signoff, or
+    /// nothing but trailers and truncation notices, in front of the model
+    /// as the series' statement of intent. Either way a text that does not
+    /// qualify leaves the model the cover letter a later source holds.
     pub fn from_stored(source: CoverLetterSource, text: String) -> Option<CoverLetter> {
         let holds_text = match source {
-            CoverLetterSource::B4Tracker => crate::patch::has_b4_prose(&text),
+            CoverLetterSource::B4Tracker => shows_b4_prose(&text),
             CoverLetterSource::PullRequestDescription => !sanitize_author_text(&text).is_empty(),
         };
         holds_text.then_some(CoverLetter { source, text })
     }
+}
+
+/// Whether the block for a b4 tracker's `text` quotes prose of the
+/// author's: a line [`crate::patch::is_b4_prose_line`] accepts among the
+/// lines [`quoted_text`] keeps, once the notice of its token cut and a last
+/// line that is [`DESCRIPTION_TRUNCATED`] are set aside.
+///
+/// The test runs on what the model reads rather than on the stored text,
+/// because cleaning and both cuts can leave prose out of the block: a text
+/// that starts with 64 KiB of zero-width characters is stored as those and
+/// the cap's `[truncated]` line, and one that starts with a few hundred
+/// `Cc:` lines quotes only those before the token cut. Such a tracker
+/// would otherwise hide the pull request description behind a block that
+/// says nothing. A last line that reads `[truncated]` is set aside even
+/// when the author wrote it, which can only refuse a tracker whose sole
+/// prose is that word.
+pub(crate) fn shows_b4_prose(text: &str) -> bool {
+    let quoted = quoted_text(text);
+    let mut lines: Vec<&str> = quoted.content.lines().collect();
+    // A cut text ends with the truncator's notice on a line of its own, and
+    // the cut always drops the stored text's last line, so the cap's marker
+    // can only be the last line of a text the token cut left whole.
+    if quoted.truncated || lines.last() == Some(&DESCRIPTION_TRUNCATED.trim_start_matches('\n')) {
+        lines.pop();
+    }
+    lines.into_iter().any(crate::patch::is_b4_prose_line)
+}
+
+/// The author's text as the block quotes it: `text` cleaned by
+/// [`sanitize_author_text`] and cut to [`COVER_LETTER_TOKENS`], ending with
+/// the cut's notice when it was cut. Blank text gives empty content.
+fn quoted_text(text: &str) -> SequentialTruncationResult {
+    Truncator::truncate_sequential(&sanitize_author_text(text), COVER_LETTER_TOKENS)
 }
 
 /// Cleans text a pull request's author wrote before a model reads it.
@@ -228,11 +266,10 @@ pub fn cover_letter_block(cover: Option<&CoverLetter>) -> String {
     let Some(cover) = cover else {
         return String::new();
     };
-    let text = sanitize_author_text(&cover.text);
+    let text = quoted_text(&cover.text).content;
     if text.is_empty() {
         return String::new();
     }
-    let text = Truncator::truncate_sequential(&text, COVER_LETTER_TOKENS).content;
     let mut block = format!(
         "\n\n{BLOCK_START}\n\
          Source: {source}.\n\
@@ -555,6 +592,100 @@ mod tests {
                 CoverLetter::from_stored(CoverLetterSource::PullRequestDescription, text.clone())
                     .is_some(),
                 "{text:?}"
+            );
+        }
+    }
+
+    /// The tracker texts ingestion stored before it judged a tracker on
+    /// what its block quotes, each holding prose the block never shows:
+    /// prose behind 64 KiB of characters the cleaning removes, so the cap
+    /// kept only those and its marker, and prose behind trailers that fill
+    /// the token budget, as whole lines or as one line wider than it.
+    fn trackers_quoting_no_prose() -> Vec<(&'static str, String)> {
+        let capped = |hidden: char| {
+            let kept = hidden.to_string().repeat(65_000 / hidden.len_utf8());
+            format!("{kept}{DESCRIPTION_TRUNCATED}")
+        };
+        vec![
+            ("zero-width spaces, then the cap", capped('\u{200B}')),
+            ("byte order marks, then the cap", capped('\u{FEFF}')),
+            ("tag characters, then the cap", capped('\u{E0041}')),
+            (
+                "Cc lines past the token budget",
+                format!("{}Real prose.", "Cc: x@y\n".repeat(1000)),
+            ),
+            (
+                "a Cc line wider than the token budget",
+                format!("Cc: {}\nReal prose.", "x".repeat(10_000)),
+            ),
+        ]
+    }
+
+    /// A stored tracker whose block would quote no prose is no cover
+    /// letter, so it leaves the model the pull request description, though
+    /// the prose it stores past what the block shows would pass a test on
+    /// the stored text.
+    #[test]
+    fn a_tracker_whose_block_quotes_no_prose_is_no_cover_letter() {
+        for (name, text) in trackers_quoting_no_prose() {
+            let block = cover_letter_block(Some(&CoverLetter {
+                source: CoverLetterSource::B4Tracker,
+                text: text.clone(),
+            }));
+            assert!(!block.contains("Real prose."), "{name}: {block}");
+            assert!(
+                CoverLetter::from_stored(CoverLetterSource::B4Tracker, text).is_none(),
+                "{name}"
+            );
+        }
+        for marker_only in [
+            DESCRIPTION_TRUNCATED.to_string(),
+            format!("Signed-off-by: A <a@x>{DESCRIPTION_TRUNCATED}"),
+        ] {
+            assert!(
+                CoverLetter::from_stored(CoverLetterSource::B4Tracker, marker_only.clone())
+                    .is_none(),
+                "{marker_only:?}"
+            );
+        }
+    }
+
+    /// A tracker counts exactly when its block quotes a prose line, on
+    /// either side of the line where the token cut falls, and prose cut by
+    /// the 64 KiB cap or by the token budget still counts.
+    #[test]
+    fn a_tracker_counts_when_its_block_quotes_prose() {
+        let mut outcomes = std::collections::HashSet::new();
+        for trailers in 700..800 {
+            let text = format!("{}Real prose.", "Cc: x@y\n".repeat(trailers));
+            let block = cover_letter_block(Some(&CoverLetter {
+                source: CoverLetterSource::B4Tracker,
+                text: text.clone(),
+            }));
+            let counted = shows_b4_prose(&text);
+            assert_eq!(
+                counted,
+                block.contains("\n| Real prose.\n"),
+                "{trailers} trailers"
+            );
+            outcomes.insert(counted);
+        }
+        assert_eq!(outcomes.len(), 2, "the range spans the token cut");
+
+        let prose_to_the_cap = format!(
+            "{}{DESCRIPTION_TRUNCATED}",
+            "Real prose.\n".repeat(65_000 / "Real prose.\n".len())
+        );
+        for text in [
+            prose_to_the_cap,
+            format!("Real prose.{DESCRIPTION_TRUNCATED}"),
+            "prose ".repeat(20_000),
+            format!("{}Real prose.", "Cc: x@y\n".repeat(10)),
+        ] {
+            assert!(
+                CoverLetter::from_stored(CoverLetterSource::B4Tracker, text.clone()).is_some(),
+                "{:?}",
+                &text[..40.min(text.len())]
             );
         }
     }
