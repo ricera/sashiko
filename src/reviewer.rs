@@ -24,6 +24,7 @@ use crate::db::{AiInteractionParams, Database, Finding, PatchsetRow, Severity};
 use crate::email_policy::EmailPolicyConfig;
 use crate::email_router::{Action as EmailAction, EmailRouter};
 use crate::git_ops::{GitWorktree, ensure_remote, get_commit_hash};
+use crate::patch::diff_is_empty;
 use crate::prerequisites::{
     PrerequisitePatch, parse_prerequisite_patch_ids, resolve_prerequisite_patches_from_lore,
 };
@@ -295,16 +296,6 @@ fn git_am_message(author: &str, date: i64, subject: &str, diff: &str) -> Result<
     Ok(format!(
         "From: {author}\nDate: {date}\nSubject: {subject}\n\n{diff}\n"
     ))
-}
-
-/// Whether a stored diff is empty, so the patch changes nothing.
-///
-/// A `b4 prep` tracker, or any `git commit --allow-empty`, is stored with
-/// an empty diff, and a clean merge with a lone newline. Every other
-/// source stores a non-empty one, so this never skips a patch that has a
-/// header `extract_files_from_diff` cannot read.
-fn diff_is_empty(diff: &str) -> bool {
-    diff.trim().is_empty()
 }
 
 /// The `Reviewer` service orchestrates the review process for patchsets.
@@ -6741,26 +6732,6 @@ fi
         assert_eq!(row.get::<Option<i64>>(2)?, None);
         assert!(rows.next().await?.is_none(), "no second row is created");
         Ok(())
-    }
-
-    #[test]
-    fn diff_is_empty_holds_only_for_a_diff_that_changes_nothing() {
-        for empty in ["", "\n", "\n\n"] {
-            assert!(diff_is_empty(empty), "{empty:?} changes nothing");
-        }
-        let changes = [
-            "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
-            // A C-quoted non-ASCII path, which extract_files_from_diff
-            // cannot read.
-            "diff --git \"a/\\303\\251.c\" \"b/\\303\\251.c\"\nindex 1..2 100644\n@@ -1 +1 @@\n-a\n+b\n",
-            // A merge that resolved a conflict.
-            "diff --cc file\nindex 1,2..3\n@@@ -1,1 -1,1 +1,1 @@@\n- a\n -b\n++c\n",
-            // A plain unified diff with no git header.
-            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
-        ];
-        for diff in changes {
-            assert!(!diff_is_empty(diff), "{diff:?} changes a file");
-        }
     }
 
     /// The premise of the empty-diff skip for git-sourced patches: the
