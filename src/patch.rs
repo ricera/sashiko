@@ -555,10 +555,20 @@ pub fn extract_b4_cover_letter(message: &str) -> Option<String> {
         .split_once(B4_TRACKING_MARKER)
         .map_or(message, |(cover, _)| cover);
     let cover = strip_b4_comments(above_marker);
-    let has_prose = cover
+    has_b4_prose(&cover).then(|| cover.trim().to_string())
+}
+
+/// Whether a b4 cover letter holds prose: a line that is neither blank nor
+/// a known trailer once the text is cleaned by
+/// [`crate::cover_letter::sanitize_author_text`], as the cover-letter block
+/// cleans it. The test runs on the cleaned text because a line holding only
+/// an HTML comment or an invisible character is not blank to `str::trim`
+/// yet reaches the model as nothing, so on the raw text a lone signoff
+/// beside such a line would pass for a cover letter.
+pub(crate) fn has_b4_prose(cover: &str) -> bool {
+    crate::cover_letter::sanitize_author_text(cover)
         .lines()
-        .any(|line| !line.trim().is_empty() && !is_trailer_line(line));
-    has_prose.then(|| cover.trim().to_string())
+        .any(|line| !line.trim().is_empty() && !is_trailer_line(line))
 }
 
 /// Applies b4's comment rules to a cover letter: `#` lines are emptied,
@@ -1210,6 +1220,19 @@ diff --git a/file.c b/file.c";
         assert_eq!(extract_b4_cover_letter(trailers), None);
         assert_eq!(extract_b4_cover_letter(""), None);
         assert_eq!(extract_b4_cover_letter("\n\n  \n"), None);
+    }
+
+    /// A tracker whose only text besides its trailers is an HTML comment
+    /// or an invisible character stores nothing, since the model would
+    /// read nothing of it but the trailers.
+    #[test]
+    fn b4_trailers_beside_hidden_text_are_no_cover_letter() {
+        for hidden in ["\u{200B}", "\u{FEFF}", "\u{00AD}", "<!-- x -->"] {
+            let message = edited_b4_tracker(hidden);
+            assert_eq!(extract_b4_cover_letter(&message), None, "{hidden:?}");
+        }
+        let message = edited_b4_tracker("Fixes\u{200B} the <!-- x -->widget.");
+        assert!(extract_b4_cover_letter(&message).is_some());
     }
 
     #[test]

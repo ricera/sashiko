@@ -105,7 +105,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `reviewer.rs`: Logic for reviewing patches.
 - `local_review.rs`: Logic for `sashiko-cli local` executing reviews locally.
 - `finding_view.rs`: Typed one-line view of a review finding (severity, title, tags, location), shared by both CLIs.
-- `cover_letter.rs`: A series cover letter (a pull request's description), how its untrusted text is cleaned, and the prompt block that carries it.
+- `cover_letter.rs`: A series cover letter (a b4 tracker's prose or a pull request's description), the order its sources are taken in, how its untrusted text is cleaned, and the prompt block that carries it.
 - `prior_revisions.rs`: The findings of a pull request's earlier revisions, cut down to the summaries the daemon sends a later revision's review, the prompt block that shows them to verification, and the block that gives the report the ones its findings link to.
 - `git_ops.rs`: Git operations wrapper.
 - `nntp.rs`: NNTP protocol handling.

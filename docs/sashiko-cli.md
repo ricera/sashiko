@@ -94,9 +94,13 @@ its first commit changes no files, the daemon reads that commit's message
 as such a tracker, marker or not, and stores the cover letter `b4 send`
 would send with the series: the text above the marker, without b4's `#`
 lines and with a `>#` header turned back into `#`, cut to 64 KiB. A message
-holding nothing but trailers, such as an unedited b4 template, stores
-nothing. The commit's subject is not part of it. The tracker commit stays
-part 1 of the series and is skipped, since it changes no files. A pull
+holding nothing but trailers once HTML comments and invisible characters
+are removed, such as an unedited b4 template, stores nothing. The commit's
+subject is not part of it. A stored cover letter that still holds prose
+once cleaned is the one the model is given, under the source line `the
+cover letter of a b4-prepared series`, and a pull request's description
+then does not reach the model. The tracker commit stays part 1 of the
+series and is skipped, since it changes no files. A pull
 request's tracker is read without the flag, when its first commit is empty
 and holds the marker, so the flag is refused with a pull request reference,
 and with anything that is not a two-dot range. A three-dot range

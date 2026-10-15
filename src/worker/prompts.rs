@@ -1912,8 +1912,8 @@ mod tests {
     }
 
     /// The cover letter the daemon puts in the payload reaches the system
-    /// prompt the review opens with; a malformed one is dropped and the
-    /// review runs as it would without one.
+    /// prompt the review opens with, under the source it names; a malformed
+    /// one is dropped and the review runs as it would without one.
     #[tokio::test]
     async fn the_worker_gives_the_payload_cover_letter_to_the_stages() {
         async fn system_prompt_for(cover_letter: Value) -> String {
@@ -1961,6 +1961,17 @@ mod tests {
         .await;
         assert!(with.contains("=== Series Cover Letter ==="), "{with}");
         assert!(with.contains("\n| Makes x reentrant.\n"), "{with}");
+
+        let tracker = system_prompt_for(serde_json::json!({
+            "source": "b4_tracker",
+            "text": "Makes x reentrant.",
+        }))
+        .await;
+        assert!(
+            tracker.contains("\nSource: the cover letter of a b4-prepared series.\n"),
+            "{tracker}"
+        );
+        assert!(tracker.contains("\n| Makes x reentrant.\n"), "{tracker}");
 
         for absent in [
             Value::Null,

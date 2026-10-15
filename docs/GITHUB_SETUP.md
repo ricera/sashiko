@@ -375,7 +375,9 @@ it was queued with is linked by its stored slug instead.
 ## What the Model Is Told About a Pull Request's Description
 
 A pull request's description is where its author says what the change is
-for, so the review gives it to the model as the series cover letter.
+for, so the review gives it to the model as the series cover letter,
+unless the pull request's first commit is a b4 tracker with an edited
+cover letter (see below).
 
 ### Which description a review gets
 
@@ -404,6 +406,16 @@ Each revision of a pull request stores a description of its own:
   way to stop a later rerun of the same head from reading the old text.
 - A description over 64 KiB is stored cut, ending in `[truncated]`. The
   model reads at most about 2000 tokens of it.
+
+A pull request whose first commit is a `b4 prep` tracker, an empty commit
+holding a `--- b4-submit-tracking ---` line, with an edited cover letter is
+reviewed with that cover letter instead. The model reads the tracker's
+prose, cleaned and framed as below with the source line `the cover letter
+of a b4-prepared series`, and not the description, which is still stored.
+A tracker that holds nothing but b4's template and trailers once HTML
+comments and invisible characters are removed leaves the description as
+the cover letter (see the b4 cover letters note in
+[sashiko-cli.md](sashiko-cli.md)).
 
 A GitLab merge request's description (`object_attributes.description`) is
 stored and shown the same way. A series that arrives by email gets no
@@ -792,7 +804,8 @@ pushed), `ready_for_review` (a draft marked ready). Every other action is
 acknowledged and skipped.
 
 `body` is the pull request's description, which the review gives the
-model as the series cover letter (see
+model as the series cover letter unless the first commit is a b4 tracker
+with an edited cover letter (see
 [What the Model Is Told About a Pull Request's Description](#what-the-model-is-told-about-a-pull-requests-description)).
 
 `html_url` ties the revisions of one pull request together: the review of
