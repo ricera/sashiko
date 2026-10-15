@@ -135,6 +135,13 @@ enum Commands {
         /// Only review patches matching subject pattern (with wildcards, e.g. *PRODKERNEL*)
         #[arg(long, value_name = "PATTERN")]
         only_subject: Option<Vec<String>>,
+
+        /// Read the range's first commit, if it changes no files, as a b4
+        /// prep tracker and keep its prose as the series cover letter. The
+        /// commit stays part 1 and is not reviewed. Needs a range
+        /// (base..head); a pull request's tracker is read without it.
+        #[arg(long)]
+        b4_cover_letter: bool,
     },
     /// Show server status and statistics
     Status,
@@ -483,6 +490,7 @@ async fn run_command(
             baseline,
             skip_subject,
             only_subject,
+            b4_cover_letter,
         } => {
             handle_submit(
                 client,
@@ -493,6 +501,7 @@ async fn run_command(
                 baseline,
                 skip_subject,
                 only_subject,
+                b4_cover_letter,
                 format,
             )
             .await
@@ -804,6 +813,7 @@ async fn handle_submit(
     baseline: Option<String>,
     skip_subjects: Option<Vec<String>>,
     only_subjects: Option<Vec<String>>,
+    b4_cover_letter: bool,
     format: OutputFormat,
 ) -> Result<()> {
     if let Some(reference) = submitted_pull_request(input.as_deref(), explicit_type) {
@@ -813,6 +823,9 @@ async fn handle_submit(
             skip_subject: skip_subjects.is_some(),
             only_subject: only_subjects.is_some(),
         })?;
+        if b4_cover_letter {
+            refuse_misplaced_b4_flag(B4FlagTarget::PullRequest)?;
+        }
         let request = reference.into_request(PrReviewMode::ReviewHead);
         return handle_pr_review(client, base_url, &request, format).await;
     }
@@ -860,6 +873,10 @@ async fn handle_submit(
         }
     };
 
+    if b4_cover_letter {
+        refuse_misplaced_b4_flag(B4FlagTarget::Submission(submission_type, &target))?;
+    }
+
     let payload = match submission_type {
         SubmitType::Mbox => {
             let content = if target == "-" {
@@ -887,6 +904,7 @@ async fn handle_submit(
                 repo: repo_path,
                 skip_subjects: skip_subjects.clone(),
                 only_subjects: only_subjects.clone(),
+                b4_cover_letter,
             }
         }
         SubmitType::Range => {
@@ -897,6 +915,7 @@ async fn handle_submit(
                 repo: repo_path,
                 skip_subjects: skip_subjects.clone(),
                 only_subjects: only_subjects.clone(),
+                b4_cover_letter,
             }
         }
         SubmitType::Thread => SubmitRequest::Thread { msgid: target },
@@ -2719,6 +2738,39 @@ fn refuse_series_options(options: &SeriesOptions) -> Result<()> {
     )
 }
 
+/// Where `submit --b4-cover-letter` was pointed.
+#[derive(Clone, Copy)]
+enum B4FlagTarget<'a> {
+    /// A pull request reference, reviewed through the daemon's route.
+    PullRequest,
+    /// Anything else, as submit detected or was told its type.
+    Submission(SubmitType, &'a str),
+}
+
+/// Refuses --b4-cover-letter where the daemon would ignore it. It reads a
+/// b4 tracker only as the first commit of a two-dot range of two or more
+/// commits, and a pull request's without being asked, by b4's tracking
+/// marker, so for anything else the flag would be accepted and silently do
+/// nothing. A three-dot range is refused because it lists both sides'
+/// commits by date, so its first commit need not be the branch's tracker.
+fn refuse_misplaced_b4_flag(target: B4FlagTarget) -> Result<()> {
+    match target {
+        B4FlagTarget::PullRequest => anyhow::bail!(
+            "--b4-cover-letter cannot be used with a pull request: the daemon reads a pull \
+             request's b4 tracker commit without it, by b4's tracking marker"
+        ),
+        B4FlagTarget::Submission(SubmitType::Remote | SubmitType::Range, target)
+            if target.contains("..") && !target.contains("...") =>
+        {
+            Ok(())
+        }
+        B4FlagTarget::Submission(..) => anyhow::bail!(
+            "--b4-cover-letter needs a two-dot commit range (base..head): the daemon reads \
+             only the first commit of such a range as a b4 tracker"
+        ),
+    }
+}
+
 /// The longest line of the daemon's reply printed for a pull request
 /// request. Its messages are well under it; the cap only bounds a reply
 /// that is not one of them.
@@ -2868,12 +2920,14 @@ async fn handle_local(
                     repo: repo_str,
                     skip_subjects: None,
                     only_subjects: None,
+                    b4_cover_letter: false,
                 },
                 _ => SubmitRequest::Remote {
                     sha: input.clone(),
                     repo: repo_str,
                     skip_subjects: None,
                     only_subjects: None,
+                    b4_cover_letter: false,
                 },
             };
 
@@ -4103,6 +4157,56 @@ mod tests {
             err.starts_with("--repo, --only-subject cannot be used with a pull request"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn submit_takes_the_b4_flag() {
+        let flag_of = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["sashiko-cli", "submit"].iter().chain(args)).unwrap();
+            match cli.command {
+                Commands::Submit {
+                    b4_cover_letter, ..
+                } => b4_cover_letter,
+                _ => panic!("{args:?} is not submit"),
+            }
+        };
+        assert!(flag_of(&["--b4-cover-letter", "HEAD~3..HEAD"]));
+        assert!(!flag_of(&["HEAD~3..HEAD"]));
+    }
+
+    /// The flag is taken only where the daemon reads a tracker by it: a
+    /// range, however its type was found. Anywhere else it would be sent
+    /// and silently do nothing, and a pull request's tracker is read by its
+    /// marker without it.
+    #[test]
+    fn the_b4_flag_is_refused_where_the_daemon_would_ignore_it() {
+        use B4FlagTarget::*;
+        for taken in [
+            Submission(SubmitType::Range, "v6.1..HEAD"),
+            Submission(SubmitType::Remote, "base..head"),
+        ] {
+            assert!(refuse_misplaced_b4_flag(taken).is_ok());
+        }
+        let err = refuse_misplaced_b4_flag(PullRequest)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("--b4-cover-letter cannot be used with a pull request"),
+            "{err}"
+        );
+        for refused in [
+            Submission(SubmitType::Remote, "HEAD"),
+            Submission(SubmitType::Remote, "base...head"),
+            Submission(SubmitType::Range, "v6.12...my-series"),
+            Submission(SubmitType::Mbox, "../series.mbox"),
+            Submission(SubmitType::Thread, "a..b@example.org"),
+        ] {
+            let err = refuse_misplaced_b4_flag(refused).unwrap_err().to_string();
+            assert!(
+                err.starts_with("--b4-cover-letter needs a two-dot commit range"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

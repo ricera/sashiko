@@ -85,12 +85,34 @@ forge.github_repository to review a pull request by number`.
 | `--baseline <REF>` | Baseline commit for mbox injection. |
 | `--skip-subject <PATTERN>` | Skip patches matching subject pattern (supports wildcards, e.g. `mm:*`). May be specified multiple times. |
 | `--only-subject <PATTERN>` | Only review patches matching subject pattern. May be specified multiple times. |
+| `--b4-cover-letter` | Read the range's first commit as a `b4 prep` cover letter (see below). Needs a two-dot range (`base..head`). |
+
+**b4 cover letters:** a `b4 prep` branch starts with an empty commit whose
+message holds the series cover letter above a `--- b4-submit-tracking ---`
+line. With `--b4-cover-letter`, when the range has two or more commits and
+its first commit changes no files, the daemon reads that commit's message
+as such a tracker, marker or not, and stores the cover letter `b4 send`
+would send with the series: the text above the marker, without b4's `#`
+lines and with a `>#` header turned back into `#`, cut to 64 KiB. A message
+holding nothing but trailers, such as an unedited b4 template, stores
+nothing. The commit's subject is not part of it. The tracker commit stays
+part 1 of the series and is skipped, since it changes no files. A pull
+request's tracker is read without the flag, when its first commit is empty
+and holds the marker, so the flag is refused with a pull request reference,
+and with anything that is not a two-dot range. A three-dot range
+(`base...head`) is refused too: it lists the commits of both sides by date,
+so its first commit need not be the branch's tracker. A range the daemon
+already has queued or reviewed is not fetched again, so give the flag the
+first time the range is submitted.
 
 **Examples:**
 
 ```bash
 # Review the last 3 commits
 sashiko-cli submit HEAD~3..HEAD
+
+# Review a b4 prep branch, reading its tracker commit's cover letter
+sashiko-cli submit --b4-cover-letter v6.12..my-series
 
 # Review a specific commit
 sashiko-cli submit abc1234

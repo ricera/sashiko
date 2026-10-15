@@ -14,6 +14,7 @@
 
 use crate::activity::{ActivityKey, ActivityRegistry, Phase};
 use crate::events::{Event, MessageSource};
+use crate::patch::{B4_TRACKING_MARKER, diff_is_empty, extract_b4_cover_letter};
 use crate::utils::redact_secret;
 use anyhow::{Result, anyhow};
 use std::collections::{HashMap, HashSet};
@@ -170,6 +171,64 @@ pub struct FetchRequest {
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
+    /// Whether the submitter asked for an empty first commit of the
+    /// two-dot range to be read as a b4 tracker even without b4's marker.
+    /// A pull request leaves it false: its tracker is recognised by the
+    /// marker, and the flag never relaxes that.
+    pub b4_cover_letter: bool,
+}
+
+/// Which first commit of a range the fetcher reads as a `b4 prep` tracker,
+/// whose prose then travels as the series' b4 cover letter.
+///
+/// The tracker is still submitted as part 1 like any commit; the rule only
+/// decides whether its message is also read as a cover letter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackerRule {
+    /// No commit is read: a single commit, a later part of a range, or a
+    /// plain range submitted without the flag.
+    Ignore,
+    /// A pull request's first commit, read when it changes nothing and its
+    /// message holds [`B4_TRACKING_MARKER`], which is how a pushed `b4
+    /// prep` branch looks. Nobody opts in, so the marker is required.
+    Marked,
+    /// A flagged range's first commit, read when it changes nothing. The
+    /// operator vouches that the range is a b4 branch, so the marker is not
+    /// required.
+    Flagged,
+}
+
+impl TrackerRule {
+    /// The rule for the first commit of a range of `count` commits. A
+    /// range of one has no series for a tracker to describe, and its only
+    /// commit is the one under review. A pull request's tracker always
+    /// needs the marker, even when a flagged plain range with the same
+    /// `base..head` shares its batch, because the flag vouches only for
+    /// the range its submitter sent.
+    fn for_range(count: usize, flagged: bool, mr_number: Option<i64>) -> Self {
+        match (count > 1, flagged, mr_number) {
+            (false, _, _) => Self::Ignore,
+            (true, _, Some(_)) => Self::Marked,
+            (true, true, None) => Self::Flagged,
+            (true, false, None) => Self::Ignore,
+        }
+    }
+
+    /// The cover letter a commit with `message` (without its subject) and
+    /// `diff` carries under this rule: `None` when the rule does not read
+    /// the commit or its message holds no prose. The prose is cut to the
+    /// description's cap, because a commit message is unbounded.
+    fn cover_letter(self, message: &str, diff: &str) -> Option<String> {
+        let read = match self {
+            Self::Ignore => false,
+            Self::Marked => diff_is_empty(diff) && message.contains(B4_TRACKING_MARKER),
+            Self::Flagged => diff_is_empty(diff),
+        };
+        if !read {
+            return None;
+        }
+        extract_b4_cover_letter(message).and_then(|prose| crate::forge::bounded_author_text(&prose))
+    }
 }
 
 pub struct FetchAgent {
@@ -216,6 +275,42 @@ impl Drop for BatchMarks<'_> {
         for commit in &self.commits {
             self.activity.clear(&ActivityKey::Commit(commit.clone()));
         }
+    }
+}
+
+/// The requests waiting for the next tick, grouped by repository.
+///
+/// A b4 flag lives here beside its range rather than on the agent, so it
+/// belongs to one repository's batch and is gone once that batch runs:
+/// a later request for the same `base..head`, a pull request's included,
+/// never inherits it.
+#[derive(Default)]
+struct PendingFetches {
+    /// Each repository's requested commits and ranges.
+    commits: HashMap<Option<String>, HashSet<String>>,
+    /// Each repository's requested ranges whose submitter asked for a b4
+    /// tracker to be read without b4's marker
+    /// (`FetchRequest::b4_cover_letter`).
+    b4_flagged: HashMap<Option<String>, HashSet<String>>,
+}
+
+impl PendingFetches {
+    /// Queues `req` for its repository's next batch.
+    fn add(&mut self, req: FetchRequest) {
+        if req.b4_cover_letter {
+            self.b4_flagged
+                .entry(req.repo_url.clone())
+                .or_default()
+                .insert(req.commit_hash.clone());
+        }
+        self.commits
+            .entry(req.repo_url)
+            .or_default()
+            .insert(req.commit_hash);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.commits.is_empty()
     }
 }
 
@@ -391,50 +486,67 @@ impl FetchAgent {
 
     pub async fn run(mut self) {
         info!("FetchAgent started");
-        let mut queue: HashMap<Option<String>, HashSet<String>> = HashMap::new();
+        let mut pending = PendingFetches::default();
         let mut ticker = interval(Duration::from_secs(10));
 
         loop {
             tokio::select! {
                 Some(req) = self.rx.recv() => {
-                    if req.mr_url.is_some() || req.mr_title.is_some() || req.mr_number.is_some() {
-                        self.mr_metadata.insert(
-                            req.commit_hash.clone(),
-                            (req.mr_url.clone(), req.mr_title.clone(), req.mr_number)
-                        );
-                    }
+                    self.remember(&req);
                     // Batched on a ten-second tick, so a request can wait
                     // that long before anything happens to it.
                     self.activity
                         .update(ActivityKey::Commit(req.commit_hash.clone()), Phase::Queued);
-                    queue.entry(req.repo_url)
-                        .or_default()
-                        .insert(req.commit_hash);
+                    pending.add(req);
                 }
                 _ = ticker.tick() => {
-                    if !queue.is_empty() {
-                        self.process_queue(&mut queue).await;
+                    if !pending.is_empty() {
+                        self.process_queue(&mut pending).await;
                     }
                 }
             }
         }
     }
 
-    async fn process_queue(&self, queue: &mut HashMap<Option<String>, HashSet<String>>) {
-        info!("Processing fetch queue with {} repos", queue.len());
+    /// Records the forge fields a request carries for its commit or range,
+    /// which the batch it joins reads when it submits it.
+    fn remember(&mut self, req: &FetchRequest) {
+        if req.mr_url.is_some() || req.mr_title.is_some() || req.mr_number.is_some() {
+            self.mr_metadata.insert(
+                req.commit_hash.clone(),
+                (req.mr_url.clone(), req.mr_title.clone(), req.mr_number),
+            );
+        }
+    }
 
-        for (url_opt, commits) in queue.drain() {
+    /// Runs every pending batch, one per repository, and leaves nothing
+    /// pending, b4 flags included.
+    async fn process_queue(&self, pending: &mut PendingFetches) {
+        info!(
+            "Processing fetch queue with {} repos",
+            pending.commits.len()
+        );
+        let mut b4_flagged = std::mem::take(&mut pending.b4_flagged);
+
+        for (url_opt, commits) in pending.commits.drain() {
             if commits.is_empty() {
                 continue;
             }
-            self.process_batch(url_opt.as_deref(), commits.into_iter().collect())
+            let flagged = b4_flagged.remove(&url_opt).unwrap_or_default();
+            self.process_batch(url_opt.as_deref(), commits.into_iter().collect(), &flagged)
                 .await;
         }
     }
 
     /// Fetches what one repository's batch is missing, then submits every
-    /// request that can still be served.
-    async fn process_batch(&self, url_opt: Option<&str>, commit_list: Vec<String>) {
+    /// request that can still be served. `b4_flagged` holds the batch's
+    /// ranges whose submitter asked for their tracker to be read.
+    async fn process_batch(
+        &self,
+        url_opt: Option<&str>,
+        commit_list: Vec<String>,
+        b4_flagged: &HashSet<String>,
+    ) {
         let marks = BatchMarks {
             activity: &self.activity,
             commits: commit_list.clone(),
@@ -473,7 +585,8 @@ impl FetchAgent {
         });
         for request in requests {
             if request.commit_or_range.contains("..") {
-                self.submit_range(&request.commit_or_range).await;
+                let flagged = b4_flagged.contains(&request.commit_or_range);
+                self.submit_range(&request.commit_or_range, flagged).await;
             } else {
                 self.submit_commit(&request.commit_or_range).await;
             }
@@ -782,8 +895,9 @@ impl FetchAgent {
         }
     }
 
-    /// Submits every commit of a `base..head` range as one series.
-    async fn submit_range(&self, range: &str) {
+    /// Submits every commit of a `base..head` range as one series, reading
+    /// a `b4_flagged` two-dot range's empty first commit as its tracker.
+    async fn submit_range(&self, range: &str, b4_flagged: bool) {
         let shas = match crate::git_ops::resolve_git_range(&self.repo_path, range).await {
             Ok(shas) => shas,
             Err(e) => {
@@ -795,8 +909,19 @@ impl FetchAgent {
         let count = shas.len() as u32;
         let (mr_url, mr_title, mr_number) = self.mr_fields(range);
         let article_id = self.request_article_id(range);
+        // A symmetric difference lists both sides' commits by date, so its
+        // first commit can be the other side's and is never a tracker.
+        let flagged = b4_flagged && !range.contains("...");
+        let first_commit = TrackerRule::for_range(shas.len(), flagged, mr_number);
 
         for (i, sha) in shas.iter().enumerate() {
+            // Only the first commit can be a tracker; it keeps part 1, so a
+            // pull request's part numbers stay its commits' positions.
+            let tracker = if i == 0 {
+                first_commit
+            } else {
+                TrackerRule::Ignore
+            };
             match self
                 .extract_patch(
                     sha,
@@ -806,6 +931,7 @@ impl FetchAgent {
                     mr_url.as_ref(),
                     mr_title.as_ref(),
                     mr_number,
+                    tracker,
                 )
                 .await
             {
@@ -847,6 +973,7 @@ impl FetchAgent {
                 mr_url.as_ref(),
                 mr_title.as_ref(),
                 mr_number,
+                TrackerRule::Ignore,
             )
             .await
         {
@@ -1149,8 +1276,10 @@ impl FetchAgent {
         mr_url: Option<&String>,
         mr_title: Option<&String>,
         mr_number: Option<i64>,
+        tracker: TrackerRule,
     ) -> Result<Event> {
         let meta = crate::git_ops::extract_patch_metadata(&self.repo_path, commit).await?;
+        let b4_cover_letter = tracker.cover_letter(&meta.message, &meta.diff);
 
         Ok(Event::PatchSubmitted {
             group: "git-fetch".to_string(),
@@ -1167,6 +1296,7 @@ impl FetchAgent {
             mr_url: mr_url.cloned(),
             mr_title: mr_title.cloned(),
             mr_number,
+            b4_cover_letter,
         })
     }
 }
@@ -1233,12 +1363,12 @@ mod tests {
         url: &str,
         requests: &[&str],
     ) -> Vec<Event> {
-        let mut queue = HashMap::new();
-        queue.insert(
+        let mut pending = PendingFetches::default();
+        pending.commits.insert(
             Some(url.to_string()),
             requests.iter().map(|r| r.to_string()).collect(),
         );
-        agent.process_queue(&mut queue).await;
+        agent.process_queue(&mut pending).await;
         drain(rx)
     }
 
@@ -1301,7 +1431,7 @@ mod tests {
         let (agent, _) = FetchAgent::new(repo_path.clone(), tx, None, ActivityRegistry::new());
 
         let event = agent
-            .extract_patch(&head, &head, 1, 1, None, None, None)
+            .extract_patch(&head, &head, 1, 1, None, None, None, TrackerRule::Ignore)
             .await?;
 
         match event {
@@ -2159,7 +2289,9 @@ mod tests {
             }
 
             let url = forge.to_string_lossy().to_string();
-            agent.process_batch(Some(&url), batch).await;
+            agent
+                .process_batch(Some(&url), batch, &HashSet::new())
+                .await;
             let events = drain(&mut rx);
 
             assert_eq!(submitted_ids(&events), [format!("mr-7-{}", newer)]);
@@ -2253,5 +2385,339 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    /// The subject b4 gives a tracker commit; the fetcher reads only the
+    /// message below it.
+    const TRACKER_SUBJECT: &str = "EDITME: cover title for example-series-v2";
+
+    /// What one submitted part of a range carried: its part index, the
+    /// series' count, whether its diff is empty (which is what makes step 3b
+    /// skip it), and its b4 cover letter.
+    type SubmittedPart = (u32, u32, bool, Option<String>);
+
+    /// A repository with a base commit, then a first commit whose message is
+    /// `TRACKER_SUBJECT` above `first_body` and which changes a file only
+    /// when `first_changes`, then a commit that changes a file. Returns the
+    /// agent on it, its receiver and the range from the base to the last
+    /// commit.
+    async fn agent_with_series(
+        dir: &std::path::Path,
+        first_body: &str,
+        first_changes: bool,
+    ) -> Result<(FetchAgent, mpsc::Receiver<Event>, String)> {
+        let base = init_repo_with_commit(dir).await?;
+        let message = format!("{TRACKER_SUBJECT}\n\n{first_body}");
+        if first_changes {
+            std::fs::write(dir.join("first.txt"), "first\n")?;
+            git_in(dir, &["add", "first.txt"]).await?;
+        }
+        // Verbatim, so git keeps b4's # lines as b4 prep writes them.
+        git_in(
+            dir,
+            &[
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--cleanup=verbatim",
+                "-m",
+                &message,
+            ],
+        )
+        .await?;
+        let head = commit_file(dir, "change.txt", "net: fix the widget").await?;
+        let (tx, rx) = mpsc::channel(16);
+        let (agent, _) = FetchAgent::new(dir.to_path_buf(), tx, None, ActivityRegistry::new());
+        Ok((agent, rx, format!("{base}..{head}")))
+    }
+
+    /// The request for `range`: a pull request's when `mr_number` is set,
+    /// with no flag, as both the webhook and the by-number route send it;
+    /// otherwise a plain range, flagged as `flagged` says.
+    fn range_request(range: &str, mr_number: Option<i64>, flagged: bool) -> FetchRequest {
+        FetchRequest {
+            repo_url: None,
+            commit_hash: range.to_string(),
+            mr_url: mr_number.map(|n| format!("https://github.com/acme/widget/pull/{n}")),
+            mr_title: mr_number.map(|_| "Fix the widget".to_string()),
+            mr_number,
+            b4_cover_letter: flagged,
+        }
+    }
+
+    /// Records and queues `request` as the run loop does, runs the queue,
+    /// and returns what each part carried, in order.
+    async fn submitted_parts(
+        agent: &mut FetchAgent,
+        rx: &mut mpsc::Receiver<Event>,
+        request: &FetchRequest,
+    ) -> Vec<SubmittedPart> {
+        agent.remember(request);
+        let mut pending = PendingFetches::default();
+        pending.add(request.clone());
+        agent.process_queue(&mut pending).await;
+        drain(rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::PatchSubmitted {
+                    index,
+                    total,
+                    diff,
+                    b4_cover_letter,
+                    ..
+                } => Some((index, total, diff_is_empty(&diff), b4_cover_letter)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The parts of a two-commit range whose first commit is empty and
+    /// carries `cover_letter`: the tracker stays part 1 of 2 with its empty
+    /// diff, and the commit after it carries none.
+    fn tracker_then_change(cover_letter: Option<&str>) -> Vec<SubmittedPart> {
+        vec![
+            (1, 2, true, cover_letter.map(str::to_string)),
+            (2, 2, false, None),
+        ]
+    }
+
+    /// An edited tracker of a pull request, requested as both PR paths
+    /// request it, has its prose read onto part 1, which stays part 1 of the
+    /// count with the empty diff step 3b skips.
+    #[tokio::test]
+    async fn a_pull_request_tracker_is_read_as_the_cover_letter() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let edited = crate::patch::edited_b4_tracker("Fixes two port_info lifetime bugs in ionic.");
+        let (mut agent, mut rx, range) = agent_with_series(dir.path(), &edited, false).await?;
+
+        let parts =
+            submitted_parts(&mut agent, &mut rx, &range_request(&range, Some(35), false)).await;
+
+        assert_eq!(
+            parts,
+            tracker_then_change(Some(
+                "Fixes two port_info lifetime bugs in ionic.\n\n\
+                 Signed-off-by: Eric Joyner <eric.joyner@amd.com>"
+            ))
+        );
+        Ok(())
+    }
+
+    /// The tracker of kernel-fork#35 is b4's unedited template, so a pull
+    /// request carrying it gets no b4 cover letter and the same parts.
+    #[tokio::test]
+    async fn an_unedited_pull_request_tracker_stores_nothing() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (mut agent, mut rx, range) =
+            agent_with_series(dir.path(), crate::patch::KERNEL_FORK_35_TRACKER, false).await?;
+
+        let parts =
+            submitted_parts(&mut agent, &mut rx, &range_request(&range, Some(35), false)).await;
+
+        assert_eq!(parts, tracker_then_change(None));
+        Ok(())
+    }
+
+    /// A pull request's empty first commit without b4's marker is an
+    /// ordinary empty commit: nobody asked for it to be read, and its
+    /// message is not a cover letter.
+    #[tokio::test]
+    async fn an_empty_first_commit_without_the_marker_is_not_a_pr_tracker() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let body = "Placeholder so the branch has a commit to rebase onto.";
+        let (mut agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
+
+        let parts =
+            submitted_parts(&mut agent, &mut rx, &range_request(&range, Some(35), false)).await;
+
+        assert_eq!(parts, tracker_then_change(None));
+        Ok(())
+    }
+
+    /// A plain range is read only when its submitter flagged it, and then
+    /// its empty first commit is read even without b4's marker.
+    #[tokio::test]
+    async fn a_plain_range_is_read_only_on_request() -> Result<()> {
+        let body = "Fixes two port_info lifetime bugs in ionic.";
+        for (flagged, expected) in [(false, None), (true, Some(body))] {
+            let dir = tempfile::tempdir()?;
+            let (mut agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
+
+            let parts =
+                submitted_parts(&mut agent, &mut rx, &range_request(&range, None, flagged)).await;
+
+            assert_eq!(parts, tracker_then_change(expected), "flagged {flagged}");
+        }
+        Ok(())
+    }
+
+    /// A flagged three-dot range is never read: its commits come from both
+    /// sides, so its first one need not be the branch's tracker. Here the
+    /// base is an ancestor, so the range lists the same commits as its
+    /// two-dot form, which is read.
+    #[tokio::test]
+    async fn a_flagged_symmetric_range_is_not_read() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let body = "Fixes two port_info lifetime bugs in ionic.";
+        let (mut agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
+        let symmetric = range.replacen("..", "...", 1);
+
+        let parts =
+            submitted_parts(&mut agent, &mut rx, &range_request(&symmetric, None, true)).await;
+
+        assert_eq!(parts, tracker_then_change(None));
+        Ok(())
+    }
+
+    /// No rule reads a first commit that changes a file, however its
+    /// message reads, or the only commit of a range of one, even an empty
+    /// tracker.
+    #[tokio::test]
+    async fn a_tracker_is_never_read_from_a_commit_with_a_diff_or_a_lone_commit() -> Result<()> {
+        let edited = crate::patch::edited_b4_tracker("Fixes two port_info lifetime bugs in ionic.");
+        for (mr_number, flagged) in [(Some(35), false), (None, true)] {
+            let dir = tempfile::tempdir()?;
+            let (mut agent, mut rx, range) = agent_with_series(dir.path(), &edited, true).await?;
+            let request = range_request(&range, mr_number, flagged);
+            assert_eq!(
+                submitted_parts(&mut agent, &mut rx, &request).await,
+                [(1, 2, false, None), (2, 2, false, None)],
+                "a first commit with a diff, {mr_number:?} flagged {flagged}"
+            );
+
+            let dir = tempfile::tempdir()?;
+            let (mut agent, mut rx, range) = agent_with_series(dir.path(), &edited, false).await?;
+            let Some((base, _)) = range.split_once("..") else {
+                return Err(anyhow!("{range} is not a range"));
+            };
+            let tracker = git_in(dir.path(), &["rev-parse", "HEAD~1"]).await?;
+            let request = range_request(&format!("{base}..{tracker}"), mr_number, flagged);
+            assert_eq!(
+                submitted_parts(&mut agent, &mut rx, &request).await,
+                [(1, 1, true, None)],
+                "a lone tracker, {mr_number:?} flagged {flagged}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The rule each request gets for its range's first commit: a range of
+    /// one is never read, a pull request reads only a marked one whether or
+    /// not its range is also flagged, and the flag reads a plain range's
+    /// empty first commit.
+    #[test]
+    fn a_range_gets_its_tracker_rule_from_its_size_flag_and_number() {
+        use TrackerRule::*;
+        let cases = [
+            (1, true, Some(7), Ignore),
+            (1, false, Some(7), Ignore),
+            (2, true, None, Flagged),
+            (2, true, Some(7), Marked),
+            (2, false, Some(7), Marked),
+            (2, false, None, Ignore),
+        ];
+        for (count, flagged, number, expected) in cases {
+            assert_eq!(
+                TrackerRule::for_range(count, flagged, number),
+                expected,
+                "{count} commits, flagged {flagged}, number {number:?}"
+            );
+        }
+    }
+
+    /// Runs `requests` as one tick's batches, each recorded and queued as
+    /// the run loop does, and returns each submitted part 1's cover letter,
+    /// sorted, since batches for different repositories run in any order.
+    async fn first_part_cover_letters(
+        agent: &mut FetchAgent,
+        rx: &mut mpsc::Receiver<Event>,
+        requests: &[FetchRequest],
+    ) -> Vec<Option<String>> {
+        let mut pending = PendingFetches::default();
+        for request in requests {
+            agent.remember(request);
+            pending.add(request.clone());
+        }
+        agent.process_queue(&mut pending).await;
+        let mut letters: Vec<Option<String>> = drain(rx)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::PatchSubmitted {
+                    index: 1,
+                    b4_cover_letter,
+                    ..
+                } => Some(b4_cover_letter),
+                _ => None,
+            })
+            .collect();
+        letters.sort();
+        letters
+    }
+
+    /// A b4 flag reads the tracker of only the range its submitter sent,
+    /// in that repository and that batch. The same `base..head` requested
+    /// later, from another repository, or by a pull request (whose tracker
+    /// needs the marker, which this one lacks) is not read.
+    #[tokio::test]
+    async fn a_b4_flag_stays_with_its_own_request() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let body = "Fixes two port_info lifetime bugs in ionic.";
+        let (mut agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
+        let in_repo = |repo: &str, flagged: bool| FetchRequest {
+            repo_url: Some(format!("https://example.com/{repo}.git")),
+            ..range_request(&range, None, flagged)
+        };
+        let read = Some(body.to_string());
+
+        assert_eq!(
+            first_part_cover_letters(&mut agent, &mut rx, &[in_repo("a", true)]).await,
+            std::slice::from_ref(&read),
+            "the flagged request"
+        );
+        assert_eq!(
+            first_part_cover_letters(&mut agent, &mut rx, &[in_repo("a", false)]).await,
+            [None],
+            "the same range in a later batch"
+        );
+
+        let two_repos = [in_repo("a", true), in_repo("b", false)];
+        assert_eq!(
+            first_part_cover_letters(&mut agent, &mut rx, &two_repos).await,
+            [None, read],
+            "another repository in the same tick"
+        );
+
+        let pull_request = FetchRequest {
+            repo_url: Some("https://example.com/a.git".to_string()),
+            ..range_request(&range, Some(35), false)
+        };
+        let beside_a_flag = [in_repo("a", true), pull_request];
+        assert_eq!(
+            first_part_cover_letters(&mut agent, &mut rx, &beside_a_flag).await,
+            [None],
+            "a pull request sharing a flagged range's batch"
+        );
+        Ok(())
+    }
+
+    /// A tracker's prose is held to the description's cap, since a commit
+    /// message is unbounded and the prose is stored and rendered beside the
+    /// description.
+    #[test]
+    fn a_tracker_cover_letter_is_capped_as_a_description_is() {
+        let message = format!(
+            "{}\n\n{B4_TRACKING_MARKER}\n{{}}",
+            "prose ".repeat(crate::forge::MAX_DESCRIPTION_BYTES)
+        );
+        let Some(cover) = TrackerRule::Flagged.cover_letter(&message, "") else {
+            panic!("an empty first commit with prose is read");
+        };
+        assert!(cover.len() <= crate::forge::MAX_DESCRIPTION_BYTES);
+        assert!(
+            cover.ends_with("\n[truncated]"),
+            "{}",
+            &cover[cover.len() - 40..]
+        );
+        assert_eq!(TrackerRule::Ignore.cover_letter(&message, ""), None);
     }
 }

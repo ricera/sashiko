@@ -197,7 +197,18 @@ const DESCRIPTION_TRUNCATED: &str = "\n[truncated]";
 /// with a line saying so, and the result, marker included, is never longer
 /// than the cap.
 pub fn request_description(value: &serde_json::Value) -> Option<String> {
-    let text = value.as_str()?.trim();
+    value.as_str().and_then(bounded_author_text)
+}
+
+/// Trims `text`, an author's description of a series, and cuts it to
+/// [`MAX_DESCRIPTION_BYTES`] as [`request_description`] does; blank text is
+/// `None`.
+///
+/// A b4 tracker's prose goes through it too: it comes from a commit
+/// message, which nothing bounds, and is stored and rendered beside the
+/// description, so both are held to one limit.
+pub fn bounded_author_text(text: &str) -> Option<String> {
+    let text = text.trim();
     if text.is_empty() {
         return None;
     }

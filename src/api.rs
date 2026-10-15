@@ -212,6 +212,13 @@ pub enum SubmitRequest {
         repo: Option<String>,
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
+        /// When `sha` is a two-dot range of two or more commits, read its
+        /// first commit, if it changes no files, as a `b4 prep` tracker
+        /// even without b4's tracking marker, and store its prose as the
+        /// series' b4 cover letter. A pull request's tracker is read
+        /// without this flag, by its marker.
+        #[serde(default)]
+        b4_cover_letter: bool,
     },
     #[serde(rename = "remote-range")]
     RemoteRange {
@@ -219,6 +226,13 @@ pub enum SubmitRequest {
         repo: Option<String>,
         skip_subjects: Option<Vec<String>>,
         only_subjects: Option<Vec<String>>,
+        /// When `sha` is a two-dot range of two or more commits, read its
+        /// first commit, if it changes no files, as a `b4 prep` tracker
+        /// even without b4's tracking marker, and store its prose as the
+        /// series' b4 cover letter. A pull request's tracker is read
+        /// without this flag, by its marker.
+        #[serde(default)]
+        b4_cover_letter: bool,
     },
     Thread {
         msgid: String,
