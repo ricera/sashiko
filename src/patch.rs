@@ -514,6 +514,106 @@ pub fn inject_changelog_into_git_show(git_show: &str, changelog: &str) -> String
     }
 }
 
+/// Whether a stored diff is empty, so the patch changes nothing.
+///
+/// A `b4 prep` tracker, or any `git commit --allow-empty`, is stored with
+/// an empty diff, and a clean merge with a lone newline. Every other
+/// source stores a non-empty one, so this never skips a patch that has a
+/// header `extract_files_from_diff` cannot read. It lives beside the b4
+/// tracker helpers because a tracker is known by its empty diff, which
+/// must mean what the reviewer's skip means.
+pub fn diff_is_empty(diff: &str) -> bool {
+    diff.trim().is_empty()
+}
+
+/// The line `b4 prep` writes between a tracker commit's cover letter and
+/// the bookkeeping JSON it keeps for itself.
+pub const B4_TRACKING_MARKER: &str = "--- b4-submit-tracking ---";
+
+/// The cover letter a `b4 prep` tracker commit's message carries, as
+/// `b4 send` would send it.
+///
+/// `message` is the commit message without its subject line, git's `%b`,
+/// which is what the fetcher holds for a commit. The text above the first
+/// [`B4_TRACKING_MARKER`] is kept, or the whole message when there is no
+/// marker. Then, as b4 does before it sends a cover letter, every line
+/// starting with `#` is emptied, a line starting with `>#` loses its `>`
+/// (b4's escape for a markdown header), and the empty lines this leaves
+/// collapse to one.
+///
+/// Returns `None` when nothing but blank lines and known trailers remains.
+/// An unedited b4 template is exactly that once its `#` instructions go,
+/// and handing b4's instructions or a lone signoff to the model as the
+/// author's statement of intent is worse than giving it no cover letter.
+pub fn extract_b4_cover_letter(message: &str) -> Option<String> {
+    let above_marker = message
+        .split_once(B4_TRACKING_MARKER)
+        .map_or(message, |(cover, _)| cover);
+    let cover = strip_b4_comments(above_marker);
+    let has_prose = cover
+        .lines()
+        .any(|line| !line.trim().is_empty() && !is_trailer_line(line));
+    has_prose.then(|| cover.trim().to_string())
+}
+
+/// Applies b4's comment rules to a cover letter: `#` lines are emptied,
+/// `>#` becomes `#`, and runs of empty lines become one, matching what
+/// b4's own cover loader sends so the model sees what a list would see.
+fn strip_b4_comments(cover: &str) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    for line in cover.lines() {
+        let line = if line.starts_with('#') {
+            ""
+        } else {
+            line.strip_prefix('>')
+                .filter(|rest| rest.starts_with('#'))
+                .unwrap_or(line)
+        };
+        if line.is_empty() && kept.last().is_some_and(|prev| prev.is_empty()) {
+            continue;
+        }
+        kept.push(line);
+    }
+    kept.join("\n")
+}
+
+/// Trailer keys treated as bookkeeping rather than prose.
+///
+/// The conventional kernel and git set, plus `To`, which `b4 prep
+/// --auto-to-cc` writes into the cover letter beside `Cc`. Not exhaustive
+/// by design: [`is_trailer_line`] says why an unknown key is prose.
+const KNOWN_TRAILERS: &[&str] = &[
+    "signed-off-by",
+    "co-developed-by",
+    "reviewed-by",
+    "acked-by",
+    "tested-by",
+    "reported-by",
+    "suggested-by",
+    "to",
+    "cc",
+    "fixes",
+    "link",
+    "closes",
+    "change-id",
+    "message-id",
+    "reviewed-on",
+];
+
+/// Whether a line is a git trailer rather than prose.
+///
+/// Matched against a known set rather than by shape, because shape cannot
+/// tell `Note:` from `Cc:`, and the two mistakes are not symmetric:
+/// taking prose for a trailer silently discards a real cover letter,
+/// while taking an unusual trailer for prose only lets a thin one
+/// through. So anything unrecognised counts as prose.
+fn is_trailer_line(line: &str) -> bool {
+    let Some((key, _)) = line.trim().split_once(':') else {
+        return false;
+    };
+    KNOWN_TRAILERS.contains(&key.trim().to_ascii_lowercase().as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,6 +1088,156 @@ diff --git a/file.c b/file.c";
         assert_eq!(
             inject_changelog_into_git_show(git_show, changelog),
             expected
+        );
+    }
+
+    #[test]
+    fn diff_is_empty_holds_only_for_a_diff_that_changes_nothing() {
+        for empty in ["", "\n", "\n\n"] {
+            assert!(diff_is_empty(empty), "{empty:?} changes nothing");
+        }
+        let changes = [
+            "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+            // A C-quoted non-ASCII path, which extract_files_from_diff
+            // cannot read.
+            "diff --git \"a/\\303\\251.c\" \"b/\\303\\251.c\"\nindex 1..2 100644\n@@ -1 +1 @@\n-a\n+b\n",
+            // A merge that resolved a conflict.
+            "diff --cc file\nindex 1,2..3\n@@@ -1,1 -1,1 +1,1 @@@\n- a\n -b\n++c\n",
+            // A plain unified diff with no git header.
+            "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+        ];
+        for diff in changes {
+            assert!(!diff_is_empty(diff), "{diff:?} changes a file");
+        }
+    }
+
+    /// The message of example-org/kernel-fork#35's tracker commit
+    /// (0a1b2c3d4e5f) exactly as the deployment database stores it: an
+    /// unedited `b4 prep` template, and the only b4 branch a deployment has
+    /// reviewed.
+    const KERNEL_FORK_35_TRACKER: &str = r##"# Describe the purpose of this series. The information you put here
+# will be used by the project maintainer to make a decision whether
+# your patches should be reviewed, and in what priority order. Please be
+# very detailed and link to any relevant discussions or sites that the
+# maintainer can review to better understand your proposed changes. If you
+# only have a single patch in your series, the contents of the cover
+# letter will be appended to the "under-the-cut" portion of the patch.
+
+# Lines starting with # will be removed from the cover letter. You can
+# use them to add notes or reminders to yourself. If you want to use
+# markdown headers in your cover letter, start the line with ">#".
+
+# You can add trailers to the cover letter. Any email addresses found in
+# these trailers will be added to the addresses specified/generated
+# during the b4 send stage. You can also run "b4 prep --auto-to-cc" to
+# auto-populate the To: and Cc: trailers based on the code being
+# modified.
+
+Signed-off-by: Eric Joyner <eric.joyner@amd.com>
+
+--- b4-submit-tracking ---
+# This section is used internally by b4 prep for tracking purposes.
+{
+  "series": {
+    "revision": 1,
+    "change-id": "20260101-example-series-v2-abcdef012345",
+    "prefixes": []
+  }
+}"##;
+
+    /// The kernel-fork#35 template with `edit` above its signoff, where
+    /// an author editing the cover letter writes it.
+    fn tracker_with(edit: &str) -> String {
+        KERNEL_FORK_35_TRACKER.replacen("Signed-off-by:", &format!("{edit}\n\nSigned-off-by:"), 1)
+    }
+
+    #[test]
+    fn an_unedited_b4_template_is_no_cover_letter() {
+        assert_eq!(extract_b4_cover_letter(KERNEL_FORK_35_TRACKER), None);
+    }
+
+    #[test]
+    fn b4_auto_to_cc_trailers_are_no_cover_letter() {
+        let message =
+            tracker_with("To: Andrew Lunn <andrew+netdev@lunn.ch>\nCc: netdev@vger.kernel.org");
+        assert_eq!(extract_b4_cover_letter(&message), None);
+    }
+
+    #[test]
+    fn b4_comment_lines_are_dropped_and_escaped_headers_kept() {
+        let message = tracker_with(
+            "Fix port_info lifetime bugs.\n\
+             # a note to myself\n\
+             >## Changes\n\
+             \n\
+             # another note\n\
+             \n\
+             - free port_info on reset\n\
+             > quoted, not a header",
+        );
+        assert_eq!(
+            extract_b4_cover_letter(&message).as_deref(),
+            Some(
+                "Fix port_info lifetime bugs.\n\
+                 \n\
+                 ## Changes\n\
+                 \n\
+                 - free port_info on reset\n\
+                 > quoted, not a header\n\
+                 \n\
+                 Signed-off-by: Eric Joyner <eric.joyner@amd.com>"
+            )
+        );
+    }
+
+    #[test]
+    fn test_b4_cover_letter_drops_the_tracking_block() {
+        let message = tracker_with("Adds hwstamp teardown so queues are freed on disable.");
+        let cover = extract_b4_cover_letter(&message);
+        let cover = cover.as_deref().unwrap_or_default();
+        assert!(cover.starts_with("Adds hwstamp teardown"), "{cover}");
+        assert!(
+            !cover.contains(B4_TRACKING_MARKER)
+                && !cover.contains("change-id")
+                && !cover.contains("Describe the purpose"),
+            "b4's template and bookkeeping must not reach the prompt: {cover}"
+        );
+    }
+
+    #[test]
+    fn test_b4_cover_letter_is_none_when_only_trailers_remain() {
+        let signoff_only = "Signed-off-by: A <a@x>\n\n--- b4-submit-tracking ---\n{}\n";
+        assert_eq!(extract_b4_cover_letter(signoff_only), None);
+        let trailers = "Signed-off-by: A <a@x>\nReviewed-by: B <b@x>\nCc: C <c@x>\n";
+        assert_eq!(extract_b4_cover_letter(trailers), None);
+        assert_eq!(extract_b4_cover_letter(""), None);
+        assert_eq!(extract_b4_cover_letter("\n\n  \n"), None);
+    }
+
+    #[test]
+    fn test_b4_cover_letter_without_a_marker() {
+        let message = "Real prose here.\n\nSigned-off-by: A <a@x>\n";
+        assert_eq!(
+            extract_b4_cover_letter(message).as_deref(),
+            Some("Real prose here.\n\nSigned-off-by: A <a@x>")
+        );
+    }
+
+    #[test]
+    fn test_trailer_detection_does_not_swallow_prose() {
+        assert!(!is_trailer_line(
+            "This fixes the following: queues leak on disable."
+        ));
+        assert!(!is_trailer_line("Note: see the discussion upstream."));
+        assert!(!is_trailer_line("no colon at all"));
+        assert!(is_trailer_line("Signed-off-by: A <a@x>"));
+        assert!(is_trailer_line("reviewed-by: B <b@x>"));
+        assert!(is_trailer_line("Cc: stable@vger.kernel.org"));
+        assert!(is_trailer_line("To: netdev@vger.kernel.org"));
+        assert_eq!(
+            extract_b4_cover_letter("Note: the queues leak.\nSigned-off-by: A <a@x>\n").as_deref(),
+            Some("Note: the queues leak.\nSigned-off-by: A <a@x>"),
+            "an unknown key is prose"
         );
     }
 }
