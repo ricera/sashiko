@@ -638,7 +638,7 @@ fn shown_under_embargo(status: Option<String>, is_embargoed: bool) -> Option<Str
 
 /// The schema version [`Database::migrate`] leaves a database at.
 #[cfg(feature = "server")]
-pub(crate) const SCHEMA_VERSION: u32 = 18;
+pub(crate) const SCHEMA_VERSION: u32 = 19;
 
 /// Whether `table` has a column named `column`, for migrations that add a
 /// column a database may already have: ALTER TABLE has no IF NOT EXISTS.
@@ -653,6 +653,48 @@ async fn table_has_column(conn: &libsql::Connection, table: &str, column: &str) 
         }
     }
     Ok(false)
+}
+
+/// A patchsets column holding author text that the reviewer may give the
+/// model as a cover letter. Each is written by one code path, stored
+/// trimmed and gzip-compressed when large, and never blank.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy)]
+enum PatchsetAuthorText {
+    /// mr_body: the pull request description as of the revision.
+    PullRequestDescription,
+    /// b4_cover_letter: the prose of the series' b4 tracker commit.
+    B4CoverLetter,
+}
+
+#[cfg(feature = "server")]
+impl PatchsetAuthorText {
+    /// The column's name. Statements splice in only this fixed name, so no
+    /// caller text reaches the SQL.
+    fn name(self) -> &'static str {
+        match self {
+            Self::PullRequestDescription => "mr_body",
+            Self::B4CoverLetter => "b4_cover_letter",
+        }
+    }
+}
+
+/// A migration that adds one TEXT column a database may already have, then
+/// runs its file.
+///
+/// The column is added only when it is missing, because ALTER TABLE has no
+/// IF NOT EXISTS and a database may already have it: the fork's databases
+/// have mr_body and findings.prior, and a database whose version was set
+/// back, as the replay tests do, has every column these migrations add.
+/// The file runs either way, so it holds only what is idempotent as
+/// written.
+#[cfg(feature = "server")]
+struct TextColumnMigration {
+    version: u32,
+    purpose: &'static str,
+    table: &'static str,
+    column: &'static str,
+    file: &'static str,
 }
 
 #[cfg(feature = "server")]
@@ -2684,6 +2726,10 @@ impl Database {
             self.migrate_findings_prior().await?;
         }
 
+        if current_version < 19 {
+            self.migrate_patchsets_b4_cover_letter().await?;
+        }
+
         info!("Database schema is up to date at version {SCHEMA_VERSION}.");
 
         Ok(())
@@ -2692,49 +2738,74 @@ impl Database {
     /// Migration 17: the pull request description column and the index on
     /// mr_url.
     ///
-    /// The column is added only when it is missing, as 015 adds its
-    /// columns, because the fork's databases already have it and ALTER
-    /// TABLE has no IF NOT EXISTS. The file, which holds only the index,
-    /// runs either way: skipping it with the column, as 014 skips its
-    /// file, would leave a database that has the column but not the index
-    /// without the index.
+    /// The file, which holds only the index, runs whether or not the column
+    /// was there: skipping it with the column, as 014 skips its file, would
+    /// leave a database that has the column but not the index without the
+    /// index.
     async fn migrate_patchsets_mr_body(&self) -> Result<()> {
-        info!("Applying database migration version 17 (pull request descriptions)...");
-        let tx = self.conn.transaction().await?;
-        if !table_has_column(&tx, "patchsets", "mr_body").await? {
-            // The pull request description as of this revision; NULL when
-            // blank; gzip-compressed when large.
-            tx.execute("ALTER TABLE patchsets ADD COLUMN mr_body TEXT", ())
-                .await?;
-        }
-        tx.execute_batch(include_str!("migrations/017_patchsets_mr_body.sql"))
-            .await?;
-        tx.execute("PRAGMA user_version = 17", ()).await?;
-        tx.commit().await?;
-        Ok(())
+        // mr_body is the pull request description as of this revision; NULL
+        // when blank; gzip-compressed when large.
+        self.migrate_text_column(TextColumnMigration {
+            version: 17,
+            purpose: "pull request descriptions",
+            table: "patchsets",
+            column: "mr_body",
+            file: include_str!("migrations/017_patchsets_mr_body.sql"),
+        })
+        .await
     }
 
     /// Migration 18: a finding's link to the finding of an earlier revision
     /// it repeats or was caused by the fix for.
-    ///
-    /// The column is added only when it is missing, as 015 and 017 add
-    /// theirs, because the fork's databases already have it and ALTER TABLE
-    /// has no IF NOT EXISTS. The file documents the column's JSON and holds
-    /// no statement, so running it on every database is harmless.
     async fn migrate_findings_prior(&self) -> Result<()> {
-        info!("Applying database migration version 18 (links to earlier findings)...");
+        // prior is JSON naming the finding of an earlier revision of the
+        // same pull request that this finding repeats or that the fix for it
+        // caused, in the form 018_findings_prior.sql describes; NULL when the
+        // finding has no such link.
+        self.migrate_text_column(TextColumnMigration {
+            version: 18,
+            purpose: "links to earlier findings",
+            table: "findings",
+            column: "prior",
+            file: include_str!("migrations/018_findings_prior.sql"),
+        })
+        .await
+    }
+
+    /// Migration 19: the cover letter a b4 tracker commit holds.
+    async fn migrate_patchsets_b4_cover_letter(&self) -> Result<()> {
+        // b4_cover_letter is the prose of the series' b4 tracker commit;
+        // NULL when there is no tracker or it holds no prose;
+        // gzip-compressed when large, as mr_body is.
+        self.migrate_text_column(TextColumnMigration {
+            version: 19,
+            purpose: "b4 tracker cover letters",
+            table: "patchsets",
+            column: "b4_cover_letter",
+            file: include_str!("migrations/019_patchsets_b4_cover_letter.sql"),
+        })
+        .await
+    }
+
+    /// Applies `migration` in one transaction: the column when it is
+    /// missing, the file, and the new user_version.
+    async fn migrate_text_column(&self, migration: TextColumnMigration) -> Result<()> {
+        let TextColumnMigration {
+            version,
+            purpose,
+            table,
+            column,
+            file,
+        } = migration;
+        info!("Applying database migration version {version} ({purpose})...");
         let tx = self.conn.transaction().await?;
-        if !table_has_column(&tx, "findings", "prior").await? {
-            // JSON naming the finding of an earlier revision of the same pull
-            // request that this finding repeats or that the fix for it
-            // caused, in the form 018_findings_prior.sql describes; NULL when
-            // the finding has no such link.
-            tx.execute("ALTER TABLE findings ADD COLUMN prior TEXT", ())
+        if !table_has_column(&tx, table, column).await? {
+            tx.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), ())
                 .await?;
         }
-        tx.execute_batch(include_str!("migrations/018_findings_prior.sql"))
+        tx.execute_batch(file).await?;
+        tx.execute(&format!("PRAGMA user_version = {version}"), ())
             .await?;
-        tx.execute("PRAGMA user_version = 18", ()).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -7718,16 +7789,22 @@ impl Database {
                     }
 
                     // A pull request description is written only onto the
-                    // placeholder a revision was queued with, and ingestion
-                    // does not carry it, so the surviving row takes the
-                    // merged row's description when it has none of its own.
+                    // placeholder a revision was queued with, and a b4 cover
+                    // letter only onto the row its tracker commit was
+                    // ingested into; either may be the row merged away here.
+                    // The surviving row takes each from the merged row when
+                    // it has none of its own.
                     tx.execute(
                         "UPDATE patchsets
                             SET mr_body = COALESCE(
                                     mr_body,
-                                    (SELECT mr_body FROM patchsets WHERE id = ?)
+                                    (SELECT mr_body FROM patchsets WHERE id = ?1)
+                                ),
+                                b4_cover_letter = COALESCE(
+                                    b4_cover_letter,
+                                    (SELECT b4_cover_letter FROM patchsets WHERE id = ?1)
                                 )
-                          WHERE id = ?",
+                          WHERE id = ?2",
                         libsql::params![merge_from_id, target_id],
                     )
                     .await?;
@@ -8324,38 +8401,77 @@ impl Database {
     /// a revision was queued with before. A large one is gzip-compressed,
     /// as message bodies are.
     pub async fn set_patchset_mr_body(&self, id: i64, description: &str) -> Result<()> {
-        let description = description.trim();
-        if description.is_empty() {
-            return Ok(());
-        }
-        self.conn
-            .execute(
-                "UPDATE patchsets SET mr_body = ? WHERE id = ?",
-                libsql::params![
-                    crate::compression::compress_string_if_needed(description),
-                    id
-                ],
-            )
-            .await?;
-        Ok(())
+        self.set_patchset_author_text(id, PatchsetAuthorText::PullRequestDescription, description)
+            .await
     }
 
     /// The pull request description stored for patchset `id`, decompressed.
     /// It is `None` when the patchset has none, holds a blank one, or does
     /// not exist.
     pub async fn get_patchset_mr_body(&self, id: i64) -> Result<Option<String>> {
+        self.get_patchset_author_text(id, PatchsetAuthorText::PullRequestDescription)
+            .await
+    }
+
+    /// Stores `cover_letter`, the prose of a b4 tracker commit, as the b4
+    /// cover letter of patchset `id`, replacing any stored one, so that a
+    /// range fetched again records the tracker as of its latest push.
+    ///
+    /// A blank cover letter changes nothing, as for
+    /// [`Self::set_patchset_mr_body`]; a large one is gzip-compressed.
+    pub async fn set_patchset_b4_cover_letter(&self, id: i64, cover_letter: &str) -> Result<()> {
+        self.set_patchset_author_text(id, PatchsetAuthorText::B4CoverLetter, cover_letter)
+            .await
+    }
+
+    /// The b4 cover letter stored for patchset `id`, decompressed. It is
+    /// `None` when the patchset has none, holds a blank one, or does not
+    /// exist.
+    pub async fn get_patchset_b4_cover_letter(&self, id: i64) -> Result<Option<String>> {
+        self.get_patchset_author_text(id, PatchsetAuthorText::B4CoverLetter)
+            .await
+    }
+
+    /// Stores trimmed `text` in patchset `id`'s `column`, compressed when
+    /// large; blank text changes nothing.
+    async fn set_patchset_author_text(
+        &self,
+        id: i64,
+        column: PatchsetAuthorText,
+        text: &str,
+    ) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                &format!("UPDATE patchsets SET {} = ? WHERE id = ?", column.name()),
+                libsql::params![crate::compression::compress_string_if_needed(text), id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reads patchset `id`'s `column`, decompressed, with blank or missing
+    /// as `None`.
+    async fn get_patchset_author_text(
+        &self,
+        id: i64,
+        column: PatchsetAuthorText,
+    ) -> Result<Option<String>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT mr_body FROM patchsets WHERE id = ?",
+                &format!("SELECT {} FROM patchsets WHERE id = ?", column.name()),
                 libsql::params![id],
             )
             .await?;
         let Some(row) = rows.next().await? else {
             return Ok(None);
         };
-        let description = crate::compression::get_compressed_string_opt(&row, 0)?;
-        Ok(description.filter(|text| !text.trim().is_empty()))
+        let text = crate::compression::get_compressed_string_opt(&row, 0)?;
+        Ok(text.filter(|text| !text.trim().is_empty()))
     }
 
     pub async fn clear_patchset_embargo(&self, id: i64) -> Result<()> {
@@ -27105,18 +27221,21 @@ mod tests {
         assert_eq!(stored_prior_of(&db, review_id).await.as_deref(), Some(link));
     }
 
-    /// A description is stored as given, a large one compressed, and a
-    /// blank one leaves the stored description alone; reading gives it
-    /// back decompressed, and blank or missing as none.
-    #[tokio::test]
-    async fn test_pull_request_description_is_stored_and_read_back() {
+    /// Text is stored trimmed in `column`, a large one compressed, and a
+    /// blank one leaves the stored text alone; reading gives it back
+    /// decompressed, and blank or missing as none.
+    async fn assert_author_text_is_stored_and_read_back(column: PatchsetAuthorText) {
         let db = setup_db().await;
-        let (ps_id, _, _) = reviewed_patchset(&db, "mr_body_store").await;
+        let (ps_id, _, _) = reviewed_patchset(&db, column.name()).await;
+        let read = || async { db.get_patchset_author_text(ps_id, column).await.unwrap() };
         let stored_type = || async {
             let mut rows = db
                 .conn
                 .query(
-                    "SELECT typeof(mr_body) FROM patchsets WHERE id = ?",
+                    &format!(
+                        "SELECT typeof({}) FROM patchsets WHERE id = ?",
+                        column.name()
+                    ),
                     libsql::params![ps_id],
                 )
                 .await
@@ -27128,100 +27247,268 @@ mod tests {
                 .get::<String>(0)
                 .unwrap()
         };
-        assert_eq!(db.get_patchset_mr_body(ps_id).await.unwrap(), None);
+        assert_eq!(read().await, None);
 
-        db.set_patchset_mr_body(ps_id, "  Fixes the widget.\n")
+        db.set_patchset_author_text(ps_id, column, "  Fixes the widget.\n")
             .await
             .unwrap();
-        assert_eq!(
-            db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
-            Some("Fixes the widget.")
-        );
+        assert_eq!(read().await.as_deref(), Some("Fixes the widget."));
         assert_eq!(stored_type().await, "text");
 
         for blank in ["", "  \r\n\t"] {
-            db.set_patchset_mr_body(ps_id, blank).await.unwrap();
+            db.set_patchset_author_text(ps_id, column, blank)
+                .await
+                .unwrap();
             assert_eq!(
-                db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
+                read().await.as_deref(),
                 Some("Fixes the widget."),
-                "{blank:?} leaves the stored description"
+                "{blank:?} leaves the stored text"
             );
         }
 
         let large = "Ein \u{00fc}berarbeiteter Absatz.\n".repeat(200);
-        db.set_patchset_mr_body(ps_id, &large).await.unwrap();
+        db.set_patchset_author_text(ps_id, column, &large)
+            .await
+            .unwrap();
         assert_eq!(stored_type().await, "blob");
-        assert_eq!(
-            db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
-            Some(large.trim())
-        );
+        assert_eq!(read().await.as_deref(), Some(large.trim()));
 
         db.conn
             .execute(
-                "UPDATE patchsets SET mr_body = ' \n' WHERE id = ?",
+                &format!(
+                    "UPDATE patchsets SET {} = ' \n' WHERE id = ?",
+                    column.name()
+                ),
                 libsql::params![ps_id],
             )
             .await
             .unwrap();
-        assert_eq!(db.get_patchset_mr_body(ps_id).await.unwrap(), None);
-        assert_eq!(db.get_patchset_mr_body(ps_id + 1000).await.unwrap(), None);
+        assert_eq!(read().await, None);
+        assert_eq!(
+            db.get_patchset_author_text(ps_id + 1000, column)
+                .await
+                .unwrap(),
+            None
+        );
     }
 
-    /// Three parts of one series form two patchsets, and the third part
-    /// merges them into the row created first, as a placeholder and the
-    /// row its patches arrived on are merged. The description is kept
-    /// whichever of the two rows held it, and a surviving row's own
-    /// description wins over the merged row's.
     #[tokio::test]
-    async fn pull_request_description_survives_a_placeholder_merge() {
-        for (survivor_body, merged_body, kept) in [
+    async fn test_pull_request_description_is_stored_and_read_back() {
+        assert_author_text_is_stored_and_read_back(PatchsetAuthorText::PullRequestDescription)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_b4_cover_letter_is_stored_and_read_back() {
+        assert_author_text_is_stored_and_read_back(PatchsetAuthorText::B4CoverLetter).await;
+    }
+
+    /// The description and the b4 cover letter are separate columns: each
+    /// setter writes only its own, and each getter reads only its own.
+    #[tokio::test]
+    async fn the_b4_cover_letter_and_the_description_are_stored_apart() {
+        let db = setup_db().await;
+        let (ps_id, _, _) = reviewed_patchset(&db, "author_text_apart").await;
+
+        db.set_patchset_b4_cover_letter(ps_id, "The tracker's prose.")
+            .await
+            .unwrap();
+        assert_eq!(db.get_patchset_mr_body(ps_id).await.unwrap(), None);
+
+        db.set_patchset_mr_body(ps_id, "The description.")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_patchset_b4_cover_letter(ps_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("The tracker's prose.")
+        );
+        assert_eq!(
+            db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
+            Some("The description.")
+        );
+    }
+
+    /// Three parts of one series in three threads: the first two form
+    /// separate patchsets, `(survivor, merged)`, with `set` applied to
+    /// each, and the third merges them into the row created first, as a
+    /// placeholder and the row its patches arrived on are merged.
+    async fn merged_placeholder(set: impl AsyncFn(&Database, i64, i64)) -> (Arc<Database>, i64) {
+        let db = setup_db().await;
+        let thread_hi = db
+            .create_thread("root_hi", "Subject", 100_000)
+            .await
+            .unwrap();
+        let thread_lo = db
+            .create_thread("root_lo", "Subject", 250_000)
+            .await
+            .unwrap();
+        let thread_mid = db
+            .create_thread("root_mid", "Subject", 175_000)
+            .await
+            .unwrap();
+        let survivor = add_unthreaded_part(&db, thread_hi, 2, 100_000, None).await;
+        let merged = add_unthreaded_part(&db, thread_lo, 1, 250_000, None).await;
+        assert_ne!(
+            survivor, merged,
+            "the two parts must form separate patchsets"
+        );
+        set(&db, survivor, merged).await;
+
+        let ps_id = add_unthreaded_part(&db, thread_mid, 3, 175_000, None).await;
+        assert_eq!(
+            ps_id, survivor,
+            "the merge keeps the patchset created first"
+        );
+        assert!(
+            db.get_patchset_details(merged, None, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "the merged row is gone"
+        );
+        (db, survivor)
+    }
+
+    /// `column` is kept through a merge whichever of the two rows held it,
+    /// and a surviving row's own text wins over the merged row's.
+    async fn assert_author_text_survives_a_placeholder_merge(column: PatchsetAuthorText) {
+        for (survivor_text, merged_text, kept) in [
             (None, Some("merged"), Some("merged")),
             (Some("survivor"), None, Some("survivor")),
             (Some("survivor"), Some("merged"), Some("survivor")),
             (None, None, None),
         ] {
-            let db = setup_db().await;
-            let thread_hi = db
-                .create_thread("root_hi", "Subject", 100_000)
-                .await
-                .unwrap();
-            let thread_lo = db
-                .create_thread("root_lo", "Subject", 250_000)
-                .await
-                .unwrap();
-            let thread_mid = db
-                .create_thread("root_mid", "Subject", 175_000)
-                .await
-                .unwrap();
-            let survivor = add_unthreaded_part(&db, thread_hi, 2, 100_000, None).await;
-            let merged = add_unthreaded_part(&db, thread_lo, 1, 250_000, None).await;
-            assert_ne!(
-                survivor, merged,
-                "the two parts must form separate patchsets"
-            );
-            for (id, body) in [(survivor, survivor_body), (merged, merged_body)] {
-                if let Some(body) = body {
-                    db.set_patchset_mr_body(id, body).await.unwrap();
+            let (db, survivor) = merged_placeholder(async |db: &Database, survivor, merged| {
+                for (id, text) in [(survivor, survivor_text), (merged, merged_text)] {
+                    if let Some(text) = text {
+                        db.set_patchset_author_text(id, column, text).await.unwrap();
+                    }
                 }
-            }
-
-            let ps_id = add_unthreaded_part(&db, thread_mid, 3, 175_000, None).await;
+            })
+            .await;
             assert_eq!(
-                ps_id, survivor,
-                "the merge keeps the patchset created first"
-            );
-            assert!(
-                db.get_patchset_details(merged, None, None)
+                db.get_patchset_author_text(survivor, column)
                     .await
                     .unwrap()
-                    .is_none(),
-                "the merged row is gone"
-            );
-            assert_eq!(
-                db.get_patchset_mr_body(survivor).await.unwrap().as_deref(),
+                    .as_deref(),
                 kept,
-                "survivor {survivor_body:?}, merged {merged_body:?}"
+                "{}: survivor {survivor_text:?}, merged {merged_text:?}",
+                column.name()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pull_request_description_survives_a_placeholder_merge() {
+        assert_author_text_survives_a_placeholder_merge(PatchsetAuthorText::PullRequestDescription)
+            .await;
+    }
+
+    /// Besides the rule every column follows, a surviving row with only a
+    /// description takes the merged row's b4 cover letter, and the reverse:
+    /// each column is carried on its own.
+    #[tokio::test]
+    async fn b4_cover_letter_survives_a_placeholder_merge() {
+        assert_author_text_survives_a_placeholder_merge(PatchsetAuthorText::B4CoverLetter).await;
+
+        let (db, survivor) = merged_placeholder(async |db: &Database, survivor, merged| {
+            db.set_patchset_mr_body(survivor, "description")
+                .await
+                .unwrap();
+            db.set_patchset_b4_cover_letter(merged, "tracker")
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(
+            db.get_patchset_mr_body(survivor).await.unwrap().as_deref(),
+            Some("description")
+        );
+        assert_eq!(
+            db.get_patchset_b4_cover_letter(survivor)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tracker")
+        );
+
+        let (db, survivor) = merged_placeholder(async |db: &Database, survivor, merged| {
+            db.set_patchset_b4_cover_letter(survivor, "tracker")
+                .await
+                .unwrap();
+            db.set_patchset_mr_body(merged, "description")
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(
+            db.get_patchset_mr_body(survivor).await.unwrap().as_deref(),
+            Some("description")
+        );
+        assert_eq!(
+            db.get_patchset_b4_cover_letter(survivor)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("tracker")
+        );
+    }
+
+    async fn has_b4_cover_letter(db: &Database) -> bool {
+        column_names(db, "patchsets")
+            .await
+            .iter()
+            .any(|c| c == "b4_cover_letter")
+    }
+
+    /// Migration 19 adds patchsets.b4_cover_letter on a fresh database and
+    /// on one at 18 without it. Set back to 16, so that migrations 17 to 19
+    /// run again over the columns they already added, they do not fail and
+    /// keep what is stored. A fork database lacks b4_cover_letter and takes
+    /// the first path.
+    #[tokio::test]
+    async fn test_migration_19_adds_the_b4_cover_letter_column() {
+        let db = memory_db().await;
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+        assert!(has_b4_cover_letter(&db).await);
+
+        let (ps_id, _, _) = reviewed_patchset(&db, "b4_cover_letter_migration").await;
+        db.conn
+            .execute_batch(
+                "ALTER TABLE patchsets DROP COLUMN b4_cover_letter;
+                 PRAGMA user_version = 18;",
+            )
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+        assert!(has_b4_cover_letter(&db).await);
+        assert_eq!(db.get_patchset_b4_cover_letter(ps_id).await.unwrap(), None);
+
+        db.set_patchset_b4_cover_letter(ps_id, "Kept across the replay.")
+            .await
+            .unwrap();
+        db.set_patchset_mr_body(ps_id, "Also kept.").await.unwrap();
+        db.conn
+            .execute("PRAGMA user_version = 16", ())
+            .await
+            .unwrap();
+        db.migrate().await.unwrap();
+        assert_eq!(user_version(&db).await, i64::from(SCHEMA_VERSION));
+        assert!(has_mr_url_index(&db).await);
+        assert_eq!(
+            db.get_patchset_b4_cover_letter(ps_id)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("Kept across the replay.")
+        );
+        assert_eq!(
+            db.get_patchset_mr_body(ps_id).await.unwrap().as_deref(),
+            Some("Also kept.")
+        );
     }
 }

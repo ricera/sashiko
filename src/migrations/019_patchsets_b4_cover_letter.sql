@@ -1,0 +1,14 @@
+-- The cover letter a b4 tracker commit holds, stored per revision in
+-- patchsets.b4_cover_letter: the prose above the tracker's
+-- "--- b4-submit-tracking ---" block, with b4's template lines dropped.
+-- NULL when the series has no tracker or its tracker holds no prose;
+-- gzip-compressed when large, as patchsets.mr_body is. Only the fetcher's
+-- tracker rule writes it, so no email can supply it.
+--
+-- The column is added from Rust, only when it is missing, like 017's and
+-- 018's: ALTER TABLE has no IF NOT EXISTS, and a database whose version was
+-- set back below 19, as the replay tests do, already has it. Databases written
+-- by the fork do not have it: the fork kept a tracker's prose as the body of
+-- an @sashiko.local part 0 message, and this migration does not copy those
+-- bodies, so the column starts NULL on every existing patchset.
+-- Nothing else in this migration needs a statement, so this file holds none.
