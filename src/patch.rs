@@ -614,6 +614,48 @@ fn is_trailer_line(line: &str) -> bool {
     KNOWN_TRAILERS.contains(&key.trim().to_ascii_lowercase().as_str())
 }
 
+/// The message of example-org/kernel-fork#35's tracker commit
+/// (0a1b2c3d4e5f) exactly as the deployment database stores it: an
+/// unedited `b4 prep` template, and the only b4 branch a deployment has
+/// reviewed. The fetcher's tests commit it as a tracker.
+#[cfg(test)]
+pub(crate) const KERNEL_FORK_35_TRACKER: &str = r##"# Describe the purpose of this series. The information you put here
+# will be used by the project maintainer to make a decision whether
+# your patches should be reviewed, and in what priority order. Please be
+# very detailed and link to any relevant discussions or sites that the
+# maintainer can review to better understand your proposed changes. If you
+# only have a single patch in your series, the contents of the cover
+# letter will be appended to the "under-the-cut" portion of the patch.
+
+# Lines starting with # will be removed from the cover letter. You can
+# use them to add notes or reminders to yourself. If you want to use
+# markdown headers in your cover letter, start the line with ">#".
+
+# You can add trailers to the cover letter. Any email addresses found in
+# these trailers will be added to the addresses specified/generated
+# during the b4 send stage. You can also run "b4 prep --auto-to-cc" to
+# auto-populate the To: and Cc: trailers based on the code being
+# modified.
+
+Signed-off-by: Eric Joyner <eric.joyner@amd.com>
+
+--- b4-submit-tracking ---
+# This section is used internally by b4 prep for tracking purposes.
+{
+  "series": {
+    "revision": 1,
+    "change-id": "20260101-example-series-v2-abcdef012345",
+    "prefixes": []
+  }
+}"##;
+
+/// The kernel-fork#35 template with `edit` above its signoff, where
+/// an author editing the cover letter writes it.
+#[cfg(test)]
+pub(crate) fn edited_b4_tracker(edit: &str) -> String {
+    KERNEL_FORK_35_TRACKER.replacen("Signed-off-by:", &format!("{edit}\n\nSigned-off-by:"), 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,46 +1153,6 @@ diff --git a/file.c b/file.c";
         }
     }
 
-    /// The message of example-org/kernel-fork#35's tracker commit
-    /// (0a1b2c3d4e5f) exactly as the deployment database stores it: an
-    /// unedited `b4 prep` template, and the only b4 branch a deployment has
-    /// reviewed.
-    const KERNEL_FORK_35_TRACKER: &str = r##"# Describe the purpose of this series. The information you put here
-# will be used by the project maintainer to make a decision whether
-# your patches should be reviewed, and in what priority order. Please be
-# very detailed and link to any relevant discussions or sites that the
-# maintainer can review to better understand your proposed changes. If you
-# only have a single patch in your series, the contents of the cover
-# letter will be appended to the "under-the-cut" portion of the patch.
-
-# Lines starting with # will be removed from the cover letter. You can
-# use them to add notes or reminders to yourself. If you want to use
-# markdown headers in your cover letter, start the line with ">#".
-
-# You can add trailers to the cover letter. Any email addresses found in
-# these trailers will be added to the addresses specified/generated
-# during the b4 send stage. You can also run "b4 prep --auto-to-cc" to
-# auto-populate the To: and Cc: trailers based on the code being
-# modified.
-
-Signed-off-by: Eric Joyner <eric.joyner@amd.com>
-
---- b4-submit-tracking ---
-# This section is used internally by b4 prep for tracking purposes.
-{
-  "series": {
-    "revision": 1,
-    "change-id": "20260101-example-series-v2-abcdef012345",
-    "prefixes": []
-  }
-}"##;
-
-    /// The kernel-fork#35 template with `edit` above its signoff, where
-    /// an author editing the cover letter writes it.
-    fn tracker_with(edit: &str) -> String {
-        KERNEL_FORK_35_TRACKER.replacen("Signed-off-by:", &format!("{edit}\n\nSigned-off-by:"), 1)
-    }
-
     #[test]
     fn an_unedited_b4_template_is_no_cover_letter() {
         assert_eq!(extract_b4_cover_letter(KERNEL_FORK_35_TRACKER), None);
@@ -1158,14 +1160,15 @@ Signed-off-by: Eric Joyner <eric.joyner@amd.com>
 
     #[test]
     fn b4_auto_to_cc_trailers_are_no_cover_letter() {
-        let message =
-            tracker_with("To: Andrew Lunn <andrew+netdev@lunn.ch>\nCc: netdev@vger.kernel.org");
+        let message = edited_b4_tracker(
+            "To: Andrew Lunn <andrew+netdev@lunn.ch>\nCc: netdev@vger.kernel.org",
+        );
         assert_eq!(extract_b4_cover_letter(&message), None);
     }
 
     #[test]
     fn b4_comment_lines_are_dropped_and_escaped_headers_kept() {
-        let message = tracker_with(
+        let message = edited_b4_tracker(
             "Fix port_info lifetime bugs.\n\
              # a note to myself\n\
              >## Changes\n\
@@ -1192,7 +1195,7 @@ Signed-off-by: Eric Joyner <eric.joyner@amd.com>
 
     #[test]
     fn test_b4_cover_letter_drops_the_tracking_block() {
-        let message = tracker_with("Adds hwstamp teardown so queues are freed on disable.");
+        let message = edited_b4_tracker("Adds hwstamp teardown so queues are freed on disable.");
         let cover = extract_b4_cover_letter(&message);
         let cover = cover.as_deref().unwrap_or_default();
         assert!(cover.starts_with("Adds hwstamp teardown"), "{cover}");

@@ -756,6 +756,7 @@ async fn run_daemon(
                                 mr_url: None,
                                 mr_title: None,
                                 mr_number: None,
+                                b4_cover_letter: None,
                                 receipt: None,
                             })
                             .await
@@ -778,6 +779,7 @@ async fn run_daemon(
                         mr_url,
                         mr_title,
                         mr_number,
+                        b4_cover_letter,
                     } => {
                         let root_msg_id = format!("{}@sashiko.local", article_id);
 
@@ -833,6 +835,7 @@ async fn run_daemon(
                                 mr_url,
                                 mr_title,
                                 mr_number,
+                                b4_cover_letter,
                                 receipt: None,
                             })
                             .await
@@ -902,6 +905,7 @@ async fn run_daemon(
                                             mr_url: None,
                                             mr_title: None,
                                             mr_number: None,
+                                            b4_cover_letter: None,
                                             receipt: None,
                                         })
                                         .await
@@ -966,6 +970,7 @@ async fn run_daemon(
                                         mr_url: None,
                                         mr_title: None,
                                         mr_number: None,
+                                        b4_cover_letter: None,
                                         receipt,
                                     })
                                     .await
@@ -2988,6 +2993,23 @@ enum ProcessStatus {
     Error,
 }
 
+/// Stores `prose`, the b4 tracker's cover letter the fetcher read from a
+/// range's first commit, on patchset `patchset_id`. A failure is a
+/// warning: the series is still reviewed, only without the tracker's
+/// prose.
+#[cfg(feature = "server")]
+async fn store_b4_cover_letter(worker_db: &Database, patchset_id: i64, prose: &str) {
+    if let Err(e) = worker_db
+        .set_patchset_b4_cover_letter(patchset_id, prose)
+        .await
+    {
+        warn!(
+            "Failed to store the b4 cover letter of patchset {}: {}",
+            patchset_id, e
+        );
+    }
+}
+
 #[cfg(feature = "server")]
 async fn fail_fetching_patchset_logged(worker_db: &Database, root_msg_id: &str, err_msg: &str) {
     if let Err(e) = worker_db.fail_fetching_patchset(root_msg_id, err_msg).await {
@@ -3019,6 +3041,7 @@ async fn process_parsed_article(
         mr_url,
         mr_title,
         mr_number,
+        b4_cover_letter,
         // The caller settles the receipt, because only it knows whether the
         // whole batch made it through.
         receipt: _,
@@ -3455,6 +3478,13 @@ async fn process_parsed_article(
                             patchset_id, e
                         );
                     }
+                }
+
+                // Outside the forge-metadata guard: a range flagged with
+                // --b4-cover-letter is no pull request and has no forge
+                // fields, yet its tracker's prose is stored all the same.
+                if let Some(prose) = b4_cover_letter.as_deref() {
+                    store_b4_cover_letter(worker_db, patchset_id, prose).await;
                 }
 
                 #[allow(clippy::collapsible_if)]
@@ -5325,7 +5355,76 @@ mod tests {
             mr_url: None,
             mr_title: None,
             mr_number: None,
+            b4_cover_letter: None,
             receipt: None,
+        }
+    }
+
+    /// Part `index` of `total` of the fetched range `article_id`, the commit
+    /// `commit` with `diff` on top of `base`, as the parser dispatcher hands
+    /// a fetched commit to ingestion: no forge fields and no b4 cover
+    /// letter.
+    #[cfg(feature = "server")]
+    fn fetched_part(
+        article_id: &str,
+        commit: &str,
+        base: &str,
+        (index, total): (u32, u32),
+        diff: &str,
+    ) -> ParsedArticle {
+        let root_msg_id = format!("{article_id}@sashiko.local");
+        let body = "frob: fix the frobnicator\n".to_string();
+        ParsedArticle {
+            group: "git-fetch".to_string(),
+            article_id: article_id.to_string(),
+            source: MessageSource::GitFetch,
+            metadata: Some(sashiko::patch::PatchsetMetadata {
+                message_id: commit.to_string(),
+                subject: "frob: fix the frobnicator".to_string(),
+                author: "A U Thor <author@example.com>".to_string(),
+                date: 1_700_000_000,
+                received_date: None,
+                in_reply_to: (total > 1).then(|| root_msg_id.clone()),
+                references: vec![root_msg_id],
+                index,
+                total,
+                to: "submitted".to_string(),
+                cc: String::new(),
+                is_patch_or_cover: true,
+                version: None,
+                body: body.clone(),
+            }),
+            patch: Some(sashiko::patch::Patch {
+                message_id: commit.to_string(),
+                body,
+                diff: diff.to_string(),
+                part_index: index,
+            }),
+            baseline: Some(base.to_string()),
+            failed_error: None,
+            skip_filters: None,
+            only_filters: None,
+            mr_url: None,
+            mr_title: None,
+            mr_number: None,
+            b4_cover_letter: None,
+            receipt: None,
+        }
+    }
+
+    /// A diff that changes a file.
+    #[cfg(feature = "server")]
+    const FROB_DIFF: &str =
+        "diff --git a/frob.c b/frob.c\n--- a/frob.c\n+++ b/frob.c\n@@ -1 +1 @@\n-a\n+b\n";
+
+    /// `article` as a part of PR 7 of `repo`.
+    #[cfg(feature = "server")]
+    fn of_pr_7(repo: &str, article: ParsedArticle) -> ParsedArticle {
+        ParsedArticle {
+            mr_url: Some(format!("https://github.com/acme/{repo}/pull/7")),
+            mr_title: Some("Fix the frobnicator".to_string()),
+            mr_number: Some(7),
+            ..article
         }
     }
 
@@ -5334,45 +5433,10 @@ mod tests {
     #[cfg(feature = "server")]
     fn fetched_pr_7_commit(repo: &str, base: &str, head: &str) -> ParsedArticle {
         let article_id = format!("mr-7-{base}..{head}");
-        let root_msg_id = format!("{article_id}@sashiko.local");
-        let body = "frob: fix the frobnicator\n".to_string();
-        let diff =
-            "diff --git a/frob.c b/frob.c\n--- a/frob.c\n+++ b/frob.c\n@@ -1 +1 @@\n-a\n+b\n";
-        ParsedArticle {
-            group: "git-fetch".to_string(),
-            article_id,
-            source: MessageSource::GitFetch,
-            metadata: Some(sashiko::patch::PatchsetMetadata {
-                message_id: head.to_string(),
-                subject: "frob: fix the frobnicator".to_string(),
-                author: "A U Thor <author@example.com>".to_string(),
-                date: 1_700_000_000,
-                received_date: None,
-                in_reply_to: None,
-                references: vec![root_msg_id],
-                index: 1,
-                total: 1,
-                to: "submitted".to_string(),
-                cc: String::new(),
-                is_patch_or_cover: true,
-                version: None,
-                body: body.clone(),
-            }),
-            patch: Some(sashiko::patch::Patch {
-                message_id: head.to_string(),
-                body,
-                diff: diff.to_string(),
-                part_index: 1,
-            }),
-            baseline: Some(base.to_string()),
-            failed_error: None,
-            skip_filters: None,
-            only_filters: None,
-            mr_url: Some(format!("https://github.com/acme/{repo}/pull/7")),
-            mr_title: Some("Fix the frobnicator".to_string()),
-            mr_number: Some(7),
-            receipt: None,
-        }
+        of_pr_7(
+            repo,
+            fetched_part(&article_id, head, base, (1, 1), FROB_DIFF),
+        )
     }
 
     /// Ingestion names each revision of a pull request with the version
@@ -5606,6 +5670,87 @@ mod tests {
                 pr_7_revisions(&db).await,
                 expected,
                 "redelivered {redelivered}"
+            );
+        }
+    }
+
+    /// The part index and commit of every patch of `patchset`, in order.
+    #[cfg(feature = "server")]
+    async fn stored_parts(db: &Database, patchset: i64) -> Vec<(i64, String)> {
+        let mut rows = db
+            .conn
+            .query(
+                "SELECT part_index, message_id FROM patches WHERE patchset_id = ? \
+                 ORDER BY part_index",
+                libsql::params![patchset],
+            )
+            .await
+            .unwrap();
+        let mut parts = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            parts.push((row.get(0).unwrap(), row.get(1).unwrap()));
+        }
+        parts
+    }
+
+    /// Ingestion stores the prose the fetcher read from a range's tracker
+    /// as the patchset's b4 cover letter, for a pull request and for a
+    /// flagged plain range, which has no forge fields, alike; an unedited
+    /// tracker, which the fetcher reads as none, stores none. Either way the
+    /// tracker stays part 1 of the series, ahead of the commit after it.
+    #[cfg(feature = "server")]
+    #[tokio::test]
+    async fn ingestion_stores_a_trackers_cover_letter_beside_its_parts() {
+        let policy = sashiko::email_policy::EmailPolicyConfig::default();
+        let (base, tracker, head) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let prose = "Fixes two port_info lifetime bugs in ionic.";
+        for (pull_request, cover_letter) in
+            [(true, Some(prose)), (false, Some(prose)), (true, None)]
+        {
+            let settings = sashiko::settings::DatabaseSettings {
+                url: ":memory:".to_string(),
+                token: String::new(),
+            };
+            let db = Database::new(&settings).await.unwrap();
+            db.migrate().await.unwrap();
+            let article_id = if pull_request {
+                format!("mr-7-{base}..{head}")
+            } else {
+                format!("{base}..{head}")
+            };
+            let as_requested = |article: ParsedArticle| {
+                if pull_request {
+                    of_pr_7("widget", article)
+                } else {
+                    article
+                }
+            };
+            let first = ParsedArticle {
+                b4_cover_letter: cover_letter.map(str::to_string),
+                ..fetched_part(&article_id, &tracker, &base, (1, 2), "")
+            };
+            let second = fetched_part(&article_id, &head, &base, (2, 2), FROB_DIFF);
+            for article in [first, second] {
+                assert!(matches!(
+                    process_parsed_article(&db, as_requested(article), None, &policy, &[]).await,
+                    ProcessStatus::Ingested
+                ));
+            }
+
+            let patchset = db
+                .find_patchset_id_by_msgid(&article_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                db.get_patchset_b4_cover_letter(patchset).await.unwrap(),
+                cover_letter.map(str::to_string),
+                "{article_id}"
+            );
+            assert_eq!(
+                stored_parts(&db, patchset).await,
+                [(1, tracker.clone()), (2, head.clone())],
+                "{article_id}"
             );
         }
     }

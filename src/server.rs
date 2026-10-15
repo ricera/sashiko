@@ -537,12 +537,14 @@ async fn submit_patch(
             repo,
             skip_subjects,
             only_subjects,
+            b4_cover_letter,
         }
         | SubmitRequest::RemoteRange {
             sha,
             repo,
             skip_subjects,
             only_subjects,
+            b4_cover_letter,
         } => {
             let has_invalid_ref = sha.trim_matches('.').is_empty()
                 || sha.chars().any(char::is_whitespace)
@@ -605,6 +607,7 @@ async fn submit_patch(
                 mr_url: None,
                 mr_title: None,
                 mr_number: None,
+                b4_cover_letter,
             };
 
             if let Err(e) = state.fetch_sender.send(req).await {
@@ -2733,6 +2736,8 @@ async fn enqueue_pull_request(
         mr_url: metadata.pr_url.clone(),
         mr_title: metadata.pr_title.clone(),
         mr_number: Some(metadata.pr_number),
+        // A pull request's tracker is read by b4's marker, never by flag.
+        b4_cover_letter: false,
     };
 
     state.fetch_sender.send(req).await.map_err(|e| {
@@ -3919,6 +3924,51 @@ mod tests {
         }
     }
 
+    /// A submitted range carries its --b4-cover-letter flag to the fetcher
+    /// as the request gave it, false when the key is absent, as it is in
+    /// every request sent before the flag existed; a range submitted as
+    /// "remote" carries it the same way. Each case names its own range,
+    /// because a range already queued is not fetched again.
+    #[tokio::test]
+    async fn a_submitted_range_passes_its_b4_flag_to_the_fetcher() {
+        let (mut state, mut fetch_rx) = pull_request_state().await;
+        state.allow_all_submit = true;
+        let state = Arc::new(state);
+        let cases = [
+            ("remote-range", None, false),
+            ("remote-range", Some(true), true),
+            ("remote", Some(true), true),
+        ];
+        for (head, (kind, flag, flagged)) in (1..).zip(cases) {
+            let range = format!("{PR_BASE}..{head:040x}");
+            let mut payload = serde_json::json!({"type": kind, "sha": range});
+            if let Some(flag) = flag {
+                payload["b4_cover_letter"] = serde_json::json!(flag);
+            }
+            let request: SubmitRequest = serde_json::from_value(payload.clone()).unwrap();
+            let Json(reply) = submit_patch(
+                crate::auth::OptionalAuthUser(None),
+                ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 9))),
+                axum::http::HeaderMap::new(),
+                State(state.clone()),
+                Json(request),
+            )
+            .await
+            .unwrap_or_else(|status| panic!("{payload} was refused with {status}"));
+            assert_eq!(reply.status, "accepted", "{payload}");
+            let sent = fetch_rx.try_recv().ok();
+            assert_eq!(
+                sent.map(|request| (
+                    request.commit_hash,
+                    request.mr_number,
+                    request.b4_cover_letter
+                )),
+                Some((range, None, flagged)),
+                "{payload}"
+            );
+        }
+    }
+
     /// A GitHub delivery still produces the placeholder id, subject, slug
     /// and fetch request it did before the enqueue path was shared, and a
     /// second delivery for a finished revision still queues a fetch while
@@ -3966,6 +4016,7 @@ mod tests {
             mr_url: Some("https://github.com/acme/widget/pull/7".to_string()),
             mr_title: Some("Fix the widget".to_string()),
             mr_number: Some(7),
+            b4_cover_letter: false,
         };
         assert_eq!(fetch_rx.try_recv().ok(), Some(expected_fetch.clone()));
 

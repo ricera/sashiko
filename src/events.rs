@@ -162,6 +162,10 @@ pub enum Event {
         mr_url: Option<String>,
         mr_title: Option<String>,
         mr_number: Option<i64>,
+        /// The prose of the series' b4 tracker commit, set only on part 1
+        /// of a range whose first commit the fetcher read as a tracker.
+        /// Ingestion stores it as the patchset's b4 cover letter.
+        b4_cover_letter: Option<String>,
     },
     RawMboxSubmitted {
         raw: String,
@@ -197,6 +201,9 @@ pub struct ParsedArticle {
     pub mr_url: Option<String>,
     pub mr_title: Option<String>,
     pub mr_number: Option<i64>,
+    /// The prose of the series' b4 tracker commit, from the fetcher's
+    /// tracker rule only, so no emailed or injected message can supply it.
+    pub b4_cover_letter: Option<String>,
     /// Travels with the article so that the fetch loop learns whether it was
     /// stored. See IngestTracker.
     pub receipt: Option<IngestReceipt>,
