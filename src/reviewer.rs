@@ -11560,7 +11560,8 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
     /// letter the model reads: the pull request description stored beside
     /// it reaches no prompt. Without one the description is the cover
     /// letter, and with neither there is none. A tracker that holds no
-    /// prose once cleaned, not even beside a signoff, does not hide the
+    /// prose once cleaned, not even beside a signoff, or whose block would
+    /// quote only the cap's marker or trailers, does not hide the
     /// description, and an unedited template,
     /// kernel-fork#35's, stores nothing, so it leaves the description as
     /// the cover letter.
@@ -11603,12 +11604,20 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             None,
             "an unedited template gives ingestion nothing to store"
         );
-        for hidden in [
-            "<!-- notes -->\n\u{200B}",
-            "Signed-off-by: A <a@x>\n\u{200B}",
-        ] {
-            db.set_patchset_b4_cover_letter(id, hidden).await?;
-            assert_eq!(cover_letter_prompts(&db, id).await?, prompts, "{hidden:?}");
+        let quoting_no_prose = [
+            "<!-- notes -->\n\u{200B}".to_string(),
+            "Signed-off-by: A <a@x>\n\u{200B}".to_string(),
+            format!("{}\n[truncated]", "\u{200B}".repeat(21_000)),
+            format!("{}Real prose.", "Cc: x@y\n".repeat(1000)),
+        ];
+        for hidden in quoting_no_prose {
+            db.set_patchset_b4_cover_letter(id, &hidden).await?;
+            assert_eq!(
+                cover_letter_prompts(&db, id).await?,
+                prompts,
+                "{:?}",
+                hidden.chars().take(40).collect::<String>()
+            );
         }
 
         db.set_patchset_b4_cover_letter(id, tracker).await?;

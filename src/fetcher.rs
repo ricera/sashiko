@@ -217,7 +217,11 @@ impl TrackerRule {
     /// The cover letter a commit with `message` (without its subject) and
     /// `diff` carries under this rule: `None` when the rule does not read
     /// the commit or its message holds no prose. The prose is cut to the
-    /// description's cap, because a commit message is unbounded.
+    /// description's cap, because a commit message is unbounded, and the
+    /// cut text must still put prose in front of the model by
+    /// [`crate::cover_letter::shows_b4_prose`], so a tracker whose block
+    /// would quote only hidden characters, trailers or truncation notices
+    /// is not stored to hide the pull request description.
     fn cover_letter(self, message: &str, diff: &str) -> Option<String> {
         let read = match self {
             Self::Ignore => false,
@@ -227,7 +231,9 @@ impl TrackerRule {
         if !read {
             return None;
         }
-        extract_b4_cover_letter(message).and_then(|prose| crate::forge::bounded_author_text(&prose))
+        extract_b4_cover_letter(message)
+            .and_then(|prose| crate::forge::bounded_author_text(&prose))
+            .filter(|stored| crate::cover_letter::shows_b4_prose(stored))
     }
 }
 
@@ -2746,5 +2752,35 @@ mod tests {
             &cover[cover.len() - 40..]
         );
         assert_eq!(TrackerRule::Ignore.cover_letter(&message, ""), None);
+    }
+
+    /// A tracker whose prose the block would not quote is not read: prose
+    /// behind characters the cleaning removes, which fill the cap so that
+    /// only its marker would reach the model, or behind trailers that fill
+    /// the token budget. Prose that lines up to the cap is still read.
+    #[test]
+    fn a_tracker_is_read_only_when_its_block_quotes_prose() {
+        let tracker = |cover: String| format!("{cover}\n\n{B4_TRACKING_MARKER}\n{{}}");
+        let hidden_prefixes = [
+            "\u{200B}".repeat(22_000),
+            "\u{FEFF}".repeat(22_000),
+            "\u{E0041}".repeat(17_000),
+            "Cc: x@y\n".repeat(1000),
+        ];
+        for prefix in hidden_prefixes {
+            let message = tracker(format!("{prefix}\nReal prose."));
+            assert!(
+                TrackerRule::Marked.cover_letter(&message, "").is_none(),
+                "{:?}",
+                &prefix[..12]
+            );
+        }
+
+        let message = tracker("Real prose.\n".repeat(6000));
+        let Some(cover) = TrackerRule::Marked.cover_letter(&message, "") else {
+            panic!("prose up to the cap is read");
+        };
+        assert!(cover.starts_with("Real prose.\n"));
+        assert!(cover.ends_with("\n[truncated]"));
     }
 }

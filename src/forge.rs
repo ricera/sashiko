@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::baseline::CommitId;
+use crate::cover_letter::DESCRIPTION_TRUNCATED;
 use crate::finding_view::sanitize_one_line;
 use crate::settings::ForgeRepo;
 use anyhow::Result;
@@ -185,9 +186,6 @@ pub struct ForgeMetadata {
 /// by the request body limit, so the cap is applied here to keep every
 /// stored revision, and every later rendering of it, bounded.
 pub const MAX_DESCRIPTION_BYTES: usize = 65536;
-
-/// What ends a description cut at [`MAX_DESCRIPTION_BYTES`].
-const DESCRIPTION_TRUNCATED: &str = "\n[truncated]";
 
 /// Reads a pull or merge request description from its JSON value.
 ///
