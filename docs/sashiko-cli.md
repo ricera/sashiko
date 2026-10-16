@@ -105,9 +105,13 @@ request's tracker is read without the flag, when its first commit is empty
 and holds the marker, so the flag is refused with a pull request reference,
 and with anything that is not a two-dot range. A three-dot range
 (`base...head`) is refused too: it lists the commits of both sides by date,
-so its first commit need not be the branch's tracker. A range the daemon
-already has queued or reviewed is not fetched again, so give the flag the
-first time the range is submitted.
+so its first commit need not be the branch's tracker. The flag decides
+only for the request that carries it, and an earlier pull request fetch of
+the same `base..head` does not change how a flagged range is read; a pull
+request fetch of the same range queued in the same ten-second batch is
+fetched once with it, as the pull request, whose tracker needs the marker.
+A range the daemon already has queued or reviewed is not fetched again, so
+give the flag the first time the range is submitted.
 
 **Examples:**
 
