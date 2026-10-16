@@ -201,7 +201,9 @@ enum TrackerRule {
 impl TrackerRule {
     /// The rule for the first commit of a range of `count` commits. A
     /// range of one has no series for a tracker to describe, and its only
-    /// commit is the one under review. A pull request's tracker always
+    /// commit is the one under review. The flag and number are those the
+    /// range's own requests carried in this batch, never a number left by
+    /// an earlier batch's pull request. A pull request's tracker always
     /// needs the marker, even when a flagged plain range with the same
     /// `base..head` shares its batch, because the flag vouches only for
     /// the range its submitter sent.
@@ -241,8 +243,6 @@ pub struct FetchAgent {
     repo_path: PathBuf,
     rx: mpsc::Receiver<FetchRequest>,
     main_tx: mpsc::Sender<Event>,
-    #[allow(clippy::type_complexity)]
-    mr_metadata: HashMap<String, (Option<String>, Option<String>, Option<i64>)>,
     gitlab_token: Option<String>,
     /// Where each requested commit or range reports the git operation in
     /// flight. A fetch against a slow or unreachable remote otherwise leaves
@@ -284,52 +284,91 @@ impl Drop for BatchMarks<'_> {
     }
 }
 
-/// The requests waiting for the next tick, grouped by repository.
-///
-/// A b4 flag lives here beside its range rather than on the agent, so it
-/// belongs to one repository's batch and is gone once that batch runs:
-/// a later request for the same `base..head`, a pull request's included,
-/// never inherits it.
-#[derive(Default)]
-struct PendingFetches {
-    /// Each repository's requested commits and ranges.
-    commits: HashMap<Option<String>, HashSet<String>>,
-    /// Each repository's requested ranges whose submitter asked for a b4
-    /// tracker to be read without b4's marker
-    /// (`FetchRequest::b4_cover_letter`).
-    b4_flagged: HashMap<Option<String>, HashSet<String>>,
+/// The forge fields of a pull or merge request's fetch, all `None` for a
+/// plain commit or range.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ForgeFields {
+    url: Option<String>,
+    title: Option<String>,
+    number: Option<i64>,
 }
 
-impl PendingFetches {
-    /// Queues `req` for its repository's next batch.
-    fn add(&mut self, req: FetchRequest) {
-        if req.b4_cover_letter {
-            self.b4_flagged
-                .entry(req.repo_url.clone())
-                .or_default()
-                .insert(req.commit_hash.clone());
+impl ForgeFields {
+    /// The forge fields `req` carries.
+    fn of(req: &FetchRequest) -> Self {
+        Self {
+            url: req.mr_url.clone(),
+            title: req.mr_title.clone(),
+            number: req.mr_number,
         }
-        self.commits
-            .entry(req.repo_url)
-            .or_default()
-            .insert(req.commit_hash);
     }
 
     fn is_empty(&self) -> bool {
-        self.commits.is_empty()
+        self.url.is_none() && self.title.is_none() && self.number.is_none()
     }
 }
 
-/// One requested commit or range, with the commits it needs present.
+/// What the requests for one commit or range queued in one batch carried
+/// beyond the commit or range itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RequestFields {
+    /// The forge fields of the last request that carried any.
+    forge: ForgeFields,
+    /// Whether any of the requests asked for a b4 tracker to be read
+    /// without b4's marker (`FetchRequest::b4_cover_letter`).
+    b4_flagged: bool,
+}
+
+/// The requests waiting for the next tick, grouped by repository.
+///
+/// A request's b4 flag and forge fields live here beside its commit or
+/// range rather than on the agent, so they belong to one repository's
+/// batch and are gone once that batch runs: a later request for the same
+/// `base..head` is read by its own fields alone, and never inherits an
+/// earlier request's flag or pull request number.
+#[derive(Default)]
+struct PendingFetches {
+    /// Each repository's requested commits and ranges, with what their
+    /// requests carried.
+    requests: HashMap<Option<String>, HashMap<String, RequestFields>>,
+}
+
+impl PendingFetches {
+    /// Queues `req` for its repository's next batch. Requests for the same
+    /// commit or range in one batch are submitted once: a forge request's
+    /// fields replace any earlier ones, and a flag from any of them stays.
+    fn add(&mut self, req: FetchRequest) {
+        let forge = ForgeFields::of(&req);
+        let fields = self
+            .requests
+            .entry(req.repo_url)
+            .or_default()
+            .entry(req.commit_hash)
+            .or_default();
+        if !forge.is_empty() {
+            fields.forge = forge;
+        }
+        fields.b4_flagged |= req.b4_cover_letter;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.requests.is_empty()
+    }
+}
+
+/// One requested commit or range, with the commits it needs present and
+/// what its requests carried.
 struct BatchRequest {
     /// The commit or `base..head` range as it was requested.
     commit_or_range: String,
     /// The commit itself, or both ends of a range.
     endpoints: Vec<String>,
+    /// The forge fields and b4 flag of the requests in this batch.
+    fields: RequestFields,
 }
 
 impl BatchRequest {
-    fn new(commit_or_range: String) -> Self {
+    fn new(commit_or_range: String, fields: RequestFields) -> Self {
         let endpoints = if commit_or_range.contains("..") {
             let parts: Vec<&str> = commit_or_range.split("..").collect();
             match parts.as_slice() {
@@ -346,12 +385,28 @@ impl BatchRequest {
         Self {
             commit_or_range,
             endpoints,
+            fields,
         }
     }
 
     /// Whether the request needs any of the `missing` commits.
     fn needs_any(&self, missing: &[String]) -> bool {
         self.endpoints.iter().any(|e| missing.contains(e))
+    }
+
+    /// The article id every event about the request carries:
+    /// `mr-{n}-{commit_or_range}` for a forge request, the request itself
+    /// otherwise.
+    ///
+    /// The API's placeholder patchset is this id with `@sashiko.local`
+    /// appended. An event named after anything else, such as one endpoint
+    /// of a range, misses the placeholder and can match an unrelated
+    /// patchset submitted for that commit alone.
+    fn article_id(&self) -> String {
+        match self.fields.forge.number {
+            Some(number) => format!("mr-{}-{}", number, self.commit_or_range),
+            None => self.commit_or_range.clone(),
+        }
     }
 }
 
@@ -479,7 +534,6 @@ impl FetchAgent {
                 repo_path,
                 rx,
                 main_tx,
-                mr_metadata: HashMap::new(),
                 gitlab_token,
                 activity,
                 git_limit: GitOp::limit,
@@ -498,7 +552,6 @@ impl FetchAgent {
         loop {
             tokio::select! {
                 Some(req) = self.rx.recv() => {
-                    self.remember(&req);
                     // Batched on a ten-second tick, so a request can wait
                     // that long before anything happens to it.
                     self.activity
@@ -514,48 +567,35 @@ impl FetchAgent {
         }
     }
 
-    /// Records the forge fields a request carries for its commit or range,
-    /// which the batch it joins reads when it submits it.
-    fn remember(&mut self, req: &FetchRequest) {
-        if req.mr_url.is_some() || req.mr_title.is_some() || req.mr_number.is_some() {
-            self.mr_metadata.insert(
-                req.commit_hash.clone(),
-                (req.mr_url.clone(), req.mr_title.clone(), req.mr_number),
-            );
-        }
-    }
-
     /// Runs every pending batch, one per repository, and leaves nothing
-    /// pending, b4 flags included.
+    /// pending, b4 flags and forge fields included.
     async fn process_queue(&self, pending: &mut PendingFetches) {
         info!(
             "Processing fetch queue with {} repos",
-            pending.commits.len()
+            pending.requests.len()
         );
-        let mut b4_flagged = std::mem::take(&mut pending.b4_flagged);
 
-        for (url_opt, commits) in pending.commits.drain() {
-            if commits.is_empty() {
+        for (url_opt, requests) in pending.requests.drain() {
+            if requests.is_empty() {
                 continue;
             }
-            let flagged = b4_flagged.remove(&url_opt).unwrap_or_default();
-            self.process_batch(url_opt.as_deref(), commits.into_iter().collect(), &flagged)
-                .await;
+            let requests = requests
+                .into_iter()
+                .map(|(commit_or_range, fields)| BatchRequest::new(commit_or_range, fields))
+                .collect();
+            self.process_batch(url_opt.as_deref(), requests).await;
         }
     }
 
     /// Fetches what one repository's batch is missing, then submits every
-    /// request that can still be served. `b4_flagged` holds the batch's
-    /// ranges whose submitter asked for their tracker to be read.
-    async fn process_batch(
-        &self,
-        url_opt: Option<&str>,
-        commit_list: Vec<String>,
-        b4_flagged: &HashSet<String>,
-    ) {
+    /// request that can still be served, each by its own fields.
+    async fn process_batch(&self, url_opt: Option<&str>, requests: Vec<BatchRequest>) {
         let marks = BatchMarks {
             activity: &self.activity,
-            commits: commit_list.clone(),
+            commits: requests
+                .iter()
+                .map(|request| request.commit_or_range.clone())
+                .collect(),
         };
         marks.mark(Phase::GitOp {
             op: "git rev-parse (checking commit presence)".to_string(),
@@ -563,11 +603,10 @@ impl FetchAgent {
 
         info!(
             "Processing {} commits for remote {}",
-            commit_list.len(),
+            requests.len(),
             url_opt.unwrap_or("local")
         );
 
-        let requests: Vec<BatchRequest> = commit_list.into_iter().map(BatchRequest::new).collect();
         let missing = self.missing_endpoints(&requests).await;
 
         let requests = match self
@@ -589,12 +628,11 @@ impl FetchAgent {
         marks.mark(Phase::GitOp {
             op: "extracting patch metadata".to_string(),
         });
-        for request in requests {
+        for request in &requests {
             if request.commit_or_range.contains("..") {
-                let flagged = b4_flagged.contains(&request.commit_or_range);
-                self.submit_range(&request.commit_or_range, flagged).await;
+                self.submit_range(request).await;
             } else {
-                self.submit_commit(&request.commit_or_range).await;
+                self.submit_commit(request).await;
             }
         }
     }
@@ -635,7 +673,7 @@ impl FetchAgent {
             .iter()
             .filter(|request| request.needs_any(missing))
             .filter_map(|request| {
-                let number = self.mr_fields(&request.commit_or_range).2?;
+                let number = request.fields.forge.number?;
                 (number > 0).then_some((number, request))
             });
         let mut heads: Vec<ForgeHead<'a>> = Vec::new();
@@ -874,40 +912,16 @@ impl FetchAgent {
         let (unfetched, ready): (Vec<_>, Vec<_>) =
             requests.into_iter().partition(|r| r.needs_any(missing));
         for request in unfetched {
-            self.fail_request(&request.commit_or_range, error.to_string())
-                .await;
+            self.fail_request(&request, error.to_string()).await;
         }
         ready
     }
 
-    /// The article id every event about a request carries:
-    /// `mr-{n}-{commit_or_range}` for a forge request, the request itself
-    /// otherwise.
-    ///
-    /// The API's placeholder patchset is this id with `@sashiko.local`
-    /// appended. An event named after anything else, such as one endpoint
-    /// of a range, misses the placeholder and can match an unrelated
-    /// patchset submitted for that commit alone.
-    fn request_article_id(&self, commit_or_range: &str) -> String {
-        match self.mr_fields(commit_or_range).2 {
-            Some(number) => format!("mr-{}-{}", number, commit_or_range),
-            None => commit_or_range.to_string(),
-        }
-    }
-
-    /// The forge URL, title and number recorded for a request, if any.
-    fn mr_fields(&self, commit_or_range: &str) -> (Option<String>, Option<String>, Option<i64>) {
-        self.mr_metadata
-            .get(commit_or_range)
-            .cloned()
-            .unwrap_or((None, None, None))
-    }
-
     /// Ends a request with `IngestionFailed`, so that its placeholder
     /// patchset leaves Fetching with `error` as its reason.
-    async fn fail_request(&self, commit_or_range: &str, error: String) {
+    async fn fail_request(&self, request: &BatchRequest, error: String) {
         let event = Event::IngestionFailed {
-            article_id: self.request_article_id(commit_or_range),
+            article_id: request.article_id(),
             error,
             source: MessageSource::GitFetch,
         };
@@ -917,13 +931,14 @@ impl FetchAgent {
     }
 
     /// Submits every commit of a `base..head` range as one series, reading
-    /// a `b4_flagged` two-dot range's empty first commit as its tracker.
-    async fn submit_range(&self, range: &str, b4_flagged: bool) {
+    /// a b4-flagged two-dot range's empty first commit as its tracker.
+    async fn submit_range(&self, request: &BatchRequest) {
+        let range = request.commit_or_range.as_str();
         let shas = match crate::git_ops::resolve_git_range(&self.repo_path, range).await {
             Ok(shas) => shas,
             Err(e) => {
                 self.fail_request(
-                    range,
+                    request,
                     format!(
                         "Failed to resolve git range: {}",
                         redact_secret(&e.to_string())
@@ -934,12 +949,12 @@ impl FetchAgent {
             }
         };
         let count = shas.len() as u32;
-        let (mr_url, mr_title, mr_number) = self.mr_fields(range);
-        let article_id = self.request_article_id(range);
+        let forge = &request.fields.forge;
+        let article_id = request.article_id();
         // A symmetric difference lists both sides' commits by date, so its
         // first commit can be the other side's and is never a tracker.
-        let flagged = b4_flagged && !range.contains("...");
-        let first_commit = TrackerRule::for_range(shas.len(), flagged, mr_number);
+        let flagged = request.fields.b4_flagged && !range.contains("...");
+        let first_commit = TrackerRule::for_range(shas.len(), flagged, forge.number);
 
         for (i, sha) in shas.iter().enumerate() {
             // Only the first commit can be a tracker; it keeps part 1, so a
@@ -955,9 +970,9 @@ impl FetchAgent {
                     &article_id,
                     (i + 1) as u32,
                     count,
-                    mr_url.as_ref(),
-                    mr_title.as_ref(),
-                    mr_number,
+                    forge.url.as_ref(),
+                    forge.title.as_ref(),
+                    forge.number,
                     tracker,
                 )
                 .await
@@ -979,20 +994,21 @@ impl FetchAgent {
     }
 
     /// Submits a single commit as a one-patch series.
-    async fn submit_commit(&self, commit: &str) {
+    async fn submit_commit(&self, request: &BatchRequest) {
+        let commit = request.commit_or_range.as_str();
         let full_sha = match self.resolve_sha(commit).await {
             Ok(sha) => sha,
             Err(e) => {
                 self.fail_request(
-                    commit,
+                    request,
                     format!("Failed to resolve SHA: {}", redact_secret(&e.to_string())),
                 )
                 .await;
                 return;
             }
         };
-        let (mr_url, mr_title, mr_number) = self.mr_fields(commit);
-        let article_id = self.request_article_id(commit);
+        let forge = &request.fields.forge;
+        let article_id = request.article_id();
 
         match self
             .extract_patch(
@@ -1000,9 +1016,9 @@ impl FetchAgent {
                 &article_id,
                 1,
                 1,
-                mr_url.as_ref(),
-                mr_title.as_ref(),
-                mr_number,
+                forge.url.as_ref(),
+                forge.title.as_ref(),
+                forge.number,
                 TrackerRule::Ignore,
             )
             .await
@@ -1017,7 +1033,7 @@ impl FetchAgent {
             Err(e) => {
                 error!("Failed to extract patch {}: {}", commit, e);
                 self.fail_request(
-                    commit,
+                    request,
                     format!("Failed to extract patch: {}", redact_secret(&e.to_string())),
                 )
                 .await;
@@ -1388,21 +1404,47 @@ mod tests {
         run_batch(agent, rx, REFUSING_REMOTE, requests).await
     }
 
-    /// Runs one batch of `requests` against `url` and returns every event
-    /// the agent sent for it.
+    /// Runs one batch of plain `requests` against `url` and returns every
+    /// event the agent sent for it.
     async fn run_batch(
         agent: &FetchAgent,
         rx: &mut mpsc::Receiver<Event>,
         url: &str,
         requests: &[&str],
     ) -> Vec<Event> {
-        let mut pending = PendingFetches::default();
-        pending.commits.insert(
-            Some(url.to_string()),
-            requests.iter().map(|r| r.to_string()).collect(),
-        );
-        agent.process_queue(&mut pending).await;
+        let requests = requests.iter().map(|request| plain(request)).collect();
+        run_requests(agent, rx, url, requests).await
+    }
+
+    /// Runs one batch of `requests` against `url` and returns every event
+    /// the agent sent for it.
+    async fn run_requests(
+        agent: &FetchAgent,
+        rx: &mut mpsc::Receiver<Event>,
+        url: &str,
+        requests: Vec<BatchRequest>,
+    ) -> Vec<Event> {
+        agent.process_batch(Some(url), requests).await;
         drain(rx)
+    }
+
+    /// A batch's request for `commit_or_range` that carried no forge fields
+    /// and no flag.
+    fn plain(commit_or_range: &str) -> BatchRequest {
+        BatchRequest::new(commit_or_range.to_string(), RequestFields::default())
+    }
+
+    /// A batch's request for `commit_or_range` from pull request 7.
+    fn pull_7(commit_or_range: &str) -> BatchRequest {
+        let forge = ForgeFields {
+            number: Some(7),
+            ..ForgeFields::default()
+        };
+        let fields = RequestFields {
+            forge,
+            b4_flagged: false,
+        };
+        BatchRequest::new(commit_or_range.to_string(), fields)
     }
 
     /// Every event waiting on `rx`, in order.
@@ -1519,11 +1561,11 @@ mod tests {
 
     #[test]
     fn batch_request_splits_a_range_into_its_endpoints() {
-        let range = BatchRequest::new("a..b".to_string());
+        let range = plain("a..b");
         assert_eq!(range.endpoints, ["a", "b"]);
-        let symmetric = BatchRequest::new("a...b".to_string());
+        let symmetric = plain("a...b");
         assert_eq!(symmetric.endpoints, ["a", "b"]);
-        let commit = BatchRequest::new("a".to_string());
+        let commit = plain("a");
         assert_eq!(commit.endpoints, ["a"]);
         assert!(range.needs_any(&["b".to_string()]));
         assert!(!range.needs_any(&["c".to_string()]));
@@ -1566,7 +1608,7 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         init_repo_with_commit(temp_dir.path()).await?;
         let (tx, mut rx) = mpsc::channel(16);
-        let (mut agent, _) = FetchAgent::new(
+        let (agent, _) = FetchAgent::new(
             temp_dir.path().to_path_buf(),
             tx,
             None,
@@ -1575,16 +1617,11 @@ mod tests {
 
         let range = format!("{}..{}", MISSING_BASE, MISSING_HEAD);
         let commit = "3333333333333333333333333333333333333333";
-        for request in [range.as_str(), commit] {
-            agent
-                .mr_metadata
-                .insert(request.to_string(), (None, None, Some(7)));
-        }
 
-        let events = run_refused_batch(&agent, &mut rx, &[&range]).await;
+        let events = run_requests(&agent, &mut rx, REFUSING_REMOTE, vec![pull_7(&range)]).await;
         assert_eq!(failed_ids(&events), [format!("mr-7-{}", range)]);
 
-        let events = run_refused_batch(&agent, &mut rx, &[commit]).await;
+        let events = run_requests(&agent, &mut rx, REFUSING_REMOTE, vec![pull_7(commit)]).await;
         assert_eq!(failed_ids(&events), [format!("mr-7-{}", commit)]);
         Ok(())
     }
@@ -2075,14 +2112,17 @@ mod tests {
         let daemon = tempfile::tempdir()?;
         let forge_dir = tempfile::tempdir()?;
         let forge = forge_dir.path().join("forge");
-        let (mut agent, mut rx, base, head) = agent_with_pull_head(daemon.path(), &forge).await?;
+        let (agent, mut rx, base, head) = agent_with_pull_head(daemon.path(), &forge).await?;
         let range = format!("{}..{}", base, head);
-        agent
-            .mr_metadata
-            .insert(range.clone(), (None, None, Some(7)));
 
         let url = forge.to_string_lossy().to_string();
-        let events = run_batch(&agent, &mut rx, &url, &[&range, MISSING_HEAD]).await;
+        let events = run_requests(
+            &agent,
+            &mut rx,
+            &url,
+            vec![pull_7(&range), plain(MISSING_HEAD)],
+        )
+        .await;
 
         assert_eq!(submitted_ids(&events), [format!("mr-7-{}", range)]);
         assert_eq!(failed_ids(&events), [MISSING_HEAD]);
@@ -2113,18 +2153,15 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         init_repo_with_commit(temp_dir.path()).await?;
         let (tx, mut rx) = mpsc::channel(16);
-        let (mut agent, _) = FetchAgent::new(
+        let (agent, _) = FetchAgent::new(
             temp_dir.path().to_path_buf(),
             tx,
             None,
             ActivityRegistry::new(),
         );
         let range = format!("{}..{}", MISSING_BASE, MISSING_HEAD);
-        agent
-            .mr_metadata
-            .insert(range.clone(), (None, None, Some(7)));
 
-        let events = run_refused_batch(&agent, &mut rx, &[&range]).await;
+        let events = run_requests(&agent, &mut rx, REFUSING_REMOTE, vec![pull_7(&range)]).await;
 
         assert_eq!(failed_ids(&events), [format!("mr-7-{}", range)]);
         assert_eq!(
@@ -2150,19 +2187,22 @@ mod tests {
         let head =
             forge_with_head_under(daemon.path(), &forge, "refs/merge-requests/7/head").await?;
         let (tx, mut rx) = mpsc::channel(16);
-        let (mut agent, _) = FetchAgent::new(
+        let (agent, _) = FetchAgent::new(
             daemon.path().to_path_buf(),
             tx,
             None,
             ActivityRegistry::new(),
         );
         let range = format!("{}..{}", base, head);
-        agent
-            .mr_metadata
-            .insert(range.clone(), (None, None, Some(7)));
 
         let url = forge.to_string_lossy().to_string();
-        let events = run_batch(&agent, &mut rx, &url, &[&range, MISSING_HEAD]).await;
+        let events = run_requests(
+            &agent,
+            &mut rx,
+            &url,
+            vec![pull_7(&range), plain(MISSING_HEAD)],
+        )
+        .await;
 
         assert_eq!(submitted_ids(&events), [format!("mr-7-{}", range)]);
         assert_eq!(
@@ -2181,16 +2221,13 @@ mod tests {
     #[tokio::test]
     async fn a_ref_fetch_timeout_stops_the_fallbacks() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
-        let (mut agent, mut rx) = agent_with_short_limits(temp_dir.path()).await?;
+        let (agent, mut rx) = agent_with_short_limits(temp_dir.path()).await?;
         // The fetch by SHA fails at once on the refused connection; the ref
         // fetch after it hangs.
         let remote = HungRemote::start_after_refusing(1).await?;
         let range = format!("{}..{}", MISSING_BASE, MISSING_HEAD);
-        agent
-            .mr_metadata
-            .insert(range.clone(), (None, None, Some(7)));
 
-        let events = run_batch(&agent, &mut rx, &remote.url, &[&range]).await;
+        let events = run_requests(&agent, &mut rx, &remote.url, vec![pull_7(&range)]).await;
 
         let reasons = failure_reasons(&events);
         assert_eq!(reasons.len(), 1, "got: {:?}", reasons);
@@ -2241,16 +2278,19 @@ mod tests {
         let daemon = tempfile::tempdir()?;
         let forge_dir = tempfile::tempdir()?;
         let forge = forge_dir.path().join("forge");
-        let (mut agent, mut rx, base, head) = agent_with_pull_head(daemon.path(), &forge).await?;
+        let (agent, mut rx, base, head) = agent_with_pull_head(daemon.path(), &forge).await?;
         let range = format!("{}..{}", base, head);
-        agent
-            .mr_metadata
-            .insert(range.clone(), (None, None, Some(7)));
         let url = forge.to_string_lossy().to_string();
         let blocker = format!("refs/remotes/{}", agent.get_remote_name(&url));
         git_in(daemon.path(), &["update-ref", &blocker, &base]).await?;
 
-        let events = run_batch(&agent, &mut rx, &url, &[&range, MISSING_HEAD]).await;
+        let events = run_requests(
+            &agent,
+            &mut rx,
+            &url,
+            vec![pull_7(&range), plain(MISSING_HEAD)],
+        )
+        .await;
 
         assert_eq!(submitted_ids(&events), [format!("mr-7-{}", range)]);
         assert_eq!(failed_ids(&events), [MISSING_HEAD]);
@@ -2272,15 +2312,18 @@ mod tests {
         let daemon = tempfile::tempdir()?;
         let forge_dir = tempfile::tempdir()?;
         let forge = forge_dir.path().join("forge");
-        let (mut agent, mut rx, _, head) = agent_with_pull_head(daemon.path(), &forge).await?;
+        let (agent, mut rx, _, head) = agent_with_pull_head(daemon.path(), &forge).await?;
         let moved_base = commit_file(&forge, "target.txt", "Target branch change").await?;
         let range = format!("{}..{}", moved_base, head);
-        agent
-            .mr_metadata
-            .insert(range.clone(), (None, None, Some(7)));
 
         let url = forge.to_string_lossy().to_string();
-        let events = run_batch(&agent, &mut rx, &url, &[&range, MISSING_HEAD]).await;
+        let events = run_requests(
+            &agent,
+            &mut rx,
+            &url,
+            vec![pull_7(&range), plain(MISSING_HEAD)],
+        )
+        .await;
 
         assert_eq!(submitted_ids(&events), [format!("mr-7-{}", range)]);
         assert_eq!(failed_ids(&events), [MISSING_HEAD]);
@@ -2307,25 +2350,16 @@ mod tests {
             let daemon = tempfile::tempdir()?;
             let forge_dir = tempfile::tempdir()?;
             let forge = forge_dir.path().join("forge");
-            let (mut agent, mut rx, base, head) =
-                agent_with_pull_head(daemon.path(), &forge).await?;
+            let (agent, mut rx, base, head) = agent_with_pull_head(daemon.path(), &forge).await?;
             let newer = format!("{}..{}", base, head);
             let older = format!("{}..{}", base, MISSING_HEAD);
-            for range in [&newer, &older] {
-                agent
-                    .mr_metadata
-                    .insert(range.clone(), (None, None, Some(7)));
-            }
-            let mut batch = vec![newer.clone(), older.clone()];
+            let mut batch = vec![pull_7(&newer), pull_7(&older)];
             if !newer_first {
                 batch.reverse();
             }
 
             let url = forge.to_string_lossy().to_string();
-            agent
-                .process_batch(Some(&url), batch, &HashSet::new())
-                .await;
-            let events = drain(&mut rx);
+            let events = run_requests(&agent, &mut rx, &url, batch).await;
 
             assert_eq!(submitted_ids(&events), [format!("mr-7-{}", newer)]);
             assert_eq!(failed_ids(&events), [format!("mr-7-{}", older)]);
@@ -2352,10 +2386,7 @@ mod tests {
     ) -> Result<ForgeHeadFetch> {
         let remote_name = agent.get_remote_name(url);
         let setup = agent.ensure_remote(&remote_name, url).await?;
-        let requests: Vec<BatchRequest> = ranges
-            .iter()
-            .map(|range| BatchRequest::new(range.to_string()))
-            .collect();
+        let requests: Vec<BatchRequest> = ranges.iter().map(|range| plain(range)).collect();
         let head = ForgeHead {
             number: 7,
             requests: requests.iter().collect(),
@@ -2478,14 +2509,13 @@ mod tests {
         }
     }
 
-    /// Records and queues `request` as the run loop does, runs the queue,
-    /// and returns what each part carried, in order.
+    /// Queues `request` as the run loop does, runs the queue, and returns
+    /// what each part carried, in order.
     async fn submitted_parts(
-        agent: &mut FetchAgent,
+        agent: &FetchAgent,
         rx: &mut mpsc::Receiver<Event>,
         request: &FetchRequest,
     ) -> Vec<SubmittedPart> {
-        agent.remember(request);
         let mut pending = PendingFetches::default();
         pending.add(request.clone());
         agent.process_queue(&mut pending).await;
@@ -2521,10 +2551,9 @@ mod tests {
     async fn a_pull_request_tracker_is_read_as_the_cover_letter() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let edited = crate::patch::edited_b4_tracker("Fixes two port_info lifetime bugs in ionic.");
-        let (mut agent, mut rx, range) = agent_with_series(dir.path(), &edited, false).await?;
+        let (agent, mut rx, range) = agent_with_series(dir.path(), &edited, false).await?;
 
-        let parts =
-            submitted_parts(&mut agent, &mut rx, &range_request(&range, Some(35), false)).await;
+        let parts = submitted_parts(&agent, &mut rx, &range_request(&range, Some(35), false)).await;
 
         assert_eq!(
             parts,
@@ -2541,11 +2570,10 @@ mod tests {
     #[tokio::test]
     async fn an_unedited_pull_request_tracker_stores_nothing() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let (mut agent, mut rx, range) =
+        let (agent, mut rx, range) =
             agent_with_series(dir.path(), crate::patch::KERNEL_FORK_35_TRACKER, false).await?;
 
-        let parts =
-            submitted_parts(&mut agent, &mut rx, &range_request(&range, Some(35), false)).await;
+        let parts = submitted_parts(&agent, &mut rx, &range_request(&range, Some(35), false)).await;
 
         assert_eq!(parts, tracker_then_change(None));
         Ok(())
@@ -2558,10 +2586,9 @@ mod tests {
     async fn an_empty_first_commit_without_the_marker_is_not_a_pr_tracker() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let body = "Placeholder so the branch has a commit to rebase onto.";
-        let (mut agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
+        let (agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
 
-        let parts =
-            submitted_parts(&mut agent, &mut rx, &range_request(&range, Some(35), false)).await;
+        let parts = submitted_parts(&agent, &mut rx, &range_request(&range, Some(35), false)).await;
 
         assert_eq!(parts, tracker_then_change(None));
         Ok(())
@@ -2574,10 +2601,10 @@ mod tests {
         let body = "Fixes two port_info lifetime bugs in ionic.";
         for (flagged, expected) in [(false, None), (true, Some(body))] {
             let dir = tempfile::tempdir()?;
-            let (mut agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
+            let (agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
 
             let parts =
-                submitted_parts(&mut agent, &mut rx, &range_request(&range, None, flagged)).await;
+                submitted_parts(&agent, &mut rx, &range_request(&range, None, flagged)).await;
 
             assert_eq!(parts, tracker_then_change(expected), "flagged {flagged}");
         }
@@ -2592,11 +2619,10 @@ mod tests {
     async fn a_flagged_symmetric_range_is_not_read() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let body = "Fixes two port_info lifetime bugs in ionic.";
-        let (mut agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
+        let (agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
         let symmetric = range.replacen("..", "...", 1);
 
-        let parts =
-            submitted_parts(&mut agent, &mut rx, &range_request(&symmetric, None, true)).await;
+        let parts = submitted_parts(&agent, &mut rx, &range_request(&symmetric, None, true)).await;
 
         assert_eq!(parts, tracker_then_change(None));
         Ok(())
@@ -2610,23 +2636,23 @@ mod tests {
         let edited = crate::patch::edited_b4_tracker("Fixes two port_info lifetime bugs in ionic.");
         for (mr_number, flagged) in [(Some(35), false), (None, true)] {
             let dir = tempfile::tempdir()?;
-            let (mut agent, mut rx, range) = agent_with_series(dir.path(), &edited, true).await?;
+            let (agent, mut rx, range) = agent_with_series(dir.path(), &edited, true).await?;
             let request = range_request(&range, mr_number, flagged);
             assert_eq!(
-                submitted_parts(&mut agent, &mut rx, &request).await,
+                submitted_parts(&agent, &mut rx, &request).await,
                 [(1, 2, false, None), (2, 2, false, None)],
                 "a first commit with a diff, {mr_number:?} flagged {flagged}"
             );
 
             let dir = tempfile::tempdir()?;
-            let (mut agent, mut rx, range) = agent_with_series(dir.path(), &edited, false).await?;
+            let (agent, mut rx, range) = agent_with_series(dir.path(), &edited, false).await?;
             let Some((base, _)) = range.split_once("..") else {
                 return Err(anyhow!("{range} is not a range"));
             };
             let tracker = git_in(dir.path(), &["rev-parse", "HEAD~1"]).await?;
             let request = range_request(&format!("{base}..{tracker}"), mr_number, flagged);
             assert_eq!(
-                submitted_parts(&mut agent, &mut rx, &request).await,
+                submitted_parts(&agent, &mut rx, &request).await,
                 [(1, 1, true, None)],
                 "a lone tracker, {mr_number:?} flagged {flagged}"
             );
@@ -2658,21 +2684,25 @@ mod tests {
         }
     }
 
-    /// Runs `requests` as one tick's batches, each recorded and queued as
-    /// the run loop does, and returns each submitted part 1's cover letter,
-    /// sorted, since batches for different repositories run in any order.
-    async fn first_part_cover_letters(
-        agent: &mut FetchAgent,
+    /// Runs `requests` as one tick's batches, each queued as the run loop
+    /// does, and returns every event the agent sent.
+    async fn run_tick(
+        agent: &FetchAgent,
         rx: &mut mpsc::Receiver<Event>,
         requests: &[FetchRequest],
-    ) -> Vec<Option<String>> {
+    ) -> Vec<Event> {
         let mut pending = PendingFetches::default();
         for request in requests {
-            agent.remember(request);
             pending.add(request.clone());
         }
         agent.process_queue(&mut pending).await;
-        let mut letters: Vec<Option<String>> = drain(rx)
+        drain(rx)
+    }
+
+    /// Each part 1's cover letter among `events`, sorted, since batches for
+    /// different repositories run in any order.
+    fn first_part_letters(events: Vec<Event>) -> Vec<Option<String>> {
+        let mut letters: Vec<Option<String>> = events
             .into_iter()
             .filter_map(|event| match event {
                 Event::PatchSubmitted {
@@ -2687,6 +2717,16 @@ mod tests {
         letters
     }
 
+    /// Runs `requests` as one tick's batches and returns each submitted
+    /// part 1's cover letter, sorted.
+    async fn first_part_cover_letters(
+        agent: &FetchAgent,
+        rx: &mut mpsc::Receiver<Event>,
+        requests: &[FetchRequest],
+    ) -> Vec<Option<String>> {
+        first_part_letters(run_tick(agent, rx, requests).await)
+    }
+
     /// A b4 flag reads the tracker of only the range its submitter sent,
     /// in that repository and that batch. The same `base..head` requested
     /// later, from another repository, or by a pull request (whose tracker
@@ -2695,7 +2735,7 @@ mod tests {
     async fn a_b4_flag_stays_with_its_own_request() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let body = "Fixes two port_info lifetime bugs in ionic.";
-        let (mut agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
+        let (agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
         let in_repo = |repo: &str, flagged: bool| FetchRequest {
             repo_url: Some(format!("https://example.com/{repo}.git")),
             ..range_request(&range, None, flagged)
@@ -2703,19 +2743,19 @@ mod tests {
         let read = Some(body.to_string());
 
         assert_eq!(
-            first_part_cover_letters(&mut agent, &mut rx, &[in_repo("a", true)]).await,
+            first_part_cover_letters(&agent, &mut rx, &[in_repo("a", true)]).await,
             std::slice::from_ref(&read),
             "the flagged request"
         );
         assert_eq!(
-            first_part_cover_letters(&mut agent, &mut rx, &[in_repo("a", false)]).await,
+            first_part_cover_letters(&agent, &mut rx, &[in_repo("a", false)]).await,
             [None],
             "the same range in a later batch"
         );
 
         let two_repos = [in_repo("a", true), in_repo("b", false)];
         assert_eq!(
-            first_part_cover_letters(&mut agent, &mut rx, &two_repos).await,
+            first_part_cover_letters(&agent, &mut rx, &two_repos).await,
             [None, read],
             "another repository in the same tick"
         );
@@ -2726,9 +2766,73 @@ mod tests {
         };
         let beside_a_flag = [in_repo("a", true), pull_request];
         assert_eq!(
-            first_part_cover_letters(&mut agent, &mut rx, &beside_a_flag).await,
+            first_part_cover_letters(&agent, &mut rx, &beside_a_flag).await,
             [None],
             "a pull request sharing a flagged range's batch"
+        );
+        Ok(())
+    }
+
+    /// Requests for one range in one repository's batch are submitted once:
+    /// a plain request after a pull request's keeps the pull request's
+    /// number, so the parts are filed under its article id and its tracker
+    /// still needs the marker, and a flag from any of the requests stays.
+    #[tokio::test]
+    async fn requests_for_one_range_in_a_batch_keep_a_number_and_any_flag() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let body = "Fixes two port_info lifetime bugs in ionic.";
+        let (agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
+        let in_repo = |mr_number: Option<i64>, flagged: bool| FetchRequest {
+            repo_url: Some("https://example.com/a.git".to_string()),
+            ..range_request(&range, mr_number, flagged)
+        };
+
+        let events = run_tick(
+            &agent,
+            &mut rx,
+            &[in_repo(Some(35), false), in_repo(None, true)],
+        )
+        .await;
+        let pull_request_id = format!("mr-35-{range}");
+        assert_eq!(
+            submitted_ids(&events),
+            [pull_request_id.as_str(), pull_request_id.as_str()],
+            "a flagged plain request after a pull request's"
+        );
+        assert_eq!(first_part_letters(events), [None], "the unmarked tracker");
+
+        let flagged_first = [in_repo(None, true), in_repo(None, false)];
+        assert_eq!(
+            first_part_cover_letters(&agent, &mut rx, &flagged_first).await,
+            [Some(body.to_string())],
+            "a flag followed by an unflagged request"
+        );
+        Ok(())
+    }
+
+    /// A pull request's number stays with its own request. The same
+    /// `base..head` requested later as a flagged plain range is read by its
+    /// flag, without the marker this tracker lacks, and is filed under the
+    /// range itself rather than the pull request's article id.
+    #[tokio::test]
+    async fn a_pull_request_does_not_decide_a_later_flagged_range() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let body = "Fixes two port_info lifetime bugs in ionic.";
+        let (agent, mut rx, range) = agent_with_series(dir.path(), body, false).await?;
+
+        let events = run_tick(&agent, &mut rx, &[range_request(&range, Some(35), false)]).await;
+        assert_eq!(
+            first_part_letters(events),
+            [None],
+            "the unmarked pull request"
+        );
+
+        let events = run_tick(&agent, &mut rx, &[range_request(&range, None, true)]).await;
+        assert_eq!(submitted_ids(&events), [range.as_str(), range.as_str()]);
+        assert_eq!(
+            first_part_letters(events),
+            [Some(body.to_string())],
+            "the flagged plain range in a later batch"
         );
         Ok(())
     }
