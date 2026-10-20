@@ -26,7 +26,7 @@ use crate::ai::{
 };
 use crate::toolbox::ToolBox;
 
-use super::engine::{StageStopCause, stop_cause};
+use super::engine::{StageStopCause, failure_reason, stop_cause};
 use super::events::WorkflowEvent;
 use super::output::OutputFormat;
 use super::policy::{RecitationPolicy, StagePolicy, ToolScope};
@@ -591,7 +591,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 if let Some(cb) = event_cb {
                     cb(WorkflowEvent::StageFailed {
                         stage_name: self.name,
-                        reason: format!("{:#}", e),
+                        reason: failure_reason(&e),
                         cause: StageStopCause::Error,
                     });
                 }
@@ -679,7 +679,7 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                     if let Some(cb) = event_cb {
                         cb(WorkflowEvent::StageFailed {
                             stage_name,
-                            reason: format!("{:#}", e),
+                            reason: failure_reason(&e),
                             cause: stop_cause(&e),
                         });
                     }
@@ -1101,7 +1101,7 @@ mod tests {
                 assert_eq!(*stage_name, "turn-cap");
                 assert_eq!(
                     *reason,
-                    format!("{:#}", err),
+                    failure_reason(&err),
                     "the reason is the error itself"
                 );
                 assert!(reason.contains("valid response"), "{reason}");
@@ -1112,6 +1112,69 @@ mod tests {
                 );
             }
             other => panic!("the last word on a failed stage must be its failure, got {other:?}"),
+        }
+    }
+
+    /// A provider whose every request fails with the same error.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl AiProvider for FailingProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            anyhow::bail!("the model endpoint refused the request")
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    /// The session wraps the provider's error in a SessionFailure carrying
+    /// the same message, so the reason a failed stage reports, which its live
+    /// row and its stored record show, must say the error once.
+    #[tokio::test]
+    async fn a_failed_stage_reports_its_error_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = WorkflowEnv {
+            provider: Arc::new(FailingProvider),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+            wind_down: None,
+        };
+        let stage: Stage<EmptyState, Value> = Stage::builder("refused")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::json())
+            .reduce(|_: &mut EmptyState, _: Value| {})
+            .build();
+
+        let events: Mutex<Vec<WorkflowEvent>> = Mutex::new(Vec::new());
+        let record = |e: WorkflowEvent| events.lock().unwrap().push(e);
+        let err = stage
+            .execute_isolated(&env, &EmptyState, Some(&record))
+            .await
+            .err()
+            .expect("a refused request fails the stage");
+        assert!(
+            err.downcast_ref::<crate::ai::SessionFailure>().is_some(),
+            "the session wraps the error: {err:#}"
+        );
+
+        let recorded = events.lock().unwrap();
+        match recorded.last() {
+            Some(WorkflowEvent::StageFailed { reason, .. }) => {
+                assert_eq!(
+                    reason
+                        .matches("the model endpoint refused the request")
+                        .count(),
+                    1,
+                    "{reason}"
+                );
+            }
+            other => panic!("a failed stage must end with its failure, got {other:?}"),
         }
     }
 
@@ -1164,7 +1227,7 @@ mod tests {
                 cause,
             }) => {
                 assert_eq!(*stage_name, "unrenderable");
-                assert_eq!(*reason, format!("{:#}", err));
+                assert_eq!(*reason, failure_reason(&err));
                 assert_eq!(*cause, StageStopCause::Error);
             }
             other => panic!("a started stage must end with its failure, got {other:?}"),

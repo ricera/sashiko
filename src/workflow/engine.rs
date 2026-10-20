@@ -133,6 +133,23 @@ pub fn stop_cause(err: &anyhow::Error) -> StageStopCause {
         .map_or(StageStopCause::Error, |stopped| stopped.cause.into())
 }
 
+/// The reason a stage reports for the error that stopped it: every message
+/// in the error's chain, outermost first, joined by ": ".
+///
+/// A link that repeats the one before it is left out. The session wraps each
+/// error it returns in a [`crate::ai::SessionFailure`] whose message is that
+/// error's own, to carry the partial history; listed in full, the chain
+/// would say every reason twice.
+pub fn failure_reason(err: &anyhow::Error) -> String {
+    let mut links: Vec<String> = Vec::new();
+    for link in err.chain().map(ToString::to_string) {
+        if links.last() != Some(&link) {
+            links.push(link);
+        }
+    }
+    links.join(": ")
+}
+
 /// A stage that failed while its siblings kept running.
 #[derive(Debug, Clone)]
 pub struct StageFailure {
@@ -517,7 +534,7 @@ async fn execute_parallel_batch<S: Send + Sync + 'static>(
                         record_stage_outcome(outcome, stage.name(), stage_outcome_from_error(&err));
                         failures.push(StageFailure {
                             stage_name: stage.name(),
-                            reason: format!("{:#}", err),
+                            reason: failure_reason(&err),
                             cause,
                         });
                         first_error.get_or_insert(err);
@@ -549,6 +566,34 @@ mod tests {
     use serde::Deserialize;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A link that repeats the one before it is said once, and distinct links
+    /// all stay, outermost first.
+    #[test]
+    fn failure_reason_says_each_message_once() {
+        let wrapped = |inner: anyhow::Error| {
+            let message = inner.to_string();
+            inner.context(crate::ai::SessionFailure {
+                message,
+                history: Vec::new(),
+                usage: crate::ai::AiUsage::default(),
+            })
+        };
+        assert_eq!(
+            failure_reason(&wrapped(anyhow::anyhow!("refused"))),
+            "refused"
+        );
+        assert_eq!(
+            failure_reason(&wrapped(
+                anyhow::anyhow!("refused").context("calling the model")
+            )),
+            "calling the model: refused"
+        );
+        assert_eq!(
+            failure_reason(&wrapped(anyhow::anyhow!("refused")).context("in stage goal")),
+            "in stage goal: refused"
+        );
+    }
 
     #[derive(Default, Clone)]
     struct DummyState {
