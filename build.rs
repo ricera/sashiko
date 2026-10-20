@@ -27,22 +27,22 @@ fn main() {
 
     track_git_changes();
 
-    let git_hash = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok()
-            } else {
-                None
-            }
-        })
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string()));
-
+    let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
+    let git_hash = git_output(&["rev-parse", "HEAD"]).unwrap_or_else(|| pkg_version.clone());
     println!("cargo:rustc-env=GIT_HASH={}", git_hash);
+
+    // The deploy's tag when the build sits on one (v0.6.1-ricera.1), or the
+    // nearest tag plus the commits since it, so a running instance names the
+    // release it came from without an edit to Cargo.toml.
+    let describe =
+        git_output(&["describe", "--tags", "--always"]).unwrap_or_else(|| pkg_version.clone());
+    println!("cargo:rustc-env=BUILD_DESCRIBE={}", describe);
+    let version = if describe == pkg_version || describe == format!("v{pkg_version}") {
+        pkg_version
+    } else {
+        format!("{pkg_version} ({describe})")
+    };
+    println!("cargo:rustc-env=SASHIKO_VERSION={}", version);
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let vendored_dir = manifest_dir.join("third_party/prompts");
@@ -203,11 +203,29 @@ fn track_git_changes() {
     {
         println!("cargo:rerun-if-changed={}", reflog.display());
     }
+    // A new loose tag changes what git describe reports without touching
+    // HEAD; Cargo scans a directory for any modified file.
+    if let Some(tags) = get_git_path("refs/tags")
+        && tags.exists()
+    {
+        println!("cargo:rerun-if-changed={}", tags.display());
+    }
     if let Some(reftable) = get_git_path("reftable/tables.list")
         && reftable.exists()
     {
         println!("cargo:rerun-if-changed={}", reftable.display());
     }
+}
+
+/// One git command's trimmed standard output, or None when git is missing,
+/// fails, or prints nothing.
+fn git_output(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git").args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 fn get_git_path(arg: &str) -> Option<PathBuf> {

@@ -61,7 +61,7 @@ function grabConst(name) {
 const LETS = ['activityPoll', 'viewGeneration', 'logView', 'logTimer'];
 const CONSTS = ['FINDING_TITLE_MAX_CHARS', 'PRIOR_REVISION_LABEL_MAX_CHARS'];
 const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'renderReviewCard', 'getSeverityColor',
-               'findingObject', 'clipTitle', 'findingTitle', 'reviewMapThreadTitle', 'reviewMapThreadLink', 'parseSeverityCalibration', 'renderSeverityCalibration',
+               'versionLabel', 'findingObject', 'clipTitle', 'findingTitle', 'reviewMapThreadTitle', 'reviewMapThreadLink', 'parseSeverityCalibration', 'renderSeverityCalibration',
                'renderFindingLocations', 'oneLine', 'priorTag', 'findingTags', 'renderFindingRow', 'renderFindingsList',
                'formatDuration', 'describeStageWait', 'summarizeReason', 'compareStageRows',
                'stageTableLabel', 'stageRowsFromRecord', 'stageStopCause', 'stageStopLabel',
@@ -1916,6 +1916,41 @@ console.log('findings on a review card');
 {
     const findingFailures = findingChecks(ctx);
     check('every finding check passes', findingFailures.length === 0, findingFailures.join(', '));
+}
+
+// ---- the header's version ----------------------------------------------------
+// The build's git description names the deployed release (its tag), so the
+// header must show it, escaped, and leave it out only when it adds nothing.
+function versionChecks(fns) {
+    const failed = [];
+    const expect = (name, cond) => { if (!cond) failed.push(name); };
+    expect('a tagged build shows its tag beside the version',
+        fns.versionLabel('0.6.1', 'v0.6.1-ricera.1') === 'v0.6.1 (v0.6.1-ricera.1)');
+    expect('an untagged build shows the nearest tag and its distance',
+        fns.versionLabel('0.6.1', 'v.0.6.1-141-g4ed4f3b64a9b') === 'v0.6.1 (v.0.6.1-141-g4ed4f3b64a9b)');
+    expect('a description that repeats the version is left out',
+        fns.versionLabel('0.6.1', 'v0.6.1') === 'v0.6.1' && fns.versionLabel('0.6.1', '0.6.1') === 'v0.6.1');
+    expect('an older server without a description shows the version alone',
+        fns.versionLabel('0.6.1', undefined) === 'v0.6.1' && fns.versionLabel('0.6.1', '') === 'v0.6.1');
+    expect('the description is escaped',
+        !fns.versionLabel('0.6.1', '<b>x</b>').includes('<b>'));
+    expect('the version is escaped', !fns.versionLabel('<b>1</b>', 'x').includes('<b>'));
+    return failed;
+}
+console.log('the header version');
+{
+    const versionFailures = versionChecks(ctx);
+    check('every version check passes', versionFailures.length === 0, versionFailures.join(', '));
+    check('the header shows versionLabel',
+        grab('fetchStats').includes('${versionLabel(data.version, data.build)}'));
+    const unescaped = load({ ...sources, versionLabel: sources.versionLabel.replaceAll('escapeHtml(', 'String(') });
+    check('a version label that does not escape is caught', versionChecks(unescaped).length > 0);
+    const noBuild = load({ ...sources,
+        versionLabel: sources.versionLabel.replace('if (!build ||', 'if (true ||') });
+    check('a version label that drops the description is caught', versionChecks(noBuild).length > 0);
+    const alwaysBuild = load({ ...sources,
+        versionLabel: sources.versionLabel.replace(" || build === `v${version}`", '') });
+    check('a version label that repeats the version is caught', versionChecks(alwaysBuild).length > 0);
 }
 
 // ---- polling hygiene -------------------------------------------------------

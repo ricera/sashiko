@@ -49,7 +49,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 const DEFAULT_SETTINGS: &str = include_str!("../docs/examples/Settings.example.toml");
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = env!("SASHIKO_VERSION"), about, long_about = None)]
 struct Cli {
     /// Number of last messages to ingest
     #[arg(long)]

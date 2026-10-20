@@ -4093,6 +4093,15 @@
             `;
         }
 
+        // The header's version: the Cargo version, then the git description
+        // the build recorded (a deploy's tag, such as v0.6.1-ricera.1) unless
+        // it only repeats the version.
+        function versionLabel(version, build) {
+            const label = `v${escapeHtml(String(version ?? ''))}`;
+            if (!build || build === version || build === `v${version}`) return label;
+            return `${label} (${escapeHtml(String(build))})`;
+        }
+
         async function fetchStats() {
             try {
                 const res = await fetch('/api/stats');
@@ -4102,7 +4111,7 @@
                 document.getElementById('stats').outerHTML = `
                     <div class="stats-container" id="stats">
                         <div class="stats-group">
-                            <span class="stats-label">${escapeHtml(config.project_name || 'Sashiko')}</span> v${data.version}
+                            <span class="stats-label">${escapeHtml(config.project_name || 'Sashiko')}</span> ${versionLabel(data.version, data.build)}
                             <span class="stats-sep"></span>
                             <a href="#" onclick="event.preventDefault(); openAbout();" style="font-weight:500;">About</a>
                             <span class="stats-sep"></span>

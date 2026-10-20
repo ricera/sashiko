@@ -2205,6 +2205,7 @@ async fn get_stats(
     Ok(Json(serde_json::json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "build": env!("BUILD_DESCRIBE"),
         "pending": pending,
         "reviewing": reviewing,
         "messages": messages,
@@ -2515,6 +2516,7 @@ async fn get_config(
             "is_authenticated": auth.0.is_some(),
         },
         "version": env!("CARGO_PKG_VERSION"),
+        "build": env!("BUILD_DESCRIBE"),
         "git_hash": env!("GIT_HASH"),
     })))
 }

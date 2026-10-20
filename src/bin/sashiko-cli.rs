@@ -54,7 +54,7 @@ fn project() -> ProjectId {
 #[derive(Parser)]
 #[command(name = "sashiko-cli")]
 #[command(about = "CLI tool for interacting with Sashiko", long_about = None)]
-#[command(version)]
+#[command(version = env!("SASHIKO_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
