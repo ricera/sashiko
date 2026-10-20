@@ -3335,6 +3335,36 @@
             return { title: trimmed, clipped: false };
         }
 
+        // The link to an earlier revision's finding that a review map thread
+        // ends with, or null. A thread that post-verification confirmed ends
+        // with its PVF, whose link the daemon copied from a hard case the PVF
+        // names; `from` is that hard case's id, so the map can say where the
+        // link came from. Any other thread ends in verification, with the link
+        // of its finding or of its hard case. A thread post-verification
+        // dismissed ends without one. `maps` holds vfById, hcById and pvfById.
+        function reviewMapThreadLink(thread, maps) {
+            const linkOf = item => (item && item.prior && typeof item.prior === 'object' ? item.prior : null);
+            const same = (a, b) => Boolean(a && b) && a.relation === b.relation
+                && a.revision === b.revision && a.earlier_problem === b.earlier_problem;
+            const vIds = Array.isArray(thread?.verification_ids) && thread.verification_ids.length > 0
+                ? thread.verification_ids.map(String)
+                : (thread?.verification_id ? [String(thread.verification_id)] : []);
+            const pvId = thread?.post_verification_id ? String(thread.post_verification_id) : '';
+            if (pvId) {
+                const pvf = maps.pvfById.get(pvId);
+                const prior = linkOf(pvf);
+                if (!prior) return null;
+                const sources = Array.isArray(pvf.source_ids) ? pvf.source_ids.map(String) : vIds;
+                const from = sources.find(id => same(linkOf(maps.hcById.get(id)), prior)) || null;
+                return { prior, from };
+            }
+            for (const id of vIds) {
+                const prior = linkOf(maps.vfById.get(id)) || linkOf(maps.hcById.get(id));
+                if (prior) return { prior, from: null };
+            }
+            return null;
+        }
+
         // A review map thread's title as its row shows it, clipped as a
         // finding card's title is, and the whole text for the expanded row
         // when the row does not show it all. A thread built from an older
@@ -7549,6 +7579,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                     const vIds = Array.isArray(t.verification_ids) && t.verification_ids.length > 0
                         ? t.verification_ids
                         : (t.verification_id ? [t.verification_id] : []);
+                    const threadLink = reviewMapThreadLink(t, { vfById, hcById, pvfById });
                     const outcome = t.outcome || '';
                     const sev = t.severity || 'Unknown';
                     const sevColor = getSeverityColor(sev);
@@ -7639,6 +7670,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                         <span>
                                             <span class="tag">verification</span>
                                             <span class="text-muted-sm">Verified</span>
+                                            ${priorTag(vf.prior)}
                                         </span>
                                         ${renderStageLogLink('verification')}
                                     </div>
@@ -7695,6 +7727,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                         <span>
                                             <span class="tag">verification</span>
                                             <span class="text-muted-sm">Escalated${t.post_verification_id ? ` to <code>${escapeHtml(pvStage)}</code>` : ''} &mdash; verification question</span>
+                                            ${priorTag(hc.prior)}
                                         </span>
                                         ${renderStageLogLink('verification')}
                                     </div>
@@ -7717,6 +7750,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                                             <span>
                                                 <span class="tag">${escapeHtml(pvStage)}</span>
                                                 <span class="text-muted-sm">Confirmed</span>
+                                                ${threadLink && threadLink.from
+                                                    ? `${priorTag(threadLink.prior)} <span class="text-muted-sm">link carried from <code>${escapeHtml(threadLink.from)}</code></span>`
+                                                    : priorTag(pvf.prior)}
                                             </span>
                                             ${renderStageLogLink(pvStage)}
                                         </div>
@@ -7754,13 +7790,14 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         : '';
                     const codeTraceHtml = renderReviewMapCodeSnippets(primaryLocations);
                     const rowTitle = reviewMapThreadTitle(t);
+                    const rowLinkHtml = threadLink ? ` ${priorTag(threadLink.prior)}` : '';
                     const fullTitleHtml = rowTitle.clipped
                         ? `<div class="log-inline-block" style="margin-bottom:8px;">${escapeHtml(rowTitle.full)}</div>`
                         : '';
 
                     return `
                         <tr id="rm-row-${idx}" onclick="toggleReviewMapThread(${idx})">
-                            <td><span id="rm-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><span style="font-weight:600; color:var(--text);">${escapeHtml(rowTitle.title)}</span></td>
+                            <td><span id="rm-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><span style="font-weight:600; color:var(--text);">${escapeHtml(rowTitle.title)}</span>${rowLinkHtml}</td>
                             <td>${stageCellHtml}</td>
                             <td>${outcomeCellHtml}</td>
                         </tr>

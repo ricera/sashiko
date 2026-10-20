@@ -61,7 +61,7 @@ function grabConst(name) {
 const LETS = ['activityPoll', 'viewGeneration', 'logView', 'logTimer'];
 const CONSTS = ['FINDING_TITLE_MAX_CHARS', 'PRIOR_REVISION_LABEL_MAX_CHARS'];
 const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'renderReviewCard', 'getSeverityColor',
-               'findingObject', 'clipTitle', 'findingTitle', 'reviewMapThreadTitle', 'parseSeverityCalibration', 'renderSeverityCalibration',
+               'findingObject', 'clipTitle', 'findingTitle', 'reviewMapThreadTitle', 'reviewMapThreadLink', 'parseSeverityCalibration', 'renderSeverityCalibration',
                'renderFindingLocations', 'oneLine', 'priorTag', 'findingTags', 'renderFindingRow', 'renderFindingsList',
                'formatDuration', 'describeStageWait', 'summarizeReason', 'compareStageRows',
                'stageTableLabel', 'stageRowsFromRecord', 'stageStopCause', 'stageStopLabel',
@@ -1338,6 +1338,35 @@ function findingTitleChecks(fns, expect) {
     const mapHeadline = mapGuard(() => fns.reviewMapThreadTitle({ title: headline, problem: paragraph }));
     expect('map title: a thread titled by a headline keeps the problem for its expanded row',
         mapHeadline.title === headline && mapHeadline.clipped === true && mapHeadline.full === paragraph);
+    // The link a review map thread ends with, and where it came from.
+    const link = { relation: 'repeat', revision: 'v2', earlier_problem: 'port reset aborts recovery',
+        revision_head: '879031c0ea07' };
+    const other = { relation: 'repeat', revision: 'v1', earlier_problem: 'something else' };
+    const maps = {
+        vfById: new Map([['VF1', { prior: other }]]),
+        hcById: new Map([['H1', { prior: link }], ['H2', {}], ['H3', { prior: other }]]),
+        pvfById: new Map([['PVF1', { source_ids: ['H2', 'H1'], prior: { ...link } }],
+            ['PVF2', { source_ids: ['H2'] }], ['PVF3', { source_ids: ['H3'], prior: link }]]),
+    };
+    const linkOf = t => mapGuard(() => fns.reviewMapThreadLink(t, maps));
+    const carried = linkOf({ verification_ids: ['H2', 'H1'], post_verification_id: 'PVF1' });
+    expect('map link: a confirmed finding shows its link and the hard case it was carried from',
+        carried && carried.prior.revision === 'v2' && carried.from === 'H1');
+    expect('map link: a confirmed finding without a link shows none',
+        linkOf({ verification_ids: ['H2'], post_verification_id: 'PVF2' }) === null);
+    const own = linkOf({ verification_ids: ['H3'], post_verification_id: 'PVF3' });
+    expect('map link: a link that matches no named hard case is shown without a source',
+        own && own.prior === link && own.from === null);
+    expect('map link: a thread post-verification dismissed shows no link',
+        linkOf({ verification_ids: ['H1'], post_verification_id: 'PVD1' }) === null);
+    const unresolved = linkOf({ verification_ids: ['H1'] });
+    expect('map link: an unresolved hard case shows its own link',
+        unresolved && unresolved.prior === link && unresolved.from === null);
+    const verified = linkOf({ verification_id: 'VF1' });
+    expect('map link: a verification finding shows its link',
+        verified && verified.prior === other && verified.from === null);
+    expect('map link: a thread with no linked item shows none',
+        linkOf({ verification_ids: ['H2'] }) === null && linkOf({}) === null);
     expect('map title: a missing title reads "Candidate issue"',
         [{}, { title: '  ' }, { title: 7 }, null].every(t =>
             mapGuard(() => fns.reviewMapThreadTitle(t)).title === 'Candidate issue'));
@@ -2599,6 +2628,11 @@ const mutate = (name, from, to) => {
         ['a review map row title that is never clipped is caught',
             mutate('reviewMapThreadTitle', "clipTitle(text, 'Candidate issue')",
                 "({ title: text || 'Candidate issue' })")],
+        ['a review map that shows the link of a thread post-verification dismissed is caught',
+            mutate('reviewMapThreadLink', 'if (pvId) {', 'if (false) {')],
+        ['a review map that never says which hard case a link came from is caught',
+            mutate('reviewMapThreadLink', "|| null;\n                return { prior, from };",
+                "|| null;\n                return { prior, from: null };")],
         ['a card title that ignores an older finding\'s headline is caught',
             mutate('findingTitle', 'if (!headline) return', 'return')],
         ['a headline title whose expanded row hides the problem is caught',
