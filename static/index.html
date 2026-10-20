@@ -3302,8 +3302,22 @@
         // enforces it and older reviews wrote a whole argument there. Code
         // points are counted, so a surrogate pair is never split. A clipped
         // title is the caller's cue to show the full text in the body.
+        // A finding's title for its collapsed row. `clipped` says the title
+        // does not show the whole problem, so the expanded row must.
+        //
+        // Reviews from before problem became a short title carry a one-line
+        // `headline` beside a paragraph-long problem, so the headline is the
+        // title when there is one. Newer reviews have no headline, and their
+        // problem is the title.
         function findingTitle(finding) {
-            return clipTitle(findingObject(finding).problem, '(no description)');
+            const f = findingObject(finding);
+            const headline = typeof f.headline === 'string' ? f.headline.trim() : '';
+            if (!headline) return clipTitle(f.problem, '(no description)');
+            const problem = typeof f.problem === 'string' ? f.problem.trim() : '';
+            const { title, clipped } = clipTitle(headline, '(no description)');
+            // The expanded row shows the problem, so a missing problem never
+            // counts as clipped.
+            return { title, clipped: problem !== '' && (clipped || problem !== headline) };
         }
 
         // Clips a title to FINDING_TITLE_MAX_CHARS characters plus "…", whole
@@ -3323,11 +3337,15 @@
 
         // A review map thread's title as its row shows it, clipped as a
         // finding card's title is, and the whole text for the expanded row
-        // when the clip cut it.
+        // when the row does not show it all. A thread built from an older
+        // review's finding carries the finding's problem, and its title is
+        // the finding card's title, so the problem is that whole text.
         function reviewMapThreadTitle(thread) {
-            const full = typeof thread?.title === 'string' ? thread.title.trim() : '';
-            const { title, clipped } = clipTitle(full, 'Candidate issue');
-            return { title, clipped, full };
+            const text = typeof thread?.title === 'string' ? thread.title.trim() : '';
+            const problem = typeof thread?.problem === 'string' ? thread.problem.trim() : '';
+            const { title } = clipTitle(text, 'Candidate issue');
+            const full = problem || text;
+            return { title, clipped: full !== '' && full !== title, full };
         }
 
         // Splits a finding's severity explanation at the rubric's step labels
@@ -7177,7 +7195,10 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 threads.push({
                     thread_id: `T${threads.length + 1}`,
                     outcome: preexisting ? 'preexisting_concern' : 'finding',
-                    title: f.problem || f.description || f.type || 'Finding',
+                    // Titled as the finding card titles it; the problem stays
+                    // whole for the expanded row.
+                    title: findingTitle(f).title,
+                    problem: typeof f.problem === 'string' ? f.problem : '',
                     type: f.type || '',
                     severity: f.severity || '',
                     preexisting,

@@ -1317,6 +1317,27 @@ function findingTitleChecks(fns, expect) {
     const mapShort = mapGuard(() => fns.reviewMapThreadTitle({ title: `  ${short}  ` }));
     expect('map title: a short thread title is the title, trimmed and not clipped',
         mapShort.title === short && mapShort.clipped === false);
+    // An older review's finding: a one-line headline beside a paragraph.
+    const paragraph = 'The patch removes the unconditional attach. ' + 'x'.repeat(400);
+    const headline = 'Reconfig paths can leave the netdev detached';
+    const withHeadline = guard(() => fns.findingTitle({ problem: paragraph, headline: `  ${headline} ` }));
+    expect('title: an older finding\'s headline is its title, and its problem goes in the body',
+        withHeadline.title === headline && withHeadline.clipped === true);
+    const headlineCard = findingsCard(fns, [{ severity: 'Low', problem: paragraph, headline }]);
+    expect('title: a headline card shows the headline and puts the whole problem in the body',
+        headlineCard.includes(headline) && headlineCard.includes(paragraph));
+    expect('title: a headline equal to the problem is not clipped',
+        guard(() => fns.findingTitle({ problem: headline, headline })).clipped === false);
+    expect('title: a headline with no problem is the title and nothing is clipped',
+        ['', undefined, 7].every(problem => {
+            const t = guard(() => fns.findingTitle({ problem, headline }));
+            return t.title === headline && t.clipped === false;
+        }));
+    expect('title: a blank headline falls back to the problem',
+        guard(() => fns.findingTitle({ problem: short, headline: '  ' })).title === short);
+    const mapHeadline = mapGuard(() => fns.reviewMapThreadTitle({ title: headline, problem: paragraph }));
+    expect('map title: a thread titled by a headline keeps the problem for its expanded row',
+        mapHeadline.title === headline && mapHeadline.clipped === true && mapHeadline.full === paragraph);
     expect('map title: a missing title reads "Candidate issue"',
         [{}, { title: '  ' }, { title: 7 }, null].every(t =>
             mapGuard(() => fns.reviewMapThreadTitle(t)).title === 'Candidate issue'));
@@ -2576,8 +2597,12 @@ const mutate = (name, from, to) => {
         ['a title that is never clipped is caught',
             mutate('clipTitle', 'chars.length > FINDING_TITLE_MAX_CHARS', 'false')],
         ['a review map row title that is never clipped is caught',
-            mutate('reviewMapThreadTitle', "clipTitle(full, 'Candidate issue')",
-                "({ title: full || 'Candidate issue', clipped: false })")],
+            mutate('reviewMapThreadTitle', "clipTitle(text, 'Candidate issue')",
+                "({ title: text || 'Candidate issue' })")],
+        ['a card title that ignores an older finding\'s headline is caught',
+            mutate('findingTitle', 'if (!headline) return', 'return')],
+        ['a headline title whose expanded row hides the problem is caught',
+            mutate('findingTitle', '(clipped || problem !== headline)', 'clipped')],
         ['a finding row that does not escape is caught',
             load({ ...sources, renderFindingRow: sources.renderFindingRow.replaceAll('escapeHtml(', 'String(') })],
         ['a location list that does not escape is caught',
