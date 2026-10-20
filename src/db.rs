@@ -10199,6 +10199,30 @@ impl Database {
         Ok(())
     }
 
+    /// Names the run that takes over a reused review row: its provider,
+    /// model, baseline and Sashiko build.
+    ///
+    /// A Pending row an interrupted run left behind was created by that run,
+    /// which may have been an older build or another model, as across an
+    /// upgrade. The result the row ends up holding is the new run's, so the
+    /// row must say which Sashiko and which model produced it.
+    pub async fn stamp_review_run(
+        &self,
+        review_id: i64,
+        provider: &str,
+        model: &str,
+        baseline_id: Option<i64>,
+        prompts_hash: Option<&str>,
+    ) -> Result<()> {
+        self.execute(
+            "UPDATE reviews SET provider = ?, model = ?, baseline_id = ?, prompts_hash = ?
+             WHERE id = ?",
+            libsql::params![provider, model, baseline_id, prompts_hash, review_id],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Records how long a patch took to reach this result, retries included.
     ///
     /// Measured from the first attempt starting, not from this row's creation,

@@ -2083,10 +2083,9 @@ impl Reviewer {
         // needed three goes, which is exactly the case worth measuring.
         let review_started = Instant::now();
 
-        let mut existing_pending_review_id = ctx
-            .db
-            .take_pending_review_id(patchset_id, Some(patch_id))
-            .await?;
+        let mut existing_pending_review_id =
+            Self::take_left_behind_row(ctx, patchset_id, patch_id, baseline_id, prompts_hash)
+                .await?;
 
         loop {
             if Self::patchset_cancelled(ctx, patchset_id).await {
@@ -2180,6 +2179,43 @@ impl Reviewer {
         }
     }
 
+    /// Takes the Pending row an interrupted run left for this patch, if any,
+    /// and stamps it with this run's provider, model, baseline and build.
+    ///
+    /// The interrupted run may have been an older Sashiko, as when a series
+    /// is resumed after an upgrade, and the row otherwise keeps naming it
+    /// while holding this run's result. A failed stamp is only logged: the
+    /// labels are a record of the run and must not stop the review.
+    async fn take_left_behind_row(
+        ctx: &ReviewContext,
+        patchset_id: i64,
+        patch_id: i64,
+        baseline_id: Option<i64>,
+        prompts_hash: Option<&str>,
+    ) -> Result<Option<i64>> {
+        let Some(id) = ctx
+            .db
+            .take_pending_review_id(patchset_id, Some(patch_id))
+            .await?
+        else {
+            return Ok(None);
+        };
+        if let Err(e) = ctx
+            .db
+            .stamp_review_run(
+                id,
+                &ctx.settings.ai.provider,
+                &ctx.settings.ai.model,
+                baseline_id,
+                prompts_hash,
+            )
+            .await
+        {
+            warn!("Failed to stamp review {} with this run: {}", id, e);
+        }
+        Ok(Some(id))
+    }
+
     /// Gives a patch skipped for touching only ignored files its review row,
     /// and returns the row's id.
     ///
@@ -2197,10 +2233,9 @@ impl Reviewer {
         baseline_id: Option<i64>,
         prompts_hash: Option<&str>,
     ) -> Result<i64> {
-        if let Some(id) = ctx
-            .db
-            .take_pending_review_id(patchset_id, Some(patch_id))
-            .await?
+        if let Some(id) =
+            Self::take_left_behind_row(ctx, patchset_id, patch_id, baseline_id, prompts_hash)
+                .await?
         {
             if let Err(e) = ctx.db.set_review_attempt(id, None).await {
                 warn!(
@@ -8726,6 +8761,9 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
         /// The patch's diff.
         const DIFF: &str = "diff --git a/foo.c b/foo.c\n+int x;";
 
+        /// The Sashiko build the review runs as.
+        const BUILD: &str = "the-running-build";
+
         /// Salvage is disabled unless `configure` sets it, so a test that
         /// times a worker out is not held for the default salvage window.
         async fn new(
@@ -8830,7 +8868,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 None,
                 &input_payload,
                 None,
-                None,
+                Some(Self::BUILD),
                 None,
                 Self::DIFF,
                 self.embargo_until,
@@ -9471,7 +9509,7 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
                 "mock",
                 "mock",
                 None,
-                None,
+                Some("an-older-build"),
                 Some(3),
             )
             .await?;
@@ -9487,6 +9525,15 @@ inline review content 4\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
             "the row is this run's first attempt: {}",
             reviews[0]
         );
+        let settings = &fixture.ctx.settings.ai;
+        assert_eq!(
+            reviews[0]["prompts_hash"],
+            WorkerFixture::BUILD,
+            "the row names the build that ran it, not the one that left it: {}",
+            reviews[0]
+        );
+        assert_eq!(reviews[0]["provider"], settings.provider.as_str());
+        assert_eq!(reviews[0]["model"], settings.model.as_str());
         Ok(())
     }
 
