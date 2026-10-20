@@ -9592,7 +9592,7 @@ impl Database {
                     r.result_description, r.status, r.inline_review, {},
                     ai.tokens_in, ai.tokens_out, r.patch_id, r.id, ai.tokens_cached,
                     r.reference_repos, r.stage_failures, r.attempt, r.duration_seconds,
-                    r.stage_durations
+                    r.stage_durations, r.model, r.provider, r.prompts_hash
              FROM reviews r
              LEFT JOIN ai_interactions ai ON r.interaction_id = ai.id
              WHERE r.patchset_id = ? AND (r.patch_id IS NULL OR r.patch_id IN ({}))
@@ -9627,9 +9627,16 @@ impl Database {
                 "attempt": r.get::<Option<i64>>(14)?,
                 "duration_seconds": r.get::<Option<i64>>(15)?,
                 "stage_durations": stored_json(r.get::<Option<String>>(16)?),
-                "model": model_name,
-                "provider": provider,
-                "prompts_hash": prompts_git_hash,
+                // Each review's own run, since the patchset's columns name
+                // only the daemon that last picked the patchset up: a series
+                // resumed under a new build would otherwise credit it with
+                // the reviews an older one wrote. A row from before these
+                // columns were filled falls back to the patchset's.
+                "model": r.get::<Option<String>>(17)?.or_else(|| model_name.map(String::from)),
+                "provider": r.get::<Option<String>>(18)?.or_else(|| provider.map(String::from)),
+                "prompts_hash": r
+                    .get::<Option<String>>(19)?
+                    .or_else(|| prompts_git_hash.map(String::from)),
                 "baseline": baseline,
             });
             if include_logs && let Some(obj) = item.as_object_mut() {
@@ -16690,6 +16697,52 @@ mod tests {
         assert_eq!(details["tokens_cached"], 10);
         assert_eq!(details["baseline"]["branch"], "master");
         assert_eq!(details["baseline"]["commit"], "commit_hash");
+
+        // A later daemon picks the patchset up and stamps its own build and
+        // model on it; the patchset page still credits the review above to
+        // the run that wrote it, and only a row without a hash borrows the
+        // patchset's.
+        db.update_patchset_baseline_info(
+            ps_id,
+            Some(baseline_id),
+            Some("claude-opus"),
+            Some("hash456"),
+            None,
+            Some("claude"),
+        )
+        .await
+        .unwrap();
+        let unstamped = db
+            .create_review(
+                ps_id,
+                Some(patch_id),
+                "claude",
+                "claude-opus",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let page = db
+            .get_patchset_details(ps_id, None, None)
+            .await
+            .unwrap()
+            .expect("patchset details should exist");
+        let review = |id: i64| {
+            page["reviews"]
+                .as_array()
+                .expect("reviews")
+                .iter()
+                .find(|r| r["id"] == id)
+                .cloned()
+                .expect("review listed")
+        };
+        let old = review(review_id);
+        assert_eq!(old["prompts_hash"], "hash123");
+        assert_eq!(old["model"], "gemini-2.5");
+        assert_eq!(old["provider"], "gemini");
+        assert_eq!(review(unstamped)["prompts_hash"], "hash456");
 
         // Non-existent review
         let none_details = db.get_review_details(99999).await.unwrap();
