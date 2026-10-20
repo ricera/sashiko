@@ -278,10 +278,16 @@ stays.
 
 ### 4.6 Wind-down, failure and the report
 
-- The stage is interruptible (`interruptible: true`): at the review's
-  deadline it is stopped like an analysis stage, and the review goes on to
-  the report with no links. Links are optional; a Partial review without
-  them is still a correct review.
+- Like every consolidation stage it runs past the review's deadline
+  (`interruptible: false`). Built as first planned, interruptible, it broke
+  the rule the wind-down rests on (only stages that gather concerns stop
+  at the deadline), and a stage stopped there counts as missing coverage,
+  so a review whose links were cut short would have read as Partial
+  although it lost no finding. `max_turns` 10 keeps the run short.
+- It is not in the planned stage list (`planned_stages_from`): it runs only
+  for a pull request with earlier revisions, which the plan cannot tell, so
+  the CLI's progress counts it when it starts, as it counts the pre-screen
+  and the planner.
 - If the stage fails, the review continues without links and the failure is
   recorded in `stage_failures` like any stage's. It never fails the review.
 - The report is unchanged: it runs after `prior-links` and reads
@@ -416,20 +422,18 @@ change.
 
 1. `review: count the findings a review reported first` (§4.9: SQL, API field, page,
    CLIs, tests; works on today's links).
-2. `review: link earlier findings in a stage of their own` (§4.1 to §4.6:
-   the stage, its rules, validator and reduce in both workflows; verification
-   stops seeing the block and loses its link rules, validator and extra
-   attempt; tests of §6.1). One change: moving where linking happens.
-3. `review: drop post-verification's earlier-revision rules` (link and
-   series rules, `inherit_prior_links`, `candidates_for_prompt`,
-   `prior_link_section`, `with_prior_series_rule`; dead after 2).
-4. `review: drop the history-sentence placement rules` (the macros'
-   `history_at` / `history_before` / `section_names`, their tests and
-   `CalibrationLabel` table use that only they had; dead after 2).
-5. `web: show which stage linked a finding on the review map` (§4.7).
-6. `docs: say how a later revision's findings are linked` (GITHUB_SETUP.md
-   and the PR design's §4.5 pointer to this design).
-7. `designs: record the linking stage's measurement` (§6.3 results, after
+2. `review: link earlier findings in a stage of their own` (§4.1 to §4.7
+   and §4.8: the stage, its rules, validator and reduce in both workflows;
+   verification and post-verification stop seeing any history and lose
+   their link rules, validator, extra attempt, link inheritance, series
+   rule and the history-sentence placement macros; the reduces drop any
+   `prior` a deciding stage writes; GITHUB_SETUP.md; tests of §6.1). As
+   built, planned commits 3, 4 and 6 are part of this one: once the
+   deciding stages stop seeing history, their rules and helpers are dead
+   code, which the build refuses as warnings, so they cannot be removed in
+   commits of their own after it.
+3. `web: show which stage linked a finding on the review map` (§4.7).
+4. `designs: record the linking stage's measurement` (§6.3 results, after
    the runs).
 
 ## 8. Open Decisions

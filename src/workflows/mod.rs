@@ -84,6 +84,10 @@ pub fn is_counted_stage(project: ProjectId, name: &str) -> bool {
 
 /// Resolves the ordered list of stages a review will run (analysis fan-out
 /// followed by consolidation stages).
+///
+/// The `prior-links` stage is left out: it runs only for a pull request
+/// with earlier revisions, which the plan cannot tell, so like the
+/// pre-screen and the planner it is counted when it starts.
 pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> Vec<String> {
     match project {
         ProjectId::Linux => {
@@ -96,6 +100,7 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
                 planned.extend(
                     linux_patch_review::CONSOLIDATION_STAGES
                         .iter()
+                        .filter(|s| s.name != linux_patch_review::PRIOR_LINKS.name)
                         .map(|s| s.name.to_string()),
                 );
             }
@@ -111,6 +116,7 @@ pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> 
                 planned.extend(
                     sashiko_patch_review::CONSOLIDATION_STAGES
                         .iter()
+                        .filter(|s| s.name != linux_patch_review::PRIOR_LINKS.name)
                         .map(|s| s.name.to_string()),
                 );
             }

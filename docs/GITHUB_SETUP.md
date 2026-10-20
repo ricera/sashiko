@@ -526,18 +526,22 @@ fix for an earlier finding caused, instead of raising them again as new.
 
 ### What the model reads
 
-Only the `verification` stage is shown the earlier findings, in the Linux
-and the Sashiko project alike. The stages that look for problems are not
-shown them, so what they raise is not anchored on what was raised before,
-and the `report` stage is shown only the earlier findings that the
-review's own findings link to (see [Where a link shows](#where-a-link-shows)).
-A review with no earlier findings gets the prompts it had before.
+Only the `prior-links` stage is shown the earlier findings, in the Linux
+and the Sashiko project alike. It runs after verification and
+post-verification have decided every finding, and only when the review
+has a finding to link. No stage that looks for problems or decides which
+concerns are findings is shown them, so what a review reports is not
+anchored on what earlier revisions were told; the `report` stage is shown
+only the earlier findings that the review's own findings link to (see
+[Where a link shows](#where-a-link-shows)). A review with no earlier
+findings gets the prompts it had before and does not run the stage.
 
-Verification is shown one block near the end of its prompt, after its
-findings format and the false-positive and severity guides, and followed
-only by its rules for the block. The block lists every earlier finding of
-the pull request, not only those on the patch under review, because code
-moves between patches as a series is reworked:
+The `prior-links` stage is shown the block after its instruction,
+followed by its rules for the block, then the review's findings, each by
+its stage item id with its title, severity explanation and locations, and
+not its severity. The block lists every earlier finding of the pull
+request, not only those on the patch under review, because code moves
+between patches as a series is reworked:
 
 ```
 === Findings From Earlier Revisions of This Pull Request ===
@@ -607,20 +611,24 @@ quoted the same way, so a quote in either cannot close it early and put
 a forged commit, role or revision label in place of the daemon's. A
 `{{name}}` in them is passed on as written, not filled in.
 
-Verification's rules for the block say that an earlier finding makes a
-concern neither more nor less likely to be valid, and that verification
-does not report an earlier finding that no concern of this review raises.
-A concern that is the same defect as an earlier finding, still present,
-is a **repeat**; a concern about code that was changed in response to an
+The stage only links: it is told that whether a finding is valid, and
+how severe it is, is settled, and it answers with links and nothing else
+(`{"links": [{"stage_item_id", "relation", "revision",
+"earlier_problem"}]}`; an answer with any other key is refused). A finding
+that is the same defect as an earlier finding, still present, is a
+**repeat**; a finding about code that was changed in response to an
 earlier finding, where that change creates the defect, is a **fix
 regression**, which must be shown by comparing the earlier code with the
-current code, not by similar wording. The finding's title stays a title:
-the history goes in one sentence in its `severity_explanation`, at the end
-of the section of the project's severity rubric that names the path, so
-the rubric's first section stays first. A Linux review ends its Triggering
-path with it and keeps the Consequence first; a Sashiko review ends its
-Likelihood and preconditions reasoning with it and keeps the Blast radius
-and irreversibility reasoning first.
+current code (the stage may read it with the git tools, in at most 10
+turns), not by similar wording. A link for a finding the stage was not
+shown, or a second link for one finding, is refused by its stage item
+id; a link naming no earlier finding the block listed is refused once per
+review with feedback naming what was listed, and the reduce removes any
+that still does not name one. The finding itself is never changed: its
+title and severity explanation are what verification or post-verification
+wrote, and the link is the whole record of the history. Any `prior` key a
+deciding stage writes anyway is dropped, so links come only from this
+stage.
 
 ### The link a finding carries
 
@@ -648,12 +656,12 @@ after its slug moves to a newer one, and
 
 A link is kept only when it names a finding the block showed:
 
-1. When verification's answer has a link that names nothing shown, it is
-   sent back once, naming each such finding, what was wrong (an unknown
-   relation, a revision not listed, a title not listed under that
-   revision) and the labels or titles that were listed. This happens at
-   most once per patch review, and the stage is given one more attempt at
-   valid output to pay for it.
+1. When the `prior-links` stage's answer has a link that names nothing
+   shown, it is sent back once, naming each such finding, what was wrong
+   (an unknown relation, a revision not listed, a title not listed under
+   that revision) and the labels or titles that were listed. This happens
+   at most once per patch review, and the stage is given one more attempt
+   at valid output to pay for it.
 2. Every link is then checked again. One that names a shown finding is
    rewritten with the label and title as the block listed them, and with
    `revision_head` added; the label and the title are compared under the

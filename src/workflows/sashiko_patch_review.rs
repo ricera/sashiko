@@ -29,19 +29,16 @@ use crate::workflow::{
 use crate::workflows::guard::{normalize_guide_name, normalize_stage_name, sanitize_guide_name};
 use crate::workflows::linux_patch_review::{
     AnalysisStage, ConsolidationStage, LinuxPatchReviewState, POST_VERIFICATION_STAGE_NAMES,
-    PRIOR_LINKS_PLACEHOLDER, PRIOR_SERIES_RULE_PLACEHOLDER, PlanningOutput, PostVerificationOutput,
-    PrescreenOutput, PriorHistory, SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput,
-    VerificationOutput, append_stage_dismissed_concerns_with_prompts,
-    append_stage_items_with_prompts, apply_planning_stage_output,
-    apply_post_verification_stage_output, apply_verification_stage_output,
-    batch_hard_cases_by_severity, build_stage_efforts_schema, candidates_for_prompt,
+    PRIOR_LINKS, PRIOR_LINKS_PLACEHOLDER, PlanningOutput, PostVerificationOutput, PrescreenOutput,
+    SERIES_CONTEXT_PLACEHOLDER, StageConcernsOutput, VerificationOutput,
+    append_stage_dismissed_concerns_with_prompts, append_stage_items_with_prompts,
+    apply_planning_stage_output, apply_post_verification_stage_output,
+    apply_verification_stage_output, batch_hard_cases_by_severity, build_stage_efforts_schema,
     collect_stage_prompts, cover_letter_placeholder, extra_prompt_paths_for_items,
     extra_prompt_paths_for_state, format_planning_feedback, format_post_verification_feedback,
-    has_valid_proof_location, prior_link_post_verification_rules, prior_link_section,
-    prior_reviews_placeholder, prior_reviews_verification_rules,
-    prior_series_post_verification_rule, resolve_stage_effort, validate_planning_stage_efforts,
-    validate_post_verification_batch_items, verification_output_checks, with_prior_links,
-    with_prior_reviews, with_prior_series_rule,
+    format_verification_stage_feedback, has_valid_proof_location, prior_links_stage_for,
+    resolve_stage_effort, validate_planning_stage_efforts, validate_post_verification_batch_items,
+    validate_verification_stage_output, with_prior_links,
 };
 
 /// State container for a Sashiko patch review run.
@@ -288,41 +285,6 @@ Generate the plain-text inline review report following the exact formatting rule
 - Do NOT include `Summary:` or `Findings:` headers (the summary is generated and displayed separately in the UI).
 - Do NOT use backticks, markdown code blocks, or markdown headings. Wrap all lines at 78 characters or fewer."#;
 
-/// How Sashiko verification uses the earlier findings (see
-/// [`prior_reviews_verification_rules`]). severity.md asks for the Blast
-/// radius and irreversibility reasoning, then the Likelihood and
-/// preconditions reasoning, at the start of the severity explanation, so the
-/// history sentence is the last sentence of the Likelihood and preconditions
-/// section, which names the path and is the last of this rubric's sections
-/// that `finding_view::CalibrationLabel` names, and the Blast radius stays
-/// first: its body is what `finding_view::consequence_of` gives as the
-/// finding's consequence when a later revision lists it, so the history
-/// must not land there.
-pub(crate) const PRIOR_REVIEWS_VERIFICATION_RULES: &str = prior_reviews_verification_rules!(
-    series_block: "Patch Series Context",
-    history_at: "Likelihood and preconditions",
-    keep_first: "Keep the \"Blast radius and irreversibility\" section first, as severity.md \
-     asks.",
-);
-
-/// What Sashiko post-verification is told when the pull request had
-/// earlier revisions (see [`prior_series_post_verification_rule`]): its
-/// worker writes the series as "Patch Series Context".
-pub(crate) const PRIOR_SERIES_POST_VERIFICATION_RULE: &str =
-    prior_series_post_verification_rule!(series_block: "Patch Series Context");
-
-/// What Sashiko post-verification is told about a linked candidate (see
-/// [`prior_link_post_verification_rules`]), placed as in verification:
-/// post-verification reads the same severity.md. Neither gets a
-/// `history_before` or a `section_names`: the finding view knows no
-/// Sashiko section after the Likelihood and preconditions one, and
-/// severity.md never asks for section names.
-pub(crate) const PRIOR_LINK_POST_VERIFICATION_RULES: &str = prior_link_post_verification_rules!(
-    history_at: "Likelihood and preconditions",
-    keep_first: "Keep the \"Blast radius and irreversibility\" section first, as severity.md \
-     asks.",
-);
-
 /// How the Sashiko report states a finding's link to an earlier finding: a
 /// note right after the bullet's severity marker, where
 /// github-summary-template.md places "(pre-existing)", and the bullet says
@@ -521,7 +483,7 @@ pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Verification",
     wants_series_context: true,
-    wants_prior_reviews: true,
+    wants_prior_reviews: false,
 };
 
 pub static POST_VERIFICATION: ConsolidationStage = ConsolidationStage {
@@ -545,8 +507,13 @@ pub static SUMMARY: ConsolidationStage = ConsolidationStage {
     wants_prior_reviews: false,
 };
 
-pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
-    &[&VERIFICATION, &POST_VERIFICATION, &REPORT, &SUMMARY];
+pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] = &[
+    &VERIFICATION,
+    &POST_VERIFICATION,
+    &PRIOR_LINKS,
+    &REPORT,
+    &SUMMARY,
+];
 
 fn series_context_placeholder(wants: bool) -> &'static str {
     if wants {
@@ -1083,20 +1050,16 @@ pub fn resolve_analysis_stages_with_options(
 pub fn verification_stage(
     max_turns: usize,
     temperature: f32,
-    history: PriorHistory,
 ) -> Stage<SashikoPatchReviewState, VerificationOutput> {
-    verification_stage_with_effort(max_turns, temperature, None, history)
+    verification_stage_with_effort(max_turns, temperature, None)
 }
 
 pub fn verification_stage_with_effort(
     max_turns: usize,
     temperature: f32,
     effort: Option<crate::ai::EffortMode>,
-    history: PriorHistory,
 ) -> Stage<SashikoPatchReviewState, VerificationOutput> {
-    let (output_format, max_validation_attempts) = verification_output_checks(history);
     let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
-    let prior_reviews = prior_reviews_placeholder(VERIFICATION.wants_prior_reviews);
     let user_template = with_series_context(
         PromptTemplate::<SashikoPatchReviewState>::new(format!(
             r#"{STAGE_VERIFICATION_INSTRUCTION}
@@ -1121,7 +1084,7 @@ Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns
 - LINEAGE REQUIREMENT ('source_ids'): Every item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every object in 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array of strings listing the exact input "C*" and/or "D*" IDs consolidated into that output item. Every input "C*" and "D*" ID MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference "C*" IDs (any contested "C*" + "D*" or promoted "D*" must be routed to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference "D*" IDs in "source_ids" (never "C*" IDs).
 - Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of "C*" IDs only), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "speculative" (boolean: true if the concrete path and preconditions that trigger the bug rest on an unverified assumption; severity.md caps a speculative finding at Medium, or Low if the impact is minor. If any part of that path rests on one, answer true. false if that path and its preconditions are established from the code. A low likelihood that is established from the code is reflected in the level, not in this key. A Category 1a finding rests on concrete code proof, so a concern you would mark true belongs in 'hard_cases' with "signal_reason": "speculative_concern" instead), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters), and may include "stages" (array of stage names) and "prompts" (array of prompt files).
 - Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
-- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of "D*" IDs only), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts".{prior_reviews}"#
+- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of "D*" IDs only), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts"."#
         ))
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
@@ -1142,18 +1105,17 @@ Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns
 
     Stage::builder(VERIFICATION.name)
         .system_prompt(sashiko_system_prompt(true))
-        .user_prompt(with_prior_reviews(
-            user_template,
-            VERIFICATION.wants_prior_reviews,
-            PRIOR_REVIEWS_VERIFICATION_RULES,
-        ))
-        .output_format(output_format)
+        .user_prompt(user_template)
+        .output_format(
+            OutputFormat::json()
+                .with_validator(validate_verification_stage_output)
+                .with_feedback_formatter(format_verification_stage_feedback),
+        )
         .policy(StagePolicy {
             tools: ToolScope::All,
             max_turns,
             temperature,
             reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
-            max_validation_attempts,
             ..StagePolicy::consolidation()
         })
         .skip_if(|s| s.all_concerns.is_empty() && s.all_dismissed_concerns.is_empty())
@@ -1179,9 +1141,7 @@ pub fn post_verification_stage_with_effort(
     temperature: f32,
     effort: Option<crate::ai::EffortMode>,
 ) -> Stage<SashikoPatchReviewState, PostVerificationOutput> {
-    let candidate_json =
-        serde_json::to_string_pretty(&candidates_for_prompt(&batch)).unwrap_or_default();
-    let prior_link_rules = prior_link_section(&batch, PRIOR_LINK_POST_VERIFICATION_RULES);
+    let candidate_json = serde_json::to_string_pretty(&batch).unwrap_or_default();
     let batch_for_prompts = batch.clone();
     let batch_for_validate = batch.clone();
     let batch_for_reduce = batch;
@@ -1206,7 +1166,7 @@ Candidate Hard Case(s) to Verify:
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (if disproved by concrete code or excluded by rules 1-2; never return both empty arrays).
 - LINEAGE REQUIREMENT ('source_ids'): Every candidate hard case in this batch has an "id" ("H1", "H2", ...). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array of strings listing the exact candidate "H*" ID(s) from this batch that it resolves, and every candidate "H*" ID in this batch MUST be accounted for in at least one output item's "source_ids".
 - Each object in 'findings' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "problem" (a short naming string under 80 characters starting with a Sashiko component prefix like 'workflow:', 'db:', 'reviewer:', 'toolbox:', 'api:', 'cli:', NEVER using backquotes), "speculative" (boolean: true if the concrete path and preconditions that trigger the bug rest on an unverified assumption; severity.md caps a speculative finding at Medium, or Low if the impact is minor. If any part of that path rests on one, answer true. false if that path and its preconditions are established from the code. A low likelihood that is established from the code is reflected in the level, not in this key. A candidate you report only because no code disproves it, without having established that path, is speculative; one whose path your tool inspection established is not, whatever its "signal_reason"), "severity" (Low, Medium, High, Critical, or Unknown), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), "locations" (array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters).
-- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code or policy rule disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving code or target snippet).{prior_link_rules}{PRIOR_SERIES_RULE_PLACEHOLDER}"#
+- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of batch "H*" IDs), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code or policy rule disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving code or target snippet)."#
         ))
         .include_file("false-positive-guide.md")
         .include_file("severity.md")
@@ -1218,7 +1178,6 @@ Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every
     .with_var("candidate_hard_cases", move |_: &SashikoPatchReviewState| {
         candidate_json.clone()
     });
-    let user_template = with_prior_series_rule(user_template, PRIOR_SERIES_POST_VERIFICATION_RULE);
 
     Stage::builder(stage_name)
         .system_prompt(sashiko_system_prompt(true))
@@ -1385,7 +1344,7 @@ pub fn summary_stage_with_effort(
 
 /// The Sashiko review workflow for a patch shown no earlier findings.
 pub fn build_sashiko_patch_review_workflow() -> Workflow<SashikoPatchReviewState> {
-    build_sashiko_patch_review_workflow_with_options(20, 0.0, PriorHistory::NotShown)
+    build_sashiko_patch_review_workflow_with_options(20, 0.0)
 }
 
 /// Builds the Sashiko patch review workflow.
@@ -1401,16 +1360,14 @@ pub fn build_sashiko_patch_review_workflow() -> Workflow<SashikoPatchReviewState
 pub fn build_sashiko_patch_review_workflow_with_options(
     max_turns: usize,
     temperature: f32,
-    history: PriorHistory,
 ) -> Workflow<SashikoPatchReviewState> {
-    build_sashiko_patch_review_workflow_with_effort(max_turns, temperature, None, history)
+    build_sashiko_patch_review_workflow_with_effort(max_turns, temperature, None)
 }
 
 pub fn build_sashiko_patch_review_workflow_with_effort(
     max_turns: usize,
     temperature: f32,
     effort: Option<crate::ai::EffortMode>,
-    history: PriorHistory,
 ) -> Workflow<SashikoPatchReviewState> {
     Workflow::builder("sashiko_patch_review")
         .stage(prescreen_stage_with_effort(temperature, effort))
@@ -1420,12 +1377,18 @@ pub fn build_sashiko_patch_review_workflow_with_effort(
             ParallelPolicy::BestEffort,
         )
         .dynamic_parallel(
-            verification_stage_with_effort(max_turns, temperature, effort, history),
+            verification_stage_with_effort(max_turns, temperature, effort),
             move |state| {
                 resolve_post_verification_stages_with_options(state, max_turns, temperature)
             },
             ParallelPolicy::BestEffort,
         )
+        .stage(prior_links_stage_for(
+            sashiko_system_prompt(true),
+            max_turns,
+            temperature,
+            effort,
+        ))
         .stage(report_stage_with_effort(max_turns, temperature, effort))
         .stage(summary_stage_with_effort(max_turns, temperature, effort))
         .build()
@@ -1453,7 +1416,7 @@ mod tests {
             .map(|(name, _)| *name)
             .collect();
         not_interruptible.sort_unstable();
-        let mut expected = vec!["verification", "report", "summary"];
+        let mut expected = vec!["verification", "prior-links", "report", "summary"];
         expected.sort_unstable();
         assert_eq!(not_interruptible, expected);
 
@@ -1707,7 +1670,7 @@ mod tests {
     fn test_build_sashiko_patch_review_workflow() {
         let wf = build_sashiko_patch_review_workflow();
         assert_eq!(wf.name, "sashiko_patch_review");
-        assert_eq!(wf.steps.len(), 5);
+        assert_eq!(wf.steps.len(), 6);
         assert_eq!(
             prescreen_stage_with_effort(1.0, None).policy.temperature,
             1.0
@@ -1779,7 +1742,7 @@ mod tests {
             wind_down: None,
         };
 
-        let wf = build_sashiko_patch_review_workflow_with_options(1, 1.0, PriorHistory::NotShown);
+        let wf = build_sashiko_patch_review_workflow_with_options(1, 1.0);
         let mut state = SashikoPatchReviewState::default();
         crate::workflow::WorkflowEngine::execute(&wf, &env, &mut state, None)
             .await
@@ -1900,7 +1863,7 @@ mod tests {
             ..Default::default()
         };
 
-        let stage = verification_stage(1, 0.0, PriorHistory::NotShown);
+        let stage = verification_stage(1, 0.0);
         let rendered_ver_log = stage.user_prompt.render_for_log(&state);
         assert!(rendered_ver_log.contains("@subsystem/db-migrations.md"));
         stage.execute(&env, &mut state, None).await.unwrap();
@@ -1958,7 +1921,7 @@ mod tests {
     #[test]
     fn test_sashiko_stage_output_validators() {
         let state = SashikoPatchReviewState::default();
-        let ver_stage = verification_stage(20, 0.0, PriorHistory::NotShown);
+        let ver_stage = verification_stage(20, 0.0);
 
         // Missing top-level arrays or stray inner objects must fail.
         assert!(ver_stage.output_format.validate("{}", &state).is_err());
@@ -2139,7 +2102,7 @@ mod tests {
         for (stage, prompt, opening) in [
             (
                 "verification",
-                verification_stage(10, 1.0, PriorHistory::NotShown)
+                verification_stage(10, 1.0)
                     .user_prompt
                     .render_for_log(&state),
                 "- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys:",

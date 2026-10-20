@@ -56,8 +56,7 @@ use crate::prior_revisions::{
 use crate::project::ProjectId;
 use crate::workflow::{StageFailure, StageStopCause, WorkflowEngine, WorkflowEnv, WorkflowEvent};
 use crate::workflows::linux_patch_review::{
-    LinuxPatchReviewState, PriorHistory, build_linux_patch_review_workflow_with_effort,
-    linux_system_prompt,
+    LinuxPatchReviewState, build_linux_patch_review_workflow_with_effort, linux_system_prompt,
 };
 use crate::workflows::sashiko_patch_review::{
     build_sashiko_patch_review_workflow_with_effort, sashiko_system_prompt,
@@ -699,21 +698,16 @@ impl Worker {
             self.global_history.push(ReviewLogEntry::new(None, system));
         }
 
-        // Built after the state, so verification checks the links to
-        // earlier findings only of a review that is shown some.
-        let history = PriorHistory::of(state.prior_reviews.as_ref());
         let workflow = match self.project {
             ProjectId::Linux => build_linux_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,
-                history,
             ),
             ProjectId::Sashiko => build_sashiko_patch_review_workflow_with_effort(
                 self.max_interactions,
                 self.temperature,
                 self.effort,
-                history,
             ),
         };
         let env = WorkflowEnv {
@@ -2135,19 +2129,60 @@ mod tests {
         assert!(post_content.contains("SERIES VERIFICATION DIRECTIVE:"));
     }
 
+    /// Answers as [`MockMultiStageSeriesProvider`] does, except that
+    /// post-verification confirms the hard case as a finding, so the review
+    /// reaches its `prior-links` stage, which links nothing.
+    struct MockConfirmingProvider;
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for MockConfirmingProvider {
+        async fn generate_content(
+            &self,
+            request: crate::ai::AiRequest,
+        ) -> anyhow::Result<crate::ai::AiResponse> {
+            // The stage's own prompt, not a retry's feedback.
+            let stage_prompt = request
+                .messages
+                .iter()
+                .find(|m| m.role == crate::ai::AiRole::User)
+                .and_then(|m| m.content.as_deref())
+                .unwrap_or_default();
+            let content = if stage_prompt.contains("# Per-finding post-verification") {
+                r#"{"findings": [{"source_ids": ["H1"], "problem": "frob: refill leaks a page", "speculative": false, "severity": "High", "severity_explanation": "Consequence: a leak.", "preexisting": false, "locations": [{"file": "ring.c", "function_or_symbol": "refill", "line": 1, "code_snippet": "refill();", "why_this_location_matters": "the leaking call"}]}], "dismissed_concerns": []}"#
+            } else if stage_prompt.contains("# Link this review's findings") {
+                r#"{"links": []}"#
+            } else {
+                return MockMultiStageSeriesProvider.generate_content(request).await;
+            };
+            Ok(crate::ai::AiResponse {
+                content: Some(content.to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            MockMultiStageSeriesProvider.get_capabilities()
+        }
+    }
+
     /// The earlier revisions' findings the daemon puts in the payload reach
-    /// the verification prompt of the patch the payload names, and no other
-    /// stage's. A malformed list, or a payload that names no patch it
+    /// the `prior-links` prompt of the patch the payload names, and no other
+    /// stage's: verification and post-verification decide the findings
+    /// without them. A malformed list, or a payload that names no patch it
     /// carries, is no block, and the review runs as it would without one.
     #[tokio::test]
-    async fn the_worker_gives_the_payload_prior_revisions_to_verification() {
+    async fn the_worker_gives_the_payload_prior_revisions_to_the_link_stage_only() {
         async fn user_prompts_for(prior_revisions: Value, patch_index: i64) -> Vec<String> {
             let temp_dir = tempfile::tempdir().unwrap();
             let prompts_dir = temp_dir.path().join("prompts");
             std::fs::create_dir_all(&prompts_dir).unwrap();
             let tools = crate::toolbox::ToolBox::new(temp_dir.path().to_path_buf(), None);
             let mut worker = Worker::new(
-                std::sync::Arc::new(MockMultiStageSeriesProvider),
+                std::sync::Arc::new(MockConfirmingProvider),
                 std::sync::Arc::new(tools),
                 PromptRegistry::new(prompts_dir),
                 WorkerConfig {
@@ -2159,7 +2194,7 @@ mod tests {
                     baseline_sha: None,
                     custom_prompt: None,
                     stages: Some(vec!["goal".to_string()]),
-                    skip_report: false,
+                    skip_report: true,
                     report_preexisting: false,
                     effort: None,
                 },
@@ -2204,16 +2239,22 @@ mod tests {
         };
 
         let prompts = user_prompts_for(revisions.clone(), 1).await;
-        let verification = prompts
+        let linking = prompts
             .iter()
-            .find(|prompt| prompt.contains("# Verification and severity estimation"))
-            .expect("verification runs");
-        assert!(verification.contains(block_opening), "{verification}");
+            .find(|prompt| prompt.contains("# Link this review's findings"))
+            .expect("prior-links runs");
+        assert!(linking.contains(block_opening), "{linking}");
         assert!(
-            verification.contains("  - [High] frob: refill leaks a page\n"),
-            "{verification}"
+            linking.contains("  - [High] frob: refill leaks a page\n"),
+            "{linking}"
         );
-        assert_eq!(given(&prompts), 1, "only verification is shown the block");
+        assert!(
+            prompts
+                .iter()
+                .any(|prompt| prompt.contains("# Verification and severity estimation")),
+            "verification runs"
+        );
+        assert_eq!(given(&prompts), 1, "only prior-links is shown the block");
 
         for (absent, patch_index) in [
             (Value::Null, 1),

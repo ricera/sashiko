@@ -1631,11 +1631,13 @@ struct PatchState {
     active_stages: std::collections::BTreeSet<String>,
     completed_stages: usize,
     active_stage_turns: std::collections::HashMap<String, usize>,
-    /// Stages that ran before the fan-out resolved, and so are not in
-    /// `planned_stages`: the pre-screen and the planner.
+    /// Stages that are not in `planned_stages`: the pre-screen and the
+    /// planner, which ran before the fan-out resolved, and `prior-links`,
+    /// which runs only for a pull request with earlier revisions.
     ///
-    /// Counted as they start rather than predicted, because whether either runs
-    /// depends on `--stages`. A stage that has started is one that ran.
+    /// Counted as they start rather than predicted, because whether each runs
+    /// depends on `--stages` or on the pull request. A stage that has started
+    /// is one that ran.
     preliminary_stages: usize,
 }
 
@@ -2511,6 +2513,11 @@ async fn handle_review_command(
             ProgressEvent::AiReviewStageStarted { patch_index, stage } => {
                 if let Some(p) = s.patches.get_mut(&patch_index) {
                     p.status = PatchStatus::Reviewing;
+                    // Not in the plan: it runs only for a pull request with
+                    // earlier revisions, so it is counted as it starts.
+                    if stage == sashiko::workflows::linux_patch_review::PRIOR_LINKS.name {
+                        p.preliminary_stages += 1;
+                    }
                     p.active_stages.insert(stage);
                     render_progress(&mut s);
                 }
