@@ -88,6 +88,18 @@ const EMBARGO_RELEASED_STATUSES_SQL: &str = "('Reviewed', 'Partial')";
 #[cfg(feature = "server")]
 const FINDINGS_COUNTED_STATUSES_SQL: &str = "('Reviewed', 'Partial')";
 
+/// The condition, over the findings row `f`, for a counted finding that this
+/// review reported first: not preexisting, and not linked as a repeat of an
+/// earlier revision's finding. A link that does not read as JSON, or names
+/// another relation (a fix regression is a defect the earlier revision did
+/// not have), leaves the finding first reported. The page and the CLIs read
+/// a finding's link by `PriorLink::from_json`; the stored column holds only
+/// links that read that way, so the two agree.
+#[cfg(feature = "server")]
+const FIRST_REPORTED_FINDING_SQL: &str = "COALESCE(f.preexisting, 0) = 0
+    AND (f.prior IS NULL OR NOT json_valid(f.prior)
+         OR COALESCE(json_extract(f.prior, '$.relation'), '') != 'repeat')";
+
 /// The patch verdicts that are final when a patchset is processed again, as
 /// after a restart: a review that ran out of time (`Partial`, `TimedOut`)
 /// and a review that failed for good (`Failed`). Each is cleared by a rerun
@@ -975,6 +987,19 @@ pub struct Subsystem {
     pub mailing_list_address: String,
 }
 
+/// A patchset's counted findings, as its list row shows them: the
+/// non-preexisting findings of its Reviewed and Partial reviews by severity,
+/// and how many of them this review reported first
+/// (`FIRST_REPORTED_FINDING_SQL`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FindingCounts {
+    pub low: i64,
+    pub medium: i64,
+    pub high: i64,
+    pub critical: i64,
+    pub first_reported: i64,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct PatchsetRow {
     pub id: i64,
@@ -992,6 +1017,11 @@ pub struct PatchsetRow {
     pub findings_medium: Option<i64>,
     pub findings_high: Option<i64>,
     pub findings_critical: Option<i64>,
+    /// How many of the counted findings this review reported first, rather
+    /// than repeated from an earlier revision of the pull request. Absent from
+    /// the JSON of a reader that does not set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_first_reported: Option<i64>,
     pub baseline_id: Option<i64>,
     pub slug: Option<String>,
     pub failed_reason: Option<String>,
@@ -4316,13 +4346,13 @@ impl Database {
         Ok(sections)
     }
 
-    /// Batch-queries non-preexisting finding counts `(low, medium, high, critical)`
-    /// for the given patchset IDs. Used by `/api/patchsets` to populate finding
-    /// counts on embargoed rows when the caller is an authorized maintainer.
+    /// Batch-queries the finding counts of the given patchset IDs, as the
+    /// list shows them. Used by `/api/patchsets` to populate finding counts on
+    /// embargoed rows when the caller is an authorized maintainer.
     pub async fn get_patchset_finding_counts(
         &self,
         patchset_ids: &[i64],
-    ) -> Result<std::collections::HashMap<i64, (i64, i64, i64, i64)>> {
+    ) -> Result<std::collections::HashMap<i64, FindingCounts>> {
         let mut counts = std::collections::HashMap::new();
         if patchset_ids.is_empty() {
             return Ok(counts);
@@ -4333,7 +4363,8 @@ impl Database {
                 COALESCE(SUM(CASE WHEN f.severity = 1 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN f.severity = 2 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END), 0),
                 COALESCE(SUM(CASE WHEN f.severity = 3 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN f.severity = 4 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN f.severity = 4 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN {FIRST_REPORTED_FINDING_SQL} THEN 1 ELSE 0 END), 0)
              FROM reviews r
              JOIN findings f ON r.id = f.review_id
              WHERE r.status IN {FINDINGS_COUNTED_STATUSES_SQL} AND r.patchset_id IN ({})
@@ -4347,11 +4378,16 @@ impl Database {
         let mut rows = self.conn.query(&sql, params).await?;
         while let Some(row) = rows.next().await? {
             let patchset_id: i64 = row.get(0)?;
-            let low: i64 = row.get(1)?;
-            let medium: i64 = row.get(2)?;
-            let high: i64 = row.get(3)?;
-            let critical: i64 = row.get(4)?;
-            counts.insert(patchset_id, (low, medium, high, critical));
+            counts.insert(
+                patchset_id,
+                FindingCounts {
+                    low: row.get(1)?,
+                    medium: row.get(2)?,
+                    high: row.get(3)?,
+                    critical: row.get(4)?,
+                    first_reported: row.get(5)?,
+                },
+            );
         }
         Ok(counts)
     }
@@ -9212,7 +9248,8 @@ impl Database {
         let sql = format!(
             "SELECT p.id, p.subject, p.status, p.thread_id, p.author, p.date, p.cover_letter_message_id, p.total_parts, p.received_parts, GROUP_CONCAT(s.name, ','),
              COALESCE(f.low, 0), COALESCE(f.medium, 0), COALESCE(f.high, 0), COALESCE(f.critical, 0), p.baseline_id, p.failed_reason, p.target_review_count, p.skip_filters, p.only_filters,
-             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug
+             p.embargo_until, p.mr_url, p.mr_title, p.mr_number, p.slug,
+             COALESCE(f.first_reported, 0)
              FROM (
                  SELECT id FROM patchsets p
                  {}
@@ -9226,7 +9263,8 @@ impl Database {
                     SUM(CASE WHEN f.severity = 1 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as low,
                     SUM(CASE WHEN f.severity = 2 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as medium,
                     SUM(CASE WHEN f.severity = 3 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as high,
-                    SUM(CASE WHEN f.severity = 4 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as critical
+                    SUM(CASE WHEN f.severity = 4 AND COALESCE(f.preexisting, 0) = 0 THEN 1 ELSE 0 END) as critical,
+                    SUM(CASE WHEN {FIRST_REPORTED_FINDING_SQL} THEN 1 ELSE 0 END) as first_reported
                 FROM reviews r
                 JOIN findings f ON r.id = f.review_id
                 WHERE r.status IN {FINDINGS_COUNTED_STATUSES_SQL}
@@ -9271,15 +9309,17 @@ impl Database {
                         false
                     };
 
-                    let (low, medium, high, critical) = if is_embargoed {
-                        (0, 0, 0, 0)
+                    let counts = if is_embargoed {
+                        FindingCounts::default()
                     } else {
-                        (
-                            row.get::<Option<i64>>(10).ok().flatten().unwrap_or(0),
-                            row.get::<Option<i64>>(11).ok().flatten().unwrap_or(0),
-                            row.get::<Option<i64>>(12).ok().flatten().unwrap_or(0),
-                            row.get::<Option<i64>>(13).ok().flatten().unwrap_or(0),
-                        )
+                        let count = |i: i32| row.get::<Option<i64>>(i).ok().flatten().unwrap_or(0);
+                        FindingCounts {
+                            low: count(10),
+                            medium: count(11),
+                            high: count(12),
+                            critical: count(13),
+                            first_reported: count(24),
+                        }
                     };
 
                     let status = shown_under_embargo(row.get(2).ok(), is_embargoed);
@@ -9296,10 +9336,11 @@ impl Database {
                         received_parts: row.get(8).ok(),
                         mailing_lists: subsystems.clone(),
                         subsystems,
-                        findings_low: Some(low),
-                        findings_medium: Some(medium),
-                        findings_high: Some(high),
-                        findings_critical: Some(critical),
+                        findings_low: Some(counts.low),
+                        findings_medium: Some(counts.medium),
+                        findings_high: Some(counts.high),
+                        findings_critical: Some(counts.critical),
+                        findings_first_reported: Some(counts.first_reported),
                         baseline_id: row.get(14).ok(),
                         failed_reason: row.get(15).ok(),
                         target_review_count: row.get(16).ok(),
@@ -10933,6 +10974,7 @@ impl Database {
                 findings_medium: None,
                 findings_high: None,
                 findings_critical: None,
+                findings_first_reported: None,
                 baseline_id: row.get(9).ok(),
                 failed_reason: row.get(10).ok(),
                 target_review_count: row.get(11).ok(),
@@ -10993,6 +11035,7 @@ impl Database {
                 findings_medium: None,
                 findings_high: None,
                 findings_critical: None,
+                findings_first_reported: None,
                 baseline_id: row.get(9).ok(),
                 failed_reason: row.get(10).ok(),
                 target_review_count: row.get(11).ok(),
@@ -15120,6 +15163,77 @@ mod tests {
         );
     }
 
+    /// A counted finding is first reported unless it is linked as a repeat
+    /// of an earlier revision's finding: an unlinked finding and a fix
+    /// regression are first reported, a repeat is not, and a preexisting
+    /// finding is in no count. The list and the counts an embargoed row is
+    /// given agree.
+    #[tokio::test]
+    async fn test_the_patchset_list_counts_the_findings_this_review_reported_first() {
+        use crate::prior_revisions::{PriorLink, PriorRelation};
+        let db = setup_db().await;
+        let (ps_id, patch_id) = one_part_series(&db, "msg_first_reported", 73500).await;
+        let review_id = db
+            .create_review(ps_id, Some(patch_id), "test", "test", None, None, None)
+            .await
+            .unwrap();
+        db.complete_review(
+            review_id,
+            "Reviewed",
+            "done",
+            Some("s"),
+            None,
+            Some("i"),
+            None,
+        )
+        .await
+        .unwrap();
+        let link = |relation| PriorLink {
+            relation,
+            revision: "v2".to_string(),
+            earlier_problem: "an earlier finding".to_string(),
+            revision_head: None,
+        };
+        for (n, (prior, preexisting)) in [
+            (None, false),
+            (Some(link(PriorRelation::Repeat)), false),
+            (Some(link(PriorRelation::FixRegression)), false),
+            (Some(link(PriorRelation::Repeat)), true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.create_finding(Finding {
+                review_id,
+                severity: Severity::Medium,
+                severity_explanation: None,
+                problem: format!("finding {n}"),
+                preexisting: Some(preexisting),
+                locations: None,
+                prior,
+            })
+            .await
+            .unwrap();
+        }
+
+        let list = db.get_patchsets(1, 0, None, None).await.unwrap();
+        assert_eq!(
+            list[0].findings_medium,
+            Some(3),
+            "the preexisting one is not counted"
+        );
+        assert_eq!(
+            list[0].findings_first_reported,
+            Some(2),
+            "the unlinked finding and the fix regression, not the repeat"
+        );
+        let counts = db.get_patchset_finding_counts(&[ps_id]).await.unwrap();
+        assert_eq!(
+            counts.get(&ps_id).map(|c| (c.medium, c.first_reported)),
+            Some((3, 2))
+        );
+    }
+
     /// The patchset list counts a Partial review's findings with a Reviewed
     /// review's, so a salvaged finding does not read as zero there. A
     /// Failed review's findings are still not counted.
@@ -15142,7 +15256,7 @@ mod tests {
         );
         // The counts a maintainer sees on an embargoed row agree.
         let counts = db.get_patchset_finding_counts(&[ps_id]).await.unwrap();
-        assert_eq!(counts.get(&ps_id).map(|c| c.2), Some(1));
+        assert_eq!(counts.get(&ps_id).map(|c| c.high), Some(1));
 
         finished_review_with_a_finding(&db, ps_id, patch_id, "Reviewed").await;
         let list = db.get_patchsets(1, 0, None, None).await.unwrap();

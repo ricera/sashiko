@@ -134,6 +134,26 @@ fn prior_tag(prior: &PriorLink) -> String {
     format!("({relation} {})", one_line(&prior.revision))
 }
 
+/// Whether a finding is linked as a repeat of an earlier revision's finding,
+/// reading the link as `PriorLink::from_json` does. A fix regression is not a
+/// repeat: the defect is one the earlier revision did not have.
+pub fn is_repeat(finding: &Value) -> bool {
+    finding
+        .get("prior")
+        .and_then(PriorLink::from_json)
+        .is_some_and(|link| link.relation == PriorRelation::Repeat)
+}
+
+/// How many of `findings` the review reported first, rather than repeated
+/// from an earlier revision, or `None` when none of them is a repeat: the
+/// figure then equals the count shown beside it, as for every review of a
+/// pull request with no earlier revisions, so the CLIs leave it out. The
+/// daemon's list counts the same way (`FIRST_REPORTED_FINDING_SQL`).
+pub fn first_reported(findings: &[&Value]) -> Option<usize> {
+    let repeats = findings.iter().filter(|f| is_repeat(f)).count();
+    (repeats > 0).then(|| findings.len() - repeats)
+}
+
 /// Writes `NOT_MARKED_NOTE` as one dim line when `findings` is a non-empty
 /// list in which no finding says whether it is speculative. Without it, an
 /// old review's untagged findings would look verified.
@@ -1298,6 +1318,28 @@ mod tests {
                 .map(|link| (link.relation, link.revision_head)),
             Some((PriorRelation::Repeat, None))
         );
+    }
+
+    /// A finding linked as a repeat is not first reported; an unlinked
+    /// finding, a fix regression and a link that does not read are. With no
+    /// repeat the figure is left out, since it would equal the count.
+    #[test]
+    fn first_reported_leaves_out_only_repeats() {
+        let with = |prior: Value| json!({"severity": "Low", "problem": "t", "prior": prior});
+        let repeat = with(json!({"relation": "repeat", "revision": "v2", "earlier_problem": "e"}));
+        let regression =
+            with(json!({"relation": "fix_regression", "revision": "v2", "earlier_problem": "e"}));
+        let unreadable = with(json!({"relation": "repeat", "revision": "v2"}));
+        let plain = json!({"severity": "Low", "problem": "t"});
+        assert!(is_repeat(&repeat));
+        assert!(!is_repeat(&regression) && !is_repeat(&unreadable) && !is_repeat(&plain));
+        assert_eq!(
+            first_reported(&[&repeat, &regression, &unreadable, &plain]),
+            Some(3)
+        );
+        assert_eq!(first_reported(&[&repeat]), Some(0));
+        assert_eq!(first_reported(&[&regression, &plain]), None);
+        assert_eq!(first_reported(&[]), None);
     }
 
     #[test]

@@ -3630,6 +3630,11 @@
                     critical: p.findings_critical || 0
                 };
                 findingsHtml = renderFindingsBadges(counts, statusLabel);
+                const total = counts.low + counts.medium + counts.high + counts.critical;
+                const first = p.findings_first_reported;
+                if (typeof first === 'number' && first < total) {
+                    findingsHtml += firstReportedNote(first);
+                }
             }
             const statusHtml = `<span class="status-badge status-${escapeHtml(statusLabel.replace(/ /g, ''))}">`
                 + `${escapeHtml(statusLabel)}</span>`;
@@ -5669,6 +5674,48 @@
             }
         }
 
+        // How many of a review's findings it reported first, rather than
+        // repeated from an earlier revision of the pull request, among those
+        // the severity counts show (not preexisting), or null when none is a
+        // repeat: the figure would then equal the counts, as for every review
+        // of a pull request with no earlier revisions. A fix regression is
+        // first reported. The daemon's list and the CLIs count the same way.
+        function firstReportedCount(findings) {
+            if (!Array.isArray(findings)) return null;
+            const counted = findings.filter(f => f && !findingObject(f).preexisting);
+            // A link counts when priorTag can show it, so the page never counts
+            // a repeat it does not tag.
+            const repeats = counted.filter(f => {
+                const prior = findingObject(f).prior;
+                return priorTag(prior) !== '' && prior.relation === 'repeat';
+            }).length;
+            return repeats > 0 ? counted.length - repeats : null;
+        }
+
+        // The figure firstReportedCount gives, as a note after a patch's or a
+        // patchset's severity badges; nothing for null.
+        function firstReportedNote(count) {
+            if (typeof count !== 'number' || !Number.isFinite(count)) return '';
+            return ` <span class="finding-tag" title="Findings this review reported first,`
+                + ` not repeats of an earlier revision's findings">(${count} first reported)</span>`;
+        }
+
+        // The most findings any of `reviews` reported first, as the badges
+        // beside it take each severity's maximum over the runs, or null when
+        // no run repeats an earlier finding.
+        function maxFirstReported(reviews) {
+            let max = null;
+            reviews.forEach(r => {
+                let count = null;
+                try {
+                    const out = typeof r.output === 'string' ? JSON.parse(r.output) : r.output;
+                    count = firstReportedCount(out && out.findings);
+                } catch (e) {}
+                if (count !== null) max = max === null ? count : Math.max(max, count);
+            });
+            return max;
+        }
+
         // Counts a review's new findings by severity. Preexisting findings are
         // left out, because the summary is about what the patch introduces. An
         // output that is missing or does not parse counts nothing.
@@ -5736,11 +5783,13 @@
                 // A Partial run's findings are not in these badges, so the
                 // runs note leaves it out too.
                 return renderFindingsBadges(maxFindingCounts(reviewed), 'Reviewed')
+                    + firstReportedNote(maxFirstReported(reviewed))
                     + maxOfRunsNote(reviews, 'Partial');
             }
             const partial = reviews.filter(r => r.status === 'Partial');
             if (partial.length > 0) {
                 return renderFindingsBadges(maxFindingCounts(partial), 'Partial')
+                    + firstReportedNote(maxFirstReported(partial))
                     + maxOfRunsNote(reviews, 'Reviewed')
                     + ' <span style="color:var(--status-partial); font-size:0.85em; font-style:italic;"'
                     + ' title="The review ran out of time; these findings come only from the stages that finished.">'
@@ -5898,6 +5947,8 @@
                                 parts.push(`High: <span style="${counts.high > 0 ? 'color:var(--sev-high);font-weight:bold' : 'color:var(--text-dim)'}">${counts.high}</span>`);
                                 parts.push(`Medium: <span style="${counts.medium > 0 ? 'color:var(--sev-medium);font-weight:bold' : 'color:var(--text-dim)'}">${counts.medium}</span>`);
                                 parts.push(`Low: <span style="${counts.low > 0 ? 'color:var(--sev-low);font-weight:bold' : 'color:var(--text-dim)'}">${counts.low}</span>`);
+                                const first = firstReportedCount(outputJson.findings);
+                                if (first !== null) parts.push(`First reported: <span style="font-weight:bold">${first}</span>`);
                                 displayResult = parts.join(' · ');
                             }
                         } else {
@@ -5941,6 +5992,8 @@
                                 parts.push(renderSeverity('High', counts.high, 'var(--sev-high)'));
                                 parts.push(renderSeverity('Medium', counts.medium, 'var(--sev-medium)'));
                                 parts.push(renderSeverity('Low', counts.low, 'var(--sev-low)'));
+                                const first = firstReportedCount(outputJson.findings);
+                                if (first !== null) parts.push(`First reported: <span style="font-weight:bold">${first}</span>`);
                                 displayResult = parts.join(' · ');
                             }
                         }

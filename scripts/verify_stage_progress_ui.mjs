@@ -67,6 +67,7 @@ const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'rend
                'stageTableLabel', 'stageRowsFromRecord', 'stageStopCause', 'stageStopLabel',
                'stoppedStageStatus', 'stageRowsFromActivity',
                'renderFindingsBadges', 'renderPatchsetListStatus', 'countNewFindings',
+               'firstReportedCount', 'firstReportedNote', 'maxFirstReported',
                'maxFindingCounts', 'maxOfRunsNote', 'patchSummaryStatus', 'renderStatCard', 'renderReviewStatCards',
                'reviewOutcomeColor',
                'isCallCount', 'toolCallBreakdown', 'toolCallsText', 'toolCallsTitle', 'reviewToolCallsValue',
@@ -1775,6 +1776,48 @@ function findingPriorHoverChecks(fns, expect) {
             && tag.split('&quot;&gt;&lt;b').length === 3);
 }
 
+// How many findings a review reported first, rather than repeated from an
+// earlier revision: on the card's Result line, the per-patch table and the
+// patchset list, and only when some finding is a repeat.
+function findingFirstReportedChecks(fns, expect) {
+    const repeat = { severity: 'High', problem: 'r', prior: PRIOR_REPEAT };
+    const regression = { severity: 'Low', problem: 'g',
+        prior: { ...PRIOR_REPEAT, relation: 'fix_regression' } };
+    const plain = { severity: 'Medium', problem: 'p' };
+    const oldRepeat = { severity: 'Low', problem: 'o', preexisting: true, prior: PRIOR_REPEAT };
+    const unreadable = { severity: 'Low', problem: 'u', prior: { relation: 'repeat', revision: 'v3' } };
+    expect('first reported: repeats are left out, a fix regression and an unlinked finding count',
+        fns.firstReportedCount([repeat, regression, plain, oldRepeat,
+            { severity: 'Low', problem: 'old', preexisting: true }]) === 2);
+    expect('first reported: no figure without a repeat',
+        fns.firstReportedCount([regression, plain]) === null && fns.firstReportedCount([]) === null
+            && fns.firstReportedCount(undefined) === null);
+    expect('first reported: a link the tag cannot show is not a repeat',
+        fns.firstReportedCount([unreadable, plain]) === null);
+    expect('first reported: the note reads "(2 first reported)", and nothing for no figure',
+        visibleText(fns.firstReportedNote(2)).trim() === '(2 first reported)'
+            && fns.firstReportedNote(null) === '');
+    expect('first reported: a patch takes the most of its runs, as its badges do',
+        fns.maxFirstReported([
+            { output: JSON.stringify({ findings: [repeat, plain] }) },
+            { output: { findings: [repeat, plain, regression] } },
+            { output: { findings: [plain] } },
+        ]) === 2
+            && fns.maxFirstReported([{ output: { findings: [plain] } }]) === null);
+    const card = findingsCard(fns, [repeat, plain]);
+    expect('first reported: the Result line gives the figure beside the counts',
+        visibleText(card).includes('First reported:') && /First reported: <span[^>]*>1</.test(card));
+    expect('first reported: no figure on a card with no repeat',
+        !visibleText(findingsCard(fns, [plain])).includes('First reported'));
+    const row = p => fns.renderPatchsetListStatus({ status: 'Reviewed', findings_low: 1,
+        findings_medium: 2, findings_high: 0, findings_critical: 0, ...p }).findingsHtml;
+    expect('first reported: the list row shows the figure when some finding is a repeat',
+        visibleText(row({ findings_first_reported: 1 })).includes('(1 first reported)'));
+    expect('first reported: the list row shows none when every finding is first reported, or no figure came',
+        !row({ findings_first_reported: 3 }).includes('first reported')
+            && !row({}).includes('first reported'));
+}
+
 // The Findings button must open the block it sits beside. The id is built in
 // two places of one template, so a typo in either leaves a button that does
 // nothing and no error anywhere.
@@ -1861,7 +1904,7 @@ function findingChecks(fns) {
                     findingEscapingChecks, findingLocationChecks, findingCalibrationLabelChecks,
                     findingCalibrationShapeChecks, findingCalibrationProseChecks,
                     findingCalibrationRenderChecks, findingSpeculativeChecks,
-                    findingPriorTagChecks, findingPriorHoverChecks,
+                    findingPriorTagChecks, findingPriorHoverChecks, findingFirstReportedChecks,
                     findingToggleChecks, findingLocationTrimChecks, findingLineNumberChecks,
                     findingBlankSeverityChecks, findingRowLayoutChecks];
     for (const group of groups) {
@@ -2737,6 +2780,12 @@ const mutate = (name, from, to) => {
             load({ ...sources, priorTag: sources.priorTag.replaceAll('escapeHtml(', 'String(') })],
         ['an earlier-finding tag that escapes only its text, not its hover, is caught',
             mutate('priorTag', 'title="${escapeHtml(hover)}"', 'title="${hover}"')],
+        ['a first-reported count that leaves out fix regressions is caught',
+            mutate('firstReportedCount', "prior.relation === 'repeat'", "prior.relation !== undefined")],
+        ['a first-reported count that counts preexisting findings is caught',
+            mutate('firstReportedCount', 'f && !findingObject(f).preexisting', 'f')],
+        ['a list row without the first-reported figure is caught',
+            mutate('renderPatchsetListStatus', 'findingsHtml += firstReportedNote(first);', '')],
         ['findingTags without the earlier-finding tag is caught',
             mutate('findingTags', 'if (prior) tags.push(prior);', '')],
         ['an earlier-finding tag before the others is caught',

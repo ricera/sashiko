@@ -989,12 +989,12 @@ async fn populate_embargoed_patchset_findings(
         })?;
     for row in items.iter_mut() {
         if visible_ids.contains(&row.id) {
-            let (low, medium, high, critical) =
-                counts.get(&row.id).copied().unwrap_or((0, 0, 0, 0));
-            row.findings_low = Some(low);
-            row.findings_medium = Some(medium);
-            row.findings_high = Some(high);
-            row.findings_critical = Some(critical);
+            let counts = counts.get(&row.id).copied().unwrap_or_default();
+            row.findings_low = Some(counts.low);
+            row.findings_medium = Some(counts.medium);
+            row.findings_high = Some(counts.high);
+            row.findings_critical = Some(counts.critical);
+            row.findings_first_reported = Some(counts.first_reported);
         }
     }
     Ok(())

@@ -3599,6 +3599,19 @@ fn print_findings_summary(
     print_severity_count("Medium", counts.medium, Color::Yellow, mode);
     print!(" · ");
     print_severity_count("Low", counts.low, Color::Cyan, mode);
+    // Among the findings the severity counts call new: a preexisting finding
+    // is in neither figure.
+    let counted: Vec<&Value> = findings_to_process
+        .iter()
+        .filter(|f| {
+            !f.get("preexisting")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .collect();
+    if let Some(first) = finding_view::first_reported(&counted) {
+        print!(" · First reported: {first}");
+    }
     println!("\n");
 
     print_finding_lines(&findings_to_process);

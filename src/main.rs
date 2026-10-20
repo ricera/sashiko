@@ -2727,14 +2727,14 @@ fn write_review_result(
         )?;
     } else if total > 0 {
         writeln!(out, "\nFindings:")?;
-        write_finding_counts(out, &counts)?;
+        write_finding_counts(out, &counts, finding_view::first_reported(&patch_findings))?;
         write_grouped_findings(out, &patch_findings, false)?;
     }
 
     if report_preexisting && !preexisting_findings.is_empty() {
         let preexisting_counts = count_findings_slice(&preexisting_findings);
         writeln!(out, "\nPre-existing Findings:")?;
-        write_finding_counts(out, &preexisting_counts)?;
+        write_finding_counts(out, &preexisting_counts, None)?;
         write_grouped_findings(out, &preexisting_findings, true)?;
     }
 
@@ -2787,7 +2787,14 @@ fn write_review_result(
     Ok(())
 }
 
-fn write_finding_counts(out: &mut impl WriteColor, counts: &FindingCounts) -> std::io::Result<()> {
+/// The per-severity counts, then, when some finding repeats an earlier
+/// revision's, how many the review reported first
+/// (`finding_view::first_reported`).
+fn write_finding_counts(
+    out: &mut impl WriteColor,
+    counts: &FindingCounts,
+    first_reported: Option<usize>,
+) -> std::io::Result<()> {
     write!(out, "  Critical: ")?;
     write_colored(out, Color::Red, &counts.critical.to_string())?;
     write!(out, "  High: ")?;
@@ -2796,6 +2803,9 @@ fn write_finding_counts(out: &mut impl WriteColor, counts: &FindingCounts) -> st
     write_colored(out, Color::Yellow, &counts.medium.to_string())?;
     write!(out, "  Low: ")?;
     write_colored(out, Color::Cyan, &counts.low.to_string())?;
+    if let Some(first) = first_reported {
+        write!(out, "  First reported: {first}")?;
+    }
     writeln!(out, "\n")
 }
 
@@ -3888,6 +3898,27 @@ fn should_start_nntp_ingestor(settings: &Settings) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The counts line says how many findings the review reported first
+    /// when one repeats an earlier revision's finding, and says nothing
+    /// about it otherwise.
+    #[test]
+    fn the_counts_line_gives_the_first_reported_figure_only_beside_a_repeat() {
+        let output_of = |findings: serde_json::Value| {
+            let result = serde_json::json!({"review": {"findings": findings}});
+            let mut buf = Buffer::no_color();
+            write_review_result(&mut buf, &result, "HEAD", false).unwrap();
+            String::from_utf8(buf.into_inner()).unwrap()
+        };
+        let repeat = serde_json::json!({"severity": "High", "problem": "r",
+            "prior": {"relation": "repeat", "revision": "v2", "earlier_problem": "e"}});
+        let plain = serde_json::json!({"severity": "Low", "problem": "p"});
+        assert!(
+            output_of(serde_json::json!([repeat, plain]))
+                .contains("Critical: 0  High: 1  Medium: 0  Low: 1  First reported: 1\n")
+        );
+        assert!(!output_of(serde_json::json!([plain])).contains("First reported"));
+    }
 
     #[test]
     fn preexisting_concerns_change_the_message_only_when_reported() {
