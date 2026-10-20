@@ -61,7 +61,7 @@ function grabConst(name) {
 const LETS = ['activityPoll', 'viewGeneration', 'logView', 'logTimer'];
 const CONSTS = ['FINDING_TITLE_MAX_CHARS', 'PRIOR_REVISION_LABEL_MAX_CHARS'];
 const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'renderReviewCard', 'getSeverityColor',
-               'findingObject', 'findingTitle', 'parseSeverityCalibration', 'renderSeverityCalibration',
+               'findingObject', 'clipTitle', 'findingTitle', 'reviewMapThreadTitle', 'parseSeverityCalibration', 'renderSeverityCalibration',
                'renderFindingLocations', 'oneLine', 'priorTag', 'findingTags', 'renderFindingRow', 'renderFindingsList',
                'formatDuration', 'describeStageWait', 'summarizeReason', 'compareStageRows',
                'stageTableLabel', 'stageRowsFromRecord', 'stageStopCause', 'stageStopLabel',
@@ -1307,6 +1307,19 @@ function findingTitleChecks(fns, expect) {
     const longCard = findingsCard(fns, [{ severity: 'Low', problem: long }]);
     expect('title: a clipped title puts the full problem in the body',
         longCard.includes(long) && longCard.includes('<details class="finding">'));
+
+    // The review map's rows clip the same way and keep the whole text for
+    // the expanded row.
+    const mapGuard = f => { try { return f(); } catch (e) { return { title: `THREW ${e}` }; } };
+    const mapLong = mapGuard(() => fns.reviewMapThreadTitle({ title: long }));
+    expect('map title: a long thread title is clipped as a card title is, with the full text kept',
+        mapLong.clipped === true && mapLong.title === clipped.title && mapLong.full === long);
+    const mapShort = mapGuard(() => fns.reviewMapThreadTitle({ title: `  ${short}  ` }));
+    expect('map title: a short thread title is the title, trimmed and not clipped',
+        mapShort.title === short && mapShort.clipped === false);
+    expect('map title: a missing title reads "Candidate issue"',
+        [{}, { title: '  ' }, { title: 7 }, null].every(t =>
+            mapGuard(() => fns.reviewMapThreadTitle(t)).title === 'Candidate issue'));
 }
 
 function findingOrderChecks(fns, expect) {
@@ -2561,7 +2574,10 @@ const mutate = (name, from, to) => {
         ['a list ranked by index only is caught',
             mutate('renderFindingsList', 'a.rank - b.rank || a.index - b.index', 'a.index - b.index')],
         ['a title that is never clipped is caught',
-            mutate('findingTitle', 'chars.length > FINDING_TITLE_MAX_CHARS', 'false')],
+            mutate('clipTitle', 'chars.length > FINDING_TITLE_MAX_CHARS', 'false')],
+        ['a review map row title that is never clipped is caught',
+            mutate('reviewMapThreadTitle', "clipTitle(full, 'Candidate issue')",
+                "({ title: full || 'Candidate issue', clipped: false })")],
         ['a finding row that does not escape is caught',
             load({ ...sources, renderFindingRow: sources.renderFindingRow.replaceAll('escapeHtml(', 'String(') })],
         ['a location list that does not escape is caught',
@@ -2624,7 +2640,7 @@ const mutate = (name, from, to) => {
         ['a not-marked note that looks at unlisted findings is caught',
             mutate('renderFindingsList', 'listed.every(({ f }) =>', 'findings.every(f =>')],
         ['a title clipped at exactly the limit is caught',
-            mutate('findingTitle', 'chars.length > FINDING_TITLE_MAX_CHARS',
+            mutate('clipTitle', 'chars.length > FINDING_TITLE_MAX_CHARS',
                 'chars.length >= FINDING_TITLE_MAX_CHARS')],
         ['a fractional line number shown as a line is caught',
             mutate('renderFindingLocations', 'Number.isSafeInteger(loc.line)', "typeof loc.line === 'number'")],

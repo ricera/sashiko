@@ -3303,15 +3303,31 @@
         // points are counted, so a surrogate pair is never split. A clipped
         // title is the caller's cue to show the full text in the body.
         function findingTitle(finding) {
-            const problem = findingObject(finding).problem;
-            const text = typeof problem === 'string' ? problem.trim() : '';
-            if (!text) return { title: '(no description)', clipped: false };
-            const chars = Array.from(text);
+            return clipTitle(findingObject(finding).problem, '(no description)');
+        }
+
+        // Clips a title to FINDING_TITLE_MAX_CHARS characters plus "…", whole
+        // characters only. Findings written before titles were short carry a
+        // paragraph as their problem, which reads as a wall of text wherever
+        // it stands as a title. A missing or blank text reads as `fallback`.
+        function clipTitle(text, fallback) {
+            const trimmed = typeof text === 'string' ? text.trim() : '';
+            if (!trimmed) return { title: fallback, clipped: false };
+            const chars = Array.from(trimmed);
             if (chars.length > FINDING_TITLE_MAX_CHARS) {
                 const cut = chars.slice(0, FINDING_TITLE_MAX_CHARS).join('').trimEnd();
                 return { title: `${cut}…`, clipped: true };
             }
-            return { title: text, clipped: false };
+            return { title: trimmed, clipped: false };
+        }
+
+        // A review map thread's title as its row shows it, clipped as a
+        // finding card's title is, and the whole text for the expanded row
+        // when the clip cut it.
+        function reviewMapThreadTitle(thread) {
+            const full = typeof thread?.title === 'string' ? thread.title.trim() : '';
+            const { title, clipped } = clipTitle(full, 'Candidate issue');
+            return { title, clipped, full };
         }
 
         // Splits a finding's severity explanation at the rubric's step labels
@@ -7716,16 +7732,21 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         `
                         : '';
                     const codeTraceHtml = renderReviewMapCodeSnippets(primaryLocations);
+                    const rowTitle = reviewMapThreadTitle(t);
+                    const fullTitleHtml = rowTitle.clipped
+                        ? `<div class="log-inline-block" style="margin-bottom:8px;">${escapeHtml(rowTitle.full)}</div>`
+                        : '';
 
                     return `
                         <tr id="rm-row-${idx}" onclick="toggleReviewMapThread(${idx})">
-                            <td><span id="rm-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><span style="font-weight:600; color:var(--text);">${escapeHtml(String(t.title || 'Candidate issue').trim())}</span></td>
+                            <td><span id="rm-chevron-${idx}" style="color:var(--text-dim); font-size:0.85em; width:12px; display:inline-block;">▶</span><span style="font-weight:600; color:var(--text);">${escapeHtml(rowTitle.title)}</span></td>
                             <td>${stageCellHtml}</td>
                             <td>${outcomeCellHtml}</td>
                         </tr>
                         <tr id="rm-detail-${idx}" class="rm-detail-row" style="display:none;">
                             <td colspan="3">
                                 <div class="review-card" style="margin-bottom:0;">
+                                    ${fullTitleHtml}
                                     ${pipelineHistoryHtml}
                                     ${codeTraceHtml}
                                 </div>
