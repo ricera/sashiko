@@ -125,6 +125,12 @@ pub trait LlmSession: Send {
         self.initial_user_prompt()
     }
 
+    /// Validation attempts the session has granted beyond the runner's
+    /// maximum, read after every rejected output.
+    fn granted_validation_attempts(&self) -> usize {
+        0
+    }
+
     /// Customizes the validation feedback message.
     fn format_validation_feedback(&self, violation: &str) -> String {
         format!(
@@ -955,7 +961,10 @@ impl<'a> SessionRunner<'a> {
                 Result::Err(ValidationError::FormatViolation(violation)) => {
                     rejected.push(sent);
                     validation_attempts += 1;
-                    if validation_attempts >= self.max_validation_attempts {
+                    let max_validation_attempts = self
+                        .max_validation_attempts
+                        .saturating_add(session.granted_validation_attempts());
+                    if validation_attempts >= max_validation_attempts {
                         // Giving up: forget the rejected answers, or a
                         // retry would be handed them and fail the same way.
                         for request in &rejected {
@@ -964,7 +973,7 @@ impl<'a> SessionRunner<'a> {
                         return Err(make_failure(
                             format!(
                                 "Failed to generate valid response after {} validation attempts. Last violation: {}",
-                                self.max_validation_attempts, violation
+                                max_validation_attempts, violation
                             ),
                             log_history,
                             total_prompt_tokens,

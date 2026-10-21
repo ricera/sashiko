@@ -41,7 +41,55 @@ use std::fmt;
 pub const LOCATION_REPO_KEY: &str = REPO_ARG;
 
 /// The key holding a location's path.
-const LOCATION_FILE_KEY: &str = "file";
+pub(crate) const LOCATION_FILE_KEY: &str = "file";
+
+/// A warning a deciding stage's reduce writes on a location it had to accept
+/// although the location does not match the trees it names. Only the reduce
+/// sets one, once the stage's retry budget is spent; a copy the model wrote is
+/// removed first ([`strip_location_flags`]), so a flag always means the check
+/// failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationFlag {
+    /// The location cites a reference's copy of a file, function or struct
+    /// the code under review carries itself.
+    RepoConflict,
+    /// The location's file is not in the repository it names.
+    UnverifiedPath,
+}
+
+impl LocationFlag {
+    /// Every flag, for stripping.
+    pub const ALL: [Self; 2] = [Self::RepoConflict, Self::UnverifiedPath];
+
+    /// The key the flag is stored under, with the value `true`.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::RepoConflict => "repo_conflict",
+            Self::UnverifiedPath => "unverified_path",
+        }
+    }
+
+    /// Writes the flag onto a location object.
+    pub fn set(self, location: &mut Value) {
+        if let Some(obj) = location.as_object_mut() {
+            obj.insert(self.key().to_string(), Value::Bool(true));
+        }
+    }
+}
+
+/// Removes every [`LocationFlag`] key from a location. The flags record a
+/// check's verdict, so a model-written copy is never kept. Returns whether
+/// anything was removed.
+pub fn strip_location_flags(location: &mut Value) -> bool {
+    let Some(obj) = location.as_object_mut() else {
+        return false;
+    };
+    let mut removed = false;
+    for flag in LocationFlag::ALL {
+        removed |= obj.remove(flag.key()).is_some();
+    }
+    removed
+}
 
 /// The key holding a location's line.
 const LOCATION_LINE_KEY: &str = "line";
@@ -206,7 +254,7 @@ fn attached_names(references: &[ReferenceRepo]) -> Vec<String> {
 
 /// Splits a `file` written as `<name>:<path>` when `<name>` is an attached
 /// repository, returning the name and the path.
-fn split_repo_prefix<'a>(
+pub(crate) fn split_repo_prefix<'a>(
     file: &'a str,
     references: &[ReferenceRepo],
 ) -> Option<(&'a str, &'a str)> {
@@ -222,7 +270,7 @@ fn split_repo_prefix<'a>(
 /// the prose form `repo:file:line`, returning the path and its first line.
 /// A path whose tail after the last colon is not such a number is returned
 /// whole.
-fn split_line_suffix(path: &str) -> (&str, Option<u64>) {
+pub(crate) fn split_line_suffix(path: &str) -> (&str, Option<u64>) {
     let Some((file, tail)) = path.rsplit_once(':') else {
         return (path, None);
     };
@@ -531,5 +579,28 @@ mod tests {
             err.to_string(),
             "is not an object; write each location as an object that opens with \"repo\""
         );
+    }
+
+    #[test]
+    fn flags_are_set_and_stripped_by_key() {
+        let mut loc = json!({"repo": "kernel", "file": "mm/slab.c"});
+        LocationFlag::RepoConflict.set(&mut loc);
+        LocationFlag::UnverifiedPath.set(&mut loc);
+        assert_eq!(loc["repo_conflict"], json!(true));
+        assert_eq!(loc["unverified_path"], json!(true));
+
+        assert!(strip_location_flags(&mut loc));
+        assert_eq!(loc, json!({"repo": "kernel", "file": "mm/slab.c"}));
+        assert!(!strip_location_flags(&mut loc));
+
+        // A model-written value of any type is a flag all the same.
+        let mut loc = json!({"file": "a.c", "repo_conflict": "no", "unverified_path": null});
+        assert!(strip_location_flags(&mut loc));
+        assert_eq!(loc, json!({"file": "a.c"}));
+
+        let mut not_object = json!("a.c");
+        LocationFlag::RepoConflict.set(&mut not_object);
+        assert!(!strip_location_flags(&mut not_object));
+        assert_eq!(not_object, json!("a.c"));
     }
 }

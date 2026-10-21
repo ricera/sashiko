@@ -37,9 +37,13 @@
 //! look missing, and a name the deliberately simple matcher does not see only
 //! means a check that does not fire.
 
-use crate::location_repo::LocationRepo;
+use crate::location_repo::{
+    LOCATION_FILE_KEY, LOCATION_REPO_KEY, LocationFlag, LocationRepo, normalize_location,
+    split_line_suffix, split_repo_prefix,
+};
 use crate::settings::ReferenceKind;
-use crate::toolbox::ReferenceRepo;
+use crate::toolbox::{REPO_ARG_REVIEW, ReferenceRepo};
+use serde_json::Value;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -225,6 +229,278 @@ impl TreeIndex {
     pub fn has_definitions(&self) -> bool {
         self.definitions.is_some()
     }
+
+    /// Holds a location to the trees it names (design "location repository
+    /// labels" §4.3, checks 1 to 3):
+    ///
+    /// 1. its `file` is in the repository its `repo` names;
+    /// 2. a location in a kernel reference does not cite a C source or header
+    ///    the code under review ships itself at the patch's commit (a module's
+    ///    own `Makefile` or `Kbuild` does not replace the kernel's, which
+    ///    drives its build, and a file only the parent or the series tip
+    ///    holds is not shipped by this patch);
+    /// 3. nor a function, struct, union, enum or macro the code under review
+    ///    defines itself.
+    ///
+    /// Checks 2 and 3 apply to kernel references only: an out-of-tree module
+    /// replaces the kernel's copy of whatever it carries, so that copy does
+    /// not run, while a userspace reference sharing a path or a name with the
+    /// module (a `Makefile`, a provider's `ionic_create_qp`) is code in its
+    /// own right.
+    ///
+    /// The location is read through [`normalize_location`], as the reduce
+    /// stores it. A location without a usable `repo` or `file` is left to the
+    /// checks that report those, and a tree that was not listed or scanned
+    /// passes, so the index can only ever reject what it knows.
+    pub fn check_location(
+        &self,
+        location: &Value,
+        references: &[ReferenceRepo],
+    ) -> Result<(), LocationTreeFault> {
+        let mut location = location.clone();
+        normalize_location(&mut location, references);
+        let Some(repo) = location
+            .get(LOCATION_REPO_KEY)
+            .and_then(Value::as_str)
+            .and_then(|name| LocationRepo::parse(name, references).ok())
+        else {
+            return Ok(());
+        };
+        let Some(file) = location.get(LOCATION_FILE_KEY).and_then(Value::as_str) else {
+            return Ok(());
+        };
+        if self.contains_path(&repo, file) == Some(false) {
+            return Err(self.missing_path_fault(repo, file, references));
+        }
+        let is_kernel = references
+            .iter()
+            .any(|r| r.name == repo.name() && r.kind == ReferenceKind::Kernel);
+        if !is_kernel {
+            return Ok(());
+        }
+        if is_c_file(file) && self.review_carries(file) == Some(true) {
+            return Err(LocationTreeFault::ShippedByReview {
+                repo,
+                file: file.to_string(),
+            });
+        }
+        let defined = location
+            .get("function_or_symbol")
+            .and_then(Value::as_str)
+            .and_then(symbol_name)
+            .and_then(|name| Some((name, self.definition(name)?)));
+        if let Some((name, definition)) = defined {
+            return Err(LocationTreeFault::DefinedByReview {
+                repo,
+                name: name.to_string(),
+                definition: definition.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Check 1's fault for `file`, which `repo`'s tree does not hold. The
+    /// trees that do are looked up by the path as the tools read it, without
+    /// an attached repository's prefix or a line number, so the message names
+    /// the actual mistake.
+    fn missing_path_fault(
+        &self,
+        repo: LocationRepo,
+        file: &str,
+        references: &[ReferenceRepo],
+    ) -> LocationTreeFault {
+        let (prefix, path) = match split_repo_prefix(file, references) {
+            Some((prefix, path)) => (Some(prefix), path),
+            None => (None, file),
+        };
+        if let Some(prefix) = prefix.filter(|prefix| *prefix != repo.name()) {
+            return LocationTreeFault::PrefixConflict {
+                repo,
+                file: file.to_string(),
+                prefix: prefix.to_string(),
+            };
+        }
+        let (path, line) = split_line_suffix(path);
+        if line.is_some() && self.contains_path(&repo, path) == Some(true) {
+            return LocationTreeFault::LineInPath {
+                repo,
+                file: file.to_string(),
+            };
+        }
+        let unchecked = std::iter::once(LocationRepo::Review)
+            .chain(
+                references
+                    .iter()
+                    .map(|r| LocationRepo::Reference(r.name.clone())),
+            )
+            .filter(|tree| self.paths(tree).is_none())
+            .collect();
+        LocationTreeFault::NotInRepo {
+            found_in: self.repos_with_path(path).cloned().collect(),
+            unchecked,
+            file: file.to_string(),
+            repo,
+        }
+    }
+}
+
+/// Whether `path` is a C source or header, the files a module's copy of
+/// replaces the kernel's at build time.
+fn is_c_file(path: &str) -> bool {
+    path.ends_with(".c") || path.ends_with(".h")
+}
+
+/// The most characters of a model-written path quoted back in a message.
+const MAX_QUOTED_PATH_CHARS: usize = 256;
+
+/// `text` clipped and quoted with its control characters escaped: it is model
+/// output going back into a prompt.
+fn quoted(text: &str) -> String {
+    let clipped: String = text.chars().take(MAX_QUOTED_PATH_CHARS).collect();
+    format!("{clipped:?}")
+}
+
+/// Why a location does not match the trees it names.
+///
+/// Its `Display` is the tail of a validator message: the caller prefixes the
+/// location it is about, e.g. `findings[0].locations[2] `, and the text goes on
+/// to say what to cite instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocationTreeFault {
+    /// Check 1: `file` is not in `repo`. `found_in` lists the listed trees
+    /// that do hold it, the code under review first, and `unchecked` the
+    /// trees that could not be listed.
+    NotInRepo {
+        repo: LocationRepo,
+        file: String,
+        found_in: Vec<LocationRepo>,
+        unchecked: Vec<LocationRepo>,
+    },
+    /// Check 1: `file` carries another attached repository's `prefix:`.
+    PrefixConflict {
+        repo: LocationRepo,
+        file: String,
+        prefix: String,
+    },
+    /// Check 1: `file` is in `repo` once its `:line` suffix is removed.
+    LineInPath { repo: LocationRepo, file: String },
+    /// Check 2: a kernel location cites a path the code under review ships.
+    ShippedByReview { repo: LocationRepo, file: String },
+    /// Check 3: a kernel location cites a name the code under review defines.
+    DefinedByReview {
+        repo: LocationRepo,
+        name: String,
+        definition: Definition,
+    },
+}
+
+impl LocationTreeFault {
+    /// The warning the reduce writes on a location accepted with this fault.
+    pub fn flag(&self) -> LocationFlag {
+        match self {
+            Self::NotInRepo { .. } | Self::PrefixConflict { .. } | Self::LineInPath { .. } => {
+                LocationFlag::UnverifiedPath
+            }
+            Self::ShippedByReview { .. } | Self::DefinedByReview { .. } => {
+                LocationFlag::RepoConflict
+            }
+        }
+    }
+}
+
+impl fmt::Display for LocationTreeFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotInRepo {
+                repo,
+                file,
+                found_in,
+                unchecked,
+            } => {
+                write!(f, "file {} is not in repo \"{repo}\"; ", quoted(file))?;
+                let names: Vec<String> = found_in.iter().map(|r| format!("\"{r}\"")).collect();
+                let unchecked: Vec<String> = unchecked.iter().map(|r| format!("\"{r}\"")).collect();
+                match names.as_slice() {
+                    [] if !unchecked.is_empty() => write!(
+                        f,
+                        "no other listed repository has it, and {} could not be checked. \
+                         Write the path from the repository's root, as the tools read it",
+                        unchecked.join(", ")
+                    ),
+                    [] => write!(
+                        f,
+                        "no attached repository has it either. Write the path from the \
+                         repository's root, as the tools read it"
+                    ),
+                    [only] => write!(
+                        f,
+                        "it is in repo {only}. Set \"{LOCATION_REPO_KEY}\" to where you read it"
+                    ),
+                    [rest @ .., last] => write!(
+                        f,
+                        "it is in repos {} and {last}. Set \"{LOCATION_REPO_KEY}\" to where you \
+                         read it",
+                        rest.join(", ")
+                    ),
+                }
+            }
+            Self::PrefixConflict { repo, file, prefix } => write!(
+                f,
+                "file {} carries the prefix \"{prefix}:\" but repo is \"{repo}\". Set \
+                 \"{LOCATION_REPO_KEY}\" to the repository you read it in and write the path \
+                 without a prefix",
+                quoted(file)
+            ),
+            Self::LineInPath { repo, file } => write!(
+                f,
+                "file {} is not in repo \"{repo}\" as written. Write the path alone in \
+                 \"{LOCATION_FILE_KEY}\" and its line in \"line\"",
+                quoted(file)
+            ),
+            Self::ShippedByReview { repo, file } => write!(
+                f,
+                "has repo \"{repo}\" and cites {}, which the code under review ships itself; \
+                 the copy in \"{repo}\" is not loaded while the module runs. Cite the module's \
+                 file with repo \"{REPO_ARG_REVIEW}\"",
+                quoted(file)
+            ),
+            Self::DefinedByReview {
+                repo,
+                name,
+                definition,
+            } => write!(
+                f,
+                "has repo \"{repo}\" and cites {name}, which the code under review defines at \
+                 {definition}; cite that with repo \"{REPO_ARG_REVIEW}\""
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LocationTreeFault {}
+
+/// The bare name a location's `function_or_symbol` cites, in the forms models
+/// write it: `name`, `name()`, `name(args)`, `struct name`, `union name`,
+/// `enum name` or `#define name`. Anything else (a member access, a
+/// declaration, prose) names nothing this check can look up.
+fn symbol_name(text: &str) -> Option<&str> {
+    let mut text = text.trim();
+    if let Some(rest) = text.strip_prefix('#') {
+        text = rest.trim_start().strip_prefix("define")?.trim_start();
+    }
+    for keyword in ["struct", "union", "enum"] {
+        if let Some(rest) = text.strip_prefix(keyword)
+            && rest.starts_with([' ', '\t'])
+        {
+            text = rest.trim_start();
+            break;
+        }
+    }
+    let name = text
+        .split_once('(')
+        .map_or(text, |(head, _)| head)
+        .trim_end();
+    (leading_ident(name) == Some(name)).then_some(name)
 }
 
 /// Reference trees already listed in this process, by commit. Every patch of
@@ -828,12 +1104,15 @@ fn function_name(line: &str) -> Option<(&str, bool)> {
     Some((name, line[open..].contains('{')))
 }
 
+/// Fake trees shared by the tests of the index and of the stage validators
+/// that read it: a module and the kernel it builds against, which share
+/// `include/linux/pds/pds_adminq.h` and a `pdsc_notify` definition.
 #[cfg(test)]
-mod tests {
+pub(crate) mod fixture {
     use super::*;
     use std::fs;
 
-    fn git(repo: &Path, args: &[&str]) -> String {
+    pub(crate) fn git(repo: &Path, args: &[&str]) -> String {
         let output = crate::git_cmd::in_dir(repo).args(args).output().unwrap();
         assert!(
             output.status.success(),
@@ -844,7 +1123,7 @@ mod tests {
     }
 
     /// A repository holding `files`, committed; returns the commit.
-    fn repo_with(dir: &Path, files: &[(&str, &str)]) -> String {
+    pub(crate) fn repo_with(dir: &Path, files: &[(&str, &str)]) -> String {
         git(dir, &["init", "-q"]);
         git(dir, &["config", "user.name", "Test"]);
         git(dir, &["config", "user.email", "test@example.com"]);
@@ -861,7 +1140,12 @@ mod tests {
         git(dir, &["rev-parse", "HEAD"])
     }
 
-    fn reference(name: &str, kind: ReferenceKind, path: &Path, commit: &str) -> ReferenceRepo {
+    pub(crate) fn reference(
+        name: &str,
+        kind: ReferenceKind,
+        path: &Path,
+        commit: &str,
+    ) -> ReferenceRepo {
         ReferenceRepo {
             name: name.to_string(),
             kind,
@@ -873,7 +1157,7 @@ mod tests {
         }
     }
 
-    const MODULE_CORE: &str = "\
+    pub(crate) const MODULE_CORE: &str = "\
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/pds/pds_adminq.h>
 
@@ -895,7 +1179,7 @@ pdsc_from_dev(struct device *dev)
 }
 ";
 
-    const MODULE_HEADER: &str = "\
+    pub(crate) const MODULE_HEADER: &str = "\
 #ifndef _PDS_ADMINQ_H_
 #define _PDS_ADMINQ_H_
 #define PDS_EVENT_RESET(x) (x)
@@ -962,15 +1246,26 @@ static inline void *vcalloc(size_t n, size_t size)
 }
 ";
 
-    struct Trees {
+    pub(crate) struct Trees {
         _module: tempfile::TempDir,
         _kernel: tempfile::TempDir,
-        module_dir: PathBuf,
-        module_commit: String,
-        kernel: ReferenceRepo,
+        pub(crate) module_dir: PathBuf,
+        pub(crate) module_commit: String,
+        pub(crate) kernel: ReferenceRepo,
     }
 
-    fn trees() -> Trees {
+    impl Trees {
+        /// The index a patch of the module gets with the kernel attached.
+        pub(crate) fn index(&self) -> TreeIndex {
+            TreeIndex::build(
+                &self.module_dir,
+                &self.module_commit,
+                std::slice::from_ref(&self.kernel),
+            )
+        }
+    }
+
+    pub(crate) fn trees() -> Trees {
         let module = tempfile::tempdir().unwrap();
         let module_commit = repo_with(
             module.path(),
@@ -1007,6 +1302,13 @@ static inline void *vcalloc(size_t n, size_t size)
             kernel,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixture::*;
+    use super::*;
+    use serde_json::json;
 
     #[test]
     fn every_tree_is_listed_at_its_commit() {
@@ -1457,7 +1759,7 @@ static inline void *vcalloc(size_t n, size_t size)
             &["-c", "commit.gpgsign=false", "commit", "-qm", "delete"],
         );
         let patch = git(&t.module_dir, &["rev-parse", "HEAD"]);
-        fs::write(t.module_dir.join("core/later.c"), "int later;\n").unwrap();
+        std::fs::write(t.module_dir.join("core/later.c"), "int later;\n").unwrap();
         git(&t.module_dir, &["add", "--all"]);
         git(
             &t.module_dir,
@@ -1491,5 +1793,326 @@ static inline void *vcalloc(size_t n, size_t size)
             index.paths(&LocationRepo::Review).map(HashSet::len),
             Some(7)
         );
+    }
+
+    fn loc(repo: &str, file: &str, symbol: &str) -> Value {
+        json!({"repo": repo, "file": file, "function_or_symbol": symbol, "line": 1})
+    }
+
+    #[test]
+    fn a_location_in_the_tree_it_names_passes() {
+        let t = trees();
+        let index = t.index();
+        let refs = std::slice::from_ref(&t.kernel);
+        for location in [
+            loc("review", "core/core.c", "pdsc_notify"),
+            loc(
+                "review",
+                "include/linux/pds/pds_adminq.h",
+                "struct pds_core_reset_event",
+            ),
+            loc("kernel", "include/linux/kvm_host.h", "struct kvm"),
+            json!({"file": "kernel:include/linux/kvm_host.h", "function_or_symbol": "kvm"}),
+            // What the cheap repository check reports is not this check's.
+            loc("linux", "nowhere.c", "pdsc_notify"),
+            json!({"file": "nowhere.c"}),
+            json!({"repo": "review", "line": 3}),
+        ] {
+            assert_eq!(index.check_location(&location, refs), Ok(()), "{location}");
+        }
+    }
+
+    #[test]
+    fn a_file_missing_from_its_repo_says_where_it_is() {
+        let t = trees();
+        let index = t.index();
+        let refs = std::slice::from_ref(&t.kernel);
+        let core = "drivers/net/ethernet/amd/pds_core/core.c";
+
+        let fault = index
+            .check_location(&loc("review", core, "pdsc_notify"), refs)
+            .unwrap_err();
+        assert_eq!(fault.flag(), LocationFlag::UnverifiedPath);
+        assert_eq!(
+            fault.to_string(),
+            format!(
+                "file \"{core}\" is not in repo \"review\"; it is in repo \"kernel\". Set \
+                 \"repo\" to where you read it"
+            )
+        );
+
+        let fault = index
+            .check_location(&loc("kernel", "vfio/dirty.c", "x"), refs)
+            .unwrap_err();
+        assert_eq!(
+            fault.to_string(),
+            "file \"vfio/dirty.c\" is not in repo \"kernel\"; it is in repo \"review\". Set \
+             \"repo\" to where you read it"
+        );
+
+        let fault = index
+            .check_location(&loc("review", "/core/core.c", "x"), refs)
+            .unwrap_err();
+        assert_eq!(
+            fault.to_string(),
+            "file \"/core/core.c\" is not in repo \"review\"; no attached repository has it \
+             either. Write the path from the repository's root, as the tools read it"
+        );
+
+        let found_in = vec![
+            LocationRepo::Review,
+            LocationRepo::Reference("kernel".to_string()),
+            LocationRepo::Reference("rdma-core".to_string()),
+        ];
+        let fault = LocationTreeFault::NotInRepo {
+            repo: LocationRepo::Reference("other".to_string()),
+            file: "a\n.c".to_string(),
+            found_in,
+            unchecked: Vec::new(),
+        };
+        assert_eq!(
+            fault.to_string(),
+            "file \"a\\n.c\" is not in repo \"other\"; it is in repos \"review\", \"kernel\" \
+             and \"rdma-core\". Set \"repo\" to where you read it"
+        );
+    }
+
+    /// A patch that drops the module's copy of a kernel header builds against
+    /// the kernel's, so the kernel's is what a location cites, though the
+    /// parent's copy can still be cited from the review.
+    #[test]
+    fn a_header_the_patch_drops_is_the_kernels_to_cite() {
+        let t = trees();
+        let header = "include/linux/pds/pds_adminq.h";
+        git(&t.module_dir, &["rm", "-q", header]);
+        git(
+            &t.module_dir,
+            &["-c", "commit.gpgsign=false", "commit", "-qm", "drop"],
+        );
+        let patch = git(&t.module_dir, &["rev-parse", "HEAD"]);
+        let refs = std::slice::from_ref(&t.kernel);
+        let index = TreeIndex::build(&t.module_dir, &patch, refs);
+
+        for location in [
+            json!({"repo": "kernel", "file": header}),
+            json!({"repo": "review", "file": header}),
+        ] {
+            assert_eq!(index.check_location(&location, refs), Ok(()), "{location}");
+        }
+    }
+
+    #[test]
+    fn a_kernel_location_of_module_code_names_the_module_copy() {
+        let t = trees();
+        let index = t.index();
+        let refs = std::slice::from_ref(&t.kernel);
+
+        let fault = index
+            .check_location(
+                &loc(
+                    "kernel",
+                    "include/linux/pds/pds_adminq.h",
+                    "pds_core_reset_event",
+                ),
+                refs,
+            )
+            .unwrap_err();
+        assert_eq!(fault.flag(), LocationFlag::RepoConflict);
+        assert_eq!(
+            fault.to_string(),
+            "has repo \"kernel\" and cites \"include/linux/pds/pds_adminq.h\", which the code \
+             under review ships itself; the copy in \"kernel\" is not loaded while the module \
+             runs. Cite the module's file with repo \"review\""
+        );
+
+        let core = "drivers/net/ethernet/amd/pds_core/core.c";
+        for symbol in [
+            "pdsc_notify",
+            "pdsc_notify()",
+            " pdsc_notify(PDS_EVENT_RESET, &ev) ",
+        ] {
+            let fault = index
+                .check_location(&loc("kernel", core, symbol), refs)
+                .unwrap_err();
+            assert_eq!(fault.flag(), LocationFlag::RepoConflict);
+            assert_eq!(
+                fault.to_string(),
+                "has repo \"kernel\" and cites pdsc_notify, which the code under review \
+                 defines at core/core.c:7; cite that with repo \"review\"",
+                "{symbol}"
+            );
+        }
+        let fault = index
+            .check_location(
+                &json!({"file": format!("kernel:{core}"), "function_or_symbol": "#define PDS_EVENT_RESET"}),
+                refs,
+            )
+            .unwrap_err();
+        assert!(
+            fault.to_string().ends_with(
+                "defines at include/linux/pds/pds_adminq.h:3; cite that with repo \"review\""
+            ),
+            "{fault}"
+        );
+    }
+
+    #[test]
+    fn module_code_checks_apply_to_kernel_references_only() {
+        let t = trees();
+        let source = ReferenceRepo {
+            name: "rdma-core".to_string(),
+            kind: ReferenceKind::Source,
+            ..t.kernel.clone()
+        };
+        let refs = [t.kernel.clone(), source];
+        let index = TreeIndex::build(&t.module_dir, &t.module_commit, &refs);
+        for location in [
+            loc(
+                "rdma-core",
+                "include/linux/pds/pds_adminq.h",
+                "pds_core_reset_event",
+            ),
+            loc(
+                "rdma-core",
+                "drivers/net/ethernet/amd/pds_core/core.c",
+                "pdsc_notify",
+            ),
+        ] {
+            assert_eq!(index.check_location(&location, &refs), Ok(()), "{location}");
+        }
+    }
+
+    #[test]
+    fn what_the_index_does_not_know_passes() {
+        let t = trees();
+        // The review tree could not be listed, and no definitions were
+        // scanned: only the kernel's own paths are known.
+        let index = TreeIndex::build(&t.module_dir, "unknown", std::slice::from_ref(&t.kernel));
+        let refs = std::slice::from_ref(&t.kernel);
+        for location in [
+            loc("review", "no/such/file.c", "x"),
+            loc(
+                "kernel",
+                "include/linux/pds/pds_adminq.h",
+                "pds_core_reset_event",
+            ),
+            loc(
+                "kernel",
+                "drivers/net/ethernet/amd/pds_core/core.c",
+                "pdsc_notify",
+            ),
+        ] {
+            assert_eq!(index.check_location(&location, refs), Ok(()), "{location}");
+        }
+        assert!(
+            index
+                .check_location(&loc("kernel", "no/such/file.c", "x"), refs)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_symbol_is_read_in_the_forms_models_write() {
+        for (text, name) in [
+            ("pdsc_notify", Some("pdsc_notify")),
+            ("pdsc_notify()", Some("pdsc_notify")),
+            ("pdsc_notify (event, data)", Some("pdsc_notify")),
+            ("struct pdsc", Some("pdsc")),
+            ("union  u", Some("u")),
+            ("enum pds_event", Some("pds_event")),
+            ("#define PDS_EVENT_RESET", Some("PDS_EVENT_RESET")),
+            ("# define X(a)", Some("X")),
+            ("structure", Some("structure")),
+            ("struct pdsc::state", None),
+            ("pdsc->state", None),
+            ("static int foo", None),
+            ("", None),
+            ("1abc", None),
+        ] {
+            assert_eq!(symbol_name(text), name, "{text}");
+        }
+    }
+
+    /// Check 1 names the actual mistake: a prefix naming another
+    /// repository, a line number in the path, or a tree that could not be
+    /// listed.
+    #[test]
+    fn a_missing_path_message_names_the_mistake() {
+        let t = trees();
+        let index = t.index();
+        let refs = std::slice::from_ref(&t.kernel);
+        let kvm = "include/linux/kvm_host.h";
+
+        let fault = index
+            .check_location(&loc("review", &format!("kernel:{kvm}"), "kvm"), refs)
+            .unwrap_err();
+        assert_eq!(fault.flag(), LocationFlag::UnverifiedPath);
+        assert_eq!(
+            fault.to_string(),
+            format!(
+                "file \"kernel:{kvm}\" carries the prefix \"kernel:\" but repo is \"review\". \
+                 Set \"repo\" to the repository you read it in and write the path without a \
+                 prefix"
+            )
+        );
+
+        let fault = index
+            .check_location(&loc("kernel", &format!("{kvm}:42"), "kvm"), refs)
+            .unwrap_err();
+        assert_eq!(fault.flag(), LocationFlag::UnverifiedPath);
+        assert_eq!(
+            fault.to_string(),
+            format!(
+                "file \"{kvm}:42\" is not in repo \"kernel\" as written. Write the path alone \
+                 in \"file\" and its line in \"line\""
+            )
+        );
+        let fault = index
+            .check_location(&loc("review", &format!("{kvm}:42-50"), "kvm"), refs)
+            .unwrap_err();
+        assert!(
+            fault
+                .to_string()
+                .ends_with("it is in repo \"kernel\". Set \"repo\" to where you read it"),
+            "{fault}"
+        );
+
+        // The review tree could not be listed, so a module path is unknown.
+        let unlisted = TreeIndex::build(&t.module_dir, "unknown", refs);
+        let fault = unlisted
+            .check_location(&loc("kernel", "vfio/dirty.c", "x"), refs)
+            .unwrap_err();
+        assert_eq!(
+            fault.to_string(),
+            "file \"vfio/dirty.c\" is not in repo \"kernel\"; no other listed repository has \
+             it, and \"review\" could not be checked. Write the path from the repository's \
+             root, as the tools read it"
+        );
+    }
+
+    /// A build file the module shares with the kernel by name is not module
+    /// code in the kernel: the kernel's Makefile drives the module's build.
+    #[test]
+    fn a_kernel_build_file_is_not_module_code() {
+        let t = trees();
+        let kernel_dir = tempfile::tempdir().unwrap();
+        let commit = repo_with(
+            kernel_dir.path(),
+            &[
+                ("Makefile", "KBUILD_CFLAGS += -fno-strict-overflow\n"),
+                ("include/linux/pds/pds_adminq.h", MODULE_HEADER),
+            ],
+        );
+        let kernel = reference("kernel", ReferenceKind::Kernel, kernel_dir.path(), &commit);
+        let refs = std::slice::from_ref(&kernel);
+        let index = TreeIndex::build(&t.module_dir, &t.module_commit, refs);
+        assert_eq!(
+            index.check_location(&loc("kernel", "Makefile", "KBUILD_CFLAGS"), refs),
+            Ok(())
+        );
+        let fault = index
+            .check_location(&loc("kernel", "include/linux/pds/pds_adminq.h", "x"), refs)
+            .unwrap_err();
+        assert_eq!(fault.flag(), LocationFlag::RepoConflict);
     }
 }

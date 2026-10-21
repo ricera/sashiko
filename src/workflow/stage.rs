@@ -20,9 +20,10 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use crate::ai::session::SessionResult;
 use crate::ai::{
     AiMessage, AiProvider, AiResponse, AiResponseFormat, AiTool, ErrorAction, LlmSession,
-    ReasoningEffort, SessionRunner, ToolCall, ValidationError, WindDownSignal,
+    ReasoningEffort, SessionFailure, SessionRunner, ToolCall, ValidationError, WindDownSignal,
 };
 use crate::toolbox::ToolBox;
 
@@ -189,6 +190,20 @@ pub type StageOutcomeReducer<S, T> = Arc<dyn Fn(&mut S, T, &StageOutcome) + Send
 /// Conditional predicate determining whether a stage should be evaluated.
 pub type StageCondition<S> = Arc<dyn Fn(&S) -> bool + Send + Sync>;
 
+/// A check run on an output that passed the stage's validator.
+pub type StageSoftCheckFn<S, T> = Arc<dyn Fn(&T, &S) -> Result<(), String> + Send + Sync>;
+
+/// A check whose rejections never fail a stage its validator alone would
+/// pass. It rejects at most `rejections` outputs per run, each granting one
+/// validation attempt beyond the policy's, so the validator's own budget is
+/// untouched. When the attempts after a rejection end in failure, whether
+/// the validator's, a truncation's or the provider's, the stage accepts the
+/// last output the check rejected instead of failing.
+pub struct StageSoftCheck<S, T> {
+    pub rejections: usize,
+    pub check: StageSoftCheckFn<S, T>,
+}
+
 /// A declarative workflow stage with typed output `T` and state reduction.
 pub struct Stage<S, T> {
     pub name: &'static str,
@@ -199,6 +214,7 @@ pub struct Stage<S, T> {
     pub reducer: StageReducer<S, T>,
     pub outcome_reducer: Option<StageOutcomeReducer<S, T>>,
     pub skip_if: Option<StageCondition<S>>,
+    pub soft_check: Option<StageSoftCheck<S, T>>,
 }
 
 impl<S: 'static, T: 'static> Stage<S, T> {
@@ -218,6 +234,7 @@ pub struct StageBuilder<S, T> {
     reducer: Option<StageReducer<S, T>>,
     outcome_reducer: Option<StageOutcomeReducer<S, T>>,
     skip_if: Option<StageCondition<S>>,
+    soft_check: Option<StageSoftCheck<S, T>>,
 }
 
 impl<S: 'static, T: 'static> StageBuilder<S, T> {
@@ -231,6 +248,7 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
             reducer: None,
             outcome_reducer: None,
             skip_if: None,
+            soft_check: None,
         }
     }
 
@@ -322,6 +340,21 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
         self
     }
 
+    /// Runs `check` on every output that passes the validator, letting it
+    /// reject at most `rejections` of them ([`StageSoftCheck`]). A check
+    /// that rejects nothing costs the stage nothing: no attempt is added
+    /// until it rejects.
+    pub fn soft_check<F>(mut self, rejections: usize, check: F) -> Self
+    where
+        F: Fn(&T, &S) -> Result<(), String> + Send + Sync + 'static,
+    {
+        self.soft_check = Some(StageSoftCheck {
+            rejections,
+            check: Arc::new(check),
+        });
+        self
+    }
+
     /// Builds the stage.
     pub fn build(self) -> Stage<S, T> {
         let user_prompt = self
@@ -341,6 +374,7 @@ impl<S: 'static, T: 'static> StageBuilder<S, T> {
             reducer,
             outcome_reducer: self.outcome_reducer,
             skip_if: self.skip_if,
+            soft_check: self.soft_check,
         }
     }
 }
@@ -357,6 +391,14 @@ struct StageSession<'a, S, T> {
     recitation_fallback_active: bool,
     /// Name and arguments of the last call run, for the duplicate guard below.
     last_tool_call: Option<(String, Value)>,
+    /// Outputs rejected so far, by the validator or the soft check. The
+    /// runner counts the same rejections.
+    rejected_outputs: usize,
+    /// Outputs the soft check has rejected so far.
+    soft_rejections: usize,
+    /// The last output the soft check rejected, accepted in place of a final
+    /// output the validator rejects.
+    soft_rejected: Option<T>,
 }
 
 #[async_trait]
@@ -487,14 +529,43 @@ impl<'a, S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> LlmSess
 
     fn validate(&mut self, response: &AiResponse) -> Result<Self::Output, ValidationError> {
         let text = response.content.as_deref().unwrap_or("");
-        match self.stage.output_format.validate_with_recitation_fallback(
+        let stage = self.stage;
+        let parsed = match stage.output_format.validate_with_recitation_fallback(
             text,
             self.state,
             self.recitation_fallback_active,
         ) {
-            Ok(parsed) => Ok(parsed),
-            Err(violation) => Err(ValidationError::FormatViolation(violation)),
+            Ok(parsed) => parsed,
+            Err(violation) => {
+                self.rejected_outputs += 1;
+                let budget = stage
+                    .policy
+                    .max_validation_attempts
+                    .saturating_add(self.soft_rejections);
+                // The runner gives up on this rejection. An output only the
+                // soft check rejected passed the validator, so it stands in.
+                if self.rejected_outputs >= budget
+                    && let Some(kept) = self.soft_rejected.take()
+                {
+                    return Ok(kept);
+                }
+                return Err(ValidationError::FormatViolation(violation));
+            }
+        };
+        if let Some(soft) = &stage.soft_check
+            && self.soft_rejections < soft.rejections
+            && let Err(violation) = (soft.check)(&parsed, self.state)
+        {
+            self.rejected_outputs += 1;
+            self.soft_rejections += 1;
+            self.soft_rejected = Some(parsed);
+            return Err(ValidationError::FormatViolation(violation));
         }
+        Ok(parsed)
+    }
+
+    fn granted_validation_attempts(&self) -> usize {
+        self.soft_rejections
     }
 
     fn handle_provider_error(&mut self, error: &anyhow::Error, _attempt: usize) -> ErrorAction {
@@ -623,6 +694,9 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
                 )),
                 recitation_fallback_active: false,
                 last_tool_call: None,
+                rejected_outputs: 0,
+                soft_rejections: 0,
+                soft_rejected: None,
             };
 
             let runner = SessionRunner::new(env.provider.as_ref())
@@ -673,9 +747,22 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
             // nothing leaves its last turn frozen on display, indistinguishable
             // from one still waiting on the model. The cause tells a stage the
             // deadline stopped from one that failed on its own.
-            match runner.run(&mut session).await {
-                Ok(result) => result,
-                Err(e) => {
+            let run = runner.run(&mut session).await;
+            match (run, session.soft_rejected.take()) {
+                (Ok(result), _) => result,
+                // An output only the soft check rejected passed the
+                // validator, so whatever ends the attempts after it, a
+                // truncation or a provider error as much as the validator,
+                // leaves it standing as the stage without the check would.
+                (Err(e), Some(output)) => {
+                    tracing::warn!(
+                        stage = stage_name,
+                        error = %failure_reason(&e),
+                        "Retry after a soft-check rejection failed; keeping the rejected output"
+                    );
+                    soft_rejected_result(output, &e)
+                }
+                (Err(e), None) => {
                     if let Some(cb) = event_cb {
                         cb(WorkflowEvent::StageFailed {
                             stage_name,
@@ -727,6 +814,23 @@ impl<S: Send + Sync + 'static, T: DeserializeOwned + Send + 'static> ExecutableS
         };
 
         Ok((outcome, mutation))
+    }
+}
+
+/// The session result that accepts `output`, which only the soft check
+/// rejected, after `error` ended the attempts that followed it. It carries
+/// the history and usage the failure kept, so the stage still reports the
+/// tokens it spent, and counts as cut short when the review's deadline
+/// stopped it.
+fn soft_rejected_result<T>(output: T, error: &anyhow::Error) -> SessionResult<T> {
+    let failure = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<SessionFailure>());
+    SessionResult {
+        output,
+        history: failure.map(|f| f.history.clone()).unwrap_or_default(),
+        usage: failure.map(|f| f.usage.clone()).unwrap_or_default(),
+        cut_short: stop_cause(error) != StageStopCause::Error,
     }
 }
 
@@ -1513,6 +1617,125 @@ mod tests {
             .execute_isolated(&env, &EmptyState, None)
             .await
             .expect("recitation fallback should accept non-quoted text response");
+    }
+
+    /// Answers each request with the next of its replies.
+    struct ScriptedProvider {
+        replies: Mutex<std::collections::VecDeque<&'static str>>,
+        requests: Mutex<usize>,
+    }
+
+    impl ScriptedProvider {
+        fn new(replies: &[&'static str]) -> Self {
+            Self {
+                replies: Mutex::new(replies.iter().copied().collect()),
+                requests: Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AiProvider for ScriptedProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            *self.requests.lock().unwrap() += 1;
+            let reply = self.replies.lock().unwrap().pop_front();
+            if reply == Some("provider error") {
+                anyhow::bail!("the provider refused the request");
+            }
+            Ok(AiResponse {
+                content: Some(reply.unwrap_or("no reply left").to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                usage: None,
+                truncated: false,
+            })
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "mock".to_string(),
+                context_window_size: 100_000,
+            }
+        }
+    }
+
+    /// Runs a stage whose validator rejects replies starting "bad" and whose
+    /// soft check rejects one reply starting "soft", against `replies`.
+    /// Returns the accepted output, or the error, and the requests made.
+    async fn run_soft_checked(replies: &[&'static str]) -> (Result<String, String>, usize) {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = Arc::new(ScriptedProvider::new(replies));
+        let env = WorkflowEnv {
+            provider: provider.clone(),
+            tools: Arc::new(ToolBox::new(tmp.path().to_path_buf(), None)),
+            base_dir: tmp.path(),
+            context_tag: None,
+            wind_down: None,
+        };
+        let stage: Stage<String, String> = Stage::builder("soft")
+            .user_prompt(PromptTemplate::new("go"))
+            .output_format(OutputFormat::text_with_validator(
+                |text, _| match text.starts_with("bad") {
+                    true => Err("bad".to_string()),
+                    false => Ok(()),
+                },
+                |v| v.to_string(),
+            ))
+            .soft_check(1, |text: &String, _: &String| {
+                match text.starts_with("soft") {
+                    true => Err("soft".to_string()),
+                    false => Ok(()),
+                }
+            })
+            .reduce(|state: &mut String, out: String| *state = out)
+            .build();
+        let mut state = String::new();
+        let result = stage
+            .execute(&env, &mut state, None)
+            .await
+            .map(|_| state)
+            .map_err(|e| format!("{e:#}"));
+        let requests = *provider.requests.lock().unwrap();
+        (result, requests)
+    }
+
+    /// A soft rejection adds one attempt and never fails a stage the
+    /// validator alone would pass; without one, the validator keeps the
+    /// policy's count.
+    #[tokio::test]
+    async fn a_soft_check_rejects_without_failing_the_stage() {
+        // Rejected once, then a clean answer is accepted.
+        assert_eq!(
+            run_soft_checked(&["soft 1", "good"]).await,
+            (Ok("good".to_string()), 2)
+        );
+        // Only one rejection: a second soft answer is accepted as it is.
+        assert_eq!(
+            run_soft_checked(&["soft 1", "soft 2"]).await,
+            (Ok("soft 2".to_string()), 2)
+        );
+        // Two validator failures, then a soft rejection on the policy's last
+        // attempt: the added attempt fails the validator, so the rejected
+        // answer stands in rather than the stage failing.
+        assert_eq!(
+            run_soft_checked(&["bad 1", "bad 2", "soft 1", "bad 3"]).await,
+            (Ok("soft 1".to_string()), 4)
+        );
+        // The added attempt ends in a provider failure rather than the
+        // validator's: the rejected answer still stands in.
+        assert_eq!(
+            run_soft_checked(&["soft 1", "provider error"]).await,
+            (Ok("soft 1".to_string()), 2)
+        );
+        // A failure with nothing soft-rejected still fails the stage.
+        let (result, _) = run_soft_checked(&["provider error"]).await;
+        assert!(result.is_err(), "{result:?}");
+        // Validator failures alone get the policy's attempts and no more.
+        let attempts = StagePolicy::default().max_validation_attempts;
+        let (result, requests) = run_soft_checked(&["bad 1", "bad 2", "bad 3", "good"]).await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(requests, attempts);
     }
 
     #[test]

@@ -23,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cover_letter::{CoverLetter, cover_letter_block};
-use crate::location_repo::{LOCATION_REPO_KEY, normalize_location, read_location_repo};
+use crate::location_repo::{
+    LOCATION_REPO_KEY, normalize_location, read_location_repo, strip_location_flags,
+};
 use crate::prior_revisions::{PriorReviewContext, ground_prior_link};
 use crate::settings::ReferenceKind;
 use crate::toolbox::{REPO_ARG, REPO_ARG_REVIEW, ReferenceRepo};
@@ -761,18 +763,118 @@ fn validate_location_repos(
 
 /// Moves a `<repo>:<path>` prefix in each item's location files into the
 /// location's `repo` before the items are stored, so what is stored matches
-/// what [`validate_location_repos`] accepted. A no-op without references.
+/// what [`validate_location_repos`] accepted, and removes any warning flag
+/// the model wrote, since only [`flag_location_tree_faults`] may set one.
+///
+/// The flags are removed with or without references: a review without them
+/// runs no check that could set one, so a flag there is model-written (patch
+/// text can ask for one) and the page would show a warning nothing produced.
+/// The flag keys are newer than any prompt, so honest output loses nothing.
 fn normalize_item_locations<'a>(
     items: impl IntoIterator<Item = &'a mut Value>,
     references: &[ReferenceRepo],
 ) {
-    if references.is_empty() {
+    for item in items {
+        if let Some(locations) = item.get_mut("locations").and_then(Value::as_array_mut) {
+            for location in locations {
+                if !references.is_empty() {
+                    normalize_location(location, references);
+                }
+                strip_location_flags(location);
+            }
+        }
+    }
+}
+
+/// How many outputs a deciding stage rejects for locations that do not match
+/// the trees they name, in one stage run. Each rejection grants the stage one
+/// validation attempt, and an output rejected only for this is accepted if
+/// the retry fails the stage's validator ([`crate::workflow::stage::StageSoftCheck`]).
+const LOCATION_TREE_REJECTIONS: usize = 1;
+
+/// Every location of every item that does not match the trees it names, as
+/// one message line each, e.g. `findings[0].locations[2] has repo "kernel"
+/// and cites pdsc_notify, which the code under review defines at
+/// core/core.c:23; cite that with repo "review"`. Empty when the checks
+/// cannot run.
+fn location_tree_faults(
+    collections: &[(&str, &[Value])],
+    state: &LinuxPatchReviewState,
+) -> Vec<String> {
+    let Some(index) = state.tree_index.as_deref() else {
+        return Vec::new();
+    };
+    if state.references.is_empty() {
+        return Vec::new();
+    }
+    let mut faults = Vec::new();
+    for (name, items) in collections {
+        for (idx, item) in items.iter().enumerate() {
+            let Some(locations) = item.get("locations").and_then(Value::as_array) else {
+                continue;
+            };
+            for (loc_idx, location) in locations.iter().enumerate() {
+                if let Err(fault) = index.check_location(location, &state.references) {
+                    faults.push(format!("{name}[{idx}].locations[{loc_idx}] {fault}"));
+                }
+            }
+        }
+    }
+    faults
+}
+
+/// The tree checks of a deciding stage (verification or post-verification),
+/// run as the stage's soft check: they reject at most
+/// [`LOCATION_TREE_REJECTIONS`] outputs, and the reduce flags each location
+/// that still fails ([`flag_location_tree_faults`]), so a finding is never
+/// lost to a dispute over where its evidence lives. Passes when the checks
+/// cannot run.
+fn check_location_trees(
+    collections: &[(&str, &[Value])],
+    state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    let faults = location_tree_faults(collections, state);
+    if faults.is_empty() {
+        Ok(())
+    } else {
+        Err(faults.join("\n"))
+    }
+}
+
+/// Prepares a deciding stage's locations for storing: normalized and stripped
+/// of model-written flags ([`normalize_item_locations`]), then flagged where
+/// they still fail the tree checks ([`flag_location_tree_faults`]). Without
+/// references it only strips the flags.
+fn settle_decided_locations<'a>(
+    items: impl IntoIterator<Item = &'a mut Value>,
+    state: &LinuxPatchReviewState,
+) {
+    for item in items {
+        normalize_item_locations(std::iter::once(&mut *item), &state.references);
+        flag_location_tree_faults(std::iter::once(item), state);
+    }
+}
+
+/// Writes a [`crate::location_repo::LocationFlag`] on every location the
+/// deciding stage's tree checks would still reject, which the stage only
+/// accepted because their rejections were spent or the retry failed its
+/// validator. A no-op when the checks cannot run.
+fn flag_location_tree_faults<'a>(
+    items: impl IntoIterator<Item = &'a mut Value>,
+    state: &LinuxPatchReviewState,
+) {
+    let Some(index) = state.tree_index.as_deref() else {
+        return;
+    };
+    if state.references.is_empty() {
         return;
     }
     for item in items {
         if let Some(locations) = item.get_mut("locations").and_then(Value::as_array_mut) {
             for location in locations {
-                normalize_location(location, references);
+                if let Err(fault) = index.check_location(location, &state.references) {
+                    fault.flag().set(location);
+                }
             }
         }
     }
@@ -994,14 +1096,24 @@ fn validate_linux_verification_output(
     state: &LinuxPatchReviewState,
 ) -> Result<(), String> {
     validate_verification_stage_output(output, state)?;
-    validate_location_repos(
-        &[
-            ("findings", &output.findings),
-            ("hard_cases", &output.hard_cases),
-            ("dismissed_concerns", &output.dismissed_concerns),
-        ],
-        &state.references,
-    )
+    validate_location_repos(&verification_locations(output), &state.references)
+}
+
+/// A verification output's arrays that carry locations, by their JSON names.
+fn verification_locations(output: &VerificationOutput) -> [(&'static str, &[Value]); 3] {
+    [
+        ("findings", &output.findings),
+        ("hard_cases", &output.hard_cases),
+        ("dismissed_concerns", &output.dismissed_concerns),
+    ]
+}
+
+/// The verification stage's tree checks ([`check_location_trees`]).
+fn check_verification_trees(
+    output: &VerificationOutput,
+    state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    check_location_trees(&verification_locations(output), state)
 }
 
 fn extract_non_empty_source_ids<'a>(
@@ -1221,13 +1333,36 @@ fn validate_post_verification_location_repos(
     output: &PostVerificationOutput,
     state: &LinuxPatchReviewState,
 ) -> Result<(), String> {
-    validate_location_repos(
-        &[
-            ("findings", &output.findings),
-            ("dismissed_concerns", &output.dismissed_concerns),
-        ],
-        &state.references,
-    )
+    validate_location_repos(&post_verification_locations(output), &state.references)
+}
+
+/// A post-verification output's arrays that carry locations, by their JSON
+/// names.
+fn post_verification_locations(output: &PostVerificationOutput) -> [(&'static str, &[Value]); 2] {
+    [
+        ("findings", &output.findings),
+        ("dismissed_concerns", &output.dismissed_concerns),
+    ]
+}
+
+/// A Linux post-verification stage's validator for `batch`: the batch's
+/// structural checks, then the every-stage repository check.
+fn linux_post_verification_validator(
+    batch: Vec<Value>,
+) -> impl Fn(&PostVerificationOutput, &LinuxPatchReviewState) -> Result<(), String> + Send + Sync + 'static
+{
+    move |output, state| {
+        validate_post_verification_batch_items(output, &batch)?;
+        validate_post_verification_location_repos(output, state)
+    }
+}
+
+/// A post-verification stage's tree checks ([`check_location_trees`]).
+fn check_post_verification_trees(
+    output: &PostVerificationOutput,
+    state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    check_location_trees(&post_verification_locations(output), state)
 }
 
 pub fn format_post_verification_feedback(violation: &str) -> String {
@@ -2967,12 +3102,12 @@ pub fn apply_verification_stage_output(
             .chain(out.hard_cases.iter_mut())
             .chain(out.dismissed_concerns.iter_mut()),
     );
-    normalize_item_locations(
+    settle_decided_locations(
         out.findings
             .iter_mut()
             .chain(out.hard_cases.iter_mut())
             .chain(out.dismissed_concerns.iter_mut()),
-        &state.references,
+        state,
     );
     enrich_verification_output(state, &mut out, outcome, stage_lookup);
     state.verification_findings.extend(out.findings.clone());
@@ -2999,11 +3134,11 @@ pub fn apply_post_verification_stage_output(
             .iter_mut()
             .chain(out.dismissed_concerns.iter_mut()),
     );
-    normalize_item_locations(
+    settle_decided_locations(
         out.findings
             .iter_mut()
             .chain(out.dismissed_concerns.iter_mut()),
-        &state.references,
+        state,
     );
     enrich_post_verification_output(
         &state.selected_guides,
@@ -3158,6 +3293,7 @@ Example Output:
             reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
             ..StagePolicy::consolidation()
         })
+        .soft_check(LOCATION_TREE_REJECTIONS, check_verification_trees)
         .reduce_with_outcome(|state, out: VerificationOutput, outcome| {
             apply_verification_stage_output(state, out, outcome, analysis_stage_by_name);
         })
@@ -3182,7 +3318,7 @@ pub fn post_verification_stage_with_effort(
 ) -> Stage<LinuxPatchReviewState, PostVerificationOutput> {
     let candidate_json = serde_json::to_string_pretty(&batch).unwrap_or_default();
     let batch_for_prompts = batch.clone();
-    let batch_for_validate = batch.clone();
+    let validator = linux_post_verification_validator(batch.clone());
     let batch_for_reduce = batch;
     let series_context = series_context_placeholder(POST_VERIFICATION.wants_series_context);
     let user_template = with_location_repo(with_series_context(
@@ -3264,10 +3400,7 @@ Example Output:
         .user_prompt(user_template)
         .output_format(
             OutputFormat::json()
-                .with_validator(move |out, state| {
-                    validate_post_verification_batch_items(out, &batch_for_validate)?;
-                    validate_post_verification_location_repos(out, state)
-                })
+                .with_validator(validator)
                 .with_feedback_formatter(format_post_verification_feedback),
         )
         .policy(StagePolicy {
@@ -3277,6 +3410,7 @@ Example Output:
             reasoning_effort: effort.map(crate::ai::EffortMode::verification_stage_effort),
             ..StagePolicy::consolidation()
         })
+        .soft_check(LOCATION_TREE_REJECTIONS, check_post_verification_trees)
         .reduce_with_outcome(move |state, out: PostVerificationOutput, outcome| {
             apply_post_verification_stage_output(
                 state,
@@ -5166,6 +5300,276 @@ mod tests {
         );
     }
 
+    /// A review of the fixture module with the fixture kernel attached and
+    /// indexed: the trees share include/linux/pds/pds_adminq.h, and the
+    /// module defines pdsc_notify at core/core.c:7.
+    fn indexed_module_state(trees: &crate::tree_index::fixture::Trees) -> LinuxPatchReviewState {
+        LinuxPatchReviewState {
+            references: vec![trees.kernel.clone()],
+            tree_index: Some(std::sync::Arc::new(trees.index())),
+            ..Default::default()
+        }
+    }
+
+    fn tree_location(repo: &str, file: &str, symbol: &str) -> Value {
+        json!({
+            "repo": repo,
+            "file": file,
+            "function_or_symbol": symbol,
+            "line": 7,
+            "code_snippet": "pdsc_notify(PDS_EVENT_RESET, &reset_event);",
+            "why_this_location_matters": "Raises the reset event."
+        })
+    }
+
+    const KERNEL_CORE: &str = "drivers/net/ethernet/amd/pds_core/core.c";
+    const PDS_ADMINQ: &str = "include/linux/pds/pds_adminq.h";
+
+    /// One location per tree check, then one that passes them all.
+    fn mislabelled_locations() -> Vec<Value> {
+        vec![
+            tree_location("review", KERNEL_CORE, "pdsc_notify"),
+            tree_location("kernel", PDS_ADMINQ, "struct pds_core_reset_event"),
+            tree_location("kernel", KERNEL_CORE, "pdsc_notify()"),
+            tree_location("kernel", "include/linux/kvm_host.h", "struct kvm"),
+        ]
+    }
+
+    /// The rejection for [`mislabelled_locations`] under `collection[0]`.
+    fn mislabelled_message(collection: &str) -> String {
+        [
+            format!(
+                "{collection}[0].locations[0] file \"{KERNEL_CORE}\" is not in repo \"review\"; \
+                 it is in repo \"kernel\". Set \"repo\" to where you read it"
+            ),
+            format!(
+                "{collection}[0].locations[1] has repo \"kernel\" and cites \"{PDS_ADMINQ}\", \
+                 which the code under review ships itself; the copy in \"kernel\" is not loaded \
+                 while the module runs. Cite the module's file with repo \"review\""
+            ),
+            format!(
+                "{collection}[0].locations[2] has repo \"kernel\" and cites pdsc_notify, which \
+                 the code under review defines at core/core.c:7; cite that with repo \"review\""
+            ),
+        ]
+        .join("\n")
+    }
+
+    /// Verification and post-verification hold every location to the tree
+    /// it names, and each rejection says what to cite instead; analysis runs
+    /// only the cheap repository check (§4.3).
+    #[test]
+    fn deciding_stages_hold_locations_to_the_trees_they_name() {
+        let trees = crate::tree_index::fixture::trees();
+        let state = indexed_module_state(&trees);
+
+        let verify = check_verification_trees;
+        assert_eq!(
+            verify(&verification_with(mislabelled_locations()), &state),
+            Err(mislabelled_message("hard_cases"))
+        );
+        let post = check_post_verification_trees;
+        assert_eq!(
+            post(&post_verification_with(mislabelled_locations()), &state),
+            Err(mislabelled_message("findings"))
+        );
+
+        let mut dismissed =
+            post_verification_with(vec![tree_location("review", "core/core.c", "pdsc_notify")]);
+        dismissed.dismissed_concerns = vec![json!({
+            "description": "Unlocked notifier chain",
+            "reasoning": "The chain takes its own lock.",
+            "locations": [tree_location("kernel", PDS_ADMINQ, "PDS_EVENT_RESET")]
+        })];
+        let err = check_post_verification_trees(&dismissed, &state).unwrap_err();
+        assert!(
+            err.starts_with("dismissed_concerns[0].locations[0] has repo \"kernel\" and cites"),
+            "{err}"
+        );
+        // Verification's dismissals are held to the trees as well.
+        let mut verified_dismissal = verification_with(Vec::new());
+        verified_dismissal.dismissed_concerns = dismissed.dismissed_concerns.clone();
+        let faults = location_tree_faults(&verification_locations(&verified_dismissal), &state);
+        assert_eq!(faults.len(), 1, "{faults:?}");
+        assert!(faults[0].starts_with("dismissed_concerns[0].locations[0] has repo \"kernel\""));
+
+        let correct = || {
+            vec![
+                tree_location("review", "core/core.c", "pdsc_notify"),
+                tree_location("review", PDS_ADMINQ, "struct pds_core_reset_event"),
+                tree_location("kernel", "include/linux/kvm_host.h", "struct kvm"),
+            ]
+        };
+        assert_eq!(verify(&verification_with(correct()), &state), Ok(()));
+        assert_eq!(post(&post_verification_with(correct()), &state), Ok(()));
+        assert_eq!(
+            validate_linux_verification_output(&verification_with(correct()), &state),
+            Ok(())
+        );
+
+        // Analysis candidates are re-checked by verification, so analysis
+        // pays for no retry over them.
+        assert_eq!(
+            validate_concerns_output(&concerns_with(mislabelled_locations()), &state),
+            Ok(())
+        );
+        // The every-stage check is the validator's, which the tree checks'
+        // rejection budget does not cover.
+        let missing = vec![repo_location(None, "vfio/dirty.c")];
+        let err =
+            validate_linux_verification_output(&verification_with(missing), &state).unwrap_err();
+        assert!(err.contains("has no \"repo\" string"), "{err}");
+    }
+
+    /// An output the tree checks reject is accepted by the stage once their
+    /// rejection is spent ([`crate::workflow::stage::StageSoftCheck`]), and
+    /// the reduce flags each location that still fails, after removing any
+    /// flag the model wrote itself (D3).
+    #[test]
+    fn after_one_rejection_mislabelled_locations_are_accepted_and_flagged() {
+        let trees = crate::tree_index::fixture::trees();
+        let state = indexed_module_state(&trees);
+        let mut locations = mislabelled_locations();
+        locations[3]["repo_conflict"] = json!(true);
+        locations[3]["unverified_path"] = json!(false);
+
+        let expect_flags = |stored: &Value| {
+            let stored = stored.as_array().unwrap();
+            assert_eq!(stored[0]["unverified_path"], json!(true));
+            assert_eq!(stored[1]["repo_conflict"], json!(true));
+            assert_eq!(stored[2]["repo_conflict"], json!(true));
+            for (idx, flag) in [
+                (0, "repo_conflict"),
+                (1, "unverified_path"),
+                (2, "unverified_path"),
+            ] {
+                assert!(stored[idx].get(flag).is_none(), "{idx}: {flag}");
+            }
+            assert_eq!(
+                stored[3],
+                tree_location("kernel", "include/linux/kvm_host.h", "struct kvm"),
+                "a passing location loses the flags the model wrote"
+            );
+        };
+
+        let output = verification_with(locations.clone());
+        assert!(check_verification_trees(&output, &state).is_err());
+        assert_eq!(validate_linux_verification_output(&output, &state), Ok(()));
+        let mut verified = state.clone();
+        apply_verification_stage_output(
+            &mut verified,
+            output,
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        expect_flags(&verified.hard_cases[0]["locations"]);
+
+        let output = post_verification_with(locations);
+        assert!(check_post_verification_trees(&output, &state).is_err());
+        assert_eq!(
+            linux_post_verification_validator(Vec::new())(&output, &state),
+            Ok(())
+        );
+        let mut decided = state.clone();
+        apply_post_verification_stage_output(
+            &mut decided,
+            POST_VERIFICATION_STAGE_NAMES[0],
+            &[],
+            output,
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        expect_flags(&decided.findings[0]["locations"]);
+
+        // Analysis stores candidates without flags of either origin.
+        let mut items = concerns_with(mislabelled_locations()).dismissed_concerns;
+        items[0]["locations"][3]["repo_conflict"] = json!(true);
+        normalize_item_locations(items.iter_mut(), &state.references);
+        for location in items[0]["locations"].as_array().unwrap() {
+            assert!(location.get("repo_conflict").is_none(), "{location}");
+            assert!(location.get("unverified_path").is_none(), "{location}");
+        }
+    }
+
+    /// The deciding stages run the tree checks as a soft check of one
+    /// rejection, which adds an attempt only when it rejects. Without an
+    /// index the checks pass everything, so such a review keeps the policy's
+    /// count (G5).
+    #[test]
+    fn the_tree_checks_are_the_deciding_stages_soft_check() {
+        let trees = crate::tree_index::fixture::trees();
+        let indexed = indexed_module_state(&trees);
+        let unindexed = LinuxPatchReviewState {
+            references: vec![trees.kernel.clone()],
+            ..Default::default()
+        };
+        let plain = LinuxPatchReviewState::default();
+
+        let verification = verification_stage(20, 0.0);
+        let post = post_verification_stage(POST_VERIFICATION_STAGE_NAMES[0], Vec::new(), 20, 0.0);
+        let verify = verification.soft_check.as_ref().unwrap();
+        let decide = post.soft_check.as_ref().unwrap();
+        assert_eq!(verify.rejections, LOCATION_TREE_REJECTIONS);
+        assert_eq!(decide.rejections, LOCATION_TREE_REJECTIONS);
+        let checked = verification_with(mislabelled_locations());
+        let decided = post_verification_with(mislabelled_locations());
+        assert!((verify.check)(&checked, &indexed).is_err());
+        assert!((decide.check)(&decided, &indexed).is_err());
+        for state in [&unindexed, &plain] {
+            assert_eq!((verify.check)(&checked, state), Ok(()));
+            assert_eq!((decide.check)(&decided, state), Ok(()));
+        }
+    }
+
+    /// Without references, or without an index, no tree check runs and no
+    /// flag is written (G5). A flag the model wrote is still removed: no
+    /// check produced it.
+    #[test]
+    fn without_an_index_locations_are_neither_held_to_trees_nor_flagged() {
+        let trees = crate::tree_index::fixture::trees();
+        let unindexed = LinuxPatchReviewState {
+            references: vec![trees.kernel.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_linux_verification_output(
+                &verification_with(mislabelled_locations()),
+                &unindexed
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check_verification_trees(&verification_with(mislabelled_locations()), &unindexed),
+            Ok(())
+        );
+        let mut verified = unindexed.clone();
+        apply_verification_stage_output(
+            &mut verified,
+            verification_with(mislabelled_locations()),
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        assert_eq!(
+            verified.hard_cases[0]["locations"],
+            json!(mislabelled_locations())
+        );
+
+        let plain = LinuxPatchReviewState::default();
+        let mut written = mislabelled_locations();
+        written[0]["repo_conflict"] = json!(true);
+        let mut verified = plain.clone();
+        apply_verification_stage_output(
+            &mut verified,
+            verification_with(written),
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        assert_eq!(
+            verified.hard_cases[0]["locations"],
+            json!(mislabelled_locations())
+        );
+    }
+
     /// An out-of-tree module often ships its own copy of a driver the kernel
     /// also has (pds_core in driver-b). Only the module's copy runs, so the
     /// caveats send every call chain to the review repository, forbid mixing
@@ -6681,6 +7085,7 @@ mod tests {
             problem: problem.to_string(),
             consequence: Some(consequence.to_string()),
             locations: vec![FindingLocation {
+                repo: None,
                 file: Some("drivers/frob/ring.c".to_string()),
                 function_or_symbol: Some(function.to_string()),
                 line: Some(812),
