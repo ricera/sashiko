@@ -1177,6 +1177,16 @@
             white-space: pre-wrap;
         }
 
+        .location-repo {
+            text-decoration: underline dotted;
+            cursor: help;
+        }
+
+        .location-warning {
+            color: var(--sev-medium);
+            font-style: italic;
+        }
+
         /* Diff highlighting */
         .diff-line {
             display: block;
@@ -3462,7 +3472,10 @@
         // The code snippet is left out because the inline review already
         // quotes the code, and a snippet here would bury the reasoning beside
         // it.
-        function renderFindingLocations(locations) {
+        //
+        // A location in a reference repository is labelled as locationRepoParts
+        // says; `pins` is what referencePins read from the review row.
+        function renderFindingLocations(locations, pins = new Map()) {
             if (!Array.isArray(locations)) return '';
             const textOf = (loc, key) => (typeof loc[key] === 'string' ? loc[key].trim() : '');
             const items = locations.filter(loc => loc && typeof loc === 'object').map(loc => {
@@ -3472,12 +3485,70 @@
                 const where = file ? `${file}${line}${fn ? ` (${fn})` : ''}` : fn;
                 const why = textOf(loc, 'why_this_location_matters');
                 if (!where && !why) return '';
+                const repo = locationRepoParts(loc, pins);
                 return '<div>'
-                    + (where ? `<code>${escapeHtml(where)}</code>` : '')
+                    + (where ? `<code>${repo.label}${escapeHtml(where)}</code>` : '')
+                    + repo.warnings.map(tag => ` ${tag}`).join('')
                     + (why ? `<div class="finding-muted">${escapeHtml(why)}</div>` : '')
                     + '</div>';
             }).filter(Boolean);
             return items.length ? `<div>${items.join('')}</div>` : '';
+        }
+
+        // The pin of each reference repository a review could read, by name,
+        // as the References line shows it: "kernel @ v6.18 (1a2b3c4d5e6f)".
+        // Read from the review row's reference_repos record, which may arrive
+        // as a JSON string; a missing or unreadable record gives an empty map,
+        // so a location still shows its label, only without the pin.
+        function referencePins(refs) {
+            const pins = new Map();
+            try {
+                if (typeof refs === 'string') refs = JSON.parse(refs);
+            } catch (e) {
+                return pins;
+            }
+            const attached = refs && typeof refs === 'object' && Array.isArray(refs.attached)
+                ? refs.attached : [];
+            for (const a of attached) {
+                if (!a || typeof a !== 'object' || typeof a.name !== 'string' || pins.has(a.name)) continue;
+                const commit = typeof a.commit === 'string' ? a.commit.slice(0, 12) : '';
+                const revision = typeof a.revision === 'string' ? a.revision : '';
+                pins.set(a.name, `${a.name}${revision ? ` @ ${revision}` : ''}${commit ? ` (${commit})` : ''}`);
+            }
+            return pins;
+        }
+
+        // Which repository a location is in, as HTML to put before its path,
+        // and the warnings the review's checks left on it. The label is read by
+        // the rule of reference_repo_of in src/finding_view.rs: only a "repo"
+        // string with visible text that is not "review" names a reference, so a
+        // location in the code under review, and every location stored before
+        // locations named their repository, gets no label and renders as it
+        // always did. The flags count only as a JSON true, as the other tags
+        // do. The repository name and its pin come from the model and the
+        // configuration, so both are escaped.
+        function locationRepoParts(loc, pins = new Map()) {
+            const repo = typeof loc.repo === 'string' ? oneLine(loc.repo) : '';
+            const reference = repo !== '' && repo !== 'review' ? repo : '';
+            const pin = reference ? pins.get(reference) : undefined;
+            const hover = pin ? `Reference repository ${pin}` : `Reference repository ${reference}`;
+            const label = reference
+                ? `<span class="location-repo" title="${escapeHtml(hover)}">${escapeHtml(reference)}:</span>`
+                : '';
+            const warnings = [];
+            if (reference && loc.repo_conflict === true) {
+                warnings.push('<span class="finding-tag location-warning" title="'
+                    + escapeHtml(`The code under review carries its own copy of what this location`
+                        + ` cites, so ${reference}'s copy does not run with it`)
+                    + `">(${escapeHtml(reference)} copy of module code)</span>`);
+            }
+            if (loc.unverified_path === true) {
+                const tree = reference || 'the code under review';
+                warnings.push('<span class="finding-tag location-warning" title="'
+                    + escapeHtml(`The review's checks did not find this file in ${tree}`)
+                    + `">(path not found in ${escapeHtml(tree)})</span>`);
+            }
+            return { label, warnings };
         }
 
         // Makes text one line by the rule of one_line in src/finding_view.rs:
@@ -3553,8 +3624,9 @@
         // One finding as a row: severity, tags and title, opening onto the full
         // problem when the title was clipped, the severity reasoning and the
         // locations. A finding with none of those is a plain row, because a
-        // control that opens onto nothing is worse than no control.
-        function renderFindingRow(finding) {
+        // control that opens onto nothing is worse than no control. `pins` are
+        // the review's reference pins (referencePins), for the locations' hover.
+        function renderFindingRow(finding, pins = new Map()) {
             const f = findingObject(finding);
             // The severity counts, the ordering and the CLIs compare the text
             // exactly, without trimming, and read a missing or blank severity as
@@ -3572,7 +3644,7 @@
                 + `<span title="${escapeHtml(title)}">${escapeHtml(title)}</span>`;
             const body = (clipped ? `<div class="finding-text">${escapeHtml(f.problem.trim())}</div>` : '')
                 + renderSeverityCalibration(f.severity_explanation)
-                + renderFindingLocations(f.locations);
+                + renderFindingLocations(f.locations, pins);
             if (!body) return `<div class="finding">${head}</div>`;
             return `<details class="finding"><summary>${head}</summary>`
                 + `<div class="finding-body">${body}</div></details>`;
@@ -3583,8 +3655,9 @@
         // with the counts beside it: a patchset-level card leaves preexisting
         // findings out, as its counts do. A severity the counts do not know is
         // counted as Low, so it is listed with the Lows, and findings of one
-        // level keep the order the model gave them.
-        function renderFindingsList(findings, uniqueId, { includePreexisting }) {
+        // level keep the order the model gave them. `pins` are passed to each
+        // row for its locations.
+        function renderFindingsList(findings, uniqueId, { includePreexisting, pins = new Map() }) {
             if (!Array.isArray(findings)) return '';
             const rankOf = f => {
                 const rank = ['critical', 'high', 'medium'].indexOf(String(f.severity || '').toLowerCase());
@@ -3606,7 +3679,7 @@
             return `
                     <div style="margin-top:8px;">
                         <button class="toggle-btn" onclick="toggleCollapsible('findings-${uniqueId}', this)">▼ Findings (${listed.length})</button>
-                        <div id="findings-${uniqueId}" class="collapsible open">${notMarked}${listed.map(({ f }) => renderFindingRow(f)).join('')}</div>
+                        <div id="findings-${uniqueId}" class="collapsible open">${notMarked}${listed.map(({ f }) => renderFindingRow(f, pins)).join('')}</div>
                     </div>
                 `;
         }
@@ -6016,7 +6089,8 @@
             // on (a null) leaves parsedFindings false, and the card falls back
             // to the result text with no list.
             const findingsHtml = parsedFindings
-                ? renderFindingsList(outputJson.findings, uniqueId, { includePreexisting: !isPatchset })
+                ? renderFindingsList(outputJson.findings, uniqueId,
+                    { includePreexisting: !isPatchset, pins: referencePins(r.reference_repos) })
                 : '';
 
             // 2. If no structured findings, fallback to r.result
@@ -7407,7 +7481,11 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
             return lines.join('\n');
         }
 
-        function renderReviewMapCodeSnippets(locations) {
+        // A review map thread's locations as its Code Trace: each one's place,
+        // snippet and reason. A location in a reference repository has its
+        // repository before its place, and the review's checks' warnings
+        // after it, as locationRepoParts gives them for `pins`.
+        function renderReviewMapCodeSnippets(locations, pins = new Map()) {
             if (!Array.isArray(locations) || locations.length === 0) return '';
             const validLocs = locations
                 .filter(loc => loc && typeof loc === 'object')
@@ -7419,7 +7497,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                         : '';
                     const snippet = dedentCodeSnippet(loc.code_snippet);
                     if (!fileLine && !sym && !why && !snippet) return null;
-                    return { fileLine, sym, why, snippet };
+                    return { fileLine, sym, why, snippet, repo: locationRepoParts(loc, pins) };
                 })
                 .filter(Boolean);
             if (validLocs.length === 0) return '';
@@ -7429,8 +7507,9 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                 const locParts = [];
                 if (item.fileLine) locParts.push(`<strong>${escapeHtml(item.fileLine)}</strong>`);
                 if (item.sym) locParts.push(`<span class="fn-name">${escapeHtml(item.sym)}</span>`);
+                const warningsHtml = item.repo.warnings.map(tag => ` ${tag}`).join('');
                 const headerHtml = locParts.length > 0
-                    ? `<div>${stepNum}${locParts.join(' <span style="color:var(--text-dim);">&middot;</span> ')}</div>`
+                    ? `<div>${stepNum}${item.repo.label}${locParts.join(' <span style="color:var(--text-dim);">&middot;</span> ')}${warningsHtml}</div>`
                     : '';
                 const snippetHtml = item.snippet
                     ? `<pre style="margin:6px 0 0 0; padding:6px 10px; background:var(--card-bg); border:1px solid var(--border-light); border-left:3px solid var(--border); border-radius:3px; white-space:pre-wrap;">${escapeHtml(item.snippet)}</pre>`
@@ -7562,6 +7641,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
 
             const stages = Array.isArray(reviewMap.stages) ? reviewMap.stages : [];
             const threads = Array.isArray(reviewMap.threads) ? reviewMap.threads : [];
+            const referencePinsOfReview = referencePins(data.reference_repos);
 
             currentReviewMapState = {
                 logs,
@@ -7850,7 +7930,7 @@ ${escapeHtml((data.body || '(no body)').replace(/\n+$/, ''), true, false)}${data
                             </div>
                         `
                         : '';
-                    const codeTraceHtml = renderReviewMapCodeSnippets(primaryLocations);
+                    const codeTraceHtml = renderReviewMapCodeSnippets(primaryLocations, referencePinsOfReview);
                     const rowTitle = reviewMapThreadTitle(t);
                     const rowLinkHtml = threadLink ? ` ${priorTag(threadLink.prior)}` : '';
                     const fullTitleHtml = rowTitle.clipped

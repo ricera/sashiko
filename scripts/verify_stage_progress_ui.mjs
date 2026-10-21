@@ -1,9 +1,10 @@
 // Checks the web UI's review card and the findings it lists, the per-patch
 // stage table (live and recorded), how live activity is routed and polled, the
 // live conversation log, the line naming the reference repositories each review
-// had, how partial and timed-out reviews read in the list, the summary table,
-// the card and the statistics, and the address a patchset page keeps paging and
-// the reason it shows when that address finds nothing.
+// had and the repository a finding's location is in, how partial and timed-out
+// reviews read in the list, the summary table, the card and the statistics, and
+// the address a patchset page keeps paging and the reason it shows when that
+// address finds nothing.
 //
 // static/index.html has no build step and no other test coverage, so this is the
 // only thing standing between a bad edit and a page that silently renders
@@ -63,6 +64,7 @@ const CONSTS = ['FINDING_TITLE_MAX_CHARS', 'PRIOR_REVISION_LABEL_MAX_CHARS'];
 const NAMES = ['escapeHtml', 'formatTokenCount', 'renderReviewReferences', 'renderReviewCard', 'getSeverityColor',
                'versionLabel', 'findingObject', 'clipTitle', 'findingTitle', 'reviewMapThreadTitle', 'reviewMapThreadLink', 'parseSeverityCalibration', 'renderSeverityCalibration',
                'renderFindingLocations', 'oneLine', 'priorTag', 'findingTags', 'renderFindingRow', 'renderFindingsList',
+               'referencePins', 'locationRepoParts', 'dedentCodeSnippet', 'renderReviewMapCodeSnippets',
                'formatDuration', 'describeStageWait', 'summarizeReason', 'compareStageRows',
                'stageTableLabel', 'stageRowsFromRecord', 'stageStopCause', 'stageStopLabel',
                'stoppedStageStatus', 'stageRowsFromActivity',
@@ -2566,6 +2568,157 @@ console.log('reference repositories');
 const refFailures = referenceChecks(ctx);
 check('every reference check passes', refFailures.length === 0, refFailures.join(', '));
 
+// ---- a location's repository ------------------------------------------------
+// A location in a reference repository says which one before its path, on the
+// review card and in the review map's Code Trace, with the reference's pin in
+// the hover; the warnings the review's checks left on it are shown beside it.
+// A location in the code under review, and every location stored before
+// locations named their repository, renders exactly as it did.
+const KERNEL_LOC = { repo: 'kernel', file: 'include/linux/pds/pds_adminq.h', line: 7,
+    function_or_symbol: 'pdsc_notify', why_this_location_matters: 'the kernel side',
+    code_snippet: 'int pdsc_notify(void);' };
+const REVIEW_LOC = { repo: 'review', file: 'vfio/dirty.c', line: 681,
+    function_or_symbol: 'pds_vfio_dirty_reset', why_this_location_matters: 'the module side',
+    code_snippet: 'reset();' };
+const PLAIN_LOC = { file: 'vfio/dirty.c', line: 681, function_or_symbol: 'pds_vfio_dirty_reset',
+    why_this_location_matters: 'the module side', code_snippet: 'reset();' };
+
+// The Code Trace of some locations, or "THREW ..." when the renderer throws.
+const codeTrace = (fns, locations, refs) => {
+    try {
+        return String(fns.renderReviewMapCodeSnippets(locations, fns.referencePins(refs)));
+    } catch (e) { return `THREW ${e}`; }
+};
+const titlesOf = html => [...html.matchAll(/title="([^"]*)"/g)].map(m => m[1]);
+// Text as read, with tags dropped rather than turned into spaces, since the
+// label is its own element directly before the path.
+const readText = html => html.replace(/<[^>]*>/g, '');
+
+function locationRepoLabelChecks(fns, expect) {
+    const card = findingsBlock(findingsCard(fns, [{ severity: 'High', problem: 'p',
+        locations: [KERNEL_LOC, REVIEW_LOC] }], { reference_repos: finishedRefs }));
+    expect('label: the card names a reference location\'s repository before its path',
+        readText(card).includes('kernel:include/linux/pds/pds_adminq.h:7 (pdsc_notify)'));
+    expect('label: a "review" location has no label',
+        card.includes('<code>vfio/dirty.c:681 (pds_vfio_dirty_reset)</code>')
+            && !visibleText(card).includes('review:'));
+    const trace = codeTrace(fns, [KERNEL_LOC, REVIEW_LOC], finishedRefs);
+    expect('label: the Code Trace names it too',
+        /kernel:<\/span><strong>include\/linux\/pds\/pds_adminq\.h:7<\/strong>/.test(trace)
+            && !visibleText(trace).includes('review:'));
+    expect('label: a location with only a function is labelled',
+        readText(fns.renderFindingLocations([{ repo: 'kernel', function_or_symbol: 'kref_put' }]))
+            === 'kernel:kref_put');
+    const padded = String(fns.renderFindingLocations([{ ...KERNEL_LOC, repo: ' kernel\n' }],
+        fns.referencePins(finishedRefs)));
+    expect('label: a padded repo is made one line and still finds its pin',
+        readText(padded).startsWith('kernel:include/')
+            && titlesOf(padded).some(t => t.includes('kernel @ v6.18')));
+    const blank = visibleText(fns.renderFindingLocations([
+        { repo: ' ', file: 'a.c' }, { repo: 7, file: 'b.c' }, { repo: null, file: 'c.c' }]));
+    expect('label: a blank or non-string repo is no label',
+        blank.includes('a.c') && !blank.includes(':a.c') && !blank.includes(':b.c') && !blank.includes(':c.c'));
+}
+
+function locationRepoHoverChecks(fns, expect) {
+    const card = findingsBlock(findingsCard(fns, [{ severity: 'High', problem: 'p',
+        locations: [KERNEL_LOC] }], { reference_repos: JSON.stringify(finishedRefs) }));
+    const pin = `kernel @ v6.18 (${SHA.slice(0, 12)})`;
+    expect('hover: the card\'s label carries the pin, from a record stored as text',
+        titlesOf(card).some(t => t.includes(pin)));
+    expect('hover: the Code Trace\'s label carries the pin',
+        titlesOf(codeTrace(fns, [KERNEL_LOC], finishedRefs)).some(t => t.includes(pin)));
+    const rdma = codeTrace(fns, [{ ...KERNEL_LOC, repo: 'rdma-core' }], finishedRefs);
+    expect('hover: each reference carries its own pin',
+        titlesOf(rdma).some(t => t.includes(`rdma-core @ origin/ionic-rdma (${RDMA_SHA.slice(0, 12)})`)));
+    const unknown = codeTrace(fns, [KERNEL_LOC], undefined);
+    expect('hover: without a record the label stays, with no pin',
+        visibleText(unknown).includes('kernel:') && !titlesOf(unknown).some(t => t.includes(' @ '))
+            && !unknown.includes('undefined'));
+    expect('hover: a malformed record gives no pins',
+        fns.referencePins('{bad').size === 0 && fns.referencePins({ attached: 'x' }).size === 0
+            && fns.referencePins({ attached: [null, { name: 3 }] }).size === 0);
+}
+
+function locationRepoEscapingChecks(fns, expect) {
+    const evil = '<script>x</script>"onerror=alert(1)';
+    const loc = { repo: evil, file: 'a.c', repo_conflict: true, unverified_path: true };
+    const refs = { attached: [{ name: evil, revision: evil, commit: SHA }] };
+    for (const [where, html] of [
+        ['card', findingsBlock(findingsCard(fns, [{ severity: 'High', problem: 'p', locations: [loc] }],
+            { reference_repos: refs }))],
+        ['Code Trace', codeTrace(fns, [loc], refs)]]) {
+        expect(`escaping: no raw markup in the ${where}'s label, hover or warnings`,
+            html.length > 0 && !html.includes('<script>') && !html.includes('"onerror'));
+        // The label, its hover (name and revision), both warnings and both of
+        // their hovers.
+        expect(`escaping: the ${where} shows the name escaped everywhere it appears`,
+            html.split('&lt;script&gt;').length - 1 >= 7);
+    }
+}
+
+function locationRepoWarningChecks(fns, expect) {
+    const conflict = { ...KERNEL_LOC, repo_conflict: true };
+    const missing = { ...KERNEL_LOC, repo: 'rdma-core', unverified_path: true };
+    const missingHere = { ...REVIEW_LOC, unverified_path: true };
+    const card = visibleText(findingsBlock(findingsCard(fns, [{ severity: 'High', problem: 'p',
+        locations: [conflict, missing, missingHere] }], { reference_repos: finishedRefs })));
+    const trace = visibleText(codeTrace(fns, [conflict, missing, missingHere], finishedRefs));
+    for (const [where, text] of [['card', card], ['Code Trace', trace]]) {
+        expect(`warning: the ${where} tags a conflict with the repository's name`,
+            text.includes('(kernel copy of module code)'));
+        expect(`warning: the ${where} tags a path not found in its reference`,
+            text.includes('(path not found in rdma-core)'));
+        expect(`warning: the ${where} tags a path not found in the code under review`,
+            text.includes('(path not found in the code under review)'));
+    }
+    const notTrue = visibleText(fns.renderFindingLocations([
+        { ...KERNEL_LOC, repo_conflict: 'yes', unverified_path: 1 }]));
+    expect('warning: only a JSON true is a warning',
+        !notTrue.includes('copy of module code') && !notTrue.includes('not found'));
+    const reviewConflict = visibleText(fns.renderFindingLocations([{ ...REVIEW_LOC, repo_conflict: true }]));
+    expect('warning: a location under review is never a reference\'s copy',
+        !reviewConflict.includes('copy of module code'));
+}
+
+function locationRepoUnchangedChecks(fns, expect) {
+    const card = findingsBlock(findingsCard(fns, [{ severity: 'High', problem: 'p',
+        locations: [PLAIN_LOC] }], { reference_repos: finishedRefs }));
+    const before = '<div><div><code>vfio/dirty.c:681 (pds_vfio_dirty_reset)</code>'
+        + '<div class="finding-muted">the module side</div></div></div>';
+    expect('unchanged: an unlabelled location renders as before on the card',
+        card.includes(before) && String(fns.renderFindingLocations([PLAIN_LOC])) === before);
+    expect('unchanged: a "review" location renders as an unlabelled one',
+        String(fns.renderFindingLocations([REVIEW_LOC], fns.referencePins(finishedRefs))) === before);
+    const plainTrace = codeTrace(fns, [PLAIN_LOC], finishedRefs);
+    expect('unchanged: an unlabelled Code Trace entry renders as before',
+        plainTrace.includes('<div><strong>vfio/dirty.c:681</strong> <span style="color:var(--text-dim);">'
+            + '&middot;</span> <span class="fn-name">pds_vfio_dirty_reset</span></div>')
+            && plainTrace === codeTrace(fns, [REVIEW_LOC], finishedRefs)
+            && plainTrace === codeTrace(fns, [PLAIN_LOC], undefined));
+}
+
+function locationRepoChecks(fns) {
+    const failed = [];
+    const expect = (name, cond) => { if (!cond) failed.push(name); };
+    for (const group of [locationRepoLabelChecks, locationRepoHoverChecks, locationRepoEscapingChecks,
+                         locationRepoWarningChecks, locationRepoUnchangedChecks]) {
+        try { group(fns, expect); } catch (e) { failed.push(`${group.name}: threw ${e}`); }
+    }
+    return failed;
+}
+console.log('a location\'s repository');
+{
+    const repoFailures = locationRepoChecks(ctx);
+    check('every location repository check passes', repoFailures.length === 0, repoFailures.join(', '));
+    // The review map is drawn by an async view that fetches, so its wiring is
+    // held to the source: its Code Trace gets the pins of the review it shows.
+    const mapView = grab('renderReviewMapView');
+    check('the review map reads its pins from the review it shows',
+        mapView.includes('const referencePinsOfReview = referencePins(data.reference_repos);')
+            && mapView.includes('renderReviewMapCodeSnippets(primaryLocations, referencePinsOfReview)'));
+}
+
 // ---- the checks catch what they are for -----------------------------------
 // The checks above are only worth something if they fail on a broken page.
 // Build broken copies from the page's own source and make sure they are caught.
@@ -2766,8 +2919,8 @@ const mutate = (name, from, to) => {
         ['a speculative tag on any truthy value is caught',
             mutate('findingTags', 'f.speculative === true', 'f.speculative')],
         ['a not-marked note shown on every row is caught',
-            mutate('renderFindingsList', '${notMarked}${listed.map(({ f }) => renderFindingRow(f)).join(\'\')}',
-                '${listed.map(({ f }) => notMarked + renderFindingRow(f)).join(\'\')}')],
+            mutate('renderFindingsList', '${notMarked}${listed.map(({ f }) => renderFindingRow(f, pins)).join(\'\')}',
+                '${listed.map(({ f }) => notMarked + renderFindingRow(f, pins)).join(\'\')}')],
         ['a not-marked note that never shows is caught',
             mutate('renderFindingsList', "typeof f.speculative !== 'boolean'", 'false')],
         ['a not-marked note that shows beside marked findings is caught',
@@ -2797,8 +2950,8 @@ const mutate = (name, from, to) => {
             mutate('renderFindingRow', "f.severity.trim() !== ''", "f.severity !== ''")],
         ['a row with the reasoning after the locations is caught',
             mutate('renderFindingRow',
-                '+ renderSeverityCalibration(f.severity_explanation)\n                + renderFindingLocations(f.locations)',
-                '+ renderFindingLocations(f.locations)\n                + renderSeverityCalibration(f.severity_explanation)')],
+                '+ renderSeverityCalibration(f.severity_explanation)\n                + renderFindingLocations(f.locations, pins)',
+                '+ renderFindingLocations(f.locations, pins)\n                + renderSeverityCalibration(f.severity_explanation)')],
         ['a row with the full problem after the reasoning is caught',
             mutate('renderFindingRow',
                 "const body = (clipped ? `<div class=\"finding-text\">${escapeHtml(f.problem.trim())}</div>` : '')\n                + renderSeverityCalibration(f.severity_explanation)",
@@ -2861,6 +3014,59 @@ const mutate = (name, from, to) => {
     ];
     for (const [name, broken] of findingMutations) {
         check(name, findingChecks(broken).length > 0);
+    }
+
+    const locationRepoMutations = [
+        ['a card location without its repository label is caught',
+            mutate('renderFindingLocations', '<code>${repo.label}', '<code>')],
+        ['a Code Trace entry without its repository label is caught',
+            mutate('renderReviewMapCodeSnippets', '${stepNum}${item.repo.label}', '${stepNum}')],
+        ['a label on a "review" location is caught',
+            mutate('locationRepoParts', "repo !== '' && repo !== 'review' ? repo : ''", "repo")],
+        ['a label that is not escaped is caught',
+            load({ ...sources, locationRepoParts: sources.locationRepoParts.replaceAll('escapeHtml(', 'String(') })],
+        ['a label whose hover is not escaped is caught',
+            mutate('locationRepoParts', 'title="${escapeHtml(hover)}"', 'title="${hover}"')],
+        ['a hover without the pin is caught',
+            mutate('locationRepoParts', 'const pin = reference ? pins.get(reference) : undefined;',
+                'const pin = undefined;')],
+        ['pins that ignore a record stored as text are caught',
+            mutate('referencePins', "if (typeof refs === 'string') refs = JSON.parse(refs);", '')],
+        ['pins without the short commit are caught',
+            mutate('referencePins', "commit ? ` (${commit})` : ''", "''")],
+        ['a card that does not pass the review\'s pins is caught',
+            mutate('renderReviewCard', 'pins: referencePins(r.reference_repos)', 'pins: new Map()')],
+        ['a row that does not pass the pins to its locations is caught',
+            mutate('renderFindingRow', 'renderFindingLocations(f.locations, pins)', 'renderFindingLocations(f.locations)')],
+        ['a list that does not pass the pins to its rows is caught',
+            mutate('renderFindingsList', 'renderFindingRow(f, pins)', 'renderFindingRow(f)')],
+        ['a conflict warning that hard-codes kernel is caught',
+            mutate('locationRepoParts', '">(${escapeHtml(reference)} copy of module code)', '">(kernel copy of module code)')],
+        ['a conflict warning that never shows is caught',
+            mutate('locationRepoParts', 'reference && loc.repo_conflict === true', 'false')],
+        ['a conflict warning on any truthy value is caught',
+            mutate('locationRepoParts', 'loc.repo_conflict === true', 'loc.repo_conflict')],
+        ['a conflict warning on a location under review is caught',
+            mutate('locationRepoParts', 'reference && loc.repo_conflict === true', 'loc.repo_conflict === true')],
+        ['a path warning that never shows is caught',
+            mutate('locationRepoParts', 'if (loc.unverified_path === true)', 'if (false)')],
+        ['a path warning on any truthy value is caught',
+            mutate('locationRepoParts', 'if (loc.unverified_path === true)', 'if (loc.unverified_path)')],
+        ['a path warning that does not name the repository is caught',
+            mutate('locationRepoParts', "const tree = reference || 'the code under review';",
+                "const tree = 'the code under review';")],
+        ['a card location without its warnings is caught',
+            mutate('renderFindingLocations', "+ repo.warnings.map(tag => ` ${tag}`).join('')", "+ ''")],
+        ['a Code Trace entry without its warnings is caught',
+            mutate('renderReviewMapCodeSnippets', '${warningsHtml}</div>', '</div>')],
+        ['a label that is not trimmed to one line is caught',
+            mutate('locationRepoParts', "typeof loc.repo === 'string' ? oneLine(loc.repo) : ''",
+                "loc.repo == null ? '' : String(loc.repo)")],
+        ['a label always shown, changing unlabelled locations, is caught',
+            mutate('renderFindingLocations', '<code>${repo.label}', '<code><span></span>${repo.label}')],
+    ];
+    for (const [name, broken] of locationRepoMutations) {
+        check(name, locationRepoChecks(broken).length > 0);
     }
     const noPartialCard = mutate('renderReviewStatCards',
         "+ renderStatCard('Total Partial', reviewsData.total_partial ?? 0)", '');
