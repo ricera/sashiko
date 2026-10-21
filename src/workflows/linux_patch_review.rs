@@ -160,6 +160,11 @@ pub struct LinuxPatchReviewState {
     /// review as out-of-tree: the repository has no mainline history and no
     /// kernel headers of its own.
     pub references: Vec<ReferenceRepo>,
+    /// The paths of the code under review and of each attached reference, and
+    /// the names the code under review defines, for the validators that check
+    /// a location against the tree it names. `None` when no reference is
+    /// attached, so a single-tree review does no extra work.
+    pub tree_index: Option<std::sync::Arc<crate::tree_index::TreeIndex>>,
 
     /// Subsystem guide markdown files selected during the pre-screen and
     /// shared with every stage.

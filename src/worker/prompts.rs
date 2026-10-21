@@ -635,6 +635,15 @@ impl Worker {
             ),
         };
 
+        let references = self.tools.references().to_vec();
+        let tree_index = crate::tree_index::TreeIndex::build_for_patch(
+            worktree_path.to_path_buf(),
+            target_commit_sha.clone(),
+            series_tip(self.series_range.as_deref()).map(str::to_string),
+            references.clone(),
+        )
+        .await;
+
         let mut state = LinuxPatchReviewState {
             ps_id,
             p_id,
@@ -648,7 +657,8 @@ impl Worker {
             follow_up_series_context,
             cover_letter: payload_cover_letter(&patchset),
             prior_reviews: payload_prior_review_context(&patchset),
-            references: self.tools.references().to_vec(),
+            references,
+            tree_index,
             selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
@@ -833,16 +843,22 @@ pub fn calculate_series_range(
     }
 }
 
+/// The last commit of a range [`calculate_series_range`] built; `None`
+/// without a range or when its tip is empty. Every reader of the tip goes
+/// through here so that they all follow the range's format.
+pub fn series_tip(series_range: Option<&str>) -> Option<&str> {
+    series_range?
+        .split("..")
+        .nth(1)
+        .filter(|tip| !tip.is_empty())
+}
+
 pub fn build_follow_up_series_context(
     series_range: Option<&str>,
     patchset: &Value,
     target_commit_sha: &str,
 ) -> Option<String> {
-    let range = series_range?;
-    let end_sha = range.split("..").nth(1)?;
-    if end_sha.is_empty() {
-        return None;
-    }
+    let end_sha = series_tip(series_range)?;
 
     let current_idx = patchset["patch_index"].as_i64().unwrap_or(1);
     let patches = patchset["patches"].as_array()?;
@@ -953,9 +969,7 @@ pub fn build_sashiko_series_context(
     preceding.sort_by_key(|(idx, _, _)| *idx);
     follow_ups.sort_by_key(|(idx, _, _)| *idx);
 
-    let end_sha = series_range
-        .and_then(|r| r.split("..").nth(1))
-        .filter(|s| !s.is_empty())
+    let end_sha = series_tip(series_range)
         .or_else(|| {
             patches
                 .iter()
