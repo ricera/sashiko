@@ -138,13 +138,7 @@ impl PriorFinding {
         }
         let locations = locations
             .and_then(Value::as_array)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(FindingLocation::from_json)
-                    .take(MAX_PRIOR_LOCATIONS)
-                    .collect()
-            })
+            .map(|entries| summary_locations(entries.iter().filter_map(FindingLocation::from_json)))
             .unwrap_or_default();
         Some(Self {
             severity,
@@ -155,6 +149,34 @@ impl PriorFinding {
             prior,
         })
     }
+}
+
+/// The `MAX_PRIOR_LOCATIONS` locations a summary keeps, in their stored
+/// order. Locations in the code under review are kept first and reference
+/// locations fill the slots left: only the former can show that a finding
+/// cites the patch under review, and a model often lists the reference
+/// contract first, which would otherwise push the module's own location out.
+fn summary_locations(parsed: impl Iterator<Item = FindingLocation>) -> Vec<FindingLocation> {
+    let parsed: Vec<FindingLocation> = parsed.collect();
+    let under_review = parsed
+        .iter()
+        .filter(|location| location.in_code_under_review())
+        .count();
+    let mut review_slots = MAX_PRIOR_LOCATIONS;
+    let mut reference_slots = MAX_PRIOR_LOCATIONS.saturating_sub(under_review);
+    parsed
+        .into_iter()
+        .filter(|location| {
+            let slots = if location.in_code_under_review() {
+                &mut review_slots
+            } else {
+                &mut reference_slots
+            };
+            let kept = *slots > 0;
+            *slots = slots.saturating_sub(1);
+            kept
+        })
+        .collect()
 }
 
 /// How a finding relates to the finding of an earlier revision it links to.
@@ -865,20 +887,27 @@ impl<'a> TargetView<'a> {
 
     /// Whether a finding cites code in the patch under review: a file this
     /// diff touches, or an identifier this diff names, which follows code
-    /// that moved to another file.
+    /// that moved to another file. Only locations in the code under review
+    /// count: a reference repository's copy of a file can share its path
+    /// with a file the diff touches, and a reference's function can share a
+    /// name the diff calls, without being the code this patch changes.
     fn is_cited_by(&self, finding: &PriorFinding) -> bool {
-        finding.locations.iter().any(|location| {
-            let cites_file = location
-                .file
-                .as_deref()
-                .is_some_and(|file| self.files.iter().any(|touched| same_file(file, touched)));
-            let cites_identifier = location
-                .function_or_symbol
-                .as_deref()
-                .and_then(cited_identifier)
-                .is_some_and(|identifier| contains_identifier(self.diff, identifier));
-            cites_file || cites_identifier
-        })
+        finding
+            .locations
+            .iter()
+            .filter(|location| location.in_code_under_review())
+            .any(|location| {
+                let cites_file = location
+                    .file
+                    .as_deref()
+                    .is_some_and(|file| self.files.iter().any(|touched| same_file(file, touched)));
+                let cites_identifier = location
+                    .function_or_symbol
+                    .as_deref()
+                    .and_then(cited_identifier)
+                    .is_some_and(|identifier| contains_identifier(self.diff, identifier));
+                cites_file || cites_identifier
+            })
     }
 }
 
@@ -1211,8 +1240,9 @@ fn push_line(block: &mut String, prefix: &str, text: &str) {
 
 /// The newest revision's version of the code its listed findings about the
 /// patch under review cite: the sections, in any of its patches' diffs, for
-/// the files those findings name, cut to `PRIOR_REVISION_DIFF_TOKENS`, each
-/// line behind the quote prefix. Nothing when no such file has a section.
+/// the files those findings name in the code under review, cut to
+/// `PRIOR_REVISION_DIFF_TOKENS`, each line behind the quote prefix. Nothing
+/// when no such file has a section.
 ///
 /// The files are gathered over the whole revision, because a finding on
 /// another patch can cite a file of the patch under review that only the
@@ -1224,6 +1254,7 @@ fn render_diff(block: &mut String, revision: &ListedRevision<'_>) {
         .flat_map(|patch| &patch.findings)
         .filter(|finding| finding.kept && finding.about_target)
         .flat_map(|finding| &finding.finding.locations)
+        .filter(|location| location.in_code_under_review())
         .filter_map(|location| location.file.as_deref())
         .collect();
     let cited: String = revision
@@ -1280,6 +1311,7 @@ mod tests {
 
     fn location(file: &str, function: &str, line: u64) -> FindingLocation {
         FindingLocation {
+            repo: None,
             file: Some(file.to_string()),
             function_or_symbol: Some(function.to_string()),
             line: Some(line),
@@ -1908,6 +1940,146 @@ mod tests {
         );
         assert!(block.contains("\n| +registered = true;\n"), "{block}");
         assert!(!block.contains("harness();"), "only the files they cite");
+    }
+
+    /// A location in a reference repository is shown with its repository,
+    /// but neither marks a finding as about the patch under review, though
+    /// its path is a file the diff touches and its function a name the diff
+    /// calls, nor brings that file's section of the earlier diff.
+    #[test]
+    fn reference_locations_are_labelled_and_cite_nothing_under_review() {
+        let in_repo = |repo: &str, file: &str, symbol: &str| {
+            let mut location = location(file, symbol, 42);
+            location.repo = Some(repo.to_string());
+            location
+        };
+        let mut kernel_only = finding("kernel copy races", "unused.c", "x");
+        kernel_only.locations = vec![in_repo(
+            "kernel",
+            "drivers/pds/cper.c",
+            "pdsc_cper_register",
+        )];
+        let mut earlier = patch(
+            2,
+            "pds_core: add CPER",
+            vec![finding("main stalls", "core/main.c", "x")],
+        );
+        earlier.findings[0]
+            .locations
+            .push(in_repo("kernel", "drivers/pds/cper.c", "x"));
+        earlier.diff = Some(
+            "diff --git a/core/main.c b/core/main.c\n+stall();\n\
+             diff --git a/drivers/pds/cper.c b/drivers/pds/cper.c\n+registered = true;\n"
+                .to_string(),
+        );
+        let block = rendered(
+            &[revision(
+                "v2",
+                vec![earlier, patch(3, "tools: add harness", vec![kernel_only])],
+            )],
+            "pds_core: add CPER",
+        );
+
+        assert!(
+            block.contains("  - [High] kernel copy races\n"),
+            "unmarked: {block}"
+        );
+        assert!(
+            block.contains("    At: kernel:drivers/pds/cper.c:42 (pdsc_cper_register)\n"),
+            "{block}"
+        );
+        assert!(
+            block.contains("    At: core/main.c:42 (x); kernel:drivers/pds/cper.c:42 (x)\n"),
+            "{block}"
+        );
+        assert!(block.contains("\n| +stall();\n"), "{block}");
+        assert!(!block.contains("registered = true;"), "{block}");
+
+        // The same location in the code under review marks the finding.
+        let review = finding("review copy races", "drivers/pds/cper.c", "x");
+        let block = rendered(
+            &[revision(
+                "v2",
+                vec![patch(3, "tools: add harness", vec![review])],
+            )],
+            "pds_core: add CPER",
+        );
+        assert!(
+            block.contains(&format!(
+                "  - [High] {CITES_TARGET_MARKER} review copy races\n"
+            )),
+            "{block}"
+        );
+    }
+
+    /// A summary read from a stored finding keeps a reference location's
+    /// repository and reads a "review" label as no label.
+    #[test]
+    fn a_stored_finding_keeps_its_locations_repositories() {
+        let locations = json!([
+            {"repo": "review", "file": "core/core.c", "function_or_symbol": "pdsc_notify", "line": 23},
+            {"repo": "kernel", "file": "include/linux/kref.h", "function_or_symbol": "kref_put", "line": 64}
+        ]);
+        let finding = PriorFinding::from_stored(Severity::High, "p", None, Some(&locations), None)
+            .expect("a titled finding");
+        assert_eq!(
+            finding.locations,
+            vec![
+                location("core/core.c", "pdsc_notify", 23),
+                FindingLocation {
+                    repo: Some("kernel".to_string()),
+                    ..location("include/linux/kref.h", "kref_put", 64)
+                },
+            ]
+        );
+    }
+
+    /// Reference locations listed first never push a location in the code
+    /// under review out of a summary; they fill only the slots it leaves.
+    #[test]
+    fn a_summary_keeps_locations_under_review_first() {
+        let kernel = |file: &str, symbol: &str| json!({"repo": "kernel", "file": file, "function_or_symbol": symbol, "line": 1});
+        let review = |file: &str| json!({"file": file, "function_or_symbol": "x", "line": 1});
+        let summary = |locations: Value| {
+            PriorFinding::from_stored(Severity::High, "p", None, Some(&locations), None)
+                .expect("a titled finding")
+                .locations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            summary(json!([
+                kernel("drivers/pds/core.c", "pdsc_notify"),
+                kernel("include/linux/pds/pds_adminq.h", "cmd"),
+                review("vfio/dirty.c"),
+            ])),
+            vec![
+                "kernel:drivers/pds/core.c:1 (pdsc_notify)",
+                "vfio/dirty.c:1 (x)"
+            ]
+        );
+        assert_eq!(
+            summary(json!([
+                kernel("drivers/pds/core.c", "pdsc_notify"),
+                review("vfio/dirty.c"),
+                review("vfio/pci.c"),
+            ])),
+            vec!["vfio/dirty.c:1 (x)", "vfio/pci.c:1 (x)"]
+        );
+        assert_eq!(
+            summary(json!([review("a.c"), review("b.c"), review("c.c"),])),
+            vec!["a.c:1 (x)", "b.c:1 (x)"]
+        );
+        assert_eq!(
+            summary(json!([
+                kernel("a.h", "a"),
+                kernel("b.h", "b"),
+                kernel("c.h", "c"),
+            ])),
+            vec!["kernel:a.h:1 (a)", "kernel:b.h:1 (b)"]
+        );
     }
 
     /// A patch's header is charged to the budget with its first kept

@@ -2887,26 +2887,15 @@ fn write_finding(
     Ok(())
 }
 
+/// Formats a location that names a file the way the one-line views do
+/// (`finding_view::FindingLocation`), so a location in a reference repository
+/// reads `repo:file:line (function)` here too. A line of 0 is left out, as
+/// it is no line of the file.
 fn format_location(loc: &Value) -> Option<String> {
-    let file = loc
-        .get("file")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
-    let line = loc.get("line").and_then(|v| v.as_i64()).filter(|&l| l > 0);
-    let symbol = loc
-        .get("function_or_symbol")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    let formatted = match (line, symbol) {
-        (Some(l), Some(s)) => format!("{file}:{l} ({s})"),
-        (Some(l), None) => format!("{file}:{l}"),
-        (None, Some(s)) => format!("{file} ({s})"),
-        (None, None) => file.to_string(),
-    };
-    Some(formatted)
+    let mut location = finding_view::FindingLocation::from_json(loc)?;
+    location.file.as_ref()?;
+    location.line = location.line.filter(|&line| line > 0);
+    Some(location.to_string())
 }
 
 fn write_locations(out: &mut impl WriteColor, item: &Value) -> std::io::Result<()> {
@@ -3925,6 +3914,33 @@ mod tests {
                 .contains("Critical: 0  High: 1  Medium: 0  Low: 1  First reported: 1\n")
         );
         assert!(!output_of(serde_json::json!([plain])).contains("First reported"));
+    }
+
+    /// A detailed location names its repository when it is a reference's
+    /// and reads as before otherwise: a file is required, and a line of 0
+    /// is left out.
+    #[test]
+    fn a_detailed_location_names_a_reference_repository() {
+        let format = |location: Value| format_location(&location);
+        assert_eq!(
+            format(
+                serde_json::json!({"repo": "kernel", "file": "include/linux/kref.h",
+                "line": 64, "function_or_symbol": "kref_put"})
+            )
+            .as_deref(),
+            Some("kernel:include/linux/kref.h:64 (kref_put)")
+        );
+        let review = serde_json::json!({"repo": "review", "file": " vfio/dirty.c ",
+            "line": 681, "function_or_symbol": "reset"});
+        assert_eq!(format(review).as_deref(), Some("vfio/dirty.c:681 (reset)"));
+        assert_eq!(
+            format(serde_json::json!({"file": "f.c", "line": 0})).as_deref(),
+            Some("f.c")
+        );
+        assert_eq!(
+            format(serde_json::json!({"repo": "kernel", "function_or_symbol": "kref_put"})),
+            None
+        );
     }
 
     #[test]

@@ -3065,15 +3065,8 @@ impl Reviewer {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let locations = concern.get("locations").cloned();
-        let source_files: Vec<String> = locations
-            .as_ref()
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-            .filter_map(|loc| loc.get("file").and_then(|v| v.as_str()))
-            .map(str::to_string)
-            .collect();
+        let locations = Self::concern_locations_under_review(concern.get("locations"));
+        let source_files = Self::concern_source_files(locations.as_ref());
         let project = ctx.settings.project.kind.unwrap_or_default();
         let input = crate::api::BugInput {
             problem,
@@ -3109,6 +3102,38 @@ impl Reviewer {
         {
             warn!("Failed to queue candidate pre-existing bug: {}", e);
         }
+    }
+
+    /// A concern's locations in the code under review. The bug pipeline reads
+    /// every location's path in the tree the patch applies to (to quote it,
+    /// blame it and search for its fix), so a location in a reference
+    /// repository, whose path can name a different file of the same name
+    /// there, is left out. A value that is not an array is handed on as is.
+    fn concern_locations_under_review(locations: Option<&Value>) -> Option<Value> {
+        let locations = locations?;
+        let Some(entries) = locations.as_array() else {
+            return Some(locations.clone());
+        };
+        Some(Value::Array(
+            entries
+                .iter()
+                .filter(|loc| crate::finding_view::reference_repo_of(loc).is_none())
+                .cloned()
+                .collect(),
+        ))
+    }
+
+    /// The files of a concern's locations in the code under review, read
+    /// from what [`Self::concern_locations_under_review`] keeps.
+    fn concern_source_files(locations: Option<&Value>) -> Vec<String> {
+        locations
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|loc| crate::finding_view::reference_repo_of(loc).is_none())
+            .filter_map(|loc| loc.get("file").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect()
     }
 
     /// The subsystems a concern touching `source_files` is attributed to.
@@ -5275,6 +5300,46 @@ mod tests {
 
         assert_eq!(ids.len(), 1_000);
         assert!(ids.iter().all(|id| id.starts_with("rev_1234_")));
+    }
+
+    /// A concern hands the bug pipeline its locations in the code under
+    /// review and their files, labelled "review" or not, and neither a
+    /// location in a reference repository nor its file.
+    #[test]
+    fn a_handed_off_concern_names_only_files_under_review() {
+        let locations = json!([
+            {"file": "vfio/dirty.c", "line": 681},
+            {"repo": "review", "file": "vfio/pci_drv.c"},
+            {"repo": "kernel", "file": "drivers/net/ethernet/amd/pds_core/core.c"},
+            {"repo": "kernel", "file": "include/linux/pds/pds_adminq.h"},
+            {"repo": "review", "function_or_symbol": "pds_vfio_reset"}
+        ]);
+        assert_eq!(
+            Reviewer::concern_source_files(Some(&locations)),
+            vec!["vfio/dirty.c".to_string(), "vfio/pci_drv.c".to_string()]
+        );
+        assert!(Reviewer::concern_source_files(None).is_empty());
+        assert!(Reviewer::concern_source_files(Some(&json!("vfio/dirty.c"))).is_empty());
+
+        // The locations handed on agree with the files.
+        let kept = Reviewer::concern_locations_under_review(Some(&locations));
+        assert_eq!(
+            kept,
+            Some(json!([
+                {"file": "vfio/dirty.c", "line": 681},
+                {"repo": "review", "file": "vfio/pci_drv.c"},
+                {"repo": "review", "function_or_symbol": "pds_vfio_reset"}
+            ]))
+        );
+        assert_eq!(
+            Reviewer::concern_source_files(kept.as_ref()),
+            Reviewer::concern_source_files(Some(&locations))
+        );
+        assert_eq!(Reviewer::concern_locations_under_review(None), None);
+        assert_eq!(
+            Reviewer::concern_locations_under_review(Some(&json!("x"))),
+            Some(json!("x"))
+        );
     }
 
     fn run_git(repo: &Path, args: &[&str]) -> Result<String> {

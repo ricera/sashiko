@@ -25367,6 +25367,7 @@ mod tests {
                 problem: "drain races the refill".to_string(),
                 consequence: Some("drain races the refill corrupts the ring.".to_string()),
                 locations: vec![crate::finding_view::FindingLocation {
+                    repo: None,
                     file: Some("drivers/frob/ring.c".to_string()),
                     function_or_symbol: Some("frob_fill".to_string()),
                     line: Some(42),

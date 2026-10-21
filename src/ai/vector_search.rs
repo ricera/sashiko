@@ -122,7 +122,7 @@ pub fn extract_bug_vector(
 
     // 3. Source files and directory hierarchies (Weight: 2.0 - 6.0)
     for file_path in source_files {
-        add_file_path_features(&mut raw_weights, file_path);
+        add_file_path_features(&mut raw_weights, None, file_path);
     }
 
     // 4. Locations JSON (functions, symbols, files) (Weight: 3.0 - 5.0)
@@ -131,7 +131,8 @@ pub fn extract_bug_vector(
     {
         for loc in arr {
             if let Some(file) = loc.get("file").and_then(|v| v.as_str()) {
-                add_file_path_features(&mut raw_weights, file);
+                let repo = crate::finding_view::reference_repo_of(loc);
+                add_file_path_features(&mut raw_weights, repo.as_deref(), file);
             }
             if let Some(symbol) = loc.get("function_or_symbol").and_then(|v| v.as_str()) {
                 let sym_clean = symbol.trim().to_lowercase();
@@ -164,19 +165,28 @@ pub fn extract_bug_vector(
     }
 }
 
-/// Adds hierarchical path components to feature weights.
-fn add_file_path_features(weights: &mut HashMap<String, f32>, file_path: &str) {
+/// Adds hierarchical path components to feature weights. A path in a
+/// reference repository (`repo` is its name) has its features prefixed with
+/// `repo:`, so the kernel's `include/linux/pds/pds_adminq.h` and a module's
+/// own file of that name are different features; a path in the code under
+/// review keeps the features it always had.
+fn add_file_path_features(weights: &mut HashMap<String, f32>, repo: Option<&str>, file_path: &str) {
     let clean_path = file_path.trim().trim_start_matches("./").to_lowercase();
     if clean_path.is_empty() {
         return;
     }
+    let repo = repo.map_or_else(String::new, |repo| format!("{}:", repo.to_lowercase()));
 
     // Full exact path (highest localization weight)
-    *weights.entry(format!("file:{}", clean_path)).or_insert(0.0) += 6.0;
+    *weights
+        .entry(format!("file:{repo}{clean_path}"))
+        .or_insert(0.0) += 6.0;
 
     let parts: Vec<&str> = clean_path.split('/').collect();
     if let Some(&filename) = parts.last() {
-        *weights.entry(format!("fname:{}", filename)).or_insert(0.0) += 4.0;
+        *weights
+            .entry(format!("fname:{repo}{filename}"))
+            .or_insert(0.0) += 4.0;
     }
 
     // Hierarchical directory prefixes (e.g. drivers/net/ethernet/intel/)
@@ -189,7 +199,9 @@ fn add_file_path_features(weights: &mut HashMap<String, f32>, file_path: &str) {
             current_dir.push('/');
         }
         current_dir.push_str(part);
-        *weights.entry(format!("dir:{}", current_dir)).or_insert(0.0) += 2.5;
+        *weights
+            .entry(format!("dir:{repo}{current_dir}"))
+            .or_insert(0.0) += 2.5;
     }
 }
 
@@ -406,6 +418,50 @@ mod tests {
             sim_unrelated < 0.1,
             "Unrelated bugs should have very low similarity, got {}",
             sim_unrelated
+        );
+    }
+
+    /// A location in a reference repository gives path features under its
+    /// repository's name, so it shares none with the same path in the code
+    /// under review; a location labelled "review" gives the features an
+    /// unlabelled one does.
+    #[test]
+    fn reference_location_paths_are_features_of_their_repository() {
+        let path_features = |location: serde_json::Value| {
+            let mut features: Vec<String> =
+                extract_bug_vector("", &[], &[], Some(&json!([location])))
+                    .features
+                    .into_keys()
+                    .filter(|feature| !feature.starts_with("sym"))
+                    .collect();
+            features.sort();
+            features
+        };
+        let file = "include/linux/pds/pds_adminq.h";
+        let unlabelled = path_features(json!({"file": file}));
+        assert_eq!(
+            unlabelled,
+            [
+                "dir:include",
+                "dir:include/linux",
+                "dir:include/linux/pds",
+                "file:include/linux/pds/pds_adminq.h",
+                "fname:pds_adminq.h",
+            ]
+        );
+        assert_eq!(
+            path_features(json!({"repo": "review", "file": file})),
+            unlabelled
+        );
+        assert_eq!(
+            path_features(json!({"repo": "Kernel", "file": file})),
+            [
+                "dir:kernel:include",
+                "dir:kernel:include/linux",
+                "dir:kernel:include/linux/pds",
+                "file:kernel:include/linux/pds/pds_adminq.h",
+                "fname:kernel:pds_adminq.h",
+            ]
         );
     }
 

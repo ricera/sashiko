@@ -22,7 +22,9 @@
 //! shows, so a summary of an earlier finding can say what it leads to.
 
 use crate::db::Severity;
+use crate::location_repo::LOCATION_REPO_KEY;
 use crate::prior_revisions::{PriorLink, PriorRelation};
+use crate::toolbox::REPO_ARG_REVIEW;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -298,10 +300,15 @@ pub fn sanitize_one_line(text: &str, max_chars: usize) -> String {
 /// verification schema asks for an integer and a guessed conversion could
 /// print a line the model never named. The web page applies the same rule
 /// when it lists a finding's locations. A line is kept only with the file it
-/// is a line of. The file and function are sanitised like a title, since
-/// both come from the model.
+/// is a line of. The repository, file and function are sanitised like a
+/// title, since all three come from the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FindingLocation {
+    /// The reference repository the location is in (see
+    /// [`reference_repo_of`]); `None` for the code under review, whether
+    /// the location says "review" or names no repository at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -331,16 +338,44 @@ impl FindingLocation {
             .as_ref()
             .and_then(|_| line_number(location.get("line")));
         Some(Self {
+            repo: reference_repo_of(location),
             file,
             function_or_symbol,
             line,
         })
     }
+
+    /// Whether the location is in the code under review: it names "review"
+    /// or no repository. Only such a location's file is a path of the
+    /// patch's tree.
+    pub fn in_code_under_review(&self) -> bool {
+        self.repo.is_none()
+    }
 }
 
-/// Formats a location as `file:line (function)`, dropping absent parts.
+/// The reference repository a stored location names in its `repo` key,
+/// sanitised like the other parts of a location. `None` when the location
+/// is in the code under review: its `repo` is "review", or absent, as in
+/// every review without references attached and every review stored before
+/// locations named their repository, or not a non-empty string.
+pub fn reference_repo_of(location: &Value) -> Option<String> {
+    location
+        .get(LOCATION_REPO_KEY)
+        .and_then(Value::as_str)
+        .map(sanitize_text)
+        .filter(|repo| !repo.is_empty() && repo != REPO_ARG_REVIEW)
+}
+
+/// Formats a location as `file:line (function)`, dropping absent parts, with
+/// `repo:` in front for a location in a reference repository, the form the
+/// report cites such a location in.
 impl std::fmt::Display for FindingLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(repo) = &self.repo
+            && (self.file.is_some() || self.function_or_symbol.is_some())
+        {
+            write!(f, "{repo}:")?;
+        }
         match (&self.file, &self.function_or_symbol) {
             (Some(file), function) => {
                 write!(f, "{file}")?;
@@ -1108,6 +1143,7 @@ mod tests {
         assert_eq!(
             read(json!({"file": " f.c\n", "line": 12, "function_or_symbol": "fn"})),
             Some(FindingLocation {
+                repo: None,
                 file: Some("f.c".to_string()),
                 function_or_symbol: Some("fn".to_string()),
                 line: Some(12),
@@ -1116,12 +1152,51 @@ mod tests {
         assert_eq!(
             read(json!({"line": 12, "function_or_symbol": "fn"})),
             Some(FindingLocation {
+                repo: None,
                 file: None,
                 function_or_symbol: Some("fn".to_string()),
                 line: None,
             })
         );
         assert_eq!(read(json!({"line": 12})), None);
+    }
+
+    /// A location in a reference repository keeps its repository and shows
+    /// it in front; one in the code under review, labelled or not, reads as
+    /// it did before locations named their repository.
+    #[test]
+    fn a_reference_location_is_shown_with_its_repository() {
+        let read = |location: Value| FindingLocation::from_json(&location);
+        let kernel = read(json!({
+            "repo": " kernel\u{202E}", "file": "include/linux/kref.h", "line": 64,
+            "function_or_symbol": "kref_put"
+        }))
+        .expect("the location names a file");
+        assert_eq!(kernel.repo.as_deref(), Some("kernel"));
+        assert!(!kernel.in_code_under_review());
+        assert_eq!(
+            kernel.to_string(),
+            "kernel:include/linux/kref.h:64 (kref_put)"
+        );
+        let symbol_only = read(json!({"repo": "kernel", "function_or_symbol": "kref_put"}));
+        assert_eq!(
+            symbol_only.map(|location| location.to_string()).as_deref(),
+            Some("kernel:kref_put")
+        );
+
+        let plain = json!({"file": "vfio/dirty.c", "line": 681, "function_or_symbol": "reset"});
+        let mut labelled = plain.clone();
+        labelled["repo"] = json!("review");
+        for repo in [json!(null), json!(""), json!(" \n"), json!(7)] {
+            let mut odd = plain.clone();
+            odd["repo"] = repo.clone();
+            assert_eq!(read(odd), read(plain.clone()), "{repo}");
+        }
+        let review = read(labelled).expect("the location names a file");
+        assert_eq!(Some(&review), read(plain).as_ref());
+        assert!(review.in_code_under_review());
+        assert_eq!(review.to_string(), "vfio/dirty.c:681 (reset)");
+        assert_eq!(read(json!({"repo": "kernel", "line": 3})), None);
     }
 
     #[test]
