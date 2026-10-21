@@ -111,26 +111,90 @@ pub struct UnknownLocationRepo {
 impl fmt::Display for UnknownLocationRepo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let given: String = self.given.chars().take(MAX_QUOTED_NAME_CHARS).collect();
-        let quoted: Vec<String> = self.attached.iter().map(|n| format!("\"{n}\"")).collect();
-        let list = match quoted.as_slice() {
-            [only] => format!("the only attached repository is {only}"),
-            [rest @ .., last] => {
-                format!(
-                    "the attached repositories are {} and {last}",
-                    rest.join(", ")
-                )
-            }
-            [] => String::new(),
-        };
         write!(
             f,
-            "has {LOCATION_REPO_KEY} {given:?} but {list}; set \"{LOCATION_REPO_KEY}\" to the \
-             one you read the code in"
+            "has {LOCATION_REPO_KEY} {given:?} but {}",
+            valid_values_and_fix(&self.attached)
         )
     }
 }
 
 impl std::error::Error for UnknownLocationRepo {}
+
+/// The end of every message about a location's `repo`: the values it can take
+/// for this patch, and what to do.
+fn valid_values_and_fix(attached: &[String]) -> String {
+    let quoted: Vec<String> = attached.iter().map(|n| format!("\"{n}\"")).collect();
+    let list = match quoted.as_slice() {
+        [only] => format!("the only attached repository is {only}"),
+        [rest @ .., last] => {
+            format!(
+                "the attached repositories are {} and {last}",
+                rest.join(", ")
+            )
+        }
+        [] => String::new(),
+    };
+    format!("{list}; set \"{LOCATION_REPO_KEY}\" to the one you read the code in")
+}
+
+/// Why a location does not name an attached repository.
+///
+/// Like [`UnknownLocationRepo`], its `Display` is the tail of a validator
+/// message, and the caller prefixes the location it is about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocationRepoError {
+    /// The location is not a JSON object, so it has no keys at all.
+    NotAnObject,
+    /// The location has no `repo` string, and its `file` carries no attached
+    /// repository's prefix either.
+    Missing { attached: Vec<String> },
+    /// The location's `repo` names no attached repository.
+    Unknown(UnknownLocationRepo),
+}
+
+impl fmt::Display for LocationRepoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotAnObject => write!(
+                f,
+                "is not an object; write each location as an object that opens with \
+                 \"{LOCATION_REPO_KEY}\""
+            ),
+            Self::Missing { attached } => write!(
+                f,
+                "has no \"{LOCATION_REPO_KEY}\" string but {}",
+                valid_values_and_fix(attached)
+            ),
+            Self::Unknown(err) => err.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for LocationRepoError {}
+
+/// Reads which attached repository a location names.
+///
+/// The location is read through [`normalize_location`] first, so a
+/// `kernel:path` file is accepted exactly as the reduce will store it. A
+/// prefix that conflicts with `repo` is left to the checks that compare a path
+/// with the tree it names; here `repo` alone decides.
+pub fn read_location_repo(
+    location: &Value,
+    references: &[ReferenceRepo],
+) -> Result<LocationRepo, LocationRepoError> {
+    if !location.is_object() {
+        return Err(LocationRepoError::NotAnObject);
+    }
+    let mut normalized = location.clone();
+    normalize_location(&mut normalized, references);
+    match normalized.get(LOCATION_REPO_KEY).and_then(Value::as_str) {
+        Some(name) => LocationRepo::parse(name, references).map_err(LocationRepoError::Unknown),
+        None => Err(LocationRepoError::Missing {
+            attached: attached_names(references),
+        }),
+    }
+}
 
 /// Every value a location's `repo` can take for this patch, the code under
 /// review first.
@@ -410,5 +474,62 @@ mod tests {
         let mut loc = original.clone();
         assert!(!normalize_location(&mut loc, &[]));
         assert_eq!(loc, original);
+    }
+
+    #[test]
+    fn a_location_is_read_through_normalization() {
+        let refs = kernel();
+        let read = |loc: Value| read_location_repo(&loc, &refs);
+        assert_eq!(
+            read(json!({"repo": "review", "file": "vfio/dirty.c"})),
+            Ok(LocationRepo::Review)
+        );
+        assert_eq!(
+            read(json!({"file": "kernel:include/linux/kref.h"})),
+            Ok(LocationRepo::Reference("kernel".to_string()))
+        );
+        assert_eq!(
+            read(json!({"repo": null, "file": "review:vfio/dirty.c"})),
+            Ok(LocationRepo::Review)
+        );
+        // A conflicting prefix is not this check's business: repo decides.
+        assert_eq!(
+            read(json!({"repo": "review", "file": "kernel:mm/slab.c"})),
+            Ok(LocationRepo::Review)
+        );
+    }
+
+    #[test]
+    fn a_location_without_a_usable_repo_names_the_fix() {
+        let refs = kernel();
+        for loc in [
+            json!({"file": "vfio/dirty.c"}),
+            json!({"repo": null, "file": "vfio/dirty.c"}),
+            json!({"repo": 3, "file": "kernel:mm/slab.c"}),
+            json!({"file": "linux:mm/slab.c"}),
+        ] {
+            let err = read_location_repo(&loc, &refs).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "has no \"repo\" string but the attached repositories are \"review\" and \
+                 \"kernel\"; set \"repo\" to the one you read the code in",
+                "{loc}"
+            );
+        }
+
+        let err =
+            read_location_repo(&json!({"repo": "linux", "file": "mm/slab.c"}), &refs).unwrap_err();
+        assert!(matches!(err, LocationRepoError::Unknown(_)));
+        assert!(
+            err.to_string().starts_with("has repo \"linux\" but"),
+            "{err}"
+        );
+
+        let err = read_location_repo(&json!("kernel:mm/slab.c"), &refs).unwrap_err();
+        assert_eq!(err, LocationRepoError::NotAnObject);
+        assert_eq!(
+            err.to_string(),
+            "is not an object; write each location as an object that opens with \"repo\""
+        );
     }
 }

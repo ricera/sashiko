@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cover_letter::{CoverLetter, cover_letter_block};
-use crate::location_repo::LOCATION_REPO_KEY;
+use crate::location_repo::{LOCATION_REPO_KEY, normalize_location, read_location_repo};
 use crate::prior_revisions::{PriorReviewContext, ground_prior_link};
 use crate::settings::ReferenceKind;
 use crate::toolbox::{REPO_ARG, REPO_ARG_REVIEW, ReferenceRepo};
@@ -729,9 +729,58 @@ pub(crate) fn has_valid_proof_location(item: &Value) -> bool {
     })
 }
 
+/// Requires every location of every item to name an attached repository
+/// (design "location repository labels" §4.3, the check every stage runs).
+///
+/// `collections` pairs each output array with the name the stage's JSON uses
+/// for it, so the message points at the exact location to fix, e.g.
+/// `concerns[1].locations[2] has repo "linux" but ...`. An item without a
+/// `locations` array is left to the stage's structural checks. With no
+/// reference attached nothing is checked, so a review without references runs
+/// the validators it always has.
+fn validate_location_repos(
+    collections: &[(&str, &[Value])],
+    references: &[ReferenceRepo],
+) -> Result<(), String> {
+    if references.is_empty() {
+        return Ok(());
+    }
+    for (name, items) in collections {
+        for (idx, item) in items.iter().enumerate() {
+            let Some(locations) = item.get("locations").and_then(Value::as_array) else {
+                continue;
+            };
+            for (loc_idx, location) in locations.iter().enumerate() {
+                read_location_repo(location, references)
+                    .map_err(|err| format!("{name}[{idx}].locations[{loc_idx}] {err}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Moves a `<repo>:<path>` prefix in each item's location files into the
+/// location's `repo` before the items are stored, so what is stored matches
+/// what [`validate_location_repos`] accepted. A no-op without references.
+fn normalize_item_locations<'a>(
+    items: impl IntoIterator<Item = &'a mut Value>,
+    references: &[ReferenceRepo],
+) {
+    if references.is_empty() {
+        return;
+    }
+    for item in items {
+        if let Some(locations) = item.get_mut("locations").and_then(Value::as_array_mut) {
+            for location in locations {
+                normalize_location(location, references);
+            }
+        }
+    }
+}
+
 fn validate_concerns_output(
     output: &StageConcernsOutput,
-    _state: &LinuxPatchReviewState,
+    state: &LinuxPatchReviewState,
 ) -> Result<(), String> {
     for (idx, concern) in output.concerns.iter().enumerate() {
         let has_desc = concern
@@ -770,7 +819,13 @@ fn validate_concerns_output(
         }
     }
 
-    Ok(())
+    validate_location_repos(
+        &[
+            ("concerns", &output.concerns),
+            ("dismissed_concerns", &output.dismissed_concerns),
+        ],
+        &state.references,
+    )
 }
 
 fn format_concerns_feedback(violation: &str) -> String {
@@ -929,6 +984,24 @@ pub fn validate_verification_stage_output(
     validate_verification_source_ids(output, state)?;
 
     Ok(())
+}
+
+/// The Linux verification stage's validator: the shared checks, then the
+/// every-stage repository check. The Sashiko workflow shares the former only,
+/// since its prompts never ask a location for its repository.
+fn validate_linux_verification_output(
+    output: &VerificationOutput,
+    state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    validate_verification_stage_output(output, state)?;
+    validate_location_repos(
+        &[
+            ("findings", &output.findings),
+            ("hard_cases", &output.hard_cases),
+            ("dismissed_concerns", &output.dismissed_concerns),
+        ],
+        &state.references,
+    )
 }
 
 fn extract_non_empty_source_ids<'a>(
@@ -1137,9 +1210,24 @@ pub fn validate_post_verification_batch_items(
 
 pub fn validate_post_verification_output(
     output: &PostVerificationOutput,
-    _state: &LinuxPatchReviewState,
+    state: &LinuxPatchReviewState,
 ) -> Result<(), String> {
-    validate_post_verification_batch_output(output, 1)
+    validate_post_verification_batch_output(output, 1)?;
+    validate_post_verification_location_repos(output, state)
+}
+
+/// The every-stage repository check for a post-verification output.
+fn validate_post_verification_location_repos(
+    output: &PostVerificationOutput,
+    state: &LinuxPatchReviewState,
+) -> Result<(), String> {
+    validate_location_repos(
+        &[
+            ("findings", &output.findings),
+            ("dismissed_concerns", &output.dismissed_concerns),
+        ],
+        &state.references,
+    )
 }
 
 pub fn format_post_verification_feedback(violation: &str) -> String {
@@ -2683,8 +2771,14 @@ fn analysis_stage(
             })
             .reduce_with_outcome(
                 move |state: &mut LinuxPatchReviewState,
-                      out: StageConcernsOutput,
+                      mut out: StageConcernsOutput,
                       outcome: &crate::workflow::stage::StageOutcome| {
+                    normalize_item_locations(
+                        out.concerns
+                            .iter_mut()
+                            .chain(out.dismissed_concerns.iter_mut()),
+                        &state.references,
+                    );
                     let prompts =
                         collect_stage_prompts(&state.selected_guides, def.guides, outcome);
                     append_stage_items_with_prompts(
@@ -2873,6 +2967,13 @@ pub fn apply_verification_stage_output(
             .chain(out.hard_cases.iter_mut())
             .chain(out.dismissed_concerns.iter_mut()),
     );
+    normalize_item_locations(
+        out.findings
+            .iter_mut()
+            .chain(out.hard_cases.iter_mut())
+            .chain(out.dismissed_concerns.iter_mut()),
+        &state.references,
+    );
     enrich_verification_output(state, &mut out, outcome, stage_lookup);
     state.verification_findings.extend(out.findings.clone());
     state
@@ -2897,6 +2998,12 @@ pub fn apply_post_verification_stage_output(
         out.findings
             .iter_mut()
             .chain(out.dismissed_concerns.iter_mut()),
+    );
+    normalize_item_locations(
+        out.findings
+            .iter_mut()
+            .chain(out.dismissed_concerns.iter_mut()),
+        &state.references,
     );
     enrich_post_verification_output(
         &state.selected_guides,
@@ -3041,7 +3148,7 @@ Example Output:
         .user_prompt(user_template)
         .output_format(
             OutputFormat::json()
-                .with_validator(validate_verification_stage_output)
+                .with_validator(validate_linux_verification_output)
                 .with_feedback_formatter(format_verification_stage_feedback),
         )
         .policy(StagePolicy {
@@ -3157,8 +3264,9 @@ Example Output:
         .user_prompt(user_template)
         .output_format(
             OutputFormat::json()
-                .with_validator(move |out, _state| {
-                    validate_post_verification_batch_items(out, &batch_for_validate)
+                .with_validator(move |out, state| {
+                    validate_post_verification_batch_items(out, &batch_for_validate)?;
+                    validate_post_verification_location_repos(out, state)
                 })
                 .with_feedback_formatter(format_post_verification_feedback),
         )
@@ -4805,6 +4913,14 @@ mod tests {
                 1,
                 "{name}: one example cites the kernel entry by its name"
             );
+            for (key, items) in example.as_object().unwrap() {
+                let items = items.as_array().unwrap();
+                assert_eq!(
+                    validate_location_repos(&[(key, items)], &state.references),
+                    Ok(()),
+                    "{name}: the worked example passes the repository check"
+                );
+            }
             examples += 1;
         }
         assert!(
@@ -4823,6 +4939,230 @@ mod tests {
         assert!(
             report.contains("as <repo>:<file> (for example rdma-core:path/to/file.h)"),
             "{report}"
+        );
+    }
+
+    /// A location with the given `repo` (or none) and `file`, complete enough
+    /// to satisfy every stage's proof-location rule.
+    fn repo_location(repo: Option<&str>, file: &str) -> Value {
+        let mut location = json!({
+            "file": file,
+            "function_or_symbol": "pdsc_notify",
+            "line": 23,
+            "code_snippet": "pdsc_notify(PDS_EVENT_RESET, &reset_event);",
+            "why_this_location_matters": "Raises the reset event."
+        });
+        if let Some(repo) = repo {
+            location["repo"] = json!(repo);
+        }
+        location
+    }
+
+    fn concerns_with(locations: Vec<Value>) -> StageConcernsOutput {
+        StageConcernsOutput {
+            concerns: vec![json!({
+                "type": "Logic",
+                "description": "Reset marks every PF stale",
+                "reasoning": "The notifier runs for every PF.",
+                "locations": [repo_location(Some("review"), "vfio/dirty.c")]
+            })],
+            dismissed_concerns: vec![json!({
+                "type": "Locking",
+                "description": "Unlocked dirty bitmap",
+                "reasoning": "The caller holds the state mutex.",
+                "locations": locations
+            })],
+        }
+    }
+
+    fn verification_with(locations: Vec<Value>) -> VerificationOutput {
+        VerificationOutput {
+            findings: vec![json!({
+                "problem": "pds-vfio-pci: reset marks every PF stale",
+                "speculative": false,
+                "severity": "Medium",
+                "severity_explanation": "Stale containers on unrelated PFs.",
+                "preexisting": false,
+                "locations": [repo_location(Some("review"), "vfio/dirty.c")]
+            })],
+            hard_cases: vec![json!({
+                "type": "Logic",
+                "description": "Reset scope",
+                "estimated_severity": "Medium",
+                "signal_reason": "speculative_dismissal",
+                "concern_arguments": "The notifier is global.",
+                "dismissal_arguments": null,
+                "verification_question": "Is the notifier per PF?",
+                "preexisting": false,
+                "locations": locations
+            })],
+            dismissed_concerns: vec![],
+        }
+    }
+
+    fn post_verification_with(locations: Vec<Value>) -> PostVerificationOutput {
+        PostVerificationOutput {
+            findings: vec![json!({
+                "problem": "pds-vfio-pci: reset marks every PF stale",
+                "speculative": false,
+                "severity": "Medium",
+                "severity_explanation": "Stale containers on unrelated PFs.",
+                "preexisting": false,
+                "locations": locations
+            })],
+            dismissed_concerns: vec![],
+        }
+    }
+
+    /// Every stage of a review with references attached rejects a location
+    /// that names no attached repository, and the message points at the exact
+    /// item and location and says what to write.
+    #[test]
+    fn every_stage_requires_a_location_to_name_an_attached_repository() {
+        let state = LinuxPatchReviewState {
+            references: module_references(),
+            ..Default::default()
+        };
+        let fix = "set \"repo\" to the one you read the code in";
+        let bad = || {
+            vec![
+                repo_location(Some("review"), "vfio/dirty.c"),
+                repo_location(Some("kernel"), "drivers/net/ethernet/amd/pds_core/core.c"),
+            ]
+        };
+
+        let err = validate_concerns_output(&concerns_with(bad()), &state).unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "dismissed_concerns[0].locations[1] has repo \"kernel\" but the attached \
+                 repositories are \"review\", \"rdma-core\" and \"linux\"; {fix}"
+            )
+        );
+        let err =
+            validate_linux_verification_output(&verification_with(bad()), &state).unwrap_err();
+        assert!(
+            err.starts_with("hard_cases[0].locations[1] has repo \"kernel\""),
+            "{err}"
+        );
+        let err =
+            validate_post_verification_output(&post_verification_with(bad()), &state).unwrap_err();
+        assert!(
+            err.starts_with("findings[0].locations[1] has repo \"kernel\""),
+            "{err}"
+        );
+
+        let missing = || vec![repo_location(None, "vfio/dirty.c")];
+        for err in [
+            validate_concerns_output(&concerns_with(missing()), &state),
+            validate_linux_verification_output(&verification_with(missing()), &state),
+            validate_post_verification_output(&post_verification_with(missing()), &state),
+        ] {
+            let err = err.unwrap_err();
+            assert!(
+                err.contains(".locations[0] has no \"repo\" string but"),
+                "{err}"
+            );
+            assert!(err.ends_with(fix), "{err}");
+        }
+    }
+
+    /// A location written the prose way, "linux:path" in its file, is accepted
+    /// by every stage, and the reduce stores it with the name moved into repo.
+    #[test]
+    fn a_prefixed_file_passes_the_check_and_is_stored_split() {
+        let state = LinuxPatchReviewState {
+            references: module_references(),
+            ..Default::default()
+        };
+        let good = || {
+            vec![
+                repo_location(Some("review"), "vfio/dirty.c"),
+                repo_location(None, "linux:include/linux/kref.h"),
+                repo_location(Some("rdma-core"), "providers/ionic/ionic.h"),
+            ]
+        };
+        assert_eq!(
+            validate_concerns_output(&concerns_with(good()), &state),
+            Ok(())
+        );
+        assert_eq!(
+            validate_linux_verification_output(&verification_with(good()), &state),
+            Ok(())
+        );
+        assert_eq!(
+            validate_post_verification_output(&post_verification_with(good()), &state),
+            Ok(())
+        );
+
+        let mut verified = state.clone();
+        apply_verification_stage_output(
+            &mut verified,
+            verification_with(good()),
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        let stored = &verified.hard_cases[0]["locations"][1];
+        assert_eq!(stored["repo"], "linux");
+        assert_eq!(stored["file"], "include/linux/kref.h");
+
+        let mut post = state.clone();
+        apply_post_verification_stage_output(
+            &mut post,
+            POST_VERIFICATION_STAGE_NAMES[0],
+            &[],
+            post_verification_with(good()),
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        let stored = &post.findings[0]["locations"][1];
+        assert_eq!(stored["repo"], "linux");
+        assert_eq!(stored["file"], "include/linux/kref.h");
+
+        let mut items = concerns_with(good()).dismissed_concerns;
+        normalize_item_locations(items.iter_mut(), &state.references);
+        assert_eq!(items[0]["locations"][1]["repo"], "linux");
+        assert_eq!(items[0]["locations"][1]["file"], "include/linux/kref.h");
+    }
+
+    /// Without references nothing about a location's repository is checked
+    /// or rewritten (G5): an unlabelled location passes every stage, a
+    /// prefixed file is stored as written, and the Sashiko workflow's shared
+    /// verification validator never checks it.
+    #[test]
+    fn without_references_locations_are_neither_checked_nor_rewritten() {
+        let state = LinuxPatchReviewState::default();
+        let unlabelled = || vec![repo_location(None, "linux:include/linux/kref.h")];
+        assert_eq!(
+            validate_concerns_output(&concerns_with(unlabelled()), &state),
+            Ok(())
+        );
+        assert_eq!(
+            validate_linux_verification_output(&verification_with(unlabelled()), &state),
+            Ok(())
+        );
+        assert_eq!(
+            validate_post_verification_output(&post_verification_with(unlabelled()), &state),
+            Ok(())
+        );
+
+        let mut verified = state.clone();
+        apply_verification_stage_output(
+            &mut verified,
+            verification_with(unlabelled()),
+            &crate::workflow::stage::StageOutcome::default(),
+            analysis_stage_by_name,
+        );
+        assert_eq!(verified.hard_cases[0]["locations"][0], unlabelled()[0]);
+
+        let with_refs = LinuxPatchReviewState {
+            references: module_references(),
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_verification_stage_output(&verification_with(unlabelled()), &with_refs),
+            Ok(()),
+            "the shared validator is the Sashiko workflow's too"
         );
     }
 
