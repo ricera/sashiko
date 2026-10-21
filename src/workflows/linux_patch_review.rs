@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cover_letter::{CoverLetter, cover_letter_block};
+use crate::location_repo::LOCATION_REPO_KEY;
 use crate::prior_revisions::{PriorReviewContext, ground_prior_link};
 use crate::settings::ReferenceKind;
 use crate::toolbox::{REPO_ARG, REPO_ARG_REVIEW, ReferenceRepo};
@@ -83,9 +84,14 @@ fn reference_context_block(references: &[ReferenceRepo]) -> String {
         ));
     }
     block.push_str(
-        "When you claim a contract with one of these repositories, cite repo:file:line. A \
-         mismatch is a finding only if this patch introduces it, or changes one side of an \
-         interface without accounting for existing users of the other side.\n\
+        "Set every location's repo to the repository you read it in (\"review\" or a \
+         reference name). When you claim a contract with one of these repositories, cite \
+         repo:file:line in prose. A location in a reference repository is evidence only for \
+         code the code under review does not carry; a comparison with a reference's copy of \
+         code the module carries belongs in the prose, labelled as a comparison, never in \
+         locations. A contract mismatch is a finding only if this patch introduces it, or \
+         changes one side of an interface without accounting for existing users of the other \
+         side.\n\
          ===========================",
     );
 
@@ -114,8 +120,9 @@ fn reference_context_block(references: &[ReferenceRepo]) -> String {
              the kernel's version of a module function describes code that never executes, \
              and cannot support or refute a finding.\n\
              - The kernel's version may still be cited as a comparison: a fix or improvement \
-             it has that the module lacks and could adopt. Label it as such; it is never \
-             evidence of what the module does.\n\n\
+             it has that the module lacks and could adopt. Label it as such in the prose and \
+             never list it in a finding's locations; it is never evidence of what the module \
+             does.\n\n\
              Consequences of being out-of-tree, all of which change what counts as a \
              finding:\n\
              - Fixes: tags, lore threads, and 'look forward in git history for the fix' do \
@@ -132,6 +139,190 @@ fn reference_context_block(references: &[ReferenceRepo]) -> String {
         ));
     }
     block
+}
+
+/// The rule that tells the stages deciding findings to re-read each location
+/// in the repository it names. Shared by verification and post-verification,
+/// which decide what a finding's evidence is.
+pub(crate) const LOCATION_REPO_RULE: &str = "LOCATIONS NAME THEIR REPOSITORY. Re-read every \
+     location you keep in the repository its \"repo\" names, with that \"repo\" passed to the \
+     tool. A location in a reference repository is evidence only for code the code under review \
+     does not carry. When the code under review has its own copy of the file, function or struct \
+     a location cites from a reference, re-check the claim in that copy: the reference's copy \
+     does not run. A claim whose call chain passes from the code under review into a reference's \
+     copy of code under review is not established.";
+
+/// Placeholders that ask for a location's repository. [`with_location_repo`]
+/// binds each one, and each renders empty when no reference is attached.
+const LOCATION_REPO_KEY_VAR: &str = "location_repo_key";
+const LOCATION_OBJECTS_REPO_VAR: &str = "location_objects_repo";
+const LOCATION_LIST_REPO_VAR: &str = "location_list_repo";
+const LOCATION_REPO_EXAMPLE_VAR: &str = "location_repo_example";
+const LOCATION_REPO_RULE_VAR: &str = "location_repo_rule";
+const LOCATION_REPO_REPORT_VAR: &str = "location_repo_report";
+
+/// The definition of a location's repository key, as a key list gives it.
+fn location_repo_key_definition() -> String {
+    format!(
+        "\"{LOCATION_REPO_KEY}\" (\"{REPO_ARG_REVIEW}\" for the code under review, or the name \
+         of the reference repository you read the code in)"
+    )
+}
+
+/// The example item each stage's example adds when a kernel reference is
+/// attached: an item whose claim rests on a core kernel API contract
+/// (kref_put() calls release() only when the count drops to zero), with the
+/// kernel's kref.h cited from the reference as the evidence for it. Each
+/// stage renders the item in its own output shape, under its own placeholder.
+#[derive(Debug, Clone, Copy)]
+enum ReferenceExample {
+    /// An analysis stage's dismissed concern.
+    Analysis,
+    /// A verification hard case.
+    Verification,
+    /// A post-verification dismissed concern.
+    PostVerification,
+}
+
+impl ReferenceExample {
+    const ALL: [Self; 3] = [Self::Analysis, Self::Verification, Self::PostVerification];
+
+    /// The placeholder the stage's example holds the item at.
+    fn var(self) -> &'static str {
+        match self {
+            Self::Analysis => "location_reference_analysis_example",
+            Self::Verification => "location_reference_verification_example",
+            Self::PostVerification => "location_reference_post_verification_example",
+        }
+    }
+
+    /// The item, with its leading comma, citing kref_put() from the kernel
+    /// entry named `kernel`. The name is configured, so it is JSON-encoded to
+    /// keep the example valid JSON whatever it holds.
+    fn render(self, kernel: &str) -> String {
+        let fields = match self {
+            Self::Analysis => {
+                "\"type\": \"Use-After-Free\",\n      \
+                 \"description\": \"Possible use-after-free of foo in foo_remove() after foo_put().\",\n      \
+                 \"reasoning\": \"foo_probe() takes a second reference with kref_get() that only foo_shutdown() drops, and kref_put() calls foo_release() only when the count drops to zero, so foo is still live when foo_remove() reads foo->state.\",\n      "
+            }
+            Self::Verification => {
+                "\"source_ids\": [\"C2\", \"D2\"],\n      \
+                 \"type\": \"Use-After-Free\",\n      \
+                 \"description\": \"Possible use-after-free of foo in foo_remove() after foo_put()\",\n      \
+                 \"estimated_severity\": \"High\",\n      \
+                 \"signal_reason\": \"mixed_signals\",\n      \
+                 \"concern_arguments\": \"foo_remove() reads foo->state after foo_put(foo), which may free foo.\",\n      \
+                 \"dismissal_arguments\": \"foo_probe() holds a second reference, so kref_put() does not call foo_release() here.\",\n      \
+                 \"verification_question\": \"Count the references to foo held when foo_remove() runs, and check whether kref_put() can call foo_release() before foo->state is read.\",\n      \
+                 \"preexisting\": false,\n      "
+            }
+            Self::PostVerification => {
+                "\"source_ids\": [\"H3\"],\n      \
+                 \"description\": \"Possible use-after-free of foo in foo_remove() after foo_put().\",\n      \
+                 \"reasoning\": \"Inspecting foo_probe() confirms it takes a second reference with kref_get() that only foo_shutdown() drops, and kref_put() calls foo_release() only when the count drops to zero, so foo is still live when foo_remove() reads foo->state.\",\n      "
+            }
+        };
+        // A hard case cites the suspected code; a dismissed concern cites the
+        // code that disproves it, as the stages' rules for each require.
+        let review_location = match self {
+            Self::Verification => {
+                "\"function_or_symbol\": \"foo_remove\",\n          \
+                 \"line\": 140,\n          \
+                 \"code_snippet\": \"foo_put(foo);\\n\\tstate = foo->state;\",\n          \
+                 \"why_this_location_matters\": \"foo is read after the module drops a reference through the kernel's kref API.\""
+            }
+            Self::Analysis | Self::PostVerification => {
+                "\"function_or_symbol\": \"foo_probe\",\n          \
+                 \"line\": 88,\n          \
+                 \"code_snippet\": \"kref_get(&foo->ref);\",\n          \
+                 \"why_this_location_matters\": \"The second reference that keeps foo live until foo_shutdown() drops it, so the foo_put() in foo_remove() cannot free foo.\""
+            }
+        };
+        format!(
+            ",\n    {{\n      {fields}\"locations\": [\n        {{\n          \
+             \"{LOCATION_REPO_KEY}\": \"{REPO_ARG_REVIEW}\",\n          \
+             \"file\": \"path/to/file.c\",\n          \
+             {review_location}\n        }},\n        {{\n          \
+             \"{LOCATION_REPO_KEY}\": {},\n          \
+             \"file\": \"include/linux/kref.h\",\n          \
+             \"function_or_symbol\": \"kref_put\",\n          \
+             \"line\": null,\n          \
+             \"code_snippet\": \"if (refcount_dec_and_test(&kref->refcount)) {{\\n\\t\\trelease(kref);\",\n          \
+             \"why_this_location_matters\": \"The kernel API contract: kref_put() calls release() only when the count drops to zero. The code under review ships no kref.h of its own, so the kernel's copy is the one that runs.\"\n        }}\n      ]\n    }}",
+            Value::String(kernel.to_string())
+        )
+    }
+}
+
+/// What the report is told about a location in a reference repository,
+/// with the first attached reference's name as the example.
+fn location_repo_report_rule(example: &str) -> String {
+    format!(
+        "\n\nREFERENCE LOCATIONS: A location whose \"{LOCATION_REPO_KEY}\" is not \
+         \"{REPO_ARG_REVIEW}\" is code in a read-only reference repository, not in the code \
+         under review. Cite such a location in the comment as <repo>:<file> (for example \
+         {example}:path/to/file.h), never as a bare path, so a reader can tell it from a \
+         file of the patch."
+    )
+}
+
+/// `text()` when a reference is attached to the patch, and nothing otherwise,
+/// so a review of a single tree renders the prompts it always did.
+fn when_referenced(s: &LinuxPatchReviewState, text: impl FnOnce() -> String) -> String {
+    if s.references.is_empty() {
+        String::new()
+    } else {
+        text()
+    }
+}
+
+/// Binds the placeholders that ask every location for its repository
+/// (design §4.5 of DESIGN_LOCATION_REPOSITORY_LABELS.md). A template that
+/// lacks one of them is unaffected by its binding.
+fn with_location_repo(
+    template: PromptTemplate<LinuxPatchReviewState>,
+) -> PromptTemplate<LinuxPatchReviewState> {
+    let template = ReferenceExample::ALL
+        .into_iter()
+        .fold(template, |template, example| {
+            template.with_var(example.var(), move |s: &LinuxPatchReviewState| {
+                s.references
+                    .iter()
+                    .find(|r| r.kind == ReferenceKind::Kernel)
+                    .map_or_else(String::new, |kernel| example.render(&kernel.name))
+            })
+        });
+    template
+        .with_var(LOCATION_REPO_KEY_VAR, |s: &LinuxPatchReviewState| {
+            when_referenced(s, || format!("{}, ", location_repo_key_definition()))
+        })
+        .with_var(LOCATION_OBJECTS_REPO_VAR, |s: &LinuxPatchReviewState| {
+            when_referenced(s, || {
+                format!(", each opening with {}", location_repo_key_definition())
+            })
+        })
+        .with_var(LOCATION_LIST_REPO_VAR, |s: &LinuxPatchReviewState| {
+            when_referenced(s, || {
+                format!(
+                    " (each location opening with {})",
+                    location_repo_key_definition()
+                )
+            })
+        })
+        .with_var(LOCATION_REPO_EXAMPLE_VAR, |s: &LinuxPatchReviewState| {
+            when_referenced(s, || {
+                format!("\"{LOCATION_REPO_KEY}\": \"{REPO_ARG_REVIEW}\",\n          ")
+            })
+        })
+        .with_var(LOCATION_REPO_RULE_VAR, |s: &LinuxPatchReviewState| {
+            when_referenced(s, || format!("\n\n{LOCATION_REPO_RULE}"))
+        })
+        .with_var(LOCATION_REPO_REPORT_VAR, |s: &LinuxPatchReviewState| {
+            s.references
+                .first()
+                .map_or_else(String::new, |r| location_repo_report_rule(&r.name))
+        })
 }
 
 /// Complete execution state of a Linux kernel patch review.
@@ -459,7 +650,7 @@ Each object in the 'concerns' array MUST use exactly the following keys: "type",
 - "description": A clear description of the problem.
 - "reasoning": A step-by-step explanation.
 - "preexisting": true if this bug already existed in the codebase before these patches were applied, false if the issue was newly introduced by the reviewed patchset.
-- "locations": An array of objects, each containing "file", "function_or_symbol", "line", "code_snippet" and "why_this_location_matters".
+- "locations": An array of objects, each containing {{location_repo_key}}"file", "function_or_symbol", "line", "code_snippet" and "why_this_location_matters".
 Each object in the 'dismissed_concerns' array MUST use exactly the following keys: "type", "description", "reasoning", "locations". They mean the same as above, except that "description" is the candidate concern that was investigated and disproved, "reasoning" is the evidence proving it does not apply, and "locations" MUST cite the concrete disproving code (the exact guard, lock, cleanup path, or caller/callee implementation that proves the issue cannot occur — not merely repeating the suspected line from the diff).
 
 Use the 'dismissed_concerns' array ONLY for candidate concerns that you considered plausible, investigated, and disproved with concrete evidence. This is especially important when you first suspect a concern and then follow the evidence chain proving that it does NOT apply.
@@ -485,7 +676,7 @@ Example Output:
       "preexisting": false,
       "locations": [
         {
-          "file": "path/to/file.c",
+          {{location_repo_example}}"file": "path/to/file.c",
           "function_or_symbol": "function_name",
           "line": 123,
           "code_snippet": "problematic_code();",
@@ -501,14 +692,14 @@ Example Output:
       "reasoning": "The concrete code path or ordering that proves this candidate concern does not apply.",
       "locations": [
         {
-          "file": "path/to/file.c",
+          {{location_repo_example}}"file": "path/to/file.c",
           "function_or_symbol": "function_name",
           "line": 125,
           "code_snippet": "safe_code_path();",
           "why_this_location_matters": "This is where the cleanup path proves the candidate leak does not apply."
         }
       ]
-    }
+    }{{location_reference_analysis_example}}
   ]
 }
 ```"#;
@@ -2471,7 +2662,8 @@ fn analysis_stage(
     for guide in def.guides {
         user_template = user_template.include_file(*guide);
     }
-    let user_template = with_series_context(user_template, def.wants_series_context);
+    let user_template =
+        with_location_repo(with_series_context(user_template, def.wants_series_context));
 
     Box::new(
         Stage::builder(def.name)
@@ -2753,7 +2945,7 @@ pub fn verification_stage_with_effort(
     effort: Option<crate::ai::EffortMode>,
 ) -> Stage<LinuxPatchReviewState, VerificationOutput> {
     let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
-    let user_template = with_series_context(
+    let user_template = with_location_repo(with_series_context(
         PromptTemplate::<LinuxPatchReviewState>::new(format!(
             r#"{STAGE_VERIFICATION_INSTRUCTION}
 
@@ -2765,7 +2957,7 @@ pub fn verification_stage_with_effort(
 @include("severity.md")
 </severity_guidelines>@includes
 
-CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must have concrete evidence in the code that proves the concern is invalid. Never drop a raised concern into 'dismissed_concerns' in this stage: every consolidated concern must be placed either in 'findings' (if well-justified with concrete code proof and no competing dismissal) or in 'hard_cases' (if contested, speculative, or requiring tool verification). Also inspect every standalone dismissed_concern: if it dismissed a plausible bug using an unverified assumption, promote it into 'hard_cases' with '"signal_reason": "speculative_dismissal"'.{series_context}
+CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must have concrete evidence in the code that proves the concern is invalid. Never drop a raised concern into 'dismissed_concerns' in this stage: every consolidated concern must be placed either in 'findings' (if well-justified with concrete code proof and no competing dismissal) or in 'hard_cases' (if contested, speculative, or requiring tool verification). Also inspect every standalone dismissed_concern: if it dismissed a plausible bug using an unverified assumption, promote it into 'hard_cases' with '"signal_reason": "speculative_dismissal"'.{{{{location_repo_rule}}}}{series_context}
 
 Aggregated Concerns:
 {{{{aggregated_concerns}}}}
@@ -2775,9 +2967,9 @@ Aggregated Dismissed Concerns:
 
 Return ONLY a JSON object with 'findings', 'hard_cases', and 'dismissed_concerns' arrays.
 - LINEAGE REQUIREMENT ('source_ids'): Every input item in Aggregated Concerns has an "id" ("C1", "C2", ...) and every input item in Aggregated Dismissed Concerns has an "id" ("D1", "D2", ...). Every output object across 'findings', 'hard_cases', and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the exact input "id" string(s) merged into that item (e.g. ["C1", "D2"]). Every input "id" (all C* and D* IDs) MUST appear in at least one output item's "source_ids". Category 1a 'findings' may ONLY reference C* IDs (any contested C* + D* or promoted D* must go to 'hard_cases'), and Category 1b 'dismissed_concerns' may ONLY reference D* IDs (never C* IDs).
-- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "speculative" (a boolean: true if you could not lay out a concrete triggering path because it rests on an unproven assumption, or on an ABI, register, or convention you might be misreading; the severity definitions cap a speculative finding at Medium. If any part of the triggering path rests on such an assumption, answer true. false if the triggering path is established from the code. Uncertainty about reachability or about the consequence alone does not make a finding speculative and never lowers its level. A Category 1a finding rests on concrete code proof, so a concern you would mark true belongs in 'hard_cases' with "signal_reason": "speculative_concern" instead), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
-- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects), and may include "stages" and "prompts".
-- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of D* input IDs), "type", "description", "reasoning", and "locations", and may include "stages" and "prompts".
+- Each object in 'findings' (Category 1a: Well-Justified Concerns) MUST use the keys: "source_ids" (non-empty array of C* input IDs), "problem" (a short naming string under 80 characters, preferably starting with a subsystem prefix like 'mm:' or 'bpf:', NEVER using backquotes, using fn_name() format for functions, describing the root cause), "speculative" (a boolean: true if you could not lay out a concrete triggering path because it rests on an unproven assumption, or on an ABI, register, or convention you might be misreading; the severity definitions cap a speculative finding at Medium. If any part of the triggering path rests on such an assumption, answer true. false if the triggering path is established from the code. Uncertainty about reachability or about the consequence alone does not make a finding speculative and never lowers its level. A Category 1a finding rests on concrete code proof, so a concern you would mark true belongs in 'hard_cases' with "signal_reason": "speculative_concern" instead), "severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "severity_explanation" (detailed reasoning and proof), "preexisting" (boolean), and "locations" (array of location objects{{{{location_objects_repo}}}}), and may include "stages" (array of stage names that raised the merged concern) and "prompts" (array of prompt files from the merged concern).
+- Each object in 'hard_cases' (Category 2: Speculative or Contested) MUST use the keys: "source_ids" (non-empty array of input IDs), "type", "description", "estimated_severity" ("Low", "Medium", "High", "Critical", or "Unknown"), "signal_reason" ("mixed_signals", "speculative_concern", "speculative_dismissal", "series_interaction", or "other"), "concern_arguments" (consolidated arguments for why the bug can occur), "dismissal_arguments" (consolidated arguments/snippets from any competing or standalone dismissal, or "" if none), "verification_question" (the specific code question post-verification must answer with tools), "preexisting" (boolean), and "locations" (array of location objects{{{{location_objects_repo}}}}), and may include "stages" and "prompts".
+- Each object in 'dismissed_concerns' (Category 1b: Well-Justified Dismissals) MUST use the keys: "source_ids" (non-empty array of D* input IDs), "type", "description", "reasoning", and "locations"{{{{location_list_repo}}}}, and may include "stages" and "prompts".
 
 Example Output:
 ```json
@@ -2792,7 +2984,7 @@ Example Output:
       "preexisting": false,
       "locations": [
         {{
-          "file": "path/to/file.c",
+          {{{{location_repo_example}}}}"file": "path/to/file.c",
           "function_or_symbol": "function_name",
           "line": 123,
           "code_snippet": "problematic_code();",
@@ -2814,14 +3006,14 @@ Example Output:
       "preexisting": false,
       "locations": [
         {{
-          "file": "path/to/file.c",
+          {{{{location_repo_example}}}}"file": "path/to/file.c",
           "function_or_symbol": "parse_tree",
           "line": 88,
           "code_snippet": "return -EINVAL;",
           "why_this_location_matters": "Early error return after allocation without local kfree."
         }}
       ]
-    }}
+    }}{{{{location_reference_verification_example}}}}
   ],
   "dismissed_concerns": []
 }}
@@ -2833,7 +3025,7 @@ Example Output:
             extra_prompt_paths_for_state(s, analysis_stage_by_name)
         }),
         VERIFICATION.wants_series_context,
-    )
+    ))
     .with_var("aggregated_concerns", |s: &LinuxPatchReviewState| {
         serde_json::to_string_pretty(&s.all_concerns).unwrap_or_default()
     })
@@ -2886,7 +3078,7 @@ pub fn post_verification_stage_with_effort(
     let batch_for_validate = batch.clone();
     let batch_for_reduce = batch;
     let series_context = series_context_placeholder(POST_VERIFICATION.wants_series_context);
-    let user_template = with_series_context(
+    let user_template = with_location_repo(with_series_context(
         PromptTemplate::<LinuxPatchReviewState>::new(format!(
             r#"{STAGE_POST_VERIFICATION_INSTRUCTION}
 
@@ -2898,15 +3090,15 @@ pub fn post_verification_stage_with_effort(
 @include("severity.md")
 </severity_guidelines>@includes
 
-CRITICAL REVIEW DIRECTIVE: To dismiss a candidate issue as a false positive, you must find concrete evidence in the code that proves the issue is invalid (e.g., verifying with tools that the caller or callee prevents the exact failure mode) and quote that disproving code in `dismissed_concerns[].locations`. If you cannot find concrete proof of safety, you must validate and report the finding in `findings`.{series_context}
+CRITICAL REVIEW DIRECTIVE: To dismiss a candidate issue as a false positive, you must find concrete evidence in the code that proves the issue is invalid (e.g., verifying with tools that the caller or callee prevents the exact failure mode) and quote that disproving code in `dismissed_concerns[].locations`. If you cannot find concrete proof of safety, you must validate and report the finding in `findings`.{{{{location_repo_rule}}}}{series_context}
 
 Candidate Hard Case(s) to Verify:
 {{{{candidate_hard_cases}}}}
 
 Return ONLY a JSON object with 'findings' and 'dismissed_concerns' arrays. Every candidate in this batch MUST be accounted for in either 'findings' (if validated) or 'dismissed_concerns' (ONLY if concrete code disproves the candidate; never return both empty arrays).
 - LINEAGE REQUIREMENT ('source_ids'): Each candidate hard case in this batch has an "id" (e.g. "H1"). Every object in 'findings' and 'dismissed_concerns' MUST include a non-empty "source_ids" array listing the candidate "id"(s) from this batch that it resolves (e.g. ["H1"]), and every candidate "id" in this batch must be accounted for.
-- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "speculative" (a boolean: true if you could not lay out a concrete triggering path because it rests on an unproven assumption, or on an ABI, register, or convention you might be misreading; the severity definitions cap a speculative finding at Medium. If any part of the triggering path rests on such an assumption, answer true. false if the triggering path is established from the code. Uncertainty about reachability or about the consequence alone does not make a finding speculative and never lowers its level. A candidate you report only because no code disproves it, without having established its triggering path, is speculative; one whose triggering path your tool inspection established is not, whatever its "signal_reason"), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces, modifies, triggers, exposes, or relies on the buggy code path, caller/callee interaction, or error cleanup path, even if the underlying helper, check, or cleanup label already existed; true ONLY if the bug is in untouched code whose reachability, inputs, and behavior are completely unaffected by the reviewed patchset), "locations" (an array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
-- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving guard, lock, cleanup path, or caller/callee implementation).
+- Each object in 'findings' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "problem" (a short naming string containing the vulnerability description. BUG NAME RULES: 1) less than 80 characters, 2) preferably start with a short subsystem prefix like 'mm:' or 'bpf:', 3) NEVER use backquotes, 4) if referring to a function, use fn_name() format, 5) try to describe the root cause instead of the consequence of the problem), "speculative" (a boolean: true if you could not lay out a concrete triggering path because it rests on an unproven assumption, or on an ABI, register, or convention you might be misreading; the severity definitions cap a speculative finding at Medium. If any part of the triggering path rests on such an assumption, answer true. false if the triggering path is established from the code. Uncertainty about reachability or about the consequence alone does not make a finding speculative and never lowers its level. A candidate you report only because no code disproves it, without having established its triggering path, is speculative; one whose triggering path your tool inspection established is not, whatever its "signal_reason"), "severity" (a string: Low, Medium, High, Critical, or Unknown), "severity_explanation" (a string detailing the reasoning and proof), "preexisting" (a boolean: false whenever the patch introduces, modifies, triggers, exposes, or relies on the buggy code path, caller/callee interaction, or error cleanup path, even if the underlying helper, check, or cleanup label already existed; true ONLY if the bug is in untouched code whose reachability, inputs, and behavior are completely unaffected by the reviewed patchset), "locations" (an array of objects with {{{{location_repo_key}}}}file, function_or_symbol, line, code_snippet, and why_this_location_matters). Carry forward the locations from the validated candidate; if you gather better evidence, replace vague locations with the most precise verified locations. Do not invent line numbers; use null when exact values are unknown.
+- Each object in 'dismissed_concerns' MUST use: "source_ids" (non-empty array of candidate H* IDs from this batch), "description" (the candidate issue that was disproved), "reasoning" (step-by-step explanation of how the inspected code disproves the candidate), and "locations" (a non-empty array of objects with {{{{location_repo_key}}}}file, function_or_symbol, line, code_snippet, and why_this_location_matters, quoting the verbatim disproving guard, lock, cleanup path, or caller/callee implementation).
 
 Example Output:
 ```json
@@ -2921,7 +3113,7 @@ Example Output:
       "preexisting": false,
       "locations": [
         {{
-          "file": "path/to/file.c",
+          {{{{location_repo_example}}}}"file": "path/to/file.c",
           "function_or_symbol": "function_name",
           "line": 123,
           "code_snippet": "problematic_code();",
@@ -2937,14 +3129,14 @@ Example Output:
       "reasoning": "Inspecting caller_fn() confirms bar_free() is unconditionally invoked in the err_out cleanup path.",
       "locations": [
         {{
-          "file": "path/to/file.c",
+          {{{{location_repo_example}}}}"file": "path/to/file.c",
           "function_or_symbol": "caller_fn",
           "line": 125,
           "code_snippet": "err_out:\n\tbar_free(bar);",
           "why_this_location_matters": "This caller error path frees the resource when foo_init() returns an error."
         }}
       ]
-    }}
+    }}{{{{location_reference_post_verification_example}}}}
   ]
 }}
 ```"#
@@ -2955,7 +3147,7 @@ Example Output:
             extra_prompt_paths_for_items(&s.selected_guides, &batch_for_prompts, analysis_stage_by_name)
         }),
         POST_VERIFICATION.wants_series_context,
-    )
+    ))
     .with_var("candidate_hard_cases", move |_: &LinuxPatchReviewState| {
         candidate_json.clone()
     });
@@ -3105,14 +3297,14 @@ pub fn report_stage_with_effort(
         .system_prompt(linux_system_prompt(true))
         .user_prompt(
             with_prior_links(
-                PromptTemplate::<LinuxPatchReviewState>::new(format!(
-                    r#"{STAGE_REPORT_INSTRUCTION}{PRIOR_LINKS_PLACEHOLDER}
+                with_location_repo(PromptTemplate::<LinuxPatchReviewState>::new(format!(
+                    r#"{STAGE_REPORT_INSTRUCTION}{{{{location_repo_report}}}}{PRIOR_LINKS_PLACEHOLDER}
 
 Findings:
 {{{{findings}}}}
 
 Return raw text output, not JSON."#
-                ))
+                )))
                 .include_file("inline-template.md")
                 .with_var("findings", |s: &LinuxPatchReviewState| {
                     serde_json::to_string_pretty(&s.findings).unwrap_or_default()
@@ -4400,6 +4592,10 @@ mod tests {
             "Fixes:",
             // A kernel entry without a description gets the built-in text.
             "builds against",
+            "Set every location's repo to the repository you read it in (\"review\" or a \
+             reference name). When you claim a contract with one of these repositories, cite \
+             repo:file:line in prose.",
+            "A contract mismatch is a finding only if this patch introduces it",
         ] {
             assert!(grounded.contains(needle), "missing {needle}: {grounded}");
         }
@@ -4465,6 +4661,171 @@ mod tests {
         assert!(!caveats.contains("ionic-rdma-v59"), "{caveats}");
     }
 
+    /// A state whose user prompts include every Linux stage: a concern for
+    /// verification, a hard case for the post-verification fan-out and a
+    /// finding for the report.
+    fn every_stage_state(references: Vec<ReferenceRepo>) -> LinuxPatchReviewState {
+        LinuxPatchReviewState {
+            references,
+            all_concerns: vec![json!({"id": "C1", "description": "a concern"})],
+            hard_cases: vec![json!({"id": "H1", "description": "x", "estimated_severity": "High"})],
+            findings: vec![json!({"problem": "frob: leak"})],
+            ..Default::default()
+        }
+    }
+
+    /// The references a location-repository test attaches: a userspace tree
+    /// first, so the report's example names it, and a kernel entry configured
+    /// under a name other than "kernel", so the examples have to read it from
+    /// the state.
+    fn module_references() -> Vec<ReferenceRepo> {
+        vec![
+            reference("rdma-core", ReferenceKind::Source, "ionic-rdma-v59"),
+            reference("linux", ReferenceKind::Kernel, "v6.18"),
+        ]
+    }
+
+    /// Every text the location-repository placeholders render for
+    /// [`module_references`]. The two key-list forms that wrap the
+    /// definition come before the bare one, which each of them contains.
+    fn location_repo_fragments() -> Vec<String> {
+        let definition = location_repo_key_definition();
+        let mut fragments: Vec<String> = ReferenceExample::ALL
+            .into_iter()
+            .map(|example| example.render("linux"))
+            .collect();
+        fragments.extend([
+            format!(" (each location opening with {definition})"),
+            format!(", each opening with {definition}"),
+            format!("{definition}, "),
+            "\"repo\": \"review\",\n          ".to_string(),
+            format!("\n\n{LOCATION_REPO_RULE}"),
+            location_repo_report_rule("rdma-core"),
+        ]);
+        fragments
+    }
+
+    /// G5 of DESIGN_LOCATION_REPOSITORY_LABELS.md: a review with no
+    /// reference attached renders the user prompts it rendered before
+    /// locations named a repository. With references attached, taking the
+    /// rendered location-repository texts back out gives exactly those
+    /// prompts, so the texts are the only change, and a Sashiko review is not
+    /// changed at all.
+    #[test]
+    fn location_repo_prompts_render_only_with_references() {
+        use crate::workflows::sashiko_patch_review::build_sashiko_patch_review_workflow;
+        let single = every_stage_state(Vec::new());
+        let referenced = every_stage_state(module_references());
+        let linux = build_linux_patch_review_workflow();
+        let plain = linux.stage_user_prompts(&single);
+        let labelled = linux.stage_user_prompts(&referenced);
+        assert_eq!(plain.len(), labelled.len());
+
+        for (name, prompt) in &plain {
+            for absent in [
+                "\"repo\"",
+                "LOCATIONS NAME THEIR REPOSITORY",
+                "REFERENCE LOCATIONS",
+                "{{location_",
+            ] {
+                assert!(
+                    !prompt.contains(absent),
+                    "{name} renders {absent}: {prompt}"
+                );
+            }
+        }
+        let fragments = location_repo_fragments();
+        for ((name, plain), (labelled_name, labelled)) in plain.iter().zip(&labelled) {
+            assert_eq!(name, labelled_name);
+            assert!(!labelled.contains("{{location_"), "{name}: {labelled}");
+            let stripped = fragments.iter().fold(labelled.clone(), |text, fragment| {
+                text.replace(fragment, "")
+            });
+            let at = stripped
+                .char_indices()
+                .zip(plain.chars())
+                .find(|((_, a), b)| a != b)
+                .map_or(stripped.len().min(plain.len()), |((at, _), _)| at);
+            assert_eq!(
+                &stripped,
+                plain,
+                "{name} differs beyond the repo texts at {:?}",
+                stripped[at..].chars().take(200).collect::<String>()
+            );
+        }
+
+        let sashiko = build_sashiko_patch_review_workflow();
+        assert_eq!(
+            sashiko.stage_user_prompts(&single),
+            sashiko.stage_user_prompts(&referenced),
+            "the Sashiko workflow asks for no location repository"
+        );
+    }
+
+    /// With references attached, each stage that writes locations defines
+    /// "repo" first and shows it in its example, the stages that decide
+    /// findings get the rule, the report is told how to cite one, and every
+    /// example is still valid JSON whose locations all name an attached
+    /// repository.
+    #[test]
+    fn location_repo_prompts_ask_every_location_for_its_repository() {
+        let state = every_stage_state(module_references());
+        let prompts = build_linux_patch_review_workflow().stage_user_prompts(&state);
+        let prompt = |stage: &str| {
+            prompts
+                .iter()
+                .find(|(name, _)| *name == stage)
+                .map(|(_, prompt)| prompt.as_str())
+                .unwrap_or_else(|| panic!("no {stage} prompt"))
+        };
+        let definition = location_repo_key_definition();
+        let mut examples = 0;
+        for (name, text) in &prompts {
+            let Some(start) = text.find("Example Output:\n```json") else {
+                continue;
+            };
+            let body = &text[start + "Example Output:\n```json".len()..];
+            let example: Value = serde_json::from_str(&body[..body.find("```").unwrap()])
+                .unwrap_or_else(|e| panic!("{name}: example is not JSON: {e}"));
+            assert!(text.contains(&definition), "{name}: {text}");
+            let repos: Vec<&str> = example
+                .as_object()
+                .unwrap()
+                .values()
+                .flat_map(|items| items.as_array().unwrap())
+                .flat_map(|item| item["locations"].as_array().unwrap())
+                .map(|location| location["repo"].as_str().unwrap_or("<missing>"))
+                .collect();
+            assert!(
+                repos.iter().all(|r| ["review", "linux"].contains(r)),
+                "{name}: {repos:?}"
+            );
+            assert_eq!(
+                repos.iter().filter(|r| **r == "linux").count(),
+                1,
+                "{name}: one example cites the kernel entry by its name"
+            );
+            examples += 1;
+        }
+        assert!(
+            examples >= 3,
+            "analysis, verification and post-verification"
+        );
+
+        for stage in ["verification", POST_VERIFICATION_STAGE_NAMES[0]] {
+            assert!(prompt(stage).contains(LOCATION_REPO_RULE), "{stage}");
+        }
+        assert!(
+            !prompt("resources").contains(LOCATION_REPO_RULE),
+            "analysis candidates are re-checked later"
+        );
+        let report = prompt("report");
+        assert!(
+            report.contains("as <repo>:<file> (for example rdma-core:path/to/file.h)"),
+            "{report}"
+        );
+    }
+
     /// An out-of-tree module often ships its own copy of a driver the kernel
     /// also has (pds_core in driver-b). Only the module's copy runs, so the
     /// caveats send every call chain to the review repository, forbid mixing
@@ -4480,9 +4841,18 @@ mod tests {
             r#"Build every call chain, execution path, and struct layout you use to verify a claim from repo="review""#,
             "Never mix the two in one argument",
             "a fix or improvement it has that the module lacks and could adopt",
+            "never list it in a finding's locations",
         ] {
             assert!(caveats.contains(needle), "missing {needle:?}: {caveats}");
         }
+        assert!(
+            prompt.contains(
+                "A location in a reference repository is evidence only for code the code under \
+                 review does not carry; a comparison with a reference's copy of code the module \
+                 carries belongs in the prose"
+            ),
+            "comparisons stay out of locations: {prompt}"
+        );
         assert!(!caveats.contains("no include/linux/"), "{caveats}");
         assert!(
             prompt.contains(
