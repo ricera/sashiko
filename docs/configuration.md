@@ -487,6 +487,52 @@ is invited to wander into it, while an `rdma/drv/` patch gets both.
   the kernel's copy is cited only as a fix or improvement the module could
   adopt.
 
+- **A location names its repository.** When a patch has references attached,
+  every location of a concern, finding, hard case or dismissed concern carries
+  a `repo` key, with the same values as the tools' `repo` argument: `"review"`
+  for the code under review, or the name of an attached reference, e.g.
+  `{"repo": "kernel", "file": "include/linux/kvm_host.h", ...}`. The prompts
+  ask for it, and every stage rejects a location whose `repo` is missing or
+  names no attached repository, e.g. `location 3 of concern C2 has repo
+  "linux" but the attached repositories are "review" and "kernel"; set "repo"
+  to the one you read the code in`. A `file` written as `kernel:<path>` is
+  accepted and stored split into `repo` and `file`.
+
+  Before the review runs, the worker lists the paths of the code under review
+  at the patch's commit and of each reference at its pin, and, when a
+  `kind = "kernel"` reference is attached, the functions, structs, unions,
+  enums and macros the code under review defines (skipped for a tree of more
+  than 20,000 files, which only an in-tree kernel has). Verification and
+  post-verification then check every location they keep:
+  1. its `file` exists in the repository `repo` names; the message says which
+     attached repository has it, if any;
+  2. a location in a `kind = "kernel"` reference does not cite a file the code
+     under review ships itself, e.g. `include/linux/pds/pds_adminq.h`;
+  3. nor a function or type the code under review defines, e.g. `pdsc_notify,
+     which the code under review defines at core/core.c:23; cite that with repo
+     "review"`.
+
+  A tree or a name the worker could not list is let through, never rejected.
+  These checks reject at most one output per stage, and that stage gets one
+  extra attempt for it; if the retry fails the stage's other checks, the
+  rejected output is accepted instead. A location that still fails these
+  checks is kept and flagged in the stored finding: `"unverified_path": true` for check 1,
+  `"repo_conflict": true` for checks 2 and 3. A finding is never dropped over
+  a location's repository. The analysis stages run only the `repo` check.
+
+  The label is shown wherever the location is: the page and the review map
+  print `kernel:` before the path, with the reference's pin on hover, and tag a
+  flagged location `(kernel copy of module code)` or `(path not found in
+  kernel)`; the CLIs print `kernel:file:line (fn)`; the report cites it as
+  `kernel:<file>`. Matching earlier revisions' findings to a diff, handing a
+  concern to the bug pipeline and similarity search use only the code under
+  review's locations, so a kernel path never stands in for a module file of
+  the same name.
+
+  A review with no references attached, and a location with no `repo` or with
+  `"review"`, are unchanged: the prompts, the checks and what is shown are
+  exactly what they were before.
+
 #### `[[git.custom_remotes]]`
 
 Optional array of additional git remotes to track.

@@ -1,6 +1,7 @@
 # Design: Say Which Repository a Finding's Location Is In
 
-Status: draft for review, 2026-10-21. Branch: `port/v0.6.1` at
+Status: being implemented (commits 2-9 of §7), 2026-10-21; the §6.3
+measurement is pending. Drafted on branch `port/v0.6.1` at
 8168ea0b4af1 ("review: keep an out-of-tree module's call chains in the
 module").
 
@@ -213,7 +214,9 @@ Verification (findings, hard cases, dismissed concerns) and post-verification
 
 Retry budget: like `PRIOR_LINK_REJECTIONS`, the stages that run checks 1-3 get
 one extra attempt, spent only on these rejections. When a stage still fails
-them after that, the output is accepted. The reduce then sets
+them after that, the output is accepted; when the retry fails the stage's
+other checks, the output these checks rejected is accepted instead. The
+reduce then sets
 `"repo_conflict": true` on each offending location (`check 2 or 3`) or
 `"unverified_path": true` (check 1), and the page shows a warning beside it
 (§4.6). A finding is never dropped by this design (§8 D3).
@@ -372,6 +375,11 @@ about $90.
 10. designs: record the measurement (§6.3 results, D-decisions settled).
 
 ## 8. Open Decisions
+
+Settled 2026-10-21: D1-D5 as recommended (key `repo`; locations are
+evidence only; accept and flag after the retry budget; analysis gets the
+cheap check only; snippet grounding is a follow-up). D6, the measurement,
+is pending.
 
 - D1. **Key name.** `repo` (recommended: the tools' own argument name and
   values) vs `repository`. Recommended: `repo`.
