@@ -64,6 +64,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 - `ingestor.rs`, `fetcher.rs`, `mbox.rs`, `nntp.rs`, `patchwork.rs`, `backfill.rs`: Mailing list, Lore mbox, NNTP, and Patchwork ingestion pipelines.
 - `reviewer.rs`: Patchset review worker orchestration.
 - `local_review.rs`: Local review execution (`sashiko review`).
+- `location_repo.rs`: The repository a finding's location names (`LocationRepo`: the code under review or an attached reference), parsed against the patch's references, and the normalization of a `<repo>:<path>` prefix in a location's `file`.
 - `finding_view.rs`: Typed one-line view of a review finding (severity, title, tags, location), shared by both CLIs.
 - `cover_letter.rs`: A series cover letter (a b4 tracker's prose or a pull request's description), the order its sources are taken in, how its untrusted text is cleaned, and the prompt block that carries it.
 - `prior_revisions.rs`: The findings of a pull request's earlier revisions, cut down to the summaries the daemon sends a later revision's review, the prompt block that shows them to the `prior-links` stage, and the block that gives the report the ones its findings link to.

@@ -42,6 +42,7 @@ pub mod git_ops;
 #[cfg(feature = "server")]
 pub mod ingestor;
 pub mod local_review;
+pub mod location_repo;
 pub mod maintainers;
 #[cfg(feature = "server")]
 pub mod mbox;
