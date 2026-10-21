@@ -35,8 +35,9 @@ use crate::workflow::stage::{ExecutableStage, Stage};
 /// What the prompt says about a kernel reference configured without a
 /// description.
 const KERNEL_REFERENCE_DESCRIPTION: &str = "The Linux kernel tree the code under review builds \
-     against. Verify API contracts, struct layouts and helper semantics by reading it rather than \
-     recalling them -- your recollection is not pinned to this version.";
+     against. Verify the kernel's API contracts, struct layouts and helper semantics by reading it \
+     rather than recalling them -- your recollection is not pinned to this version. Anything the \
+     code under review carries its own copy of is read there, not here.";
 
 /// The prompt block describing the attached reference repositories, or
 /// nothing when there are none.
@@ -92,12 +93,29 @@ fn reference_context_block(references: &[ReferenceRepo]) -> String {
         block.push_str(&format!(
             "\n\n=== Out-of-Tree Module ===\n\
              The repository under review is an out-of-tree Linux kernel module, not a \
-             mainline kernel tree. It contains the module's own sources and nothing else: \
-             there is no include/linux/, no kernel core code, and no mainline history.\n\n\
+             mainline kernel tree. It contains the module's own sources, sometimes with its \
+             own copies of headers, but no kernel core code and no mainline history.\n\n\
              The kernel this module builds against is available as the read-only repository \
-             {REPO_ARG}=\"{}\", pinned at {}. Verify API contracts, struct layouts, and helper \
-             semantics by reading that tree rather than recalling them -- your recollection is \
-             not pinned to this kernel version and may describe a different one.\n\n\
+             {REPO_ARG}=\"{kernel}\", pinned at {revision}. Verify the kernel's API contracts, \
+             struct layouts, and helper semantics by reading that tree rather than recalling \
+             them -- your recollection is not pinned to this kernel version and may describe a \
+             different one.\n\n\
+             The module replaces the kernel's own version of the same code. When the \
+             repository under review carries a driver, file, function, struct, or header that \
+             also exists in {REPO_ARG}=\"{kernel}\", the kernel's version is not loaded while \
+             this module runs, and the module never calls into it:\n\
+             - Build every call chain, execution path, and struct layout you use to verify a \
+             claim from {REPO_ARG}=\"{REPO_ARG_REVIEW}\". Read {REPO_ARG}=\"{kernel}\" only for \
+             code the module does not carry, such as core kernel APIs and headers it does not \
+             ship. Before citing a function, struct, or header from {REPO_ARG}=\"{kernel}\", \
+             check whether {REPO_ARG}=\"{REPO_ARG_REVIEW}\" has its own; if it does, cite and \
+             reason from that one.\n\
+             - Never mix the two in one argument. A path that runs from a module function into \
+             the kernel's version of a module function describes code that never executes, \
+             and cannot support or refute a finding.\n\
+             - The kernel's version may still be cited as a comparison: a fix or improvement \
+             it has that the module lacks and could adopt. Label it as such; it is never \
+             evidence of what the module does.\n\n\
              Consequences of being out-of-tree, all of which change what counts as a \
              finding:\n\
              - Fixes: tags, lore threads, and 'look forward in git history for the fix' do \
@@ -109,7 +127,8 @@ fn reference_context_block(references: &[ReferenceRepo]) -> String {
              - File paths will not match mainline paths. Do not conclude that code is \
              missing or misplaced from its path alone.\n\
              ===========================",
-            kernel.name, kernel.revision
+            kernel = kernel.name,
+            revision = kernel.revision
         ));
     }
     block
@@ -4439,6 +4458,33 @@ mod tests {
         );
         assert!(!caveats.contains("rdma-core"), "{caveats}");
         assert!(!caveats.contains("ionic-rdma-v59"), "{caveats}");
+    }
+
+    /// An out-of-tree module often ships its own copy of a driver the kernel
+    /// also has (pds_core in driver-b). Only the module's copy runs, so the
+    /// caveats send every call chain to the review repository, forbid mixing
+    /// in the kernel's copy, and keep it only as a source of fixes. They no
+    /// longer claim the module has no headers, which sent the model to the
+    /// kernel's copy of a header the module ships.
+    #[test]
+    fn out_of_tree_caveats_keep_call_chains_in_the_module() {
+        let prompt = render_with(vec![reference("kernel", ReferenceKind::Kernel, "v7.2")]);
+        let caveats = &prompt[prompt.find("=== Out-of-Tree Module ===").unwrap()..];
+        for needle in [
+            r#"the kernel's version is not loaded while this module runs, and the module never calls into it"#,
+            r#"Build every call chain, execution path, and struct layout you use to verify a claim from repo="review""#,
+            "Never mix the two in one argument",
+            "a fix or improvement it has that the module lacks and could adopt",
+        ] {
+            assert!(caveats.contains(needle), "missing {needle:?}: {caveats}");
+        }
+        assert!(!caveats.contains("no include/linux/"), "{caveats}");
+        assert!(
+            prompt.contains(
+                "Anything the code under review carries its own copy of is read there, not here."
+            ),
+            "the kernel's list entry defers to the module's own copies: {prompt}"
+        );
     }
 
     /// A kernel entry scoped away from a patch is not attached to it, so that

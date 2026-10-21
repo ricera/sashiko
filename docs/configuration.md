@@ -480,6 +480,13 @@ is invited to wander into it, while an `rdma/drv/` patch gets both.
   `Fixes:` tags, lore and mainline paths are expected again -- and reads no
   kernel tree. Do not scope the kernel entry of an out-of-tree module.
 
+  The caveats also say that the module replaces the kernel's version of
+  whatever it ships: a driver, function, struct or header present in both is
+  read from the code under review, because the kernel's copy is not loaded
+  while the module runs. Call chains that verify a claim stay in the module;
+  the kernel's copy is cited only as a fix or improvement the module could
+  adopt.
+
 #### `[[git.custom_remotes]]`
 
 Optional array of additional git remotes to track.
