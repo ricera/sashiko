@@ -3642,6 +3642,21 @@ async fn bug_action(
 mod tests {
     use super::*;
 
+    /// The patchset page sends its page size as limit=, the CLIs as
+    /// per_page=; the route reads either, decoded as axum decodes it.
+    #[test]
+    fn patch_query_reads_limit_as_the_page_size() {
+        for uri in [
+            "/api/patchset?id=7&page=2&limit=10",
+            "/api/patchset?id=7&page=2&per_page=10",
+        ] {
+            let parsed: axum::http::Uri = uri.parse().unwrap();
+            let Query(query) = Query::<PatchQuery>::try_from_uri(&parsed).unwrap();
+            assert_eq!(query.per_page, Some(10), "{uri}");
+            assert_eq!(query.page, Some(2), "{uri}");
+        }
+    }
+
     #[test]
     fn test_thread_message_id_remains_unencoded() {
         assert_eq!(

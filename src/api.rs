@@ -42,6 +42,10 @@ pub struct MessagesResponse {
 pub struct PatchQuery {
     pub id: String,
     pub page: Option<u32>,
+    /// The web page asks for its page size as `limit`, the CLIs as
+    /// `per_page`; both name this field, so the page's size is not dropped
+    /// for the default.
+    #[serde(alias = "limit")]
     pub per_page: Option<u32>,
 }
 
