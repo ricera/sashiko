@@ -1040,19 +1040,19 @@ async fn get_patchset(
         info!("Fetching details for patchset id: {}", id_val);
         state
             .db
-            .get_patchset_details(id_val, query.page, query.per_page)
+            .get_patchset_details(id_val, query.page, query.page_size())
             .await
     } else if query.id.contains('-') && !query.id.contains('@') {
         info!("Fetching details for patchset slug: {}", query.id);
         state
             .db
-            .get_patchset_details_by_slug(&query.id, query.page, query.per_page)
+            .get_patchset_details_by_slug(&query.id, query.page, query.page_size())
             .await
     } else {
         info!("Fetching details for patchset msgid: {}", query.id);
         state
             .db
-            .get_patchset_details_by_msgid(&query.id, query.page, query.per_page)
+            .get_patchset_details_by_msgid(&query.id, query.page, query.page_size())
             .await
     };
 
@@ -1065,7 +1065,7 @@ async fn get_patchset(
                 &principal,
                 &mut details,
                 query.page,
-                query.per_page,
+                query.page_size(),
                 true,
             )
             .await?;
@@ -1151,19 +1151,19 @@ async fn get_patchset_summary(
         info!("Fetching summary for patchset id: {}", id_val);
         state
             .db
-            .get_patchset_summary(id_val, query.page, query.per_page)
+            .get_patchset_summary(id_val, query.page, query.page_size())
             .await
     } else if query.id.contains('-') && !query.id.contains('@') {
         info!("Fetching summary for patchset slug: {}", query.id);
         state
             .db
-            .get_patchset_summary_by_slug(&query.id, query.page, query.per_page)
+            .get_patchset_summary_by_slug(&query.id, query.page, query.page_size())
             .await
     } else {
         info!("Fetching summary for patchset msgid: {}", query.id);
         state
             .db
-            .get_patchset_summary_by_msgid(&query.id, query.page, query.per_page)
+            .get_patchset_summary_by_msgid(&query.id, query.page, query.page_size())
             .await
     };
 
@@ -1176,7 +1176,7 @@ async fn get_patchset_summary(
                 &principal,
                 &mut details,
                 query.page,
-                query.per_page,
+                query.page_size(),
                 false,
             )
             .await?;
@@ -2917,6 +2917,44 @@ async fn bug_action(
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    /// The patchset page sends its page size as limit=, the API's own name is
+    /// per_page=; the route reads either, decoded as axum decodes it, bounded
+    /// as the list endpoints bound theirs, and an edited address that is not
+    /// a number falls back to the default rather than failing the request.
+    #[test]
+    fn patch_query_reads_limit_as_the_page_size() {
+        let page_size = |uri: &str| {
+            let parsed: axum::http::Uri = uri.parse().unwrap();
+            let Query(query) = Query::<PatchQuery>::try_from_uri(&parsed)
+                .unwrap_or_else(|e| panic!("{uri} was refused: {e}"));
+            assert_eq!(query.page, Some(2), "{uri}");
+            query.page_size()
+        };
+        let max = Some(crate::api::MAX_PATCHSET_PAGE_SIZE);
+        for (query, expected) in [
+            ("limit=10", Some(10)),
+            ("per_page=10", Some(10)),
+            ("limit=4294967295", max),
+            ("limit=99999999999999999999", max),
+            ("limit=101", max),
+            ("limit=0", Some(1)),
+            ("limit=-5", Some(1)),
+            ("limit=-99999999999999999999", Some(1)),
+            ("limit=%2B7", Some(7)),
+            ("limit=abc", None),
+            ("limit=7abc", None),
+            ("limit=-", None),
+            ("limit=", None),
+            ("x=1", None),
+            ("per_page=20&limit=10", Some(20)),
+            ("limit=10&per_page=20", Some(20)),
+            ("per_page=abc&limit=10", Some(10)),
+        ] {
+            let uri = format!("/api/patchset?id=7&page=2&{query}");
+            assert_eq!(page_size(&uri), expected, "{uri}");
+        }
+    }
 
     #[test]
     fn test_thread_message_id_remains_unencoded() {
@@ -5660,6 +5698,7 @@ F:	*
             id: ps_id.to_string(),
             page: None,
             per_page: None,
+            limit: None,
         };
         let list_pagination = || Pagination {
             page: Some(1),

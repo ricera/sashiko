@@ -364,6 +364,70 @@ async fn test_patchset_message_and_review_query_endpoints() {
     assert_eq!(body["logs"].as_str().unwrap(), logs_json);
 }
 
+/// The patchset page asks for its page size as limit=. Through the real
+/// router, the size reaches the query on both patchset routes, per_page wins
+/// when both are named, the size is bounded at 100, a value that is not a
+/// number falls back to the default, and a repeated key is refused as a
+/// repeated per_page always was.
+#[tokio::test]
+async fn test_patchset_page_size_reaches_the_query() {
+    let server = spawn_test_server(false).await;
+    let client = reqwest::Client::new();
+
+    let tx = server.db.begin_immediate_transaction().await.unwrap();
+    tx.execute(
+        "INSERT INTO patchsets (id, status, subject, author, date, total_parts, received_parts) \
+         VALUES (1, 'Pending', '[PATCH 0/120] big series', 'Author <a@b.com>', 1234567890, 120, 120)",
+        (),
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 120)
+         INSERT INTO messages (message_id, subject, author, date, body)
+         SELECT '<page-' || x || '@example.com>', 'part ' || x, 'Author <a@b.com>', 1234567890, ''
+         FROM cnt",
+        (),
+    )
+    .await
+    .unwrap();
+    tx.execute(
+        "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 120)
+         INSERT INTO patches (id, patchset_id, message_id, part_index)
+         SELECT x, 1, '<page-' || x || '@example.com>', x FROM cnt",
+        (),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let get = |route: &str, query: &str| {
+        let url = format!("{}/api/{route}?id=1&{query}", server.base_url);
+        let client = client.clone();
+        async move { client.get(url).send().await.unwrap() }
+    };
+    for route in ["patch", "patchset"] {
+        for (query, expected) in [
+            ("limit=7", 7),
+            ("per_page=7", 7),
+            ("per_page=9&limit=7", 9),
+            ("limit=4294967295", 100),
+            ("limit=abc", 50),
+            ("page=1", 50),
+        ] {
+            let resp = get(route, query).await;
+            assert_eq!(resp.status(), 200, "{route}?{query}");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["limit"], expected, "{route}?{query}");
+            // The rows, not only the echo: the size is what bounds the query.
+            let patches = body["patches"].as_array().map(Vec::len);
+            assert_eq!(patches, Some(expected), "{route}?{query} patches");
+        }
+        let resp = get(route, "limit=7&limit=9").await;
+        assert_eq!(resp.status(), 400, "{route}: a repeated limit");
+    }
+}
+
 #[tokio::test]
 async fn test_stats_reviews_and_tools_endpoints() {
     let server = spawn_test_server(false).await;
