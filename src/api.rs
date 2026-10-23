@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// The most patches one page of a patchset carries, the bound the list
+/// endpoints put on their pages too.
+pub const MAX_PATCHSET_PAGE_SIZE: u32 = 100;
 
 #[derive(Deserialize)]
 pub struct Pagination {
@@ -42,11 +46,57 @@ pub struct MessagesResponse {
 pub struct PatchQuery {
     pub id: String,
     pub page: Option<u32>,
-    /// The web page asks for its page size as `limit`, the CLIs as
-    /// `per_page`; both name this field, so the page's size is not dropped
-    /// for the default.
-    #[serde(alias = "limit")]
+    /// How many patches a page carries, by the API's own name. Read it
+    /// through [`PatchQuery::page_size`], which also takes the web page's
+    /// name for it.
+    #[serde(default, deserialize_with = "page_size")]
     pub per_page: Option<u32>,
+    /// The same size by the name the web page sends, `limit`. A field of its
+    /// own rather than a serde alias: an alias makes a request naming both
+    /// fail as a duplicate field, where before it was answered. A request
+    /// that repeats `limit` itself is refused, as one repeating `per_page`,
+    /// `page` or `id` always was.
+    #[serde(default, deserialize_with = "page_size")]
+    pub limit: Option<u32>,
+}
+
+impl PatchQuery {
+    /// The page size the request asked for, `per_page` before `limit`. Both
+    /// come from an address anyone can edit, so both are read leniently and
+    /// bounded ([`page_size`]) rather than handed to the query as written.
+    pub fn page_size(&self) -> Option<u32> {
+        self.per_page.or(self.limit)
+    }
+}
+
+/// A requested page size, clamped to 1..=[`MAX_PATCHSET_PAGE_SIZE`] as the
+/// list endpoints clamp theirs. A value that is not an integer reads as no
+/// request, so the default applies, as it did before the page's `limit` was
+/// read at all: an edited value shows a page, not an error.
+fn page_size<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
+    let requested = Option::<String>::deserialize(deserializer)?;
+    Ok(requested.as_deref().and_then(clamp_page_size))
+}
+
+/// The page size `raw` asks for, clamped, or `None` when it is not an
+/// integer. Read from its digits rather than parsed into a fixed width, so
+/// an integer too large for any width still clamps to the maximum instead
+/// of reading as no request.
+fn clamp_page_size(raw: &str) -> Option<u32> {
+    let raw = raw.trim();
+    let (negative, digits) = match raw.strip_prefix('-') {
+        Some(digits) => (true, digits),
+        None => (false, raw.strip_prefix('+').unwrap_or(raw)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if negative {
+        return Some(1);
+    }
+    // Only overflow can fail here: the digits were checked above.
+    let size = digits.parse::<u64>().unwrap_or(u64::MAX);
+    u32::try_from(size.clamp(1, u64::from(MAX_PATCHSET_PAGE_SIZE))).ok()
 }
 
 #[derive(Deserialize)]
