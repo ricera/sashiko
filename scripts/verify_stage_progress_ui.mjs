@@ -1955,6 +1955,63 @@ console.log('the header version');
     check('a version label that repeats the version is caught', versionChecks(alwaysBuild).length > 0);
 }
 
+// ---- dates in the viewer's time zone ------------------------------------------
+// A list row shows a date and a time; both must be the viewer's local ones.
+// The row once took the date from toISOString(), which is UTC, so an evening
+// review west of Greenwich showed the next day's date beside today's time.
+// The time zone is set per check: node reads TZ again when it changes.
+const DATE_NAMES = ['localDateString', 'formatDateParts', 'formatDate'];
+function loadDates(srcs) {
+    const out = {};
+    new Function('out', DATE_NAMES.map(n => srcs[n]).join('\n\n')
+        + '\n;' + DATE_NAMES.map(n => `out.${n} = ${n};`).join(''))(out);
+    return out;
+}
+const dateSources = Object.fromEntries(DATE_NAMES.map(n => [n, grab(n)]));
+// 2026-10-22 17:34 in Los Angeles, 2026-10-23 00:34 UTC.
+const EVENING_PDT = 1792715656;
+function dateChecks(fns) {
+    const failed = [];
+    const expect = (name, cond) => { if (!cond) failed.push(name); };
+    const savedTz = process.env.TZ;
+    try {
+        process.env.TZ = 'America/Los_Angeles';
+        expect('a list row shows the viewer\'s date, not UTC\'s',
+            fns.formatDateParts(EVENING_PDT).dateStr === '2026-10-22');
+        expect('the list row\'s time is the viewer\'s too',
+            /5:34|17:34/.test(fns.formatDateParts(EVENING_PDT).timeStr));
+        expect('a short date is the viewer\'s date',
+            fns.formatDate(EVENING_PDT) === '2026-10-22');
+        expect('milliseconds read the same as seconds',
+            fns.formatDateParts(EVENING_PDT * 1000).dateStr === '2026-10-22');
+        process.env.TZ = 'UTC';
+        expect('a UTC viewer sees the UTC date',
+            fns.formatDateParts(EVENING_PDT).dateStr === '2026-10-23'
+                && fns.formatDate(EVENING_PDT) === '2026-10-23');
+        process.env.TZ = 'Asia/Tokyo';
+        expect('a viewer east of Greenwich sees their own date',
+            fns.formatDateParts(1792602000).dateStr === '2026-10-22');
+        expect('the month and day are zero-padded',
+            fns.localDateString(new Date(2026, 0, 5)) === '2026-01-05');
+        expect('a missing date is a dash',
+            fns.formatDateParts(null).dateStr === '-' && fns.formatDate('') === '-');
+    } finally {
+        if (savedTz === undefined) delete process.env.TZ; else process.env.TZ = savedTz;
+    }
+    return failed;
+}
+console.log('dates in the viewer\'s time zone');
+{
+    const dateFailures = dateChecks(loadDates(dateSources));
+    check('every date check passes', dateFailures.length === 0, dateFailures.join(', '));
+    const utcRow = loadDates({ ...dateSources,
+        formatDateParts: dateSources.formatDateParts.replace('localDateString(d)', "d.toISOString().split('T')[0]") });
+    check('a list row that takes its date from UTC is caught', dateChecks(utcRow).length > 0);
+    const utcShort = loadDates({ ...dateSources,
+        formatDate: dateSources.formatDate.replace('localDateString(d)', "d.toISOString().split('T')[0]") });
+    check('a short date taken from UTC is caught', dateChecks(utcShort).length > 0);
+}
+
 // ---- polling hygiene -------------------------------------------------------
 console.log('activity polling');
 {
